@@ -24,13 +24,16 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 
 def load_dotenv(path: Path) -> None:
@@ -59,7 +62,16 @@ HISTORY_N = int(os.environ.get("HISTORY_N", "24"))
 MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
 TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 STREAM_OUTPUT = os.environ.get("LOOP_STREAM", "1").lower() not in {"0", "false", "no"}
-FALLBACK_CODES = {401, 403, 404, 408, 409, 429, 500, 502, 503, 504}
+LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"))
+LOOP_CALLBACK_TIMEOUT_SECONDS = float(os.environ.get("LOOP_CALLBACK_TIMEOUT_SECONDS", "30"))
+LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = float(os.environ.get("LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS", "15"))
+LOOP_DISPATCH_TIMEOUT_SECONDS = float(os.environ.get("LOOP_DISPATCH_TIMEOUT_SECONDS", "180"))
+if min(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, LOOP_CALLBACK_TIMEOUT_SECONDS,
+       LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS, LOOP_DISPATCH_TIMEOUT_SECONDS) <= 0:
+    raise SystemExit("loop timeouts must be positive")
+if LOOP_DISPATCH_TIMEOUT_SECONDS < (LOOP_MODEL_TOTAL_TIMEOUT_SECONDS + LOOP_CALLBACK_TIMEOUT_SECONDS + LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS):
+    raise SystemExit("LOOP_DISPATCH_TIMEOUT_SECONDS must cover model total, callback, and safety margin")
+SAFE_FALLBACK_ERROR_CODES = {"model_not_found", "model_not_supported", "unsupported_model"}
 
 if not PERSONA and PERSONA_FILE:
     try:
@@ -216,7 +228,7 @@ def relay_rows(before_id: int | None, session_id: str, limit: int) -> list[dict[
         f"WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?"
     )
     params.append(max(0, limit))
-    with sqlite3.connect(str(path)) as conn:
+    with closing(sqlite3.connect(str(path))) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in reversed(rows)]
@@ -273,20 +285,53 @@ def update_config(body: dict[str, Any]) -> dict[str, Any]:
     return public_config()
 
 
-async def relay_out(payload: dict[str, Any]) -> tuple[bool, Any]:
+async def relay_out(payload: dict[str, Any]) -> tuple[bool, Any, bool]:
     if not RELAY_SECRET:
-        return False, "RELAY_SECRET missing"
-    async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
-        resp = await client.post(
-            f"{RELAY_URL}/channel/out",
-            headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
-            json=payload,
-        )
+        return False, {"error": "relay_secret_missing"}, False
+    try:
+        async with asyncio.timeout(LOOP_CALLBACK_TIMEOUT_SECONDS):
+            async with httpx.AsyncClient(timeout=LOOP_CALLBACK_TIMEOUT_SECONDS, trust_env=False) as client:
+                resp = await client.post(
+                    f"{RELAY_URL}/channel/out",
+                    headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+    except (TimeoutError, httpx.TimeoutException, httpx.NetworkError):
+        return False, {"error": "callback_uncertain"}, True
     try:
         body: Any = resp.json()
     except Exception:
-        body = resp.text[:500]
-    return resp.status_code < 300, body
+        return False, {"error": "invalid_callback_response"}, True
+    ok = resp.status_code < 300 and isinstance(body, dict) and body.get("ok") is not False and "id" in body
+    return ok, body, False
+
+
+class ModelRouteError(Exception):
+    def __init__(self, category: str, outcome: str):
+        super().__init__(category)
+        self.category = category
+        self.outcome = outcome
+
+
+def _safe_log(category: str) -> None:
+    print(f"[api-loop] model_dispatch={category}", file=sys.stderr, flush=True)
+
+
+async def _check_provider_response(resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    if resp.status_code == 404:
+        try:
+            await resp.aread()
+            payload = resp.json()
+            code = str((payload.get("error") or {}).get("code") or "").strip().lower()
+        except Exception:
+            code = ""
+        if code in SAFE_FALLBACK_ERROR_CODES:
+            raise ModelRouteError("model_unsupported", "safe_to_fallback")
+    if resp.status_code in {408, 429} or resp.status_code >= 500:
+        raise ModelRouteError("provider_response_uncertain", "dispatch_uncertain")
+    raise ModelRouteError("provider_explicit_rejection", "explicit_failed")
 
 
 async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
@@ -299,34 +344,46 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
     }
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        async with client.stream(
-            "POST",
-            route["url"].rstrip("/") + "/chat/completions",
-            headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"},
-            json=body,
-        ) as resp:
-            if resp.status_code in FALLBACK_CODES:
-                raise HTTPException(status_code=resp.status_code, detail="fallback")
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    ev = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(ev.get("usage"), dict):
-                    usage = ev["usage"]
-                delta = (((ev.get("choices") or [{}])[0]).get("delta") or {})
-                chunk = delta.get("content") or ""
-                if chunk:
-                    text_parts.append(chunk)
-                    await sink(chunk)
+    model_work_started = False
+    done_received = False
+    try:
+        async with httpx.AsyncClient(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with client.stream(
+                "POST", route["url"].rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
+            ) as resp:
+                await _check_provider_response(resp)
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        done_received = True
+                        break
+                    try:
+                        ev = json.loads(data)
+                    except json.JSONDecodeError:
+                        raise ModelRouteError("invalid_stream_response", "dispatch_uncertain") from None
+                    if not isinstance(ev, dict) or not isinstance(ev.get("choices"), list):
+                        raise ModelRouteError("invalid_stream_response", "dispatch_uncertain")
+                    if isinstance(ev.get("usage"), dict):
+                        usage = ev["usage"]
+                    delta = (((ev.get("choices") or [{}])[0]).get("delta") or {})
+                    chunk = delta.get("content") or ""
+                    if chunk:
+                        model_work_started = True
+                        text_parts.append(chunk)
+                        await sink(chunk)
+    except asyncio.CancelledError:
+        raise
+    except ModelRouteError:
+        raise
+    except Exception:
+        category = "model_stream_interrupted" if model_work_started else "model_transport_uncertain"
+        raise ModelRouteError(category, "dispatch_uncertain") from None
+    if not done_received or not text_parts:
+        raise ModelRouteError("incomplete_stream_response", "dispatch_uncertain")
     return {"text": "".join(text_parts).strip(), "usage": usage}
 
 
@@ -338,57 +395,85 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]]) -
         "max_tokens": MAX_TOKENS,
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-        resp = await client.post(
-            route["url"].rstrip("/") + "/chat/completions",
-            headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"},
-            json=body,
-        )
-    if resp.status_code in FALLBACK_CODES:
-        raise HTTPException(status_code=resp.status_code, detail="fallback")
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
+            resp = await client.post(
+                route["url"].rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
+            )
+        await _check_provider_response(resp)
+        data = resp.json()
+    except asyncio.CancelledError:
+        raise
+    except ModelRouteError:
+        raise
+    except Exception:
+        raise ModelRouteError("model_transport_uncertain", "dispatch_uncertain") from None
     msg = ((data.get("choices") or [{}])[0]).get("message") or {}
-    return {"text": (msg.get("content") or "").strip(), "usage": data.get("usage") or {}}
+    text = (msg.get("content") or "").strip()
+    if not text:
+        raise ModelRouteError("empty_model_response", "dispatch_uncertain")
+    return {"text": text, "usage": data.get("usage") or {}}
 
 
 async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", session_id: str = "", emit_stream: bool = False) -> dict[str, Any]:
-    tried = []
-    last_error = ""
-    for route in main_chain():
-        tried.append(route.get("model"))
-        try:
-            if emit_stream and STREAM_OUTPUT:
-                async def sink(chunk: str) -> None:
-                    await relay_out({
-                        "type": "reply_delta",
-                        "stream_id": stream_id,
-                        "text": chunk,
-                        "done": False,
-                        "api_session": session_id,
-                    })
-                out = await stream_chat(route, messages, sink)
-            else:
-                out = await complete_chat(route, messages)
-            out["model"] = route.get("model")
-            out["tried"] = tried[:-1]
-            return out
-        except HTTPException as exc:
-            if exc.status_code not in FALLBACK_CODES:
+    tried: list[str] = []
+
+    async def execute() -> dict[str, Any]:
+        for route in main_chain():
+            tried.append(str(route.get("model") or ""))
+            try:
+                if emit_stream and STREAM_OUTPUT:
+                    async def sink(chunk: str) -> None:
+                        await relay_out({"type": "reply_delta", "stream_id": stream_id, "text": chunk,
+                                         "done": False, "api_session": session_id})
+                    out = await stream_chat(route, messages, sink)
+                else:
+                    out = await complete_chat(route, messages)
+            except asyncio.CancelledError:
                 raise
-            last_error = f"HTTP {exc.status_code}"
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-    return {"text": "", "error": last_error or "all models failed", "tried": tried}
+            except ModelRouteError as exc:
+                if exc.outcome == "safe_to_fallback":
+                    continue
+                _safe_log(exc.category)
+                return {"outcome": exc.outcome, "error": exc.category, "tried": tried}
+            except Exception:
+                _safe_log("model_unexpected_uncertain")
+                return {"outcome": "dispatch_uncertain", "error": "model_unexpected_uncertain", "tried": tried}
+            out.update({"outcome": "success", "model": route.get("model"), "tried": tried[:-1]})
+            return out
+        return {"outcome": "explicit_failed", "error": "no_supported_model", "tried": tried}
+
+    try:
+        async with asyncio.timeout(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS):
+            return await execute()
+    except TimeoutError:
+        _safe_log("model_timeout")
+        return {"outcome": "dispatch_uncertain", "error": "model_timeout", "tried": tried}
 
 
-async def handle_ingest(text: str, msg_id: int | None, session_id: str, *, dry: bool = False) -> dict[str, Any]:
-    stream_id = "api-" + uuid.uuid4().hex[:16]
+async def handle_ingest(
+    text: str,
+    msg_id: int | None,
+    session_id: str,
+    *,
+    dry: bool = False,
+    stream_id: str = "",
+    generation_id: str = "",
+    reply_to: str = "",
+    channel: str = "",
+    channel_account: str = "",
+    channel_conversation: str = "",
+) -> dict[str, Any]:
+    stream_id = stream_id or ("api-" + uuid.uuid4().hex[:16])
     messages = build_messages(text, before_id=msg_id, session_id=session_id, use_context=True)
     out = await run_model(messages, stream_id=stream_id, session_id=session_id, emit_stream=not dry)
+    if out.get("outcome") != "success":
+        uncertain = out.get("outcome") == "dispatch_uncertain"
+        return {"ok": False, "callback_delivered": False, "dispatch_uncertain": uncertain,
+                "generation_id": generation_id, "stream_id": stream_id,
+                "api_session": session_id, "error": out.get("error") or "model_failed"}
     reply = (out.get("text") or "").strip()
-    if not reply:
-        reply = "(The API loop did not produce a reply.)"
     meta = {
         "runtime": "api_loop",
         "model": out.get("model"),
@@ -399,17 +484,29 @@ async def handle_ingest(text: str, msg_id: int | None, session_id: str, *, dry: 
     if dry:
         return {"ok": True, "reply": reply, "api": meta}
     if STREAM_OUTPUT:
-        ok, body = await relay_out({
+        ok, body, uncertain = await relay_out({
             "type": "reply_delta",
             "stream_id": stream_id,
+            "generation_id": generation_id,
+            "reply_to": reply_to,
             "done": True,
             "final_text": reply,
             "api": meta,
             "api_session": session_id,
+            "channel": channel,
+            "channel_account": channel_account,
+            "channel_conversation": channel_conversation,
         })
     else:
-        ok, body = await relay_out({"type": "reply", "text": reply, "api": meta, "api_session": session_id})
-    return {"ok": ok, "relay": body, "api": meta}
+        ok, body, uncertain = await relay_out({
+            "type": "reply", "text": reply, "api": meta, "api_session": session_id,
+            "stream_id": stream_id, "generation_id": generation_id, "reply_to": reply_to,
+            "channel": channel, "channel_account": channel_account,
+            "channel_conversation": channel_conversation,
+        })
+    return {"ok": ok, "callback_delivered": ok, "dispatch_uncertain": uncertain,
+            "generation_id": generation_id, "stream_id": stream_id, "api_session": session_id,
+            "relay": body, "api": meta}
 
 
 app = FastAPI(title="companion-api-loop")
@@ -466,6 +563,9 @@ async def loop_chat(request: Request):
     session_id = str(body.get("session_id") or body.get("api_session") or active_session_id() or "").strip()
     messages = build_messages(text, before_id=None, session_id=session_id, use_context=bool(body.get("use_context", True)))
     out = await run_model(messages, emit_stream=False)
+    if out.get("outcome") != "success":
+        return JSONResponse({"ok": False, "dispatch_uncertain": out.get("outcome") == "dispatch_uncertain",
+                             "error": out.get("error")}, status_code=504 if out.get("outcome") == "dispatch_uncertain" else 502)
     return {"ok": True, "reply": out.get("text") or "", "api": out}
 
 
@@ -482,7 +582,21 @@ async def loop_ingest(request: Request):
         before_id = None
     session_id = str(body.get("session_id") or body.get("api_session") or active_session_id() or "").strip()
     dry = bool(body.get("dry"))
-    return await handle_ingest(text, before_id, session_id, dry=dry)
+    result = await handle_ingest(
+        text,
+        before_id,
+        session_id,
+        dry=dry,
+        stream_id=str(body.get("stream_id") or "").strip(),
+        generation_id=str(body.get("generation_id") or "").strip(),
+        reply_to=str(body.get("reply_to") or "").strip(),
+        channel=str(body.get("channel") or "").strip(),
+        channel_account=str(body.get("channel_account") or "").strip(),
+        channel_conversation=str(body.get("channel_conversation") or "").strip(),
+    )
+    if result.get("ok") is not True:
+        return JSONResponse(result, status_code=504 if result.get("dispatch_uncertain") else 502)
+    return result
 
 
 if __name__ == "__main__":

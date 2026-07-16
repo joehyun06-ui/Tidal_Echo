@@ -38,6 +38,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
+    from . import channel_store
+    from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
+except ImportError:  # support `python backend/app.py`
+    import channel_store
+    from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
+
+try:
     from pywebpush import webpush, WebPushException
 except Exception:  # a missing lib must not stop the relay from starting
     webpush = None
@@ -86,7 +93,26 @@ PRESENCE_RECENT_SEC = int(os.environ.get("RELAY_PRESENCE_RECENT_SEC", "1800"))
 # human messages to a local HTTP loop, which replies through /channel/out.
 BRAIN_FILE = Path(os.environ.get("RELAY_BRAIN_FILE", str(Path(__file__).parent / "brain_target")))
 LOOP_INGEST_URL = os.environ.get("RELAY_LOOP_INGEST_URL", "http://127.0.0.1:3020/loop/ingest")
+LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"))
+LOOP_CALLBACK_TIMEOUT_SECONDS = float(os.environ.get("LOOP_CALLBACK_TIMEOUT_SECONDS", "30"))
+LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = float(os.environ.get("LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS", "15"))
+LOOP_DISPATCH_TIMEOUT_SECONDS = float(os.environ.get("LOOP_DISPATCH_TIMEOUT_SECONDS", "180"))
+
+
+def validate_loop_timeouts(model_total: float, callback: float, margin: float, dispatch: float) -> None:
+    if min(model_total, callback, margin, dispatch) <= 0:
+        raise ValueError("loop timeouts must be positive")
+    if dispatch < model_total + callback + margin:
+        raise ValueError("dispatch timeout must cover model total, callback, and safety margin")
+
+
+try:
+    validate_loop_timeouts(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, LOOP_CALLBACK_TIMEOUT_SECONDS,
+                           LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS, LOOP_DISPATCH_TIMEOUT_SECONDS)
+except ValueError as exc:
+    raise SystemExit(f"invalid loop timeout configuration: {exc}") from None
 STREAM_DRAFT_TTL = int(os.environ.get("RELAY_STREAM_DRAFT_TTL", "600"))
+TELEGRAM = TelegramConfig.from_env()
 
 if not SECRET:
     raise SystemExit("RELAY_SECRET is required (set it in the systemd EnvironmentFile)")
@@ -101,8 +127,10 @@ def now_iso() -> str:
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, factory=channel_store.ClosingConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -134,6 +162,9 @@ def init_db() -> None:
             """
         )
         conn.commit()
+    channel_store.run_migrations(DB_PATH)
+    channel_store.recover_inflight_generations(DB_PATH)
+    channel_store.recover_inflight_deliveries(DB_PATH)
 
 
 def save_message(direction: str, kind: str, text: str, meta: dict) -> dict:
@@ -359,20 +390,56 @@ def brain_target() -> str:
         return "desktop"
 
 
-def _forward_to_loop_sync(msg: dict) -> None:
+def _forward_to_loop_sync(msg: dict, routing: dict | None = None) -> dict:
     meta = msg.get("meta") or {}
-    data = json.dumps({
+    payload = {
         "id": msg.get("id"),
         "text": msg.get("text", ""),
         "session_id": meta.get("api_session") or "",
-    }, ensure_ascii=False).encode("utf-8")
+    }
+    if routing:
+        payload.update(routing)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         LOOP_INGEST_URL,
         data=data,
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    urllib.request.urlopen(req, timeout=10).read()
+    try:
+        with urllib.request.urlopen(req, timeout=LOOP_DISPATCH_TIMEOUT_SECONDS) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = {}
+        uncertain = bool(payload.get("dispatch_uncertain")) if isinstance(payload, dict) else False
+        raise LoopDispatchError("loop_dispatch_uncertain" if uncertain else "loop_explicit_failed", uncertain) from None
+    except (TimeoutError, urllib.error.URLError, ConnectionError, OSError):
+        raise LoopDispatchError("loop_dispatch_timeout", True) from None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise LoopDispatchError("loop_invalid_ack", True) from None
+    if not isinstance(payload, dict):
+        raise LoopDispatchError("loop_invalid_ack", True)
+    if payload.get("ok") is False:
+        raise LoopDispatchError("loop_dispatch_uncertain" if payload.get("dispatch_uncertain") else "loop_explicit_failed",
+                                bool(payload.get("dispatch_uncertain")))
+    required_ack = ("callback_delivered", "generation_id", "stream_id", "api_session")
+    if payload.get("ok") is not True or any(key not in payload for key in required_ack):
+        raise LoopDispatchError("correlation_missing", True)
+    if payload.get("callback_delivered") is not True:
+        raise LoopDispatchError("loop_callback_failed", False)
+    if routing:
+        expected = {
+            "generation_id": routing.get("generation_id"), "stream_id": routing.get("stream_id"),
+            "api_session": routing.get("api_session"),
+        }
+        if any(str(payload.get(key) or "") != str(value or "") for key, value in expected.items()):
+            raise LoopDispatchError("loop_ack_correlation_mismatch", False)
+    return payload
 
 
 async def forward_to_loop(msg: dict) -> None:
@@ -380,6 +447,67 @@ async def forward_to_loop(msg: dict) -> None:
         await asyncio.to_thread(_forward_to_loop_sync, msg)
     except Exception as exc:
         print(f"[loop] forward failed: {type(exc).__name__}: {exc}")
+
+
+async def dispatch_telegram_generation(job: dict, msg: dict) -> None:
+    """Dispatch one claimed Telegram job only to loop with explicit correlation IDs."""
+    if brain_target() != "loop":
+        raise LoopDispatchError("loop_required", False)
+    await asyncio.to_thread(_forward_to_loop_sync, msg, {
+        "api_session": job["api_session"],
+        "stream_id": job["stream_id"],
+        "generation_id": job["generation_id"],
+        "reply_to": job["reply_to"],
+        "channel": "telegram",
+        "channel_account": job["external_account_id"],
+        "channel_conversation": job["external_conversation_id"],
+    })
+
+
+async def dispatch_human_message(
+    text: str,
+    *,
+    attachments: list | None = None,
+    api_session: str = "",
+    existing_message: dict | None = None,
+    route: bool = True,
+    extra_meta: dict | None = None,
+) -> dict:
+    """Canonical human-message path shared by Web and channel adapters."""
+    attachments = attachments or []
+    if existing_message is None:
+        meta = {"user": "human", "attachments": attachments}
+        if api_session:
+            meta["api_session"] = api_session
+        if extra_meta:
+            meta.update(extra_meta)
+        msg = save_message("in", "user", text, meta)
+    else:
+        msg = existing_message
+    if route:
+        if brain_target() == "loop":
+            asyncio.create_task(forward_to_loop(msg))
+        else:
+            await broadcast(plugin_subs, plugin_payload(msg))
+    await broadcast(app_subs, app_payload(msg))
+    await broadcast(app_subs, {"type": "typing", "active": True})
+    return msg
+
+
+def telegram_completion_for(msg: dict) -> dict | None:
+    """Atomically complete a strongly correlated Telegram reply, if present."""
+    if msg.get("kind") != "reply":
+        return None
+    meta = msg.get("meta") or {}
+    result = channel_store.complete_telegram_generation(DB_PATH, meta=meta, text=msg.get("text") or "", kind="reply")
+    if result:
+        return result
+    complete_keys = ("channel_account", "channel_conversation", "api_session", "reply_to")
+    if meta.get("channel") == "telegram" and all(meta.get(key) for key in complete_keys) and (meta.get("generation_id") or meta.get("stream_id")):
+        return None  # the transactional validator already wrote one fixed-category audit event
+    if any(meta.get(key) for key in ("generation_id", "reply_to", "channel_account", "channel_conversation")) or str(meta.get("stream_id") or "").startswith("tg-stream-"):
+        channel_store.mark_uncorrelated(DB_PATH, meta)
+    return None
 
 
 def prune_stream_drafts() -> None:
@@ -429,8 +557,19 @@ async def handle_stream_delta(kind: str, body: dict) -> dict:
     text = draft.get("text") or ""
     stream_drafts.pop(key, None)
     if not text:
+        if (draft.get("meta") or {}).get("channel") == "telegram":
+            raise HTTPException(status_code=422, detail="empty Telegram reply")
         return {"ok": True, "stream_id": stream_id, "saved": False}
-    msg = save_message("out", base_kind, text, dict(draft.get("meta") or {}))
+    final_meta = dict(draft.get("meta") or {})
+    completion = telegram_completion_for({"kind": base_kind, "text": text, "meta": final_meta})
+    if completion:
+        msg = completion["message"]
+        if completion.get("duplicate"):
+            return {"id": msg["id"], "stream_id": stream_id, "saved": True, "duplicate": True}
+    else:
+        if final_meta.get("channel") == "telegram":
+            raise HTTPException(status_code=409, detail="telegram correlation rejected")
+        msg = save_message("out", base_kind, text, final_meta)
     await broadcast(app_subs, {"type": "typing", "active": False})
     await broadcast(app_subs, app_payload(msg))
     if base_kind == "reply" and not app_subs:
@@ -629,7 +768,20 @@ def check_auth(request: Request) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    worker_task = None
+    if TELEGRAM.enabled:
+        worker = TelegramWorker(DB_PATH, TELEGRAM, dispatch_telegram_generation)
+        app.state.telegram_worker = worker
+        worker_task = asyncio.create_task(worker.run_forever())
+    try:
+        yield
+    finally:
+        if worker_task:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -682,7 +834,15 @@ async def channel_out(request: Request):
         return {"id": target_id, "reactions": reactions}
     text = body.get("text", "")
     meta = {k: v for k, v in body.items() if k not in ("type", "text")}
-    msg = save_message("out", kind, text, meta)
+    completion = telegram_completion_for({"kind": kind, "text": text, "meta": meta})
+    if completion:
+        msg = completion["message"]
+        if completion.get("duplicate"):
+            return {"id": msg["id"], "duplicate": True}
+    else:
+        if meta.get("channel") == "telegram":
+            raise HTTPException(status_code=409, detail="telegram correlation rejected")
+        msg = save_message("out", kind, text, meta)
     # the AI replied — clear the typing state
     await broadcast(app_subs, {"type": "typing", "active": False})
     await broadcast(app_subs, app_payload(msg))
@@ -708,21 +868,64 @@ async def app_send(request: Request):
     api_session = str(body.get("api_session") or body.get("session_id") or "").strip()
     if not text and not attachments:
         raise HTTPException(status_code=400, detail="empty text")
-    meta = {"user": "human", "attachments": attachments}
-    if api_session:
-        meta["api_session"] = api_session
-    msg = save_message("in", "user", text, meta)
-    # Route to exactly one AI body. "desktop" keeps the Claude Code channel;
-    # "loop" calls the optional server-side API loop.
-    if brain_target() == "loop":
-        asyncio.create_task(forward_to_loop(msg))
-    else:
-        await broadcast(plugin_subs, plugin_payload(msg))
-    # echo to the PWA so the sender's bubble + other tabs stay in sync
-    await broadcast(app_subs, app_payload(msg))
-    # the AI starts processing — push a typing state to the PWA
-    await broadcast(app_subs, {"type": "typing", "active": True})
+    msg = await dispatch_human_message(text, attachments=attachments, api_session=api_session)
     return {"id": msg["id"]}
+
+
+@app.post("/integrations/telegram/webhook")
+async def telegram_webhook(request: Request):
+    if not TELEGRAM.enabled:
+        raise HTTPException(status_code=404, detail="integration disabled")
+    received = request.headers.get("x-telegram-bot-api-secret-token", "")
+    if not received or not hmac.compare_digest(received, TELEGRAM.webhook_secret):
+        raise HTTPException(status_code=401, detail="invalid webhook authentication")
+    content_length = request.headers.get("content-length", "")
+    try:
+        if content_length and int(content_length) > TELEGRAM.webhook_max_body_bytes:
+            return Response(content='{"ok":false,"error":"body_too_large"}', status_code=413, media_type="application/json")
+    except ValueError:
+        return Response(content='{"ok":false,"error":"malformed_request"}', status_code=400, media_type="application/json")
+    raw_buffer = bytearray()
+    async for chunk in request.stream():
+        raw_buffer.extend(chunk)
+        if len(raw_buffer) > TELEGRAM.webhook_max_body_bytes:
+            return Response(content='{"ok":false,"error":"body_too_large"}', status_code=413, media_type="application/json")
+    raw = bytes(raw_buffer)
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return Response(content='{"ok":false,"error":"malformed_json"}', status_code=400, media_type="application/json")
+    update, error = validate_update(TELEGRAM, body)
+    if error:
+        public_reason = {
+            "unsupported_update": "unsupported_update", "not_allowed": "not_allowed",
+            "private_chat_required": "not_private", "commands_not_supported": "command",
+            "text_required": "empty_text", "text_too_long": "text_too_long",
+            "bot_sender": "bot_sender", "malformed_update": "malformed_update",
+        }.get(error, "unsupported_update")
+        return {"ok": True, "ignored": True, "reason": public_reason}
+    try:
+        result = channel_store.enqueue_telegram_update(
+            DB_PATH, account_id=TELEGRAM.account_id, update_id=update["update_id"],
+            chat_id=update["chat_id"], user_id=update["user_id"],
+            external_message_id=update["external_message_id"], text=update["text"],
+            rate_limit=20, rate_window_seconds=60,
+        )
+    except (sqlite3.Error, OSError):
+        return Response(content='{"ok":false,"error":"temporarily_unavailable"}', status_code=503, media_type="application/json")
+    if result.get("rejected") == "rate_limited":
+        return {"ok": True, "ignored": True, "reason": "rate_limited"}
+    if result.get("duplicate"):
+        response = {"ok": True, "duplicate": True}
+        if result.get("ignored"):
+            response.update({"ignored": True, "reason": result.get("reason") or "duplicate"})
+        return response
+    try:
+        await dispatch_human_message(update["text"], api_session=result["api_session"],
+                                     existing_message=result["message"], route=False)
+    except Exception:
+        print("[telegram] sse_broadcast_failed")
+    return {"ok": True, "queued": True}
 
 
 @app.post("/app/upload")

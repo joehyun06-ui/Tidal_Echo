@@ -10,6 +10,8 @@ relay.env
 # Runtime data: the conversation DB and uploaded attachments are private
 relay.db
 relay.db-*
+*.sqlite
+*.sqlite3
 uploads/
 inbox/
 last_in_id

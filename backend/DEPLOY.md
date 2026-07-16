@@ -216,10 +216,30 @@ AI 侧默认是你电脑上的 Claude Code 加一个 **channel 插件**，它：
 
 ---
 
-## 8. API 速查
+## 8. Telegram 私聊文字 MVP（可选）
+
+完整限制、变量和 webhook 配置步骤见 [`TELEGRAM_MVP.md`](TELEGRAM_MVP.md)。Bot 必须由你在
+BotFather 中人工创建；真实 token 与 webhook secret 只能写入服务器的 `relay.env`，不要写入
+命令历史、URL、Git 或前端文件。配置不完整或 `TELEGRAM_ENABLED=false` 时，Telegram 路由保持
+禁用，原有 relay 仍可正常启动。
+
+### Telegram reliability deployment notes
+
+Deploy the relay and `examples/api_loop.py` from the same revision and restart both before setting `TELEGRAM_ENABLED=true`. Configure `CHANNEL_AUDIT_HMAC_SECRET`, `TELEGRAM_GENERATION_MAX_ATTEMPTS`, `LOOP_MODEL_TOTAL_TIMEOUT_SECONDS`, `LOOP_CALLBACK_TIMEOUT_SECONDS`, `LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS`, `LOOP_DISPATCH_TIMEOUT_SECONDS`, and the webhook body limit from `.env.example`. The model value is a wall-clock deadline for the entire route chain, and dispatch must be at least model total plus callback plus margin.
+
+Fallback is limited to explicit model-not-found/unsupported responses that prove no generation began. Timeout, disconnect, response loss, malformed/incomplete streaming, any error after a delta, and generic exceptions become `dispatch_uncertain` without fallback. A legacy loop acknowledgement missing callback/correlation fields becomes `correlation_missing` under `dispatch_uncertain`; it is not automatically retried. This conservative policy applies to Telegram and ordinary Web loop calls and may require manual review.
+
+Permanent authenticated policy rejects return `200 ignored`; only temporary database/service failures are retryable non-2xx responses. Neither `dispatch_uncertain` nor `delivery_uncertain` retries automatically. Production uses the official HTTPS Telegram API by default; custom Bot API servers require the explicit HTTPS allowlist. This SQLite implementation supports one relay/worker process.
+
+Back up the database as one consistent file, including migrations, mappings, jobs, completion identities, deliveries, and `delivery_parts`. The database, uploads, environment file, and key files must be owned by the service account and not be group/world readable. Use a protected systemd `EnvironmentFile` or platform secret store; never put secrets in `ExecStart`, public command history, or deployment logs.
+
+Run exactly one production relay/Telegram worker instance with SQLite. The test suite uses ASGI in-memory transports and blocks all real network access, including loopback.
+
+## 9. API 速查
 
 | 方法 | 路径 | 谁用 | 作用 |
 |---|---|---|---|
+| POST | `/integrations/telegram/webhook` | Telegram | Uses `X-Telegram-Bot-Api-Secret-Token`; no relay Bearer/query-token auth |
 | GET | `/healthz` | — | 健康检查（免鉴权） |
 | GET | `/channel/in` | AI侧 | SSE：接收人类发来的消息 |
 | POST | `/channel/out` | AI侧 | 发回复 / 戳一戳 |
@@ -237,4 +257,4 @@ AI 侧默认是你电脑上的 Claude Code 加一个 **channel 插件**，它：
 | POST | `/app/subscribe` · `/app/unsubscribe` | PWA | 开/关锁屏推送订阅 |
 | POST | `/app/push_test` | PWA | 推一条测试通知 |
 
-所有端点（除 `/healthz`）都要 `Authorization: Bearer <RELAY_SECRET>`；SSE 端点也可用 `?token=<RELAY_SECRET>`。
+除 `/healthz` 和 Telegram webhook 外，端点都要 `Authorization: Bearer <RELAY_SECRET>`；SSE 端点也可用 `?token=<RELAY_SECRET>`。Telegram webhook 只使用专用 secret header。
