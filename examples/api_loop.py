@@ -35,6 +35,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from backend import deployment_config
+
 
 def load_dotenv(path: Path) -> None:
     try:
@@ -51,7 +53,7 @@ def load_dotenv(path: Path) -> None:
 HERE = Path(__file__).resolve().parent
 load_dotenv(HERE / ".env")
 
-LOOP_PORT = int(os.environ.get("LOOP_PORT", "3020"))
+LOOP_PORT = deployment_config.parse_port(os.environ.get("LOOP_PORT", "3020"), "invalid_loop_port")
 LOOP_CONFIG = Path(os.environ.get("LOOP_CONFIG", str(HERE / "api_loop.config.json")))
 RELAY_DB = os.environ.get("RELAY_DB", str(HERE.parent / "backend" / "relay.db"))
 RELAY_URL = os.environ.get("RELAY_URL", "http://127.0.0.1:3011").rstrip("/")
@@ -61,16 +63,30 @@ PERSONA = os.environ.get("PERSONA", "").strip()
 HISTORY_N = int(os.environ.get("HISTORY_N", "24"))
 MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
 TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
-STREAM_OUTPUT = os.environ.get("LOOP_STREAM", "1").lower() not in {"0", "false", "no"}
-LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"))
-LOOP_CALLBACK_TIMEOUT_SECONDS = float(os.environ.get("LOOP_CALLBACK_TIMEOUT_SECONDS", "30"))
-LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = float(os.environ.get("LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS", "15"))
-LOOP_DISPATCH_TIMEOUT_SECONDS = float(os.environ.get("LOOP_DISPATCH_TIMEOUT_SECONDS", "180"))
-if min(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, LOOP_CALLBACK_TIMEOUT_SECONDS,
-       LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS, LOOP_DISPATCH_TIMEOUT_SECONDS) <= 0:
-    raise SystemExit("loop timeouts must be positive")
-if LOOP_DISPATCH_TIMEOUT_SECONDS < (LOOP_MODEL_TOTAL_TIMEOUT_SECONDS + LOOP_CALLBACK_TIMEOUT_SECONDS + LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS):
-    raise SystemExit("LOOP_DISPATCH_TIMEOUT_SECONDS must cover model total, callback, and safety margin")
+STREAM_OUTPUT = deployment_config.parse_strict_bool(os.environ.get("LOOP_STREAM", "1"), "invalid_loop_stream")
+RENDER_TELEGRAM_MVP = deployment_config.parse_strict_bool(
+    os.environ.get("RENDER_TELEGRAM_MVP", "false"), "invalid_render_telegram_mvp"
+)
+API_LOOP_INSTANCE_NONCE = os.environ.get("API_LOOP_INSTANCE_NONCE", "")
+LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = deployment_config.parse_positive_finite_float(
+    os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"
+)
+LOOP_CALLBACK_TIMEOUT_SECONDS = deployment_config.parse_positive_finite_float(
+    os.environ.get("LOOP_CALLBACK_TIMEOUT_SECONDS", "30"), "invalid_loop_timeout"
+)
+LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = deployment_config.parse_positive_finite_float(
+    os.environ.get("LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS", "15"), "invalid_loop_timeout"
+)
+LOOP_DISPATCH_TIMEOUT_SECONDS = deployment_config.parse_positive_finite_float(
+    os.environ.get("LOOP_DISPATCH_TIMEOUT_SECONDS", "180"), "invalid_loop_timeout"
+)
+deployment_config.validate_loop_timeouts(
+    LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, LOOP_CALLBACK_TIMEOUT_SECONDS,
+    LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS, LOOP_DISPATCH_TIMEOUT_SECONDS,
+)
+if RENDER_TELEGRAM_MVP and not API_LOOP_INSTANCE_NONCE:
+    raise SystemExit("invalid deployment configuration: api_loop_instance_nonce_missing")
+deployment_config.validate_loop_config_file(LOOP_CONFIG, render_mvp=RENDER_TELEGRAM_MVP)
 SAFE_FALLBACK_ERROR_CODES = {"model_not_found", "model_not_supported", "unsupported_model"}
 
 if not PERSONA and PERSONA_FILE:
@@ -88,9 +104,9 @@ if not PERSONA:
 def env_routes() -> list[dict[str, str]]:
     routes: list[dict[str, str]] = []
     for suffix in ("", "_2", "_3", "_4"):
-        base = os.environ.get(f"LLM_API_BASE{suffix}", "").rstrip("/")
-        key = os.environ.get(f"LLM_API_KEY{suffix}", "")
-        model = os.environ.get(f"LLM_MODEL{suffix}", "")
+        base = os.environ.get(f"LLM_API_BASE{suffix}", "").strip().rstrip("/")
+        key = os.environ.get(f"LLM_API_KEY{suffix}", "").strip()
+        model = os.environ.get(f"LLM_MODEL{suffix}", "").strip()
         if base and key and model:
             routes.append({"url": base, "key": key, "model": model})
     return routes
@@ -112,18 +128,28 @@ def mask_key(key: str) -> str:
 def load_config() -> dict[str, Any]:
     try:
         data = json.loads(LOOP_CONFIG.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            if RENDER_TELEGRAM_MVP:
+                deployment_config.validate_loop_config_payload(data, render_mvp=True)
+            return data
+        if RENDER_TELEGRAM_MVP:
+            raise HTTPException(status_code=503, detail="invalid_loop_config")
+        return {}
     except FileNotFoundError:
         return {}
+    except HTTPException:
+        raise
     except Exception:
+        if RENDER_TELEGRAM_MVP:
+            raise HTTPException(status_code=503, detail="invalid_loop_config") from None
         return {}
 
 
 def save_config(cfg: dict[str, Any]) -> None:
-    LOOP_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = LOOP_CONFIG.with_suffix(LOOP_CONFIG.suffix + ".tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(LOOP_CONFIG)
+    deployment_config.validate_loop_config_payload(cfg, render_mvp=RENDER_TELEGRAM_MVP)
+    deployment_config.atomic_write_text(
+        LOOP_CONFIG, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 def main_chain() -> list[dict[str, str]]:
@@ -260,6 +286,10 @@ def public_config() -> dict[str, Any]:
 
 
 def update_config(body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        deployment_config.validate_loop_config_update_request(body, render_mvp=RENDER_TELEGRAM_MVP)
+    except deployment_config.DeploymentConfigError as exc:
+        raise HTTPException(status_code=400, detail=exc.category) from None
     cfg = load_config()
     if "history_n" in body:
         cfg["history_n"] = max(0, min(int(body.get("history_n") or 0), 200))
@@ -268,7 +298,17 @@ def update_config(body: dict[str, Any]) -> dict[str, Any]:
         new_chain = []
         for pos, item in enumerate(body["main_chain"]):
             if not isinstance(item, dict):
+                if RENDER_TELEGRAM_MVP:
+                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
                 continue
+            if RENDER_TELEGRAM_MVP:
+                allowed = {"index", "model", "url", "key"}
+                if not set(item).issubset(allowed):
+                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
+                if "index" in item and (not isinstance(item["index"], int) or isinstance(item["index"], bool)):
+                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
+                if any(name in item and not isinstance(item[name], str) for name in ("model", "url", "key")):
+                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
             old_idx = int(item.get("index", pos) or 0)
             prev = old[old_idx] if 0 <= old_idx < len(old) else {}
             entry = {
@@ -281,6 +321,15 @@ def update_config(body: dict[str, Any]) -> dict[str, Any]:
             new_chain.append(entry)
         if new_chain:
             cfg["main_chain"] = new_chain
+        elif RENDER_TELEGRAM_MVP:
+            raise HTTPException(status_code=400, detail="invalid_loop_model_route")
+    elif RENDER_TELEGRAM_MVP and "main_chain" in body:
+        raise HTTPException(status_code=400, detail="invalid_loop_config_structure")
+    if RENDER_TELEGRAM_MVP:
+        try:
+            deployment_config.validate_loop_config_payload(cfg, render_mvp=True)
+        except deployment_config.DeploymentConfigError as exc:
+            raise HTTPException(status_code=400, detail=exc.category) from None
     save_config(cfg)
     return public_config()
 
@@ -514,12 +563,14 @@ app = FastAPI(title="companion-api-loop")
 
 @app.get("/healthz")
 async def healthz():
+    if RENDER_TELEGRAM_MVP:
+        routes = main_chain()
+        if len(routes) != 1:
+            raise HTTPException(status_code=503, detail="invalid_loop_model_routes")
     return {
         "ok": True,
-        "models": [r.get("model") for r in main_chain()],
-        "history_n": history_n(),
-        "relay_db": RELAY_DB,
-        "relay_secret_loaded": bool(RELAY_SECRET),
+        "service": "api_loop",
+        "instance_nonce": API_LOOP_INSTANCE_NONCE,
     }
 
 

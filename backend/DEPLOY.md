@@ -115,7 +115,7 @@ S=填你的RELAY_SECRET
 
 # 1) 健康检查（不需要密钥）
 curl -s https://your-domain.example/relay/healthz
-#   期望: {"ok":true,"plugin_subs":0,"app_subs":0}
+#   期望: {"ok":true}
 
 # 2) 发一条消息（模拟 PWA → 落库）
 curl -s -X POST https://your-domain.example/relay/app/send \
@@ -220,8 +220,12 @@ AI 侧默认是你电脑上的 Claude Code 加一个 **channel 插件**，它：
 
 完整限制、变量和 webhook 配置步骤见 [`TELEGRAM_MVP.md`](TELEGRAM_MVP.md)。Bot 必须由你在
 BotFather 中人工创建；真实 token 与 webhook secret 只能写入服务器的 `relay.env`，不要写入
-命令历史、URL、Git 或前端文件。配置不完整或 `TELEGRAM_ENABLED=false` 时，Telegram 路由保持
-禁用，原有 relay 仍可正常启动。
+命令历史、URL、Git 或前端文件。`TELEGRAM_ENABLED=false` 时路由保持禁用；明确设为 `true` 后，
+任何必需配置缺失或非法都会 fail-fast，避免部署表面健康但 Telegram 实际未启用。
+
+Render 部署不要套用本页的 systemd/nginx `/relay` 步骤；使用
+[`RENDER_TELEGRAM.md`](RENDER_TELEGRAM.md) 和仓库根目录 `render.yaml`。Render 直连 webhook
+路由没有 nginx `/relay` 前缀。
 
 ### Telegram reliability deployment notes
 
@@ -241,6 +245,7 @@ Run exactly one production relay/Telegram worker instance with SQLite. The test 
 |---|---|---|---|
 | POST | `/integrations/telegram/webhook` | Telegram | Uses `X-Telegram-Bot-Api-Secret-Token`; no relay Bearer/query-token auth |
 | GET | `/healthz` | — | 健康检查（免鉴权） |
+| GET | `/readyz` | — | 部署就绪检查（免鉴权，不返回路径或 Secret） |
 | GET | `/channel/in` | AI侧 | SSE：接收人类发来的消息 |
 | POST | `/channel/out` | AI侧 | 发回复 / 戳一戳 |
 | POST | `/app/send` | PWA | 人类发消息（含图片附件 id） |
@@ -257,4 +262,4 @@ Run exactly one production relay/Telegram worker instance with SQLite. The test 
 | POST | `/app/subscribe` · `/app/unsubscribe` | PWA | 开/关锁屏推送订阅 |
 | POST | `/app/push_test` | PWA | 推一条测试通知 |
 
-除 `/healthz` 和 Telegram webhook 外，端点都要 `Authorization: Bearer <RELAY_SECRET>`；SSE 端点也可用 `?token=<RELAY_SECRET>`。Telegram webhook 只使用专用 secret header。
+除 `/healthz`、`/readyz` 和 Telegram webhook 外，端点都要 `Authorization: Bearer <RELAY_SECRET>`；SSE 端点也可用 `?token=<RELAY_SECRET>`。Telegram webhook 只使用专用 secret header。

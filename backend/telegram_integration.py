@@ -10,20 +10,17 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
+import re
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Mapping
 
 try:
-    from . import channel_store
+    from . import channel_store, deployment_config
 except ImportError:
-    import channel_store
+    import channel_store, deployment_config
 
 
 MAX_TELEGRAM_ID = 2**63 - 1
-
-
-def _truthy(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _strict_positive_id(value: object) -> int:
@@ -45,10 +42,12 @@ def _strict_ids(value: str) -> frozenset[int]:
         return frozenset()
     values = set()
     for item in value.split(","):
-        item = item.strip()
-        if not item or item == "*":
+        if not item or item != item.strip() or item == "*":
             raise ValueError("integer allowlist required")
-        values.add(_strict_positive_id(item))
+        parsed = _strict_positive_id(item)
+        if parsed in values:
+            raise ValueError("duplicate allowlist id")
+        values.add(parsed)
     return frozenset(values)
 
 
@@ -106,25 +105,34 @@ class TelegramConfig:
     error: str = ""
 
     @classmethod
-    def from_env(cls) -> "TelegramConfig":
-        requested = _truthy(os.environ.get("TELEGRAM_ENABLED", "false"))
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
-        audit_secret = os.environ.get("CHANNEL_AUDIT_HMAC_SECRET", "").strip()
-        account = os.environ.get("TELEGRAM_BOT_ACCOUNT_ID", "").strip()
-        raw_base = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org")
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "TelegramConfig":
+        env = os.environ if environ is None else environ
+        requested = deployment_config.parse_strict_bool(
+            env.get("TELEGRAM_ENABLED", "false"), "invalid_telegram_enabled"
+        )
+        token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
+        secret = env.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+        audit_secret = env.get("CHANNEL_AUDIT_HMAC_SECRET", "").strip()
+        account = env.get("TELEGRAM_BOT_ACCOUNT_ID", "").strip()
+        raw_base = env.get("TELEGRAM_API_BASE", "https://api.telegram.org")
         empty = (requested, False, "", "", "", "", frozenset(), frozenset(), "", 4096, 65536, 1.0, 2)
         try:
-            users = _strict_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", ""))
-            chats = _strict_ids(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", ""))
-            max_text = max(1, min(int(os.environ.get("TELEGRAM_MAX_TEXT_LENGTH", "4096")), 4096))
-            body_max = max(1024, min(int(os.environ.get("TELEGRAM_WEBHOOK_MAX_BODY_BYTES", "65536")), 1048576))
-            poll = max(0.25, float(os.environ.get("TELEGRAM_WORKER_POLL_SECONDS", "1")))
-            attempts = max(1, min(int(os.environ.get("TELEGRAM_GENERATION_MAX_ATTEMPTS", "2")), 10))
-            test_mode = _truthy(os.environ.get("TELEGRAM_TEST_MODE", "false"))
-            custom = frozenset(x.strip().rstrip("/") for x in os.environ.get("TELEGRAM_API_BASE_ALLOWLIST", "").split(",") if x.strip())
+            if secret and (len(secret) > 256 or re.fullmatch(r"[A-Za-z0-9_-]+", secret) is None):
+                raise ValueError("invalid webhook secret")
+            users = _strict_ids(env.get("TELEGRAM_ALLOWED_USER_IDS", ""))
+            chats = _strict_ids(env.get("TELEGRAM_ALLOWED_CHAT_IDS", ""))
+            max_text = max(1, min(int(env.get("TELEGRAM_MAX_TEXT_LENGTH", "4096")), 4096))
+            body_max = max(1024, min(int(env.get("TELEGRAM_WEBHOOK_MAX_BODY_BYTES", "65536")), 1048576))
+            poll = max(0.25, deployment_config.parse_positive_finite_float(
+                env.get("TELEGRAM_WORKER_POLL_SECONDS", "1"), "invalid_telegram_worker_poll"
+            ))
+            attempts = max(1, min(int(env.get("TELEGRAM_GENERATION_MAX_ATTEMPTS", "2")), 10))
+            test_mode = deployment_config.parse_strict_bool(
+                env.get("TELEGRAM_TEST_MODE", "false"), "invalid_telegram_test_mode"
+            )
+            custom = frozenset(x.strip().rstrip("/") for x in env.get("TELEGRAM_API_BASE_ALLOWLIST", "").split(",") if x.strip())
             api_base = _safe_api_base(raw_base, test_mode=test_mode, custom_allowlist=custom)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, deployment_config.DeploymentConfigError):
             return cls(*empty, "invalid_config")
         complete = bool(token and secret and audit_secret and account and users and chats and api_base)
         return cls(requested, requested and complete, token, secret, audit_secret, account, users, chats,

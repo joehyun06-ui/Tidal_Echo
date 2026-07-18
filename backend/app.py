@@ -29,19 +29,21 @@ import sqlite3
 import urllib.error
 import urllib.request
 import urllib.parse
-from contextlib import asynccontextmanager
+import signal
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
 try:
-    from . import channel_store
+    from . import channel_store, deployment_config
     from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 except ImportError:  # support `python backend/app.py`
-    import channel_store
+    import channel_store, deployment_config
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 
 try:
@@ -59,7 +61,7 @@ HUMAN_NAME = os.environ.get("RELAY_HUMAN_NAME", "对方")   # how the AI is told
 # --- core config / secrets (all from env) ----------------------------------
 SECRET = os.environ.get("RELAY_SECRET", "")
 DB_PATH = os.environ.get("RELAY_DB", str(Path(__file__).parent / "relay.db"))
-PORT = int(os.environ.get("RELAY_PORT", "3011"))
+PORT = deployment_config.parse_port(os.environ.get("RELAY_PORT", "3011"), "invalid_relay_port")
 UPLOAD_DIR = Path(os.environ.get("RELAY_UPLOAD_DIR", str(Path(__file__).parent / "uploads")))
 PUBLIC_PREFIX = os.environ.get("RELAY_PUBLIC_PREFIX", "/relay").rstrip("/")
 APP_PATH = os.environ.get("RELAY_APP_PATH", "/")  # where a push-notification tap opens the PWA
@@ -93,26 +95,24 @@ PRESENCE_RECENT_SEC = int(os.environ.get("RELAY_PRESENCE_RECENT_SEC", "1800"))
 # human messages to a local HTTP loop, which replies through /channel/out.
 BRAIN_FILE = Path(os.environ.get("RELAY_BRAIN_FILE", str(Path(__file__).parent / "brain_target")))
 LOOP_INGEST_URL = os.environ.get("RELAY_LOOP_INGEST_URL", "http://127.0.0.1:3020/loop/ingest")
-LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"))
-LOOP_CALLBACK_TIMEOUT_SECONDS = float(os.environ.get("LOOP_CALLBACK_TIMEOUT_SECONDS", "30"))
-LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = float(os.environ.get("LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS", "15"))
-LOOP_DISPATCH_TIMEOUT_SECONDS = float(os.environ.get("LOOP_DISPATCH_TIMEOUT_SECONDS", "180"))
-
-
-def validate_loop_timeouts(model_total: float, callback: float, margin: float, dispatch: float) -> None:
-    if min(model_total, callback, margin, dispatch) <= 0:
-        raise ValueError("loop timeouts must be positive")
-    if dispatch < model_total + callback + margin:
-        raise ValueError("dispatch timeout must cover model total, callback, and safety margin")
-
-
-try:
-    validate_loop_timeouts(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, LOOP_CALLBACK_TIMEOUT_SECONDS,
-                           LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS, LOOP_DISPATCH_TIMEOUT_SECONDS)
-except ValueError as exc:
-    raise SystemExit(f"invalid loop timeout configuration: {exc}") from None
 STREAM_DRAFT_TTL = int(os.environ.get("RELAY_STREAM_DRAFT_TTL", "600"))
-TELEGRAM = TelegramConfig.from_env()
+API_LOOP_EXPECTED_NONCE = os.environ.get("API_LOOP_EXPECTED_NONCE", "")
+try:
+    TELEGRAM = TelegramConfig.from_env()
+    DEPLOYMENT = deployment_config.load_deployment_config(TELEGRAM)
+    if DEPLOYMENT.render_telegram_mvp and not API_LOOP_EXPECTED_NONCE:
+        raise deployment_config.DeploymentConfigError("api_loop_expected_nonce_missing")
+    deployment_config.prepare_persistent_paths(DEPLOYMENT)
+    deployment_config.initialize_brain_target(DEPLOYMENT)
+except deployment_config.DeploymentConfigError as exc:
+    raise SystemExit(f"invalid deployment configuration: {exc.category}") from None
+except OSError:
+    raise SystemExit("invalid deployment configuration: brain_target_initialization_failed") from None
+LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.model_total
+LOOP_CALLBACK_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.callback
+LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = DEPLOYMENT.timeouts.safety_margin
+LOOP_DISPATCH_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.dispatch
+validate_loop_timeouts = deployment_config.validate_loop_timeouts
 
 if not SECRET:
     raise SystemExit("RELAY_SECRET is required (set it in the systemd EnvironmentFile)")
@@ -765,26 +765,57 @@ def check_auth(request: Request) -> None:
 # app
 # ---------------------------------------------------------------------------
 
+def _request_worker_restart() -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _telegram_worker_done(task: asyncio.Task) -> None:
+    if not DEPLOYMENT.render_telegram_mvp or getattr(app.state, "shutting_down", False):
+        return
+    if not task.cancelled():
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+    if getattr(app.state, "worker_restart_requested", False):
+        return
+    app.state.worker_restart_requested = True
+    print("[telegram-worker] terminal task exit; requesting process restart", flush=True)
+    _request_worker_restart()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     worker_task = None
+    app.state.shutting_down = False
+    app.state.worker_restart_requested = False
+    app.state.telegram_worker_task = None
     if TELEGRAM.enabled:
         worker = TelegramWorker(DB_PATH, TELEGRAM, dispatch_telegram_generation)
         app.state.telegram_worker = worker
         worker_task = asyncio.create_task(worker.run_forever())
+        worker_task.add_done_callback(_telegram_worker_done)
+        app.state.telegram_worker_task = worker_task
     try:
         yield
     finally:
+        app.state.shutting_down = True
         if worker_task:
             worker_task.cancel()
             try:
                 await worker_task
             except asyncio.CancelledError:
                 pass
+        app.state.telegram_worker_task = None
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url=None if DEPLOYMENT.render_telegram_mvp else "/docs",
+    redoc_url=None if DEPLOYMENT.render_telegram_mvp else "/redoc",
+    openapi_url=None if DEPLOYMENT.render_telegram_mvp else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
@@ -795,7 +826,84 @@ app.add_middleware(
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "plugin_subs": len(plugin_subs), "app_subs": len(app_subs)}
+    return {"ok": True}
+
+
+def _database_ready() -> bool:
+    try:
+        uri = Path(DB_PATH).resolve(strict=False).as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            required_tables = {
+                "messages", "schema_migrations", "generation_jobs", "delivery_attempts",
+                "telegram_completions", "delivery_parts", "external_messages",
+                "channel_accounts", "channel_conversations", "inbound_events",
+            }
+            found = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN (%s)"
+                    % ",".join("?" for _ in required_tables), tuple(required_tables)
+                )
+            }
+            if found != required_tables:
+                return False
+            latest = channel_store.MIGRATIONS[-1][0]
+            row = conn.execute(
+                "SELECT status FROM schema_migrations WHERE version=?", (latest,)
+            ).fetchone()
+            return row is not None and row[0] == "applied"
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+
+
+async def _api_loop_ready() -> bool:
+    if DEPLOYMENT.render_telegram_mvp and not API_LOOP_EXPECTED_NONCE:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=0.5, trust_env=False) as client:
+            response = await client.get(f"http://127.0.0.1:{DEPLOYMENT.loop_port}/healthz")
+        if response.status_code < 200 or response.status_code >= 300:
+            return False
+        payload = response.json()
+        expected = API_LOOP_EXPECTED_NONCE
+        nonce_matches = (
+            isinstance(payload, dict)
+            and isinstance(payload.get("instance_nonce"), str)
+            and (not DEPLOYMENT.render_telegram_mvp or hmac.compare_digest(payload["instance_nonce"], expected))
+        )
+        return bool(payload.get("ok") is True and payload.get("service") == "api_loop" and nonce_matches)
+    except Exception:
+        return False
+
+
+def _persistent_paths_ready() -> bool:
+    if not DEPLOYMENT.render_telegram_mvp:
+        return True
+    paths = (DEPLOYMENT.db_path, DEPLOYMENT.upload_dir, DEPLOYMENT.brain_file, DEPLOYMENT.loop_config)
+    if not all(deployment_config.path_within_root(path, DEPLOYMENT.persistent_root) for path in paths):
+        return False
+    return (
+        DEPLOYMENT.db_path.is_file()
+        and DEPLOYMENT.upload_dir.is_dir()
+        and DEPLOYMENT.brain_file.is_file()
+        and DEPLOYMENT.loop_config.parent.is_dir()
+        and DEPLOYMENT.db_path.parent.is_dir()
+    )
+
+
+@app.get("/readyz")
+async def readyz():
+    worker_task = getattr(app.state, "telegram_worker_task", None)
+    checks = {
+        "database": await asyncio.to_thread(_database_ready),
+        "persistent_path": await asyncio.to_thread(_persistent_paths_ready),
+        "brain_target": brain_target() == "loop",
+        "telegram_config": TELEGRAM.requested and TELEGRAM.enabled,
+        "telegram_worker": worker_task is not None and not worker_task.done(),
+        "api_loop": await _api_loop_ready(),
+    }
+    ready = all(checks.values())
+    payload = {"ready": ready, "checks": checks, "status": "ready" if ready else "not_ready"}
+    return JSONResponse(payload, status_code=200 if ready else 503)
 
 
 # ---- AI side ---------------------------------------------------------------
@@ -1173,10 +1281,16 @@ async def get_brain(request: Request):
 async def set_brain(request: Request):
     check_auth(request)
     body = await request.json()
-    target = str(body.get("target") or "").strip()
+    raw_target = body.get("target") if isinstance(body, dict) else None
+    if DEPLOYMENT.render_telegram_mvp:
+        if not isinstance(raw_target, str) or raw_target != "loop":
+            raise HTTPException(status_code=400, detail="brain_target_loop_required")
+        target = raw_target
+    else:
+        target = str(raw_target or "").strip()
     if target not in ("desktop", "loop"):
         raise HTTPException(status_code=400, detail="target must be 'desktop' or 'loop'")
-    BRAIN_FILE.write_text(target, encoding="utf-8")
+    deployment_config.atomic_write_text(BRAIN_FILE, target + "\n")
     return {"target": target}
 
 
@@ -1189,7 +1303,14 @@ async def get_loop_config(request: Request):
 @app.post("/app/loop_config")
 async def set_loop_config(request: Request):
     check_auth(request)
-    return loop_json("/loop/config", method="POST", body=await request.json())
+    body = await request.json()
+    try:
+        deployment_config.validate_loop_config_update_request(
+            body, render_mvp=DEPLOYMENT.render_telegram_mvp
+        )
+    except deployment_config.DeploymentConfigError as exc:
+        raise HTTPException(status_code=400, detail=exc.category) from None
+    return loop_json("/loop/config", method="POST", body=body)
 
 
 @app.get("/app/sessions")

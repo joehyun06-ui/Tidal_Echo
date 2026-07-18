@@ -26,6 +26,9 @@ TELEGRAM_MAX_TEXT_LENGTH=4096
 TELEGRAM_WORKER_POLL_SECONDS=1
 ```
 
+`TELEGRAM_BOT_ACCOUNT_ID` 是 relay 数据库中的稳定内部命名空间，不会发送给 Telegram，也不依赖
+Bot Token 的文本格式，因此不比较 Token 冒号前缀；同一个生产 Bot 重启或重新部署时必须保持该值不变。
+
 ### Reliability and deployment contract
 
 - Set `CHANNEL_AUDIT_HMAC_SECRET` to a separate, high-entropy, server-only value. Audit identifiers are truncated HMAC-SHA256 values; raw Telegram user/chat IDs and the HMAC secret are never logged.
@@ -43,7 +46,8 @@ TELEGRAM_WORKER_POLL_SECONDS=1
 
 Telegram `429` records `retry_after` and stops as a finite failed delivery in this MVP. Telegram `5xx`, timeout, connection loss, invalid JSON, or missing `message_id` are conservatively `delivery_uncertain` and are not resent automatically.
 
-配置缺项、allowlist 非整数/含通配符时，集成会安全地保持禁用，不影响原 relay。
+`TELEGRAM_ENABLED=false` 时集成保持禁用，不影响原 relay；一旦明确设为 `true`，配置缺项、
+allowlist 非整数/含通配符或 Secret 重复会让服务 fail-fast，避免静默半启用。
 `TELEGRAM_API_BASE` 仅用于将测试指向 Mock server；生产保持官方 Bot API 基址。
 
 ## Webhook

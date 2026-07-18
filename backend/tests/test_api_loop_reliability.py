@@ -104,7 +104,9 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_total_deadline_shared_across_routes(self):
         calls = []
-        self.module.LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = 0.04
+        # Leave enough headroom for asyncio debug mode on slower Windows CI;
+        # the second route still blocks forever and must consume the shared deadline.
+        self.module.LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = 0.2
         async def slow_safe(route, messages):
             calls.append(route["model"])
             if len(calls) == 1:
