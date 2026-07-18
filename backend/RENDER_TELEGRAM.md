@@ -55,6 +55,10 @@ Start: python scripts/render_start.py
 Health check: /healthz
 ```
 
+Render 当前的 Blueprint 校验不允许挂载持久盘的服务显式设置 `maxShutdownDelaySeconds`，因此本模板
+依赖 Render 默认的关闭等待时间。应用内部 supervisor 仍使用
+`SUPERVISOR_SHUTDOWN_GRACE_SECONDS=10` 完成 graceful shutdown，并在超时后清理子进程树。
+
 `/healthz` 是轻量 liveness，不连接 Telegram、模型或 api_loop。`/readyz` 是内部状态 readiness：
 它检查 SQLite 只读查询、持久路径、loop brain target、Telegram 配置、worker task 和本机 api_loop。
 api_loop 身份通过 supervisor 每次启动生成的临时 nonce 验证，而不是只检查端口。未就绪时返回

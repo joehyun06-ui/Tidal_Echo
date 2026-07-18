@@ -648,8 +648,12 @@ class BlueprintTests(unittest.TestCase):
         self.assertIs(service["autoDeploy"], False)
         self.assertEqual(service["branch"], "feat/render-telegram-deployment")
         self.assertEqual(service["disk"]["mountPath"], "/var/data")
+        self.assertNotIn("maxShutdownDelaySeconds", service)
         env = {item["key"]: item for item in service["envVars"]}
         self.assertEqual(env["PYTHON_VERSION"]["value"], "3.12.11")
+        shutdown_grace = env["SUPERVISOR_SHUTDOWN_GRACE_SECONDS"]["value"]
+        self.assertEqual(shutdown_grace, "10")
+        self.assertGreater(float(shutdown_grace), 0)
         for key in (
             "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
             "CHANNEL_AUDIT_HMAC_SECRET", "TELEGRAM_BOT_ACCOUNT_ID",
