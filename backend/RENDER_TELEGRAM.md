@@ -118,6 +118,8 @@ conversation，并限制为全局并发 2、单 client 并发 1、每分钟 10 �
 生成一次性内部 token，且生产 uvicorn access log 已关闭，避免认证头或请求元数据泄漏。
 
 Kelivo 是有限的 OpenAI-compatible 非流式接口：`stream=true` 和非空 `tools` 均不支持。
+非流式请求可为兼容性携带受限的 `stream_options`（`null`、`{}` 或仅含布尔
+`include_usage`）；它不会转发给 provider，也不改变非流式响应。
 每次请求冻结唯一的 provider prompt；旧 active snapshot 和 canonical history 不会被静默注入。
 同 key 的 prepared/dispatching 请求稳定返回 409 `idempotency_in_progress`，不同内容返回 409
 `idempotency_conflict`，只有不同 key 才可能因 generation queue 返回 429。

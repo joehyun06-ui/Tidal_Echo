@@ -261,7 +261,9 @@ active Telegram account/chat。本项目不开放公共映射后台。
 
 `GET /v1/models` 只暴露 `KELIVO_MODEL_ALIAS`。`POST
 /v1/chat/completions` 必须携带 `Idempotency-Key`，只接受纯文本消息和
-`stream=false`。模型路由、provider URL、上游 key 和 fallback 仍完全由服务端
+`stream=false`。为兼容 Kelivo，非流式请求可额外携带 `stream_options=null`、`{}` 或仅含
+布尔 `include_usage` 的对象；该字段会被忽略且不会转发给 provider，`stream=true` 仍不支持。
+模型路由、provider URL、上游 key 和 fallback 仍完全由服务端
 控制；非空 `tools` 会稳定返回 `tools_not_supported`。客户端消息按原顺序发送给模型，
 但统一历史每次只写入最后一条 user 消息和最终 assistant 回复，不重复写客户端附带历史。
 最终 provider 顺序固定为：服务端 `PERSONA` system message 在前，随后是客户端经过验证的

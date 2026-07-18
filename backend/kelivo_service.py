@@ -32,7 +32,9 @@ MAX_MAX_TOKENS = 32_768
 MAX_IDEMPOTENCY_KEY_CHARS = 128
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}\Z")
 ALLOWED_ROLES = frozenset({"system", "developer", "user", "assistant"})
-ALLOWED_REQUEST_KEYS = frozenset({"model", "messages", "tools", "temperature", "max_tokens", "stream"})
+ALLOWED_REQUEST_KEYS = frozenset({
+    "model", "messages", "tools", "temperature", "max_tokens", "stream", "stream_options",
+})
 PROMPT_CONTRACT_VERSION = "kelivo-provider-prompt-v1"
 
 
@@ -186,6 +188,14 @@ def validate_completion(payload: Any, model_alias: str) -> ValidatedCompletion:
     if payload.get("stream", False) is not False:
         raise KelivoError(400 if payload.get("stream") is True else 422,
                           "streaming_not_supported" if payload.get("stream") is True else "invalid_stream")
+
+    stream_options = payload.get("stream_options")
+    if stream_options is not None and (
+        not isinstance(stream_options, dict)
+        or set(stream_options) - {"include_usage"}
+        or ("include_usage" in stream_options and not isinstance(stream_options["include_usage"], bool))
+    ):
+        raise KelivoError(422, "invalid_stream_options")
 
     source_messages = payload.get("messages")
     if not isinstance(source_messages, list) or not source_messages or len(source_messages) > MAX_MESSAGES:

@@ -137,10 +137,69 @@ class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         wrong = await request(self.module, "POST", "/v1/chat/completions", headers=self.headers,
                               json=self.payload(model="real-provider-model"))
         stream = await request(self.module, "POST", "/v1/chat/completions", headers=self.headers,
-                               json=self.payload(stream=True))
+                               json=self.payload(stream=True, stream_options={"include_usage": True}))
         self.assertEqual(wrong.status_code, 404)
         self.assertEqual(stream.status_code, 400)
         self.assertEqual(stream.json()["error"]["code"], "streaming_not_supported")
+        self.assertEqual(self.calls, [])
+
+    async def test_nonstream_stream_options_shapes_are_ignored(self):
+        missing = object()
+        shapes = (missing, None, {}, {"include_usage": True}, {"include_usage": False})
+        responses = []
+        for index, shape in enumerate(shapes):
+            headers = dict(self.headers)
+            headers["Idempotency-Key"] = f"stream-options-shape-{index:04d}"
+            body = self.payload()
+            if shape is not missing:
+                body["stream_options"] = shape
+            responses.append(await request(
+                self.module, "POST", "/v1/chat/completions", headers=headers, json=body,
+            ))
+        self.assertEqual([response.status_code for response in responses], [200] * len(shapes))
+        self.assertEqual([response.json()["usage"]["total_tokens"] for response in responses], [5] * len(shapes))
+        self.assertEqual(len(self.calls), len(shapes))
+        self.assertTrue(all("stream_options" not in json.dumps(call) for call in self.calls))
+        with self.module.db() as conn:
+            rows = conn.execute(
+                "SELECT request_payload_hash,request_identity_hash,context_bundle_json,provider_messages_json "
+                "FROM kelivo_requests ORDER BY id"
+            ).fetchall()
+            snapshots = conn.execute("SELECT count(*) FROM companion_context_snapshots").fetchone()[0]
+        self.assertEqual(len({row["request_payload_hash"] for row in rows}), 1)
+        self.assertEqual(len({row["request_identity_hash"] for row in rows}), 1)
+        self.assertTrue(all("stream_options" not in row["context_bundle_json"] for row in rows))
+        self.assertTrue(all("stream_options" not in row["provider_messages_json"] for row in rows))
+        self.assertEqual(snapshots, 0)
+
+    async def test_stream_options_variants_replay_same_key_without_second_generation(self):
+        first = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.headers,
+            json=self.payload(stream_options={"include_usage": True}),
+        )
+        second = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.headers,
+            json=self.payload(stream_options={"include_usage": False}),
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.json(), first.json())
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_invalid_stream_options_are_rejected_without_generation(self):
+        cases = (
+            "true", 1, [], {"unknown": True}, {"nested": {}},
+            {"include_usage": "true"}, {"include_usage": 1}, {"include_usage": None},
+        )
+        for index, stream_options in enumerate(cases):
+            with self.subTest(index=index):
+                headers = dict(self.headers)
+                headers["Idempotency-Key"] = f"invalid-stream-options-{index:04d}"
+                response = await request(
+                    self.module, "POST", "/v1/chat/completions", headers=headers,
+                    json=self.payload(stream_options=stream_options),
+                )
+                self.assertEqual((response.status_code, response.json()["error"]["code"]),
+                                 (422, "invalid_stream_options"))
         self.assertEqual(self.calls, [])
 
     async def test_body_size_and_duplicate_json_keys(self):
@@ -446,7 +505,7 @@ class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             {"role": "developer", "content": "developer rule"},
             {"role": "assistant", "content": "old answer"},
             {"role": "user", "content": " exact user "},
-        ])
+        ], stream_options={"include_usage": True})
         response = await request(self.module, "POST", "/v1/chat/completions",
                                  headers=self.headers, json=body)
         self.assertEqual(response.status_code, 200)
@@ -454,7 +513,8 @@ class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         explicit_headers["Idempotency-Key"] = "provider-explicit-key-0002"
         explicit = await request(
             self.module, "POST", "/v1/chat/completions", headers=explicit_headers,
-            json=self.payload(temperature=0.25, max_tokens=321),
+            json=self.payload(temperature=0.25, max_tokens=321,
+                              stream_options={"include_usage": False}),
         )
         self.assertEqual(explicit.status_code, 200)
         self.assertEqual(len(captured), 2)
@@ -463,6 +523,7 @@ class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["model"], "provider-model")
         self.assertEqual((captured[0]["temperature"], captured[0]["max_tokens"]), (0.61, 456))
         self.assertEqual((captured[1]["temperature"], captured[1]["max_tokens"]), (0.25, 321))
+        self.assertTrue(all("stream_options" not in provider_payload for provider_payload in captured))
         with self.module.db() as conn:
             rows = conn.execute(
                 """SELECT context_bundle_json,context_bundle_hash,provider_model,

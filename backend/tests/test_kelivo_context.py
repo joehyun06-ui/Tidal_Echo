@@ -36,6 +36,44 @@ class KelivoContextTests(unittest.TestCase):
             ):
                 kelivo_service.validate_completion({**base, "temperature": value}, "ouou-home")
 
+    def test_stream_options_canonicalize_out_of_payload_and_identity_hashes(self):
+        base = {"model": "ouou-home", "messages": [{"role": "user", "content": "same"}]}
+        payloads = (
+            base,
+            {**base, "stream_options": None},
+            {**base, "stream_options": {}},
+            {**base, "stream_options": {"include_usage": True}},
+            {**base, "stream_options": {"include_usage": False}},
+        )
+        validated = [kelivo_service.validate_completion(payload, "ouou-home") for payload in payloads]
+        self.assertEqual(len({item.request_payload_hash for item in validated}), 1)
+        self.assertTrue(all("stream_options" not in item.normalized_request for item in validated))
+        self.assertTrue(all(not item.snapshots for item in validated))
+        with channel_store.connect(self.path) as conn:
+            conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY,ts TEXT,direction TEXT,kind TEXT,text TEXT,meta TEXT)")
+            stamp = channel_store.now_iso()
+            conn.execute(
+                """INSERT INTO kelivo_clients
+                   (client_id,api_session,enabled,mapping_revision,created_at,updated_at)
+                   VALUES('a','s',1,1,?,?)""", (stamp, stamp),
+            )
+        for index, item in enumerate(validated):
+            kelivo_service.prepare_request(
+                self.path, "a", f"stream-options-hash-{index:04d}", item,
+                persona_text="persona", provider_model="provider-a",
+                effective_temperature=0.0, effective_max_tokens=77,
+            )
+        with channel_store.connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT request_identity_hash,provider_messages_json,context_bundle_json "
+                "FROM kelivo_requests ORDER BY id"
+            ).fetchall()
+            snapshots = conn.execute("SELECT count(*) FROM companion_context_snapshots").fetchone()[0]
+        self.assertEqual(len({row["request_identity_hash"] for row in rows}), 1)
+        self.assertTrue(all("stream_options" not in row["provider_messages_json"] for row in rows))
+        self.assertTrue(all("stream_options" not in row["context_bundle_json"] for row in rows))
+        self.assertEqual(snapshots, 0)
+
     def test_identical_snapshot_is_deduplicated(self):
         with channel_store.connect(self.path) as conn:
             conn.execute("BEGIN IMMEDIATE")
