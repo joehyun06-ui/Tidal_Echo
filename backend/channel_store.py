@@ -25,10 +25,15 @@ def now_iso() -> str:
 
 
 def connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=30, isolation_level=None, factory=ClosingConnection)
+    try:
+        timeout = float(os.environ.get("SQLITE_BUSY_TIMEOUT_SECONDS", "30"))
+    except (TypeError, ValueError):
+        timeout = 30.0
+    timeout = timeout if timeout > 0 else 30.0
+    conn = sqlite3.connect(path, timeout=timeout, isolation_level=None, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout * 1000))}")
     return conn
 
 
@@ -124,9 +129,278 @@ def _migration_002(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_parts_status ON delivery_parts(delivery_id,status,part_index)")
 
 
+KELIVO_TABLE_DDL: dict[str, str] = {
+    "kelivo_clients": """CREATE TABLE kelivo_clients (
+            client_id TEXT PRIMARY KEY,
+            api_session TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+            mapping_revision INTEGER NOT NULL DEFAULT 1 CHECK(mapping_revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)""",
+    "kelivo_requests": """CREATE TABLE kelivo_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL,
+            request_payload_hash TEXT NOT NULL,
+            request_identity_hash TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            api_session TEXT NOT NULL,
+            mapping_revision INTEGER NOT NULL CHECK(mapping_revision > 0),
+            history_before_id INTEGER NOT NULL CHECK(history_before_id >= 0),
+            context_bundle_json TEXT NOT NULL,
+            context_bundle_hash TEXT NOT NULL,
+            provider_messages_json TEXT NOT NULL,
+            prompt_contract_version TEXT NOT NULL,
+            persona_hash TEXT NOT NULL,
+            persona_source TEXT NOT NULL,
+            provider_model TEXT NOT NULL,
+            effective_temperature REAL NOT NULL CHECK(effective_temperature >= 0 AND effective_temperature <= 2),
+            effective_max_tokens INTEGER NOT NULL CHECK(effective_max_tokens >= 1 AND effective_max_tokens <= 32768),
+            status TEXT NOT NULL CHECK(status IN
+                ('prepared','dispatching','dispatch_uncertain','failed','completed')),
+            dispatch_expires_at TEXT,
+            generation_id TEXT NOT NULL UNIQUE,
+            user_message_id INTEGER,
+            assistant_message_id INTEGER,
+            response_json TEXT,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(client_id,idempotency_key),
+            FOREIGN KEY(client_id) REFERENCES kelivo_clients(client_id),
+            FOREIGN KEY(user_message_id) REFERENCES messages(id),
+            FOREIGN KEY(assistant_message_id) REFERENCES messages(id))""",
+    "companion_context_snapshots": """CREATE TABLE companion_context_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_session TEXT NOT NULL,
+            snapshot_type TEXT NOT NULL,
+            normalized_json TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            version INTEGER NOT NULL CHECK(version > 0),
+            created_at TEXT NOT NULL,
+            UNIQUE(api_session, snapshot_type, content_hash),
+            UNIQUE(api_session, snapshot_type, version))""",
+    "kelivo_rate_limits": """CREATE TABLE kelivo_rate_limits (
+            client_id TEXT NOT NULL,
+            window_started_at INTEGER NOT NULL CHECK(window_started_at >= 0),
+            request_count INTEGER NOT NULL CHECK(request_count > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(client_id,window_started_at),
+            FOREIGN KEY(client_id) REFERENCES kelivo_clients(client_id))""",
+}
+
+KELIVO_INDEX_DDL: dict[str, str] = {
+    "idx_kelivo_requests_status":
+        "CREATE INDEX idx_kelivo_requests_status ON kelivo_requests(status,dispatch_expires_at,id)",
+    "idx_kelivo_rate_limits_window":
+        "CREATE INDEX idx_kelivo_rate_limits_window ON kelivo_rate_limits(window_started_at,client_id)",
+    "idx_context_snapshots_lookup":
+        "CREATE INDEX idx_context_snapshots_lookup ON companion_context_snapshots(api_session,snapshot_type,active,version)",
+    "idx_context_snapshots_one_active":
+        "CREATE UNIQUE INDEX idx_context_snapshots_one_active ON companion_context_snapshots(api_session,snapshot_type) WHERE active=1",
+}
+
+
+def _migration_003(conn: sqlite3.Connection) -> None:
+    """Kelivo client mapping, idempotent requests, and normalized context."""
+    for statement in (*KELIVO_TABLE_DDL.values(), *KELIVO_INDEX_DDL.values()):
+        conn.execute(statement)
+
+
+def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
+    rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
+    return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
+
+
+def _sql_fingerprint(sql: str) -> tuple[str, ...]:
+    """Tokenize the limited migration DDL, ignoring whitespace/comments but preserving boolean structure."""
+    tokens: list[str] = []
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        if char.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            end = sql.find("\n", index + 2)
+            index = len(sql) if end < 0 else end + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                raise sqlite3.DatabaseError("invalid kelivo schema SQL")
+            index = end + 2
+            continue
+        if char == "'":
+            end = index + 1
+            while end < len(sql):
+                if sql[end] == "'":
+                    if end + 1 < len(sql) and sql[end + 1] == "'":
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                end += 1
+            if end > len(sql) or sql[end - 1] != "'":
+                raise sqlite3.DatabaseError("invalid kelivo schema SQL")
+            tokens.append(sql[index:end])
+            index = end
+            continue
+        if char.isalpha() or char == "_":
+            end = index + 1
+            while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
+                end += 1
+            tokens.append(sql[index:end].lower())
+            index = end
+            continue
+        if char.isdigit():
+            end = index + 1
+            while end < len(sql) and (sql[end].isdigit() or sql[end] == "."):
+                end += 1
+            tokens.append(sql[index:end])
+            index = end
+            continue
+        operator = sql[index:index + 2]
+        if operator in {">=", "<=", "!=", "<>", "=="}:
+            tokens.append(operator)
+            index += 2
+            continue
+        if char in "(),=><+-*/":
+            tokens.append(char)
+            index += 1
+            continue
+        # Current migration deliberately uses no quoted identifiers or expressions.
+        raise sqlite3.DatabaseError("invalid kelivo schema SQL")
+    return tuple(tokens)
+
+
+def _validate_index_xinfo(conn: sqlite3.Connection, name: str, columns: tuple[str, ...]) -> None:
+    rows = conn.execute(f"PRAGMA index_xinfo({name})").fetchall()
+    key_rows = [row for row in rows if row["key"] == 1]
+    auxiliary = [row for row in rows if row["key"] == 0]
+    if tuple(row["name"] for row in key_rows) != columns:
+        raise sqlite3.DatabaseError(f"invalid kelivo index columns: {name}")
+    if any(row["cid"] < 0 or row["desc"] != 0 or str(row["coll"]).upper() != "BINARY" for row in key_rows):
+        raise sqlite3.DatabaseError(f"invalid kelivo index expression: {name}")
+    if len(auxiliary) != 1 or auxiliary[0]["cid"] != -1:
+        raise sqlite3.DatabaseError(f"invalid kelivo index auxiliary shape: {name}")
+
+
+def validate_kelivo_schema(conn: sqlite3.Connection) -> None:
+    """Reject an applied v3 marker unless its complete structural fingerprint matches."""
+    expected_columns = {
+        "kelivo_clients": {
+            "client_id": ("TEXT", 0, None, 1), "api_session": ("TEXT", 1, None, 0),
+            "enabled": ("INTEGER", 1, "1", 0), "mapping_revision": ("INTEGER", 1, "1", 0),
+            "created_at": ("TEXT", 1, None, 0), "updated_at": ("TEXT", 1, None, 0),
+        },
+        "kelivo_requests": {
+            "id": ("INTEGER", 0, None, 1), "idempotency_key": ("TEXT", 1, None, 0),
+            "request_payload_hash": ("TEXT", 1, None, 0), "request_identity_hash": ("TEXT", 1, None, 0),
+            "client_id": ("TEXT", 1, None, 0), "api_session": ("TEXT", 1, None, 0),
+            "mapping_revision": ("INTEGER", 1, None, 0), "history_before_id": ("INTEGER", 1, None, 0),
+            "context_bundle_json": ("TEXT", 1, None, 0), "context_bundle_hash": ("TEXT", 1, None, 0),
+            "provider_messages_json": ("TEXT", 1, None, 0),
+            "prompt_contract_version": ("TEXT", 1, None, 0), "persona_hash": ("TEXT", 1, None, 0),
+            "persona_source": ("TEXT", 1, None, 0), "provider_model": ("TEXT", 1, None, 0),
+            "effective_temperature": ("REAL", 1, None, 0),
+            "effective_max_tokens": ("INTEGER", 1, None, 0), "status": ("TEXT", 1, None, 0),
+            "dispatch_expires_at": ("TEXT", 0, None, 0), "generation_id": ("TEXT", 1, None, 0),
+            "user_message_id": ("INTEGER", 0, None, 0), "assistant_message_id": ("INTEGER", 0, None, 0),
+            "response_json": ("TEXT", 0, None, 0), "error_category": ("TEXT", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0), "updated_at": ("TEXT", 1, None, 0),
+        },
+        "companion_context_snapshots": {
+            "id": ("INTEGER", 0, None, 1), "api_session": ("TEXT", 1, None, 0),
+            "snapshot_type": ("TEXT", 1, None, 0), "normalized_json": ("TEXT", 1, None, 0),
+            "content_hash": ("TEXT", 1, None, 0), "active": ("INTEGER", 1, "1", 0),
+            "version": ("INTEGER", 1, None, 0), "created_at": ("TEXT", 1, None, 0),
+        },
+        "kelivo_rate_limits": {
+            "client_id": ("TEXT", 1, None, 1), "window_started_at": ("INTEGER", 1, None, 2),
+            "request_count": ("INTEGER", 1, None, 0), "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+    }
+    for table, expected in expected_columns.items():
+        xinfo_rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if any(int(row["hidden"]) != 0 for row in xinfo_rows):
+            raise sqlite3.DatabaseError(f"invalid hidden kelivo column: {table}")
+        actual = {
+            row["name"]: (str(row["type"]).upper(), int(row["notnull"]), row["dflt_value"], int(row["pk"]))
+            for row in xinfo_rows
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid kelivo schema: {table} columns")
+
+    expected_indexes = {
+        "kelivo_clients": {
+            "sqlite_autoindex_kelivo_clients_1": (True, "pk", False, ("client_id",)),
+        },
+        "kelivo_requests": {
+            "sqlite_autoindex_kelivo_requests_1": (True, "u", False, ("generation_id",)),
+            "sqlite_autoindex_kelivo_requests_2": (True, "u", False, ("client_id", "idempotency_key")),
+            "idx_kelivo_requests_status": (False, "c", False, ("status", "dispatch_expires_at", "id")),
+        },
+        "companion_context_snapshots": {
+            "sqlite_autoindex_companion_context_snapshots_1":
+                (True, "u", False, ("api_session", "snapshot_type", "content_hash")),
+            "sqlite_autoindex_companion_context_snapshots_2":
+                (True, "u", False, ("api_session", "snapshot_type", "version")),
+            "idx_context_snapshots_lookup":
+                (False, "c", False, ("api_session", "snapshot_type", "active", "version")),
+            "idx_context_snapshots_one_active":
+                (True, "c", True, ("api_session", "snapshot_type")),
+        },
+        "kelivo_rate_limits": {
+            "sqlite_autoindex_kelivo_rate_limits_1":
+                (True, "pk", False, ("client_id", "window_started_at")),
+            "idx_kelivo_rate_limits_window":
+                (False, "c", False, ("window_started_at", "client_id")),
+        },
+    }
+    for table, expected in expected_indexes.items():
+        actual_rows = {row["name"]: row for row in conn.execute(f"PRAGMA index_list({table})")}
+        if set(actual_rows) != set(expected):
+            raise sqlite3.DatabaseError(f"invalid kelivo index set: {table}")
+        for name, (unique, origin, partial, columns) in expected.items():
+            row = actual_rows[name]
+            if (bool(row["unique"]), row["origin"], bool(row["partial"])) != (unique, origin, partial):
+                raise sqlite3.DatabaseError(f"invalid kelivo index attributes: {name}")
+            _validate_index_xinfo(conn, name, columns)
+    expected_fks = {
+        "kelivo_requests": {
+            ("client_id", "kelivo_clients", "client_id", "NO ACTION", "NO ACTION", "NONE"),
+            ("user_message_id", "messages", "id", "NO ACTION", "NO ACTION", "NONE"),
+            ("assistant_message_id", "messages", "id", "NO ACTION", "NO ACTION", "NONE"),
+        },
+        "kelivo_rate_limits": {
+            ("client_id", "kelivo_clients", "client_id", "NO ACTION", "NO ACTION", "NONE"),
+        },
+        "kelivo_clients": set(), "companion_context_snapshots": set(),
+    }
+    for table, expected in expected_fks.items():
+        actual = {
+            (row["from"], row["table"], row["to"], row["on_update"], row["on_delete"], row["match"])
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid kelivo foreign key: {table}")
+    for table, expected_sql in KELIVO_TABLE_DDL.items():
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid kelivo table fingerprint: {table}")
+    for name, expected_sql in KELIVO_INDEX_DDL.items():
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid kelivo index fingerprint: {name}")
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "telegram_private_text_mvp", _migration_001),
     (2, "telegram_reliability", _migration_002),
+    (3, "kelivo_nonstream_foundation", _migration_003),
 )
 
 
@@ -139,15 +413,21 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 version INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
             for version, name, apply in migrations:
-                row = conn.execute("SELECT status FROM schema_migrations WHERE version=?", (version,)).fetchone()
-                if row and row["status"] == "applied":
-                    continue
+                row = conn.execute("SELECT name,status FROM schema_migrations WHERE version=?", (version,)).fetchone()
+                if row:
+                    if row["status"] == "applied" and row["name"] == name:
+                        if version == 3 and name == "kelivo_nonstream_foundation":
+                            validate_kelivo_schema(conn)
+                        continue
+                    raise sqlite3.DatabaseError("invalid migration state")
                 apply(conn)
                 stamp = now_iso()
                 conn.execute(
                     "INSERT INTO schema_migrations(version,name,status,created_at,updated_at) VALUES(?,?,?,?,?)",
                     (version, name, "applied", stamp, stamp),
                 )
+                if version == 3 and name == "kelivo_nonstream_foundation":
+                    validate_kelivo_schema(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

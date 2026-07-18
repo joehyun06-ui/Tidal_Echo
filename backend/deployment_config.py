@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import urllib.parse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -15,6 +16,10 @@ from typing import Mapping
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 LOOP_CONFIG_MAX_BYTES = 1024 * 1024
+DEFAULT_PERSONA = (
+    "You are the user's private AI companion in a one-to-one chat. "
+    "Reply naturally, warmly, and concisely unless the user asks for detail."
+)
 
 
 class DeploymentConfigError(ValueError):
@@ -67,6 +72,16 @@ def parse_port(value: object, category: str) -> int:
     return port
 
 
+def parse_bounded_int(value: object, minimum: int, maximum: int, category: str) -> int:
+    raw = str(value if value is not None else "")
+    if not raw or raw != raw.strip() or not raw.isascii() or not raw.isdecimal():
+        raise DeploymentConfigError(category)
+    result = int(raw, 10)
+    if result < minimum or result > maximum:
+        raise DeploymentConfigError(category)
+    return result
+
+
 def path_within_root(path: str | Path, root: str | Path) -> bool:
     try:
         raw_candidate = Path(path).expanduser()
@@ -94,6 +109,31 @@ class LoopTimeouts:
 
 
 @dataclass(frozen=True)
+class KelivoProviderDefaults:
+    provider_model: str
+    temperature: float
+    max_tokens: int
+
+
+@dataclass(frozen=True)
+class KelivoConfig:
+    enabled: bool
+    api_key: str
+    client_id: str
+    api_session: str
+    model_alias: str
+    global_concurrency: int
+    client_concurrency: int
+    rate_limit_per_minute: int
+    queue_timeout_seconds: float
+    stale_dispatch_seconds: int
+    completion_commit_margin_seconds: float
+    internal_response_max_bytes: int
+    allow_session_remap: bool
+    require_telegram_session: bool
+
+
+@dataclass(frozen=True)
 class DeploymentConfig:
     render_telegram_mvp: bool
     persistent_root: Path
@@ -104,6 +144,65 @@ class DeploymentConfig:
     loop_config: Path
     loop_port: int
     timeouts: LoopTimeouts
+    sqlite_busy_timeout_seconds: float
+    kelivo: KelivoConfig
+
+
+def load_server_persona(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Load the server persona once and return exact text plus a non-sensitive source marker."""
+    env = os.environ if environ is None else environ
+    direct = str(env.get("PERSONA", "")).strip()
+    if direct:
+        return direct, "environment"
+    persona_file = str(env.get("PERSONA_FILE", "")).strip()
+    if persona_file:
+        try:
+            loaded = Path(persona_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            loaded = ""
+        if loaded:
+            return loaded, "file"
+    return DEFAULT_PERSONA, "default"
+
+
+def resolve_kelivo_provider_contract_defaults(
+    environ: Mapping[str, str] | None = None, loop_config: str | Path | None = None,
+) -> KelivoProviderDefaults:
+    """Resolve the one primary model and concrete generation defaults used by Kelivo."""
+    env = os.environ if environ is None else environ
+    model = str(env.get("LLM_MODEL", ""))
+    config_path = Path(loop_config) if loop_config is not None else Path(
+        str(env.get("LOOP_CONFIG", Path(__file__).parent.parent / "examples" / "api_loop.config.json"))
+    )
+    if config_path.exists():
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            validate_loop_config_payload(payload, render_mvp=False)
+        except (OSError, UnicodeError, json.JSONDecodeError, DeploymentConfigError):
+            raise DeploymentConfigError("invalid_kelivo_provider_contract") from None
+        chain = payload.get("main_chain")
+        if isinstance(chain, list) and chain:
+            model = chain[0]["model"]
+    if not model or model != model.strip():
+        raise DeploymentConfigError("kelivo_provider_model_missing")
+
+    raw_temperature = str(env.get("LLM_TEMPERATURE", "0.7"))
+    try:
+        temperature = float(raw_temperature)
+    except (TypeError, ValueError):
+        raise DeploymentConfigError("invalid_kelivo_default_temperature") from None
+    if (
+        not raw_temperature or raw_temperature != raw_temperature.strip()
+        or not raw_temperature.isascii() or not math.isfinite(temperature)
+        or temperature < 0 or temperature > 2
+    ):
+        raise DeploymentConfigError("invalid_kelivo_default_temperature")
+    if temperature == 0:
+        temperature = 0.0
+    max_tokens = parse_bounded_int(
+        env.get("LLM_MAX_TOKENS", "2000"), 1, 32768, "invalid_kelivo_default_max_tokens"
+    )
+    return KelivoProviderDefaults(model, temperature, max_tokens)
 
 
 def validate_loop_config_payload(payload: object, *, render_mvp: bool) -> dict:
@@ -171,6 +270,7 @@ def load_deployment_config(
     render_mvp = parse_strict_bool(env.get("RENDER_TELEGRAM_MVP", "false"), "invalid_render_telegram_mvp")
     telegram_enabled = parse_strict_bool(env.get("TELEGRAM_ENABLED", "false"), "invalid_telegram_enabled")
     telegram_test_mode = parse_strict_bool(env.get("TELEGRAM_TEST_MODE", "false"), "invalid_telegram_test_mode")
+    kelivo_enabled = parse_strict_bool(env.get("KELIVO_ENABLED", "false"), "invalid_kelivo_enabled")
     if telegram_enabled != bool(telegram_config.requested):
         raise DeploymentConfigError("telegram_config_invalid")
 
@@ -196,6 +296,67 @@ def load_deployment_config(
         if len(set(secrets)) != len(secrets):
             raise DeploymentConfigError("telegram_secrets_must_be_distinct")
 
+    kelivo_key = str(env.get("KELIVO_API_KEY", "")).strip()
+    kelivo_client_id = str(env.get("KELIVO_CLIENT_ID", "primary-kelivo")).strip()
+    kelivo_api_session = str(env.get("KELIVO_API_SESSION", "")).strip()
+    kelivo_model_alias = str(env.get("KELIVO_MODEL_ALIAS", "ouou-home")).strip()
+    kelivo_allow_remap = parse_strict_bool(
+        env.get("KELIVO_ALLOW_SESSION_REMAP", "false"), "invalid_kelivo_allow_session_remap"
+    )
+    kelivo_require_telegram = parse_strict_bool(
+        env.get("KELIVO_REQUIRE_TELEGRAM_SESSION", "false"), "invalid_kelivo_require_telegram_session"
+    )
+    kelivo_global_concurrency = parse_bounded_int(
+        env.get("KELIVO_GLOBAL_CONCURRENCY", "2"), 1, 32, "invalid_kelivo_global_concurrency"
+    )
+    kelivo_client_concurrency = parse_bounded_int(
+        env.get("KELIVO_CLIENT_CONCURRENCY", "1"), 1, 16, "invalid_kelivo_client_concurrency"
+    )
+    if kelivo_enabled and kelivo_client_concurrency > kelivo_global_concurrency:
+        raise DeploymentConfigError("invalid_kelivo_concurrency_relationship")
+    kelivo_rate_limit = parse_bounded_int(
+        env.get("KELIVO_RATE_LIMIT_PER_MINUTE", "10"), 1, 600, "invalid_kelivo_rate_limit"
+    )
+    kelivo_queue_timeout = parse_positive_finite_float(
+        env.get("KELIVO_QUEUE_TIMEOUT_SECONDS", "2"), "invalid_kelivo_queue_timeout"
+    )
+    if kelivo_queue_timeout > 60:
+        raise DeploymentConfigError("invalid_kelivo_queue_timeout")
+    kelivo_stale_dispatch = parse_bounded_int(
+        env.get("KELIVO_DISPATCH_STALE_SECONDS", "300"), 30, 86400, "invalid_kelivo_stale_dispatch"
+    )
+    sqlite_busy_timeout = parse_positive_finite_float(
+        env.get("SQLITE_BUSY_TIMEOUT_SECONDS", "30"), "invalid_sqlite_busy_timeout"
+    )
+    if sqlite_busy_timeout > 300:
+        raise DeploymentConfigError("invalid_sqlite_busy_timeout")
+    kelivo_completion_margin = parse_positive_finite_float(
+        env.get("KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS", "15"),
+        "invalid_kelivo_completion_commit_margin",
+    )
+    if kelivo_completion_margin > 300:
+        raise DeploymentConfigError("invalid_kelivo_completion_commit_margin")
+    kelivo_internal_response_max = parse_bounded_int(
+        env.get("KELIVO_INTERNAL_RESPONSE_MAX_BYTES", "1048576"), 4096, 8 * 1024 * 1024,
+        "invalid_kelivo_internal_response_max_bytes",
+    )
+    safe_identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+    if kelivo_enabled:
+        if len(kelivo_key) < 32 or len(kelivo_key) > 512:
+            raise DeploymentConfigError("kelivo_api_key_missing")
+        if any(safe_identifier.fullmatch(item) is None for item in
+               (kelivo_client_id, kelivo_api_session, kelivo_model_alias)):
+            raise DeploymentConfigError("kelivo_identity_invalid")
+        protected = {
+            str(env.get("RELAY_SECRET", "")).strip(),
+            str(env.get("TELEGRAM_WEBHOOK_SECRET", "")).strip(),
+            str(env.get("CHANNEL_AUDIT_HMAC_SECRET", "")).strip(),
+            str(env.get("LLM_API_KEY", "")).strip(),
+        }
+        protected.discard("")
+        if kelivo_key in protected:
+            raise DeploymentConfigError("kelivo_api_key_must_be_distinct")
+
     try:
         timeouts = LoopTimeouts(
             model_total=parse_positive_finite_float(env.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"),
@@ -206,6 +367,10 @@ def load_deployment_config(
     except DeploymentConfigError:
         raise DeploymentConfigError("invalid_loop_timeout") from None
     validate_loop_timeouts(timeouts.model_total, timeouts.callback, timeouts.safety_margin, timeouts.dispatch)
+    if kelivo_enabled and kelivo_stale_dispatch <= (
+        timeouts.model_total + kelivo_queue_timeout + sqlite_busy_timeout + kelivo_completion_margin
+    ):
+        raise DeploymentConfigError("invalid_kelivo_stale_dispatch_relationship")
 
     persistent_root = Path(str(env.get("RENDER_PERSISTENT_ROOT", "/var/data"))).expanduser()
     db_path = Path(str(env.get("RELAY_DB", Path(__file__).parent / "relay.db"))).expanduser()
@@ -250,6 +415,9 @@ def load_deployment_config(
                 raise DeploymentConfigError("model_fallback_not_allowed")
         validate_loop_config_file(loop_config, render_mvp=True)
 
+    if kelivo_enabled:
+        resolve_kelivo_provider_contract_defaults(env, loop_config)
+
     return DeploymentConfig(
         render_telegram_mvp=render_mvp,
         persistent_root=persistent_root.resolve(strict=False),
@@ -260,6 +428,23 @@ def load_deployment_config(
         loop_config=loop_config.resolve(strict=False),
         loop_port=loop_port,
         timeouts=timeouts,
+        sqlite_busy_timeout_seconds=sqlite_busy_timeout,
+        kelivo=KelivoConfig(
+            enabled=kelivo_enabled,
+            api_key=kelivo_key,
+            client_id=kelivo_client_id,
+            api_session=kelivo_api_session,
+            model_alias=kelivo_model_alias,
+            global_concurrency=kelivo_global_concurrency,
+            client_concurrency=kelivo_client_concurrency,
+            rate_limit_per_minute=kelivo_rate_limit,
+            queue_timeout_seconds=kelivo_queue_timeout,
+            stale_dispatch_seconds=kelivo_stale_dispatch,
+            completion_commit_margin_seconds=kelivo_completion_margin,
+            internal_response_max_bytes=kelivo_internal_response_max,
+            allow_session_remap=kelivo_allow_remap,
+            require_telegram_session=kelivo_require_telegram,
+        ),
     )
 
 

@@ -48,6 +48,7 @@ def render_env(root: Path) -> dict[str, str]:
         "LLM_API_BASE": "https://model.invalid/v1",
         "LLM_API_KEY": "invalid-test-model-key",
         "LLM_MODEL": "test-model",
+        "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
     }
 
 
@@ -570,8 +571,10 @@ class SupervisorTests(NoNetworkMixin, unittest.TestCase):
             env["API_LOOP_EXPECTED_NONCE"] = "stale-expected"
             self.assertEqual(supervisor.run(config, env), 1)
         self.assertEqual(envs[0]["API_LOOP_INSTANCE_NONCE"], config.instance_nonce)
+        self.assertEqual(envs[0]["API_LOOP_INTERNAL_TOKEN"], config.internal_token)
         self.assertNotIn("API_LOOP_EXPECTED_NONCE", envs[0])
         self.assertEqual(envs[1]["API_LOOP_EXPECTED_NONCE"], config.instance_nonce)
+        self.assertEqual(envs[1]["API_LOOP_INTERNAL_TOKEN"], config.internal_token)
         self.assertNotIn("API_LOOP_INSTANCE_NONCE", envs[1])
 
 
@@ -654,11 +657,16 @@ class BlueprintTests(unittest.TestCase):
         shutdown_grace = env["SUPERVISOR_SHUTDOWN_GRACE_SECONDS"]["value"]
         self.assertEqual(shutdown_grace, "10")
         self.assertGreater(float(shutdown_grace), 0)
+        self.assertEqual(env["KELIVO_ENABLED"]["value"], "false")
+        self.assertEqual(env["KELIVO_CLIENT_ID"]["value"], "primary-kelivo")
+        self.assertEqual(env["KELIVO_MODEL_ALIAS"]["value"], "ouou-home")
+        self.assertEqual(env["SQLITE_BUSY_TIMEOUT_SECONDS"]["value"], "30")
+        self.assertEqual(env["KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS"]["value"], "15")
         for key in (
             "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
             "CHANNEL_AUDIT_HMAC_SECRET", "TELEGRAM_BOT_ACCOUNT_ID",
             "TELEGRAM_ALLOWED_USER_IDS", "TELEGRAM_ALLOWED_CHAT_IDS",
-            "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL",
+            "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL", "KELIVO_API_KEY",
         ):
             self.assertEqual(env[key], {"key": key, "sync": False})
 

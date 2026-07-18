@@ -239,6 +239,66 @@ Back up the database as one consistent file, including migrations, mappings, job
 
 Run exactly one production relay/Telegram worker instance with SQLite. The test suite uses ASGI in-memory transports and blocks all real network access, including loopback.
 
+### Kelivo OpenAI-compatible 非流式 API（可选）
+
+Kelivo 默认关闭。只有设置 `KELIVO_ENABLED=true`、一把全新的
+`KELIVO_API_KEY`，以及显式的 `KELIVO_API_SESSION` 后才启用。Kelivo key
+至少 32 个字符，
+必须不同于 `RELAY_SECRET`、Telegram/audit secrets 和 `LLM_API_KEY`，只在
+`/v1/*` 的 `Authorization: Bearer ...` 中接受，不接受 query key。
+`KELIVO_CLIENT_ID` 只由服务端映射到固定 session，客户端不能选择另一条
+session。若要与某条 Telegram 会话共享 companion session，把那条会话已有的
+`api_session` 明确填入 `KELIVO_API_SESSION`，并设置
+`KELIVO_REQUIRE_TELEGRAM_SESSION=true`；启动时会确认它属于当前 allowlist 中的
+active Telegram account/chat。本项目不开放公共映射后台。
+
+已有 `KELIVO_CLIENT_ID` 的 session 不会被启动配置静默覆盖。确需迁移时，先备份
+数据库，设置新 `KELIVO_API_SESSION` 与 `KELIVO_ALLOW_SESSION_REMAP=true` 启动一次，
+确认 `channel_audit_events` 出现 `kelivo_session_remap` 后立刻恢复为 `false` 并再重启。
+映射版本会递增，已冻结请求仍绑定旧版本。多个 client 可以显式映射到同一 session，
+但每个 client 必须使用自己的 API key/部署入口；当前单实例只配置一个 client。
+`client_id` 只接受 ASCII 安全标识符并区分大小写。
+
+`GET /v1/models` 只暴露 `KELIVO_MODEL_ALIAS`。`POST
+/v1/chat/completions` 必须携带 `Idempotency-Key`，只接受纯文本消息和
+`stream=false`。模型路由、provider URL、上游 key 和 fallback 仍完全由服务端
+控制；非空 `tools` 会稳定返回 `tools_not_supported`。客户端消息按原顺序发送给模型，
+但统一历史每次只写入最后一条 user 消息和最终 assistant 回复，不重复写客户端附带历史。
+最终 provider 顺序固定为：服务端 `PERSONA` system message 在前，随后是客户端经过验证的
+完整 messages 原顺序；不会再拼接 canonical history。system/developer snapshot 只统一 CRLF/CR
+为 LF，实际模型消息以及 user/assistant 字符串（含首尾空格）保持原样并参与 request hash。
+默认全局并发 2、单 client 并发 1、每分钟 10 个新幂等请求；429 会带 `Retry-After`。
+同一幂等键的重放不重复计数。手工分别启动 relay 和 api_loop 时，两者必须共享一把
+至少 32 字符的 `API_LOOP_INTERNAL_TOKEN`；Render supervisor 会在每次启动时自动生成，
+不要把它设置为公开 secret。
+
+v3 上线前必须备份 SQLite 文件。v3 只新增 Kelivo 表/索引，不重建或删除 Telegram 表；
+但回退旧代码不会删除 v3 数据，也不保证旧代码理解新状态。需要彻底回滚 schema 时，应停服后
+恢复上线前的整库备份，不能只删除 `schema_migrations` 标记，也不要手工拆表后继续启动。
+
+### Kelivo frozen provider contract and v3 recovery rules
+
+At `prepare`, the relay persists the real primary `provider_model`, exact
+`provider_messages`, and concrete `effective_temperature`/`effective_max_tokens`.
+The authenticated `/loop/chat` path executes those values directly: it neither
+selects fallback routes nor substitutes runtime defaults. A changed primary model
+is rejected instead of silently rerouted. Completed idempotent requests replay the
+persisted response; unfinished same-key requests conflict when the frozen persona
+or provider contract differs from current preparation inputs.
+
+The identifiers have separate meanings:
+
+- `request_payload_hash` fingerprints the validated public request.
+- `request_identity_hash` deterministically fingerprints the complete frozen contract.
+- `generation_id` is random correlation only and never participates in identity equality.
+
+The v3 validator compares `table_xinfo`, `index_list`, `index_xinfo`, and
+`foreign_key_list`, then checks a fail-safe token fingerprint for every v3 table
+and explicit index. Whitespace, comments, and keyword case are ignored; changed
+CHECK or partial-WHERE boolean structure is rejected. Even a seemingly equivalent
+manual DDL rewrite may be rejected: restore or use a formal migration. Back up the
+complete `relay.db` before deploying v3.
+
 ## 9. API 速查
 
 | 方法 | 路径 | 谁用 | 作用 |
@@ -263,3 +323,24 @@ Run exactly one production relay/Telegram worker instance with SQLite. The test 
 | POST | `/app/push_test` | PWA | 推一条测试通知 |
 
 除 `/healthz`、`/readyz` 和 Telegram webhook 外，端点都要 `Authorization: Bearer <RELAY_SECRET>`；SSE 端点也可用 `?token=<RELAY_SECRET>`。Telegram webhook 只使用专用 secret header。
+
+### Kelivo v3 提交前语义补充
+
+Kelivo 的 `prepare` 阶段会一次性冻结服务端 persona、persona hash/source、客户端完整
+messages、当前请求新建的 system/developer snapshot 标识、temperature/max_tokens、mapping
+revision 与 generation correlation。内部 `/loop/chat` 只接受这份带版本号的
+`provider_messages`，不会再次追加运行时 persona、canonical history 或旧 active snapshot。
+客户端附带的历史只参与本次生成；canonical history 仍只写最后一条真实 user 和最终 assistant。
+
+相同 `Idempotency-Key` 的并发请求在短期 key 锁内完成 lookup/prepare：相同 payload 若正在
+prepared/dispatching 返回 `idempotency_in_progress`，不同 payload（包括原始空白差异）返回
+`idempotency_conflict`，completed 则回放原结果；这些状态不会被普通 generation queue 的 429
+覆盖。不同 key 才竞争并发队列。
+
+启用 Kelivo 时必须严格满足
+`KELIVO_DISPATCH_STALE_SECONDS > LOOP_MODEL_TOTAL_TIMEOUT_SECONDS + KELIVO_QUEUE_TIMEOUT_SECONDS + SQLITE_BUSY_TIMEOUT_SECONDS + KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS`。
+进入真实 provider dispatch 前会原子写入 `dispatch_expires_at`，reaper 只处理已真正过期的
+dispatching 行。Kelivo 关闭时不检查 Kelivo 专属跨字段关系，`/v1/*` 仍保持不可用。
+
+发布 v3 前必须备份完整 `relay.db`。若曾运行未提交的旧 v3 测试 schema，应删除测试数据库，
+或从 v2/上线前整库备份恢复；不能只修改 migration marker，也不要让启动逻辑猜测修复可疑结构。

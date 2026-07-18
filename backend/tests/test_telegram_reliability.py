@@ -24,7 +24,7 @@ class FakeResponse:
         self.payload = json.dumps(payload).encode()
     def __enter__(self): return self
     def __exit__(self, *args): return False
-    def read(self): return self.payload
+    def read(self, size=-1): return self.payload if size < 0 else self.payload[:size]
 
 
 class TelegramReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
@@ -337,7 +337,7 @@ class ConcurrentMigrationTests(unittest.TestCase):
             asyncio.run(run())
             with closing(sqlite3.connect(path)) as conn:
                 self.assertEqual(conn.execute("SELECT text FROM messages").fetchone()[0], "keep")
-                self.assertEqual(conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0], 2)
+                self.assertEqual(conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0], 3)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,25 @@
         {"key": "LOOP_DISPATCH_TIMEOUT_SECONDS", "value": "180"},
         {"key": "SUPERVISOR_LOOP_READY_TIMEOUT_SECONDS", "value": "15"},
         {"key": "SUPERVISOR_SHUTDOWN_GRACE_SECONDS", "value": "10"},
+        {"key": "KELIVO_ENABLED", "value": "false"},
+        {"key": "KELIVO_CLIENT_ID", "value": "primary-kelivo"},
+        {"key": "KELIVO_API_SESSION", "sync": false},
+        {"key": "KELIVO_MODEL_ALIAS", "value": "ouou-home"},
+        {"key": "KELIVO_GLOBAL_CONCURRENCY", "value": "2"},
+        {"key": "KELIVO_CLIENT_CONCURRENCY", "value": "1"},
+        {"key": "KELIVO_RATE_LIMIT_PER_MINUTE", "value": "10"},
+        {"key": "KELIVO_QUEUE_TIMEOUT_SECONDS", "value": "2"},
+        {"key": "KELIVO_DISPATCH_STALE_SECONDS", "value": "300"},
+        {"key": "SQLITE_BUSY_TIMEOUT_SECONDS", "value": "30"},
+        {"key": "KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS", "value": "15"},
+        {"key": "KELIVO_INTERNAL_RESPONSE_MAX_BYTES", "value": "1048576"},
+        {"key": "KELIVO_ALLOW_SESSION_REMAP", "value": "false"},
+        {"key": "KELIVO_REQUIRE_TELEGRAM_SESSION", "value": "true"},
+        {"key": "LOOP_INTERNAL_REQUEST_MAX_BYTES", "value": "1048576"},
+        {"key": "LOOP_PROVIDER_RESPONSE_MAX_BYTES", "value": "1048576"},
+        {"key": "LOOP_ASSISTANT_MAX_CHARS", "value": "64000"},
         {"key": "RELAY_SECRET", "sync": false},
+        {"key": "KELIVO_API_KEY", "sync": false},
         {"key": "TELEGRAM_BOT_TOKEN", "sync": false},
         {"key": "TELEGRAM_WEBHOOK_SECRET", "sync": false},
         {"key": "CHANNEL_AUDIT_HMAC_SECRET", "sync": false},
@@ -48,7 +66,9 @@
         {"key": "TELEGRAM_ALLOWED_CHAT_IDS", "sync": false},
         {"key": "LLM_API_BASE", "sync": false},
         {"key": "LLM_API_KEY", "sync": false},
-        {"key": "LLM_MODEL", "sync": false}
+        {"key": "LLM_MODEL", "sync": false},
+        {"key": "LLM_TEMPERATURE", "value": "0.7"},
+        {"key": "LLM_MAX_TOKENS", "value": "2000"}
       ]
     }
   ]

@@ -24,7 +24,7 @@ class MigrationTests(unittest.TestCase):
         channel_store.run_migrations(self.db_path)
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(conn.execute("SELECT text FROM messages").fetchone()[0], "preserve me")
-            self.assertEqual(conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0], 3)
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"channel_accounts", "channel_conversations", "inbound_events",
                          "external_messages", "generation_jobs", "delivery_attempts",
@@ -38,12 +38,12 @@ class MigrationTests(unittest.TestCase):
             raise RuntimeError("boom")
 
         with self.assertRaises(RuntimeError):
-            channel_store.run_migrations(self.db_path, [(3, "broken", broken)])
+            channel_store.run_migrations(self.db_path, [(4, "broken", broken)])
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='should_rollback'"
             ).fetchone())
-            self.assertIsNone(conn.execute("SELECT version FROM schema_migrations WHERE version=3").fetchone())
+            self.assertIsNone(conn.execute("SELECT version FROM schema_migrations WHERE version=4").fetchone())
 
     def test_actual_v2_failure_rolls_back_every_schema_change(self):
         channel_store.run_migrations(self.db_path, [channel_store.MIGRATIONS[0]])

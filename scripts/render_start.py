@@ -36,6 +36,7 @@ class SupervisorConfig:
     loop_ready_timeout: float
     shutdown_grace: float
     instance_nonce: str
+    internal_token: str
 
 
 def preflight(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
@@ -53,13 +54,17 @@ def preflight(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
     )
     deployment_config.prepare_persistent_paths(deployment)
     initialize_brain_target(deployment)
-    return SupervisorConfig(deployment, relay_port, loop_ready_timeout, shutdown_grace, secrets.token_urlsafe(32))
+    return SupervisorConfig(
+        deployment, relay_port, loop_ready_timeout, shutdown_grace,
+        secrets.token_urlsafe(32), secrets.token_urlsafe(48),
+    )
 
 
 def child_environment(config: SupervisorConfig, environ: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if environ is None else environ)
     env.pop("API_LOOP_INSTANCE_NONCE", None)
     env.pop("API_LOOP_EXPECTED_NONCE", None)
+    env.pop("API_LOOP_INTERNAL_TOKEN", None)
     env["RELAY_URL"] = f"http://127.0.0.1:{config.relay_port}"
     env["RELAY_PORT"] = str(config.relay_port)
     env["LOOP_PORT"] = str(config.deployment.loop_port)
@@ -72,10 +77,12 @@ def child_commands(config: SupervisorConfig, executable: str | None = None) -> d
         "api_loop": [
             python, "-m", "uvicorn", "examples.api_loop:app", "--host", "127.0.0.1",
             "--port", str(config.deployment.loop_port), "--workers", "1",
+            "--no-access-log",
         ],
         "relay": [
             python, "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0",
             "--port", str(config.relay_port), "--workers", "1",
+            "--no-access-log",
         ],
     }
 
@@ -212,8 +219,10 @@ class RenderSupervisor:
                 previous[signum] = signal.signal(signum, self.handle_signal)
             api_env = dict(env)
             api_env["API_LOOP_INSTANCE_NONCE"] = config.instance_nonce
+            api_env["API_LOOP_INTERNAL_TOKEN"] = config.internal_token
             relay_env = dict(env)
             relay_env["API_LOOP_EXPECTED_NONCE"] = config.instance_nonce
+            relay_env["API_LOOP_INTERNAL_TOKEN"] = config.internal_token
             loop_process = self._start("api_loop", commands["api_loop"], api_env)
             self._wait_for_loop(loop_process, config.deployment.loop_port, config.instance_nonce, config.loop_ready_timeout)
             self._start("relay", commands["relay"], relay_env)
