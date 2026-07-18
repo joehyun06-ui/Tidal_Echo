@@ -67,6 +67,8 @@ jobs:
 
           env = {item["key"]: item for item in service.get("envVars", [])}
           assert env["KELIVO_ENABLED"].get("value") == "false"
+          assert env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"].get("value") == "false"
+          assert env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"].get("value") == "300"
           assert env["KELIVO_API_KEY"].get("sync") is False
           assert env["KELIVO_API_SESSION"].get("sync") is False
 

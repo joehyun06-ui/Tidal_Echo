@@ -120,6 +120,12 @@ conversation，并限制为全局并发 2、单 client 并发 1、每分钟 10 �
 Kelivo 是有限的 OpenAI-compatible 非流式接口：`stream=true` 和非空 `tools` 均不支持。
 非流式请求可为兼容性携带受限的 `stream_options`（`null`、`{}` 或仅含布尔
 `include_usage`）；它不会转发给 provider，也不改变非流式响应。
+Blueprint 同时固定 `KELIVO_AUTO_IDEMPOTENCY_ENABLED=false`。当前 Kelivo GUI 缺失
+`Idempotency-Key` 时，只有显式开启该开关并把 replay window 配置为大于 dispatch stale
+timeout 才会启用自动兼容；能发送 key 的客户端应继续优先使用显式模式。自动模式只是有限
+窗口的请求重试保护，不是永久 exactly-once，并存在两个完全相同首轮 messages 在窗口内
+被视为重试的限制。v4 上线前必须备份完整 `relay.db`；migration 只重建 Kelivo request 表，
+不会重建或删除 Telegram 表。
 每次请求冻结唯一的 provider prompt；旧 active snapshot 和 canonical history 不会被静默注入。
 同 key 的 prepared/dispatching 请求稳定返回 409 `idempotency_in_progress`，不同内容返回 409
 `idempotency_conflict`，只有不同 key 才可能因 generation queue 返回 429。

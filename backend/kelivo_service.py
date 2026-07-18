@@ -76,6 +76,18 @@ class PreparedRequest:
     context_bundle: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
     error_category: str | None = None
+    idempotency_key: str = ""
+    idempotency_mode: str = "explicit"
+
+
+@dataclass(frozen=True)
+class FrozenRequestContract:
+    api_session: str
+    mapping_revision: int
+    provider_messages: tuple[dict[str, str], ...]
+    context_bundle: dict[str, Any]
+    context_bundle_hash: str
+    request_identity_hash: str
 
 
 GenerationCallable = Callable[
@@ -374,7 +386,8 @@ def lookup_request(
 ) -> PreparedRequest | None:
     with channel_store.connect(path) as conn:
         row = conn.execute(
-            "SELECT * FROM kelivo_requests WHERE client_id=? AND idempotency_key=?",
+            """SELECT * FROM kelivo_requests
+               WHERE client_id=? AND idempotency_key=? AND idempotency_mode='explicit'""",
             (client_id, idempotency_key),
         ).fetchone()
         mapping = conn.execute(
@@ -453,7 +466,8 @@ def prepare_request(
         if not mapping:
             raise KelivoError(503, "client_mapping_unavailable")
         existing = conn.execute(
-            "SELECT * FROM kelivo_requests WHERE client_id=? AND idempotency_key=?",
+            """SELECT * FROM kelivo_requests
+               WHERE client_id=? AND idempotency_key=? AND idempotency_mode='explicit'""",
             (client_id, idempotency_key),
         ).fetchone()
         if existing:
@@ -518,6 +532,174 @@ def prepare_request(
         return PreparedRequest(
             "prepared", generation_id, api_session, provider_model, effective_temperature,
             effective_max_tokens, provider_messages, bundle,
+        )
+
+
+def freeze_automatic_request(
+    path: str, client_id: str, validated: ValidatedCompletion, *, persona_text: str = "",
+    persona_source: str = "default", provider_model: str = "test-provider",
+    effective_temperature: float = 0.7, effective_max_tokens: int = 2000,
+) -> FrozenRequestContract:
+    """Persist/deduplicate snapshot correlations and build the existing frozen identity once."""
+    with channel_store.connect(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        mapping = conn.execute(
+            """SELECT api_session,mapping_revision FROM kelivo_clients
+               WHERE client_id=? AND enabled=1""", (client_id,),
+        ).fetchone()
+        if not mapping:
+            raise KelivoError(503, "client_mapping_unavailable")
+        api_session = mapping["api_session"]
+        snapshot_rows = [
+            store_snapshot(conn, api_session, snapshot_type, value)
+            for snapshot_type, value in validated.snapshots
+        ]
+        provider_messages, bundle, bundle_hash, request_identity_hash = build_frozen_prompt_contract(
+            validated, persona_text=persona_text, persona_source=persona_source,
+            client_id=client_id, api_session=api_session,
+            mapping_revision=int(mapping["mapping_revision"]), provider_model=provider_model,
+            effective_temperature=effective_temperature, effective_max_tokens=effective_max_tokens,
+            snapshot_rows=snapshot_rows,
+        )
+        conn.execute("COMMIT")
+    return FrozenRequestContract(
+        api_session, int(mapping["mapping_revision"]), provider_messages, bundle,
+        bundle_hash, request_identity_hash,
+    )
+
+
+def _automatic_row_result(row: sqlite3.Row, now: datetime) -> PreparedRequest | None:
+    if row["idempotency_mode"] != "automatic":
+        raise KelivoError(503, "stored_contract_invalid")
+    if not hmac.compare_digest(row["automatic_fingerprint"], row["request_identity_hash"]):
+        raise KelivoError(503, "stored_contract_invalid")
+    common = {
+        "idempotency_key": row["idempotency_key"],
+        "idempotency_mode": "automatic",
+    }
+    if row["status"] in {"prepared", "dispatching"}:
+        return PreparedRequest(
+            "blocked", row["generation_id"], row["api_session"],
+            error_category="idempotency_in_progress", **common,
+        )
+    if row["status"] == "dispatch_uncertain":
+        return PreparedRequest(
+            "blocked", row["generation_id"], row["api_session"],
+            error_category=row["error_category"] or "dispatch_uncertain", **common,
+        )
+    try:
+        replay_until = datetime.fromisoformat(row["automatic_replay_until"])
+    except (TypeError, ValueError):
+        raise KelivoError(503, "stored_contract_invalid") from None
+    if replay_until.tzinfo is None:
+        raise KelivoError(503, "stored_contract_invalid")
+    if replay_until <= now:
+        return None
+    if row["status"] == "completed" and row["response_json"]:
+        return PreparedRequest(
+            "replay", row["generation_id"], row["api_session"],
+            response=json.loads(row["response_json"]), **common,
+        )
+    return PreparedRequest(
+        "blocked", row["generation_id"], row["api_session"],
+        error_category=row["error_category"] or row["status"], **common,
+    )
+
+
+def lookup_automatic_request(
+    path: str, client_id: str, automatic_fingerprint: str, *, now: datetime | None = None,
+) -> PreparedRequest | None:
+    with channel_store.connect(path) as conn:
+        row = conn.execute(
+            """SELECT * FROM kelivo_requests
+               WHERE client_id=? AND idempotency_mode='automatic' AND automatic_fingerprint=?
+               ORDER BY id DESC LIMIT 1""",
+            (client_id, automatic_fingerprint),
+        ).fetchone()
+    return None if row is None else _automatic_row_result(row, now or datetime.now(timezone.utc))
+
+
+def prepare_automatic_request(
+    path: str, client_id: str, automatic_fingerprint: str, validated: ValidatedCompletion,
+    contract: FrozenRequestContract, *, persona_source: str = "default",
+    provider_model: str = "test-provider", effective_temperature: float = 0.7,
+    effective_max_tokens: int = 2000, replay_seconds: int = 300,
+    rate_limit: int = 10, rate_window_seconds: int = 60, now: datetime | None = None,
+) -> PreparedRequest:
+    if not hmac.compare_digest(automatic_fingerprint, contract.request_identity_hash):
+        raise KelivoError(409, "automatic_identity_changed")
+    bundle = contract.context_bundle
+    persona = bundle.get("persona") if isinstance(bundle, dict) else None
+    if (
+        not isinstance(persona, dict)
+        or bundle.get("provider_model") != provider_model
+        or bundle.get("effective_temperature") != effective_temperature
+        or bundle.get("effective_max_tokens") != effective_max_tokens
+        or persona.get("source") != persona_source
+    ):
+        raise KelivoError(409, "automatic_identity_changed")
+    stamp_dt = now or datetime.now(timezone.utc)
+    stamp = stamp_dt.isoformat()
+    with channel_store.connect(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """SELECT * FROM kelivo_requests
+               WHERE client_id=? AND idempotency_mode='automatic' AND automatic_fingerprint=?
+               ORDER BY id DESC LIMIT 1""",
+            (client_id, automatic_fingerprint),
+        ).fetchone()
+        if existing:
+            action = _automatic_row_result(existing, stamp_dt)
+            if action is not None:
+                conn.execute("COMMIT")
+                return action
+        mapping = conn.execute(
+            """SELECT api_session,mapping_revision FROM kelivo_clients
+               WHERE client_id=? AND enabled=1""", (client_id,),
+        ).fetchone()
+        if (
+            not mapping or mapping["api_session"] != contract.api_session
+            or int(mapping["mapping_revision"]) != contract.mapping_revision
+        ):
+            raise KelivoError(409, "automatic_identity_changed")
+        _consume_rate_limit(conn, client_id, rate_limit, rate_window_seconds, int(stamp_dt.timestamp()))
+        boundary = int(conn.execute(
+            """SELECT COALESCE(MAX(id),0) FROM messages
+               WHERE json_valid(meta) AND json_extract(meta,'$.api_session')=?""",
+            (contract.api_session,),
+        ).fetchone()[0])
+        generation_id = "chatcmpl-" + secrets.token_urlsafe(18)
+        for _ in range(3):
+            internal_key = "@auto:" + secrets.token_urlsafe(24)
+            if conn.execute(
+                "SELECT 1 FROM kelivo_requests WHERE client_id=? AND idempotency_key=?",
+                (client_id, internal_key),
+            ).fetchone() is None:
+                break
+        else:
+            raise KelivoError(503, "automatic_key_unavailable")
+        replay_until = (stamp_dt + timedelta(seconds=replay_seconds)).isoformat()
+        bundle_json = normalized_json(contract.context_bundle)
+        prompt_json = normalized_json(list(contract.provider_messages))
+        conn.execute(
+            """INSERT INTO kelivo_requests
+               (idempotency_key,idempotency_mode,automatic_fingerprint,automatic_replay_until,
+                request_payload_hash,request_identity_hash,client_id,api_session,mapping_revision,
+                history_before_id,context_bundle_json,context_bundle_hash,provider_messages_json,
+                prompt_contract_version,persona_hash,persona_source,provider_model,
+                effective_temperature,effective_max_tokens,status,generation_id,created_at,updated_at)
+               VALUES(?,'automatic',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?,?,?)""",
+            (internal_key, automatic_fingerprint, replay_until, validated.request_payload_hash,
+             contract.request_identity_hash, client_id, contract.api_session, contract.mapping_revision,
+             boundary, bundle_json, contract.context_bundle_hash, prompt_json,
+             PROMPT_CONTRACT_VERSION, persona["hash"], persona_source, provider_model,
+             effective_temperature, effective_max_tokens, generation_id, stamp, stamp),
+        )
+        conn.execute("COMMIT")
+        return PreparedRequest(
+            "prepared", generation_id, contract.api_session, provider_model,
+            effective_temperature, effective_max_tokens, contract.provider_messages,
+            contract.context_bundle, idempotency_key=internal_key, idempotency_mode="automatic",
         )
 
 

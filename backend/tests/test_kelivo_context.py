@@ -259,6 +259,90 @@ class KelivoContextTests(unittest.TestCase):
             ))
         self.assertEqual(len(hashes), 5)
 
+    def test_automatic_fingerprint_reuses_full_frozen_identity_contract(self):
+        with channel_store.connect(self.path) as conn:
+            conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY,ts TEXT,direction TEXT,kind TEXT,text TEXT,meta TEXT)")
+            stamp = channel_store.now_iso()
+            conn.execute(
+                """INSERT INTO kelivo_clients
+                   (client_id,api_session,enabled,mapping_revision,created_at,updated_at)
+                   VALUES('a','s',1,3,?,?)""", (stamp, stamp),
+            )
+        validated = kelivo_service.validate_completion({
+            "model": "ouou-home",
+            "messages": [
+                {"role": "system", "content": "snapshot"},
+                {"role": "user", "content": " exact user whitespace "},
+            ],
+        }, "ouou-home")
+        base = kelivo_service.freeze_automatic_request(
+            self.path, "a", validated, persona_text="persona-a", provider_model="provider-a",
+            effective_temperature=0.2, effective_max_tokens=88,
+        )
+        same = kelivo_service.freeze_automatic_request(
+            self.path, "a", validated, persona_text="persona-a", provider_model="provider-a",
+            effective_temperature=0.2, effective_max_tokens=88,
+        )
+        self.assertEqual(base.request_identity_hash, same.request_identity_hash)
+        self.assertEqual(base.provider_messages[-1]["content"], " exact user whitespace ")
+        variants = (
+            ("persona-b", "provider-a", 0.2, 88),
+            ("persona-a", "provider-b", 0.2, 88),
+            ("persona-a", "provider-a", 0.3, 88),
+            ("persona-a", "provider-a", 0.2, 89),
+        )
+        hashes = {base.request_identity_hash}
+        for persona, model, temperature, max_tokens in variants:
+            contract = kelivo_service.freeze_automatic_request(
+                self.path, "a", validated, persona_text=persona, provider_model=model,
+                effective_temperature=temperature, effective_max_tokens=max_tokens,
+            )
+            hashes.add(contract.request_identity_hash)
+        self.assertEqual(len(hashes), 5)
+        changed_snapshot = kelivo_service.validate_completion({
+            "model": "ouou-home",
+            "messages": [
+                {"role": "system", "content": "different snapshot"},
+                {"role": "user", "content": " exact user whitespace "},
+            ],
+        }, "ouou-home")
+        changed = kelivo_service.freeze_automatic_request(
+            self.path, "a", changed_snapshot, persona_text="persona-a", provider_model="provider-a",
+            effective_temperature=0.2, effective_max_tokens=88,
+        )
+        self.assertNotEqual(changed.request_identity_hash, base.request_identity_hash)
+
+    def test_automatic_restart_recovery_blocks_prepared_and_uncertain_without_new_generation(self):
+        with channel_store.connect(self.path) as conn:
+            conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY,ts TEXT,direction TEXT,kind TEXT,text TEXT,meta TEXT)")
+            stamp = channel_store.now_iso()
+            conn.execute(
+                """INSERT INTO kelivo_clients
+                   (client_id,api_session,enabled,mapping_revision,created_at,updated_at)
+                   VALUES('a','s',1,1,?,?)""", (stamp, stamp),
+            )
+        requests = [kelivo_service.validate_completion({
+            "model": "ouou-home", "messages": [{"role": "user", "content": text}],
+        }, "ouou-home") for text in ("prepared", "dispatching")]
+        prepared_rows = []
+        for validated in requests:
+            contract = kelivo_service.freeze_automatic_request(self.path, "a", validated)
+            prepared_rows.append((contract, kelivo_service.prepare_automatic_request(
+                self.path, "a", contract.request_identity_hash, validated, contract,
+                replay_seconds=600,
+            )))
+        second = prepared_rows[1][1]
+        kelivo_service.begin_dispatch(self.path, "a", second.idempotency_key, stale_seconds=300)
+        self.assertEqual(kelivo_service.recover_dispatching_requests(self.path), 1)
+        blocked = [kelivo_service.lookup_automatic_request(
+            self.path, "a", contract.request_identity_hash,
+        ) for contract, _prepared in prepared_rows]
+        self.assertTrue(all(item is not None and item.action == "blocked" for item in blocked))
+        self.assertEqual(blocked[0].error_category, "relay_restarted_before_dispatch")
+        self.assertEqual(blocked[1].error_category, "relay_restarted")
+        with channel_store.connect(self.path) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0], 2)
+
     def test_restart_recovery_distinguishes_prepared_and_dispatched(self):
         with channel_store.connect(self.path) as conn:
             conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY,ts TEXT,direction TEXT,kind TEXT,text TEXT,meta TEXT)")

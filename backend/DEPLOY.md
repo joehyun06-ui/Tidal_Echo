@@ -263,6 +263,14 @@ active Telegram account/chat。本项目不开放公共映射后台。
 /v1/chat/completions` 必须携带 `Idempotency-Key`，只接受纯文本消息和
 `stream=false`。为兼容 Kelivo，非流式请求可额外携带 `stream_options=null`、`{}` 或仅含
 布尔 `include_usage` 的对象；该字段会被忽略且不会转发给 provider，`stream=true` 仍不支持。
+显式 `Idempotency-Key` 仍是首选，并保持永久的强幂等语义。当前 Kelivo GUI 不发送该
+header 时，可显式设置 `KELIVO_AUTO_IDEMPOTENCY_ENABLED=true`；这会使用完整 frozen provider
+contract 的确定性指纹，在 `KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS`（60–3600 秒，且必须大于
+`KELIVO_DISPATCH_STALE_SECONDS`）内阻止重复 dispatch 或回放已完成 JSON。header 若存在但为空、
+空白或非法仍会拒绝，不会降级为自动模式。自动模式默认关闭，只提供有限窗口的重试保护，
+不是永久 exactly-once：窗口过期后 completed/failed 请求可成为新 generation；任何
+`dispatch_uncertain` 请求都不会自动重调。两个独立新对话若提交完全相同的完整 messages，
+可能在窗口内被视为同一次重试。
 模型路由、provider URL、上游 key 和 fallback 仍完全由服务端
 控制；非空 `tools` 会稳定返回 `tools_not_supported`。客户端消息按原顺序发送给模型，
 但统一历史每次只写入最后一条 user 消息和最终 assistant 回复，不重复写客户端附带历史。
@@ -274,7 +282,9 @@ active Telegram account/chat。本项目不开放公共映射后台。
 至少 32 字符的 `API_LOOP_INTERNAL_TOKEN`；Render supervisor 会在每次启动时自动生成，
 不要把它设置为公开 secret。
 
-v3 上线前必须备份 SQLite 文件。v3 只新增 Kelivo 表/索引，不重建或删除 Telegram 表；
+v4 上线前必须备份完整 SQLite 文件。v4 将现有 Kelivo 显式请求原样迁移为 `explicit`，
+新增自动模式指纹、replay deadline 和查询索引；不会重建或删除 Telegram 表。
+v3 只新增 Kelivo 表/索引，不重建或删除 Telegram 表；
 但回退旧代码不会删除 v3 数据，也不保证旧代码理解新状态。需要彻底回滚 schema 时，应停服后
 恢复上线前的整库备份，不能只删除 `schema_migrations` 标记，也不要手工拆表后继续启动。
 

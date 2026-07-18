@@ -658,6 +658,8 @@ class BlueprintTests(unittest.TestCase):
         self.assertEqual(shutdown_grace, "10")
         self.assertGreater(float(shutdown_grace), 0)
         self.assertEqual(env["KELIVO_ENABLED"]["value"], "false")
+        self.assertEqual(env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"]["value"], "false")
+        self.assertEqual(env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"]["value"], "300")
         self.assertEqual(env["KELIVO_CLIENT_ID"]["value"], "primary-kelivo")
         self.assertEqual(env["KELIVO_MODEL_ALIAS"]["value"], "ouou-home")
         self.assertEqual(env["SQLITE_BUSY_TIMEOUT_SECONDS"]["value"], "30")

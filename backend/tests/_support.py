@@ -55,7 +55,8 @@ class NoNetworkMixin:
             self.addCleanup(patcher.stop)
 
 
-def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False):
+def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False,
+             auto_idempotency: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -81,6 +82,8 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "KELIVO_CLIENT_ID": "primary-kelivo",
         "KELIVO_API_SESSION": "shared-test-session",
         "KELIVO_MODEL_ALIAS": "ouou-home",
+        "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "true" if auto_idempotency else "false",
+        "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "600",
         "LLM_MODEL": "test-provider-model",
         "LLM_TEMPERATURE": "0.7",
         "LLM_MAX_TOKENS": "2000",

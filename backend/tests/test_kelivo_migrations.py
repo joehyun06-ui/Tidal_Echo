@@ -25,7 +25,8 @@ class KelivoMigrationTests(unittest.TestCase):
             indexes = source.execute(
                 """SELECT name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND name IN
                    ('idx_kelivo_requests_status','idx_kelivo_rate_limits_window',
-                    'idx_context_snapshots_lookup','idx_context_snapshots_one_active')"""
+                    'idx_context_snapshots_lookup','idx_context_snapshots_one_active',
+                    'idx_kelivo_requests_automatic')"""
             ).fetchall()
         self.corrupt_count += 1
         target_path = str(Path(self.temp.name) / f"corrupt-{self.corrupt_count}.sqlite3")
@@ -41,13 +42,13 @@ class KelivoMigrationTests(unittest.TestCase):
                     target.execute(sql)
         return target_path
 
-    def test_v3_upgrades_empty_database_and_is_repeatable(self):
+    def test_v4_upgrades_empty_database_and_is_repeatable(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
         self.assertTrue({"kelivo_clients", "kelivo_requests", "companion_context_snapshots",
                          "kelivo_rate_limits"}.issubset(tables))
 
@@ -202,6 +203,97 @@ class KelivoMigrationTests(unittest.TestCase):
         self.assertEqual(kelivo_tables, [])
         self.assertIsNone(marker)
         self.assertEqual(bot, "rollback-bot")
+
+    def test_v3_request_data_is_preserved_and_marked_explicit_by_v4(self):
+        channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:3])
+        with channel_store.connect(self.path) as conn:
+            conn.execute("""CREATE TABLE messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,direction TEXT,kind TEXT,text TEXT,meta TEXT)""")
+            stamp = channel_store.now_iso()
+            conn.execute(
+                """INSERT INTO kelivo_clients
+                   (client_id,api_session,enabled,mapping_revision,created_at,updated_at)
+                   VALUES('client','session',1,1,?,?)""", (stamp, stamp),
+            )
+            conn.execute(
+                """INSERT INTO kelivo_requests
+                   (idempotency_key,request_payload_hash,request_identity_hash,client_id,api_session,
+                    mapping_revision,history_before_id,context_bundle_json,context_bundle_hash,
+                    provider_messages_json,prompt_contract_version,persona_hash,persona_source,
+                    provider_model,effective_temperature,effective_max_tokens,status,generation_id,
+                    created_at,updated_at)
+                   VALUES('explicit-key-0001','payload','identity','client','session',1,0,
+                    '{}','bundle','[]','contract','persona','test','provider',0.7,100,
+                    'prepared','generation-v3',?,?)""", (stamp, stamp),
+            )
+        channel_store.run_migrations(self.path)
+        with channel_store.connect(self.path) as conn:
+            row = conn.execute("SELECT * FROM kelivo_requests").fetchone()
+            versions = [item[0] for item in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )]
+        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual((row["idempotency_key"], row["generation_id"], row["idempotency_mode"]),
+                         ("explicit-key-0001", "generation-v3", "explicit"))
+        self.assertIsNone(row["automatic_fingerprint"])
+        self.assertIsNone(row["automatic_replay_until"])
+
+    def test_actual_v4_apply_exception_rolls_back_schema_marker_and_preserves_v3(self):
+        channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:3])
+        with channel_store.connect(self.path) as conn:
+            conn.execute("""CREATE TABLE messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,direction TEXT,kind TEXT,text TEXT,meta TEXT)""")
+            stamp = channel_store.now_iso()
+            conn.execute(
+                "INSERT INTO channel_accounts(channel,external_account_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("telegram", "rollback-v4-bot", "active", stamp, stamp),
+            )
+            conn.execute(
+                """INSERT INTO kelivo_clients
+                   (client_id,api_session,enabled,mapping_revision,created_at,updated_at)
+                   VALUES('client','session',1,1,?,?)""", (stamp, stamp),
+            )
+            conn.execute(
+                """INSERT INTO kelivo_requests
+                   (idempotency_key,request_payload_hash,request_identity_hash,client_id,api_session,
+                    mapping_revision,history_before_id,context_bundle_json,context_bundle_hash,
+                    provider_messages_json,prompt_contract_version,persona_hash,persona_source,
+                    provider_model,effective_temperature,effective_max_tokens,status,generation_id,
+                    created_at,updated_at)
+                   VALUES('rollback-key-0001','payload','identity','client','session',1,0,
+                    '{}','bundle','[]','contract','persona','test','provider',0.7,100,
+                    'prepared','rollback-generation',?,?)""", (stamp, stamp),
+            )
+        def broken_v4(conn):
+            channel_store._migration_004(conn)
+            raise RuntimeError("injected v4 failure")
+        migrations = (*channel_store.MIGRATIONS[:3], (4, "kelivo_automatic_idempotency", broken_v4))
+        with self.assertRaisesRegex(RuntimeError, "injected v4"):
+            channel_store.run_migrations(self.path, migrations)
+        with channel_store.connect(self.path) as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_xinfo(kelivo_requests)")}
+            marker = conn.execute("SELECT status FROM schema_migrations WHERE version=4").fetchone()
+            bot = conn.execute("SELECT external_account_id FROM channel_accounts").fetchone()[0]
+            request = conn.execute("SELECT idempotency_key,generation_id FROM kelivo_requests").fetchone()
+            channel_store.validate_kelivo_schema(conn, version=3)
+        self.assertNotIn("idempotency_mode", columns)
+        self.assertIsNone(marker)
+        self.assertEqual(bot, "rollback-v4-bot")
+        self.assertEqual(tuple(request), ("rollback-key-0001", "rollback-generation"))
+
+    def test_v4_validator_rejects_automatic_constraint_and_index_corruption(self):
+        broken_check = self.corrupted_schema(transform_table=lambda name, sql: sql.replace(
+            "idempotency_mode='automatic' AND automatic_fingerprint IS NOT NULL",
+            "idempotency_mode='automatic'",
+        ) if name == "kelivo_requests" else sql)
+        with channel_store.connect(broken_check) as conn, self.assertRaises(sqlite3.DatabaseError):
+            channel_store.validate_kelivo_schema(conn)
+        broken_index = self.corrupted_schema(transform_index=lambda name, sql: sql.replace(
+            "client_id,automatic_fingerprint,created_at,status",
+            "client_id,automatic_fingerprint,status,created_at",
+        ) if name == "idx_kelivo_requests_automatic" else sql)
+        with channel_store.connect(broken_index) as conn, self.assertRaises(sqlite3.DatabaseError):
+            channel_store.validate_kelivo_schema(conn)
 
     def test_v2_data_is_preserved(self):
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:2])

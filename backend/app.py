@@ -1079,7 +1079,14 @@ async def kelivo_chat_completions(request: Request):
         )
         _validate_json_complexity(payload)
         validated = kelivo_service.validate_completion(payload, DEPLOYMENT.kelivo.model_alias)
-        idempotency_key = kelivo_service.validate_idempotency_key(request.headers.get("idempotency-key"))
+        raw_idempotency_key = request.headers.get("idempotency-key")
+        idempotency_mode = "explicit"
+        if raw_idempotency_key is None and DEPLOYMENT.kelivo.auto_idempotency_enabled:
+            idempotency_mode = "automatic"
+            idempotency_key = ""
+        else:
+            # Present-but-empty/invalid values never fall through to compatibility mode.
+            idempotency_key = kelivo_service.validate_idempotency_key(raw_idempotency_key)
         provider_defaults = await asyncio.to_thread(
             deployment_config.resolve_kelivo_provider_contract_defaults,
             os.environ, DEPLOYMENT.loop_config,
@@ -1095,6 +1102,15 @@ async def kelivo_chat_completions(request: Request):
             stale_seconds=DEPLOYMENT.kelivo.stale_dispatch_seconds,
             category="dispatch_expired",
         )
+        automatic_contract = None
+        if idempotency_mode == "automatic":
+            automatic_contract = await asyncio.to_thread(
+                kelivo_service.freeze_automatic_request,
+                DB_PATH, DEPLOYMENT.kelivo.client_id, validated,
+                persona_text=KELIVO_PERSONA, persona_source=KELIVO_PERSONA_SOURCE,
+                provider_model=provider_defaults.provider_model,
+                effective_temperature=effective_temperature, effective_max_tokens=effective_max_tokens,
+            )
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
         return kelivo_error(400, "malformed_json")
     except MemoryError:
@@ -1106,32 +1122,59 @@ async def kelivo_chat_completions(request: Request):
     except (sqlite3.Error, OSError):
         return kelivo_error(503, "temporarily_unavailable")
     try:
-        async with KELIVO_KEY_LOCKS.hold(DEPLOYMENT.kelivo.client_id, idempotency_key):
-            prepared = await asyncio.to_thread(
-                kelivo_service.lookup_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                idempotency_key, validated, KELIVO_PERSONA,
-                provider_defaults.provider_model, effective_temperature, effective_max_tokens,
-            )
+        lock_key = (
+            automatic_contract.request_identity_hash
+            if automatic_contract is not None else idempotency_key
+        )
+        async with KELIVO_KEY_LOCKS.hold(DEPLOYMENT.kelivo.client_id, lock_key):
+            if automatic_contract is not None:
+                prepared = await asyncio.to_thread(
+                    kelivo_service.lookup_automatic_request,
+                    DB_PATH, DEPLOYMENT.kelivo.client_id, automatic_contract.request_identity_hash,
+                )
+            else:
+                prepared = await asyncio.to_thread(
+                    kelivo_service.lookup_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
+                    idempotency_key, validated, KELIVO_PERSONA,
+                    provider_defaults.provider_model, effective_temperature, effective_max_tokens,
+                )
             if prepared is None:
-                prepare_task = asyncio.create_task(asyncio.to_thread(
-                    kelivo_service.prepare_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                    idempotency_key, validated, persona_text=KELIVO_PERSONA,
-                    persona_source=KELIVO_PERSONA_SOURCE,
-                    provider_model=provider_defaults.provider_model,
-                    effective_temperature=effective_temperature,
-                    effective_max_tokens=effective_max_tokens,
-                    rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
-                ))
+                if automatic_contract is not None:
+                    prepare_task = asyncio.create_task(asyncio.to_thread(
+                        kelivo_service.prepare_automatic_request,
+                        DB_PATH, DEPLOYMENT.kelivo.client_id,
+                        automatic_contract.request_identity_hash, validated, automatic_contract,
+                        persona_source=KELIVO_PERSONA_SOURCE,
+                        provider_model=provider_defaults.provider_model,
+                        effective_temperature=effective_temperature,
+                        effective_max_tokens=effective_max_tokens,
+                        replay_seconds=DEPLOYMENT.kelivo.auto_idempotency_replay_seconds,
+                        rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
+                    ))
+                else:
+                    prepare_task = asyncio.create_task(asyncio.to_thread(
+                        kelivo_service.prepare_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
+                        idempotency_key, validated, persona_text=KELIVO_PERSONA,
+                        persona_source=KELIVO_PERSONA_SOURCE,
+                        provider_model=provider_defaults.provider_model,
+                        effective_temperature=effective_temperature,
+                        effective_max_tokens=effective_max_tokens,
+                        rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
+                    ))
                 try:
                     prepared = await asyncio.shield(prepare_task)
                 except asyncio.CancelledError:
                     prepared = await asyncio.shield(prepare_task)
+                    if prepared.idempotency_key:
+                        idempotency_key = prepared.idempotency_key
                     if prepared.action == "prepared":
                         await asyncio.to_thread(
                             kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
                             idempotency_key, "request_cancelled_before_dispatch", False,
                         )
                     raise
+            if prepared.idempotency_key:
+                idempotency_key = prepared.idempotency_key
     except kelivo_service.KelivoError as exc:
         return kelivo_error(exc.status_code, exc.category, retry_after=exc.retry_after)
     except (sqlite3.Error, OSError):

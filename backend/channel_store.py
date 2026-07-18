@@ -129,7 +129,7 @@ def _migration_002(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_parts_status ON delivery_parts(delivery_id,status,part_index)")
 
 
-KELIVO_TABLE_DDL: dict[str, str] = {
+KELIVO_V3_TABLE_DDL: dict[str, str] = {
     "kelivo_clients": """CREATE TABLE kelivo_clients (
             client_id TEXT PRIMARY KEY,
             api_session TEXT NOT NULL,
@@ -190,7 +190,7 @@ KELIVO_TABLE_DDL: dict[str, str] = {
             FOREIGN KEY(client_id) REFERENCES kelivo_clients(client_id))""",
 }
 
-KELIVO_INDEX_DDL: dict[str, str] = {
+KELIVO_V3_INDEX_DDL: dict[str, str] = {
     "idx_kelivo_requests_status":
         "CREATE INDEX idx_kelivo_requests_status ON kelivo_requests(status,dispatch_expires_at,id)",
     "idx_kelivo_rate_limits_window":
@@ -204,8 +204,89 @@ KELIVO_INDEX_DDL: dict[str, str] = {
 
 def _migration_003(conn: sqlite3.Connection) -> None:
     """Kelivo client mapping, idempotent requests, and normalized context."""
-    for statement in (*KELIVO_TABLE_DDL.values(), *KELIVO_INDEX_DDL.values()):
+    for statement in (*KELIVO_V3_TABLE_DDL.values(), *KELIVO_V3_INDEX_DDL.values()):
         conn.execute(statement)
+
+
+KELIVO_TABLE_DDL: dict[str, str] = {
+    **KELIVO_V3_TABLE_DDL,
+    "kelivo_requests": """CREATE TABLE kelivo_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL,
+            idempotency_mode TEXT NOT NULL DEFAULT 'explicit'
+                CHECK(idempotency_mode IN ('explicit','automatic')),
+            automatic_fingerprint TEXT,
+            automatic_replay_until TEXT,
+            request_payload_hash TEXT NOT NULL,
+            request_identity_hash TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            api_session TEXT NOT NULL,
+            mapping_revision INTEGER NOT NULL CHECK(mapping_revision > 0),
+            history_before_id INTEGER NOT NULL CHECK(history_before_id >= 0),
+            context_bundle_json TEXT NOT NULL,
+            context_bundle_hash TEXT NOT NULL,
+            provider_messages_json TEXT NOT NULL,
+            prompt_contract_version TEXT NOT NULL,
+            persona_hash TEXT NOT NULL,
+            persona_source TEXT NOT NULL,
+            provider_model TEXT NOT NULL,
+            effective_temperature REAL NOT NULL CHECK(effective_temperature >= 0 AND effective_temperature <= 2),
+            effective_max_tokens INTEGER NOT NULL CHECK(effective_max_tokens >= 1 AND effective_max_tokens <= 32768),
+            status TEXT NOT NULL CHECK(status IN
+                ('prepared','dispatching','dispatch_uncertain','failed','completed')),
+            dispatch_expires_at TEXT,
+            generation_id TEXT NOT NULL UNIQUE,
+            user_message_id INTEGER,
+            assistant_message_id INTEGER,
+            response_json TEXT,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(client_id,idempotency_key),
+            CHECK(
+                (idempotency_mode='explicit' AND automatic_fingerprint IS NULL AND automatic_replay_until IS NULL)
+                OR
+                (idempotency_mode='automatic' AND automatic_fingerprint IS NOT NULL
+                 AND length(automatic_fingerprint)=64
+                 AND automatic_fingerprint NOT GLOB '*[^0-9a-f]*'
+                 AND automatic_replay_until IS NOT NULL AND length(automatic_replay_until)>0)
+            ),
+            FOREIGN KEY(client_id) REFERENCES kelivo_clients(client_id),
+            FOREIGN KEY(user_message_id) REFERENCES messages(id),
+            FOREIGN KEY(assistant_message_id) REFERENCES messages(id))""",
+}
+
+KELIVO_INDEX_DDL: dict[str, str] = {
+    **KELIVO_V3_INDEX_DDL,
+    "idx_kelivo_requests_automatic":
+        "CREATE INDEX idx_kelivo_requests_automatic ON kelivo_requests(client_id,automatic_fingerprint,created_at,status)",
+}
+
+
+def _migration_004(conn: sqlite3.Connection) -> None:
+    """Add bounded automatic idempotency metadata without touching Telegram tables."""
+    validate_kelivo_schema(conn, version=3)
+    conn.execute("DROP INDEX idx_kelivo_requests_status")
+    conn.execute("ALTER TABLE kelivo_requests RENAME TO kelivo_requests_v3")
+    conn.execute(KELIVO_TABLE_DDL["kelivo_requests"])
+    if conn.execute("SELECT EXISTS(SELECT 1 FROM kelivo_requests_v3)").fetchone()[0]:
+        conn.execute("""INSERT INTO kelivo_requests
+            (id,idempotency_key,idempotency_mode,automatic_fingerprint,automatic_replay_until,
+             request_payload_hash,request_identity_hash,client_id,api_session,mapping_revision,
+             history_before_id,context_bundle_json,context_bundle_hash,provider_messages_json,
+             prompt_contract_version,persona_hash,persona_source,provider_model,
+             effective_temperature,effective_max_tokens,status,dispatch_expires_at,generation_id,
+             user_message_id,assistant_message_id,response_json,error_category,created_at,updated_at)
+            SELECT id,idempotency_key,'explicit',NULL,NULL,
+             request_payload_hash,request_identity_hash,client_id,api_session,mapping_revision,
+             history_before_id,context_bundle_json,context_bundle_hash,provider_messages_json,
+             prompt_contract_version,persona_hash,persona_source,provider_model,
+             effective_temperature,effective_max_tokens,status,dispatch_expires_at,generation_id,
+             user_message_id,assistant_message_id,response_json,error_category,created_at,updated_at
+            FROM kelivo_requests_v3""")
+    conn.execute("DROP TABLE kelivo_requests_v3")
+    conn.execute(KELIVO_INDEX_DDL["idx_kelivo_requests_status"])
+    conn.execute(KELIVO_INDEX_DDL["idx_kelivo_requests_automatic"])
 
 
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
@@ -287,8 +368,10 @@ def _validate_index_xinfo(conn: sqlite3.Connection, name: str, columns: tuple[st
         raise sqlite3.DatabaseError(f"invalid kelivo index auxiliary shape: {name}")
 
 
-def validate_kelivo_schema(conn: sqlite3.Connection) -> None:
-    """Reject an applied v3 marker unless its complete structural fingerprint matches."""
+def validate_kelivo_schema(conn: sqlite3.Connection, *, version: int = 4) -> None:
+    """Reject an applied Kelivo marker unless its complete structural fingerprint matches."""
+    if version not in {3, 4}:
+        raise sqlite3.DatabaseError("unsupported kelivo schema version")
     expected_columns = {
         "kelivo_clients": {
             "client_id": ("TEXT", 0, None, 1), "api_session": ("TEXT", 1, None, 0),
@@ -323,6 +406,11 @@ def validate_kelivo_schema(conn: sqlite3.Connection) -> None:
             "updated_at": ("TEXT", 1, None, 0),
         },
     }
+    if version >= 4:
+        request_columns = expected_columns["kelivo_requests"]
+        request_columns["idempotency_mode"] = ("TEXT", 1, "'explicit'", 0)
+        request_columns["automatic_fingerprint"] = ("TEXT", 0, None, 0)
+        request_columns["automatic_replay_until"] = ("TEXT", 0, None, 0)
     for table, expected in expected_columns.items():
         xinfo_rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
         if any(int(row["hidden"]) != 0 for row in xinfo_rows):
@@ -360,6 +448,10 @@ def validate_kelivo_schema(conn: sqlite3.Connection) -> None:
                 (False, "c", False, ("window_started_at", "client_id")),
         },
     }
+    if version >= 4:
+        expected_indexes["kelivo_requests"]["idx_kelivo_requests_automatic"] = (
+            False, "c", False, ("client_id", "automatic_fingerprint", "created_at", "status")
+        )
     for table, expected in expected_indexes.items():
         actual_rows = {row["name"]: row for row in conn.execute(f"PRAGMA index_list({table})")}
         if set(actual_rows) != set(expected):
@@ -387,11 +479,13 @@ def validate_kelivo_schema(conn: sqlite3.Connection) -> None:
         }
         if actual != expected:
             raise sqlite3.DatabaseError(f"invalid kelivo foreign key: {table}")
-    for table, expected_sql in KELIVO_TABLE_DDL.items():
+    expected_tables = KELIVO_TABLE_DDL if version >= 4 else KELIVO_V3_TABLE_DDL
+    expected_index_ddl = KELIVO_INDEX_DDL if version >= 4 else KELIVO_V3_INDEX_DDL
+    for table, expected_sql in expected_tables.items():
         row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
         if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
             raise sqlite3.DatabaseError(f"invalid kelivo table fingerprint: {table}")
-    for name, expected_sql in KELIVO_INDEX_DDL.items():
+    for name, expected_sql in expected_index_ddl.items():
         row = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
         if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
             raise sqlite3.DatabaseError(f"invalid kelivo index fingerprint: {name}")
@@ -401,6 +495,7 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
     (1, "telegram_private_text_mvp", _migration_001),
     (2, "telegram_reliability", _migration_002),
     (3, "kelivo_nonstream_foundation", _migration_003),
+    (4, "kelivo_automatic_idempotency", _migration_004),
 )
 
 
@@ -416,8 +511,6 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 row = conn.execute("SELECT name,status FROM schema_migrations WHERE version=?", (version,)).fetchone()
                 if row:
                     if row["status"] == "applied" and row["name"] == name:
-                        if version == 3 and name == "kelivo_nonstream_foundation":
-                            validate_kelivo_schema(conn)
                         continue
                     raise sqlite3.DatabaseError("invalid migration state")
                 apply(conn)
@@ -426,8 +519,11 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                     "INSERT INTO schema_migrations(version,name,status,created_at,updated_at) VALUES(?,?,?,?,?)",
                     (version, name, "applied", stamp, stamp),
                 )
-                if version == 3 and name == "kelivo_nonstream_foundation":
-                    validate_kelivo_schema(conn)
+            latest = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations WHERE status='applied'"
+            ).fetchone()[0]
+            if latest is not None and int(latest) >= 3:
+                validate_kelivo_schema(conn, version=4 if int(latest) >= 4 else 3)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

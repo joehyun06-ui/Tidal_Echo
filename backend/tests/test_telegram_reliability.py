@@ -337,7 +337,8 @@ class ConcurrentMigrationTests(unittest.TestCase):
             asyncio.run(run())
             with closing(sqlite3.connect(path)) as conn:
                 self.assertEqual(conn.execute("SELECT text FROM messages").fetchone()[0], "keep")
-                self.assertEqual(conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0], 3)
+                self.assertEqual(conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0],
+                                 len(channel_store.MIGRATIONS))
 
 
 if __name__ == "__main__":

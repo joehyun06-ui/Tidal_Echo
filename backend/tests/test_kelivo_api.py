@@ -25,6 +25,8 @@ class KelivoConfigurationTests(unittest.TestCase):
             "KELIVO_CLIENT_ID": "primary-kelivo",
             "KELIVO_API_SESSION": "shared-session",
             "KELIVO_MODEL_ALIAS": "ouou-home",
+            "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "false",
+            "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "300",
             "LLM_MODEL": "test-provider-model",
             "RELAY_SECRET": "relay-distinct",
             "TELEGRAM_ENABLED": "false",
@@ -83,6 +85,33 @@ class KelivoConfigurationTests(unittest.TestCase):
                                     "invalid_kelivo_concurrency_relationship"):
             self.load(env)
 
+    def test_auto_idempotency_configuration_is_explicit_and_bounded(self):
+        disabled = {
+            "KELIVO_ENABLED": "false", "TELEGRAM_ENABLED": "false", "TELEGRAM_TEST_MODE": "false",
+            "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "not-a-boolean",
+            "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "not-an-integer",
+        }
+        self.assertFalse(self.load(disabled).kelivo.auto_idempotency_enabled)
+        for name, value, category in (
+            ("KELIVO_AUTO_IDEMPOTENCY_ENABLED", "maybe", "invalid_kelivo_auto_idempotency_enabled"),
+            ("KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS", "59", "invalid_kelivo_auto_idempotency_replay_seconds"),
+            ("KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS", "3601", "invalid_kelivo_auto_idempotency_replay_seconds"),
+            ("KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS", "300.0", "invalid_kelivo_auto_idempotency_replay_seconds"),
+        ):
+            env = self.base_env(); env[name] = value
+            with self.subTest(name=name, value=value), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError, category,
+            ):
+                self.load(env)
+        env = self.base_env(); env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"] = "true"
+        with self.assertRaisesRegex(deployment_config.DeploymentConfigError,
+                                    "invalid_kelivo_auto_idempotency_replay_window"):
+            self.load(env)
+        env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"] = "301"
+        config = self.load(env)
+        self.assertTrue(config.kelivo.auto_idempotency_enabled)
+        self.assertEqual(config.kelivo.auto_idempotency_replay_seconds, 301)
+
 
 class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -109,6 +138,216 @@ class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         }
         body.update(updates)
         return body
+
+    def enable_auto_idempotency(self, replay_seconds=600):
+        self.module.DEPLOYMENT = dataclasses.replace(
+            self.module.DEPLOYMENT,
+            kelivo=dataclasses.replace(
+                self.module.DEPLOYMENT.kelivo,
+                auto_idempotency_enabled=True,
+                auto_idempotency_replay_seconds=replay_seconds,
+            ),
+        )
+
+    @property
+    def auto_headers(self):
+        return {"Authorization": self.headers["Authorization"]}
+
+    async def test_missing_idempotency_header_requires_explicit_compatibility_switch(self):
+        disabled = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers,
+            json=self.payload(),
+        )
+        self.assertEqual((disabled.status_code, disabled.json()["error"]["code"]),
+                         (400, "invalid_idempotency_key"))
+        self.assertEqual(self.calls, [])
+        self.enable_auto_idempotency()
+        enabled = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers,
+            json=self.payload(),
+        )
+        self.assertEqual(enabled.status_code, 200)
+        self.assertEqual(len(self.calls), 1)
+        with self.module.db() as conn:
+            row = conn.execute(
+                """SELECT idempotency_mode,automatic_fingerprint,automatic_replay_until,
+                          idempotency_key FROM kelivo_requests"""
+            ).fetchone()
+        self.assertEqual(row["idempotency_mode"], "automatic")
+        self.assertEqual(len(row["automatic_fingerprint"]), 64)
+        self.assertIsNotNone(row["automatic_replay_until"])
+        self.assertTrue(row["idempotency_key"].startswith("@auto:"))
+
+    async def test_present_empty_whitespace_or_invalid_key_never_enters_auto_mode(self):
+        self.enable_auto_idempotency()
+        for index, value in enumerate(("", "   ", "short", "invalid key value")):
+            with self.subTest(index=index):
+                response = await request(
+                    self.module, "POST", "/v1/chat/completions",
+                    headers={**self.auto_headers, "Idempotency-Key": value}, json=self.payload(),
+                )
+                self.assertEqual((response.status_code, response.json()["error"]["code"]),
+                                 (400, "invalid_idempotency_key"))
+        with self.module.db() as conn:
+            count = conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(self.calls, [])
+
+    async def test_automatic_completed_request_replays_and_does_not_reconsume_rate_limit(self):
+        self.enable_auto_idempotency()
+        first = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        second = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual(second.json(), first.json())
+        self.assertEqual(len(self.calls), 1)
+        with self.module.db() as conn:
+            requests = conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0]
+            rate_count = conn.execute("SELECT sum(request_count) FROM kelivo_rate_limits").fetchone()[0]
+        self.assertEqual((requests, rate_count), (1, 1))
+
+    async def test_automatic_same_request_concurrency_calls_provider_once(self):
+        self.enable_auto_idempotency()
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+        async def slow(*_args):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return {"text": "automatic reply", "usage": {}}
+        self.module.KELIVO_GENERATOR = slow
+        first = asyncio.create_task(request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        ))
+        await started.wait()
+        second = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual((second.status_code, second.json()["error"]["code"]),
+                         (409, "idempotency_in_progress"))
+        release.set()
+        self.assertEqual((await first).status_code, 200)
+        replay = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.module.KELIVO_KEY_LOCKS.entry_count, 0)
+
+    async def test_automatic_expired_terminal_request_can_create_new_generation(self):
+        self.enable_auto_idempotency()
+        first = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        with self.module.db() as conn:
+            conn.execute("UPDATE kelivo_requests SET automatic_replay_until='2000-01-01T00:00:00+00:00'")
+        second = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+        self.assertEqual(len(self.calls), 2)
+        with self.module.db() as conn:
+            rows = conn.execute(
+                "SELECT generation_id,automatic_fingerprint FROM kelivo_requests ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["generation_id"], rows[1]["generation_id"])
+        self.assertEqual(rows[0]["automatic_fingerprint"], rows[1]["automatic_fingerprint"])
+
+    async def test_automatic_failed_request_blocks_within_window_then_can_retry_after_expiry(self):
+        self.enable_auto_idempotency()
+        calls = 0
+        async def fail(*_args):
+            nonlocal calls
+            calls += 1
+            raise self.module.kelivo_service.GenerationError("provider_rejected", False)
+        self.module.KELIVO_GENERATOR = fail
+        first = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        blocked = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual((first.status_code, blocked.status_code), (502, 409))
+        self.assertEqual(calls, 1)
+        with self.module.db() as conn:
+            conn.execute("UPDATE kelivo_requests SET automatic_replay_until='2000-01-01T00:00:00+00:00'")
+        retried = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual(retried.status_code, 502)
+        self.assertEqual(calls, 2)
+        with self.module.db() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0], 2)
+
+    async def test_automatic_uncertain_request_is_never_redispatched_even_after_window(self):
+        self.enable_auto_idempotency()
+        calls = 0
+        async def uncertain(*_args):
+            nonlocal calls
+            calls += 1
+            raise self.module.kelivo_service.GenerationError("model_timeout", True)
+        self.module.KELIVO_GENERATOR = uncertain
+        first = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        with self.module.db() as conn:
+            conn.execute("UPDATE kelivo_requests SET automatic_replay_until='2000-01-01T00:00:00+00:00'")
+        blocked = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        self.assertEqual((first.status_code, blocked.status_code), (504, 409))
+        self.assertEqual(calls, 1)
+        with self.module.db() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0], 1)
+
+    async def test_automatic_fingerprint_distinguishes_messages_and_conversation_history(self):
+        self.enable_auto_idempotency()
+        bodies = (
+            self.payload(messages=[{"role": "user", "content": "first"}]),
+            self.payload(messages=[{"role": "user", "content": "different"}]),
+            self.payload(messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "prior answer"},
+                {"role": "user", "content": "next"},
+            ]),
+        )
+        for body in bodies:
+            response = await request(
+                self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=body,
+            )
+            self.assertEqual(response.status_code, 200)
+        with self.module.db() as conn:
+            fingerprints = [row[0] for row in conn.execute(
+                "SELECT automatic_fingerprint FROM kelivo_requests ORDER BY id"
+            )]
+        self.assertEqual((len(self.calls), len(set(fingerprints))), (3, 3))
+
+    async def test_automatic_and_explicit_modes_are_fully_isolated(self):
+        self.enable_auto_idempotency()
+        automatic = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        explicit = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.headers, json=self.payload(),
+        )
+        automatic_replay = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.auto_headers, json=self.payload(),
+        )
+        explicit_replay = await request(
+            self.module, "POST", "/v1/chat/completions", headers=self.headers, json=self.payload(),
+        )
+        self.assertEqual(automatic_replay.json(), automatic.json())
+        self.assertEqual(explicit_replay.json(), explicit.json())
+        self.assertEqual(len(self.calls), 2)
+        with self.module.db() as conn:
+            modes = [row[0] for row in conn.execute(
+                "SELECT idempotency_mode FROM kelivo_requests ORDER BY id"
+            )]
+        self.assertEqual(modes, ["automatic", "explicit"])
 
     async def test_auth_and_models_shape(self):
         for headers in ({}, {"Authorization": "Bearer wrong"}):

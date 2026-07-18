@@ -48,6 +48,8 @@
         {"key": "KELIVO_RATE_LIMIT_PER_MINUTE", "value": "10"},
         {"key": "KELIVO_QUEUE_TIMEOUT_SECONDS", "value": "2"},
         {"key": "KELIVO_DISPATCH_STALE_SECONDS", "value": "300"},
+        {"key": "KELIVO_AUTO_IDEMPOTENCY_ENABLED", "value": "false"},
+        {"key": "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS", "value": "300"},
         {"key": "SQLITE_BUSY_TIMEOUT_SECONDS", "value": "30"},
         {"key": "KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS", "value": "15"},
         {"key": "KELIVO_INTERNAL_RESPONSE_MAX_BYTES", "value": "1048576"},

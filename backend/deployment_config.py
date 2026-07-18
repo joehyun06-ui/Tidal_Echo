@@ -131,6 +131,8 @@ class KelivoConfig:
     internal_response_max_bytes: int
     allow_session_remap: bool
     require_telegram_session: bool
+    auto_idempotency_enabled: bool
+    auto_idempotency_replay_seconds: int
 
 
 @dataclass(frozen=True)
@@ -306,6 +308,19 @@ def load_deployment_config(
     kelivo_require_telegram = parse_strict_bool(
         env.get("KELIVO_REQUIRE_TELEGRAM_SESSION", "false"), "invalid_kelivo_require_telegram_session"
     )
+    if kelivo_enabled:
+        kelivo_auto_idempotency = parse_strict_bool(
+            env.get("KELIVO_AUTO_IDEMPOTENCY_ENABLED", "false"),
+            "invalid_kelivo_auto_idempotency_enabled",
+        )
+        kelivo_auto_replay_seconds = parse_bounded_int(
+            env.get("KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS", "300"), 60, 3600,
+            "invalid_kelivo_auto_idempotency_replay_seconds",
+        )
+    else:
+        # Disabled Kelivo deployments ignore compatibility-only configuration.
+        kelivo_auto_idempotency = False
+        kelivo_auto_replay_seconds = 300
     kelivo_global_concurrency = parse_bounded_int(
         env.get("KELIVO_GLOBAL_CONCURRENCY", "2"), 1, 32, "invalid_kelivo_global_concurrency"
     )
@@ -371,6 +386,8 @@ def load_deployment_config(
         timeouts.model_total + kelivo_queue_timeout + sqlite_busy_timeout + kelivo_completion_margin
     ):
         raise DeploymentConfigError("invalid_kelivo_stale_dispatch_relationship")
+    if kelivo_enabled and kelivo_auto_idempotency and kelivo_auto_replay_seconds <= kelivo_stale_dispatch:
+        raise DeploymentConfigError("invalid_kelivo_auto_idempotency_replay_window")
 
     persistent_root = Path(str(env.get("RENDER_PERSISTENT_ROOT", "/var/data"))).expanduser()
     db_path = Path(str(env.get("RELAY_DB", Path(__file__).parent / "relay.db"))).expanduser()
@@ -444,6 +461,8 @@ def load_deployment_config(
             internal_response_max_bytes=kelivo_internal_response_max,
             allow_session_remap=kelivo_allow_remap,
             require_telegram_session=kelivo_require_telegram,
+            auto_idempotency_enabled=kelivo_auto_idempotency,
+            auto_idempotency_replay_seconds=kelivo_auto_replay_seconds,
         ),
     )
 
