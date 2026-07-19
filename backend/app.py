@@ -946,6 +946,7 @@ def _database_ready() -> bool:
                 "messages", "schema_migrations", "generation_jobs", "delivery_attempts",
                 "telegram_completions", "delivery_parts", "external_messages",
                 "channel_accounts", "channel_conversations", "inbound_events",
+                "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
             }
             if DEPLOYMENT.kelivo.enabled:
                 required_tables.update({
@@ -967,6 +968,7 @@ def _database_ready() -> bool:
                 return False
             if DEPLOYMENT.kelivo.enabled:
                 channel_store.validate_kelivo_schema(conn)
+            channel_store.validate_heartbeat_schema(conn)
             return True
     except (OSError, sqlite3.Error, ValueError):
         return False

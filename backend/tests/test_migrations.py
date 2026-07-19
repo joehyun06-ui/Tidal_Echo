@@ -39,12 +39,12 @@ class MigrationTests(unittest.TestCase):
             raise RuntimeError("boom")
 
         with self.assertRaises(RuntimeError):
-            channel_store.run_migrations(self.db_path, [(5, "broken", broken)])
+            channel_store.run_migrations(self.db_path, [(6, "broken", broken)])
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='should_rollback'"
             ).fetchone())
-            self.assertIsNone(conn.execute("SELECT version FROM schema_migrations WHERE version=5").fetchone())
+            self.assertIsNone(conn.execute("SELECT version FROM schema_migrations WHERE version=6").fetchone())
 
     def test_actual_v2_failure_rolls_back_every_schema_change(self):
         channel_store.run_migrations(self.db_path, [channel_store.MIGRATIONS[0]])

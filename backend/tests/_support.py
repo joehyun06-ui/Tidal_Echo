@@ -84,13 +84,15 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "KELIVO_MODEL_ALIAS": "ouou-home",
         "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "true" if auto_idempotency else "false",
         "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "600",
+        "HEARTBEAT_ENABLED": "false",
         "LLM_MODEL": "test-provider-model",
         "LLM_TEMPERATURE": "0.7",
         "LLM_MAX_TOKENS": "2000",
         "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
     }
     os.environ.update(values)
-    for name in ("backend.app", "backend.telegram_integration", "backend.channel_store", "backend.kelivo_service"):
+    for name in ("backend.app", "backend.telegram_integration", "backend.channel_store",
+                 "backend.kelivo_service", "backend.heartbeat_service"):
         sys.modules.pop(name, None)
     module = importlib.import_module("backend.app")
     module.telegram_integration = importlib.import_module("backend.telegram_integration")
