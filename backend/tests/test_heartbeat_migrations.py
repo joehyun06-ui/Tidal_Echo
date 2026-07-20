@@ -14,7 +14,7 @@ class HeartbeatMigrationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = str(Path(self.temp.name) / "heartbeat-migration.sqlite3")
 
-    def test_v5_schema_is_repeatable_and_strictly_validated(self):
+    def test_latest_schema_is_repeatable_and_strictly_validated(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
@@ -25,10 +25,62 @@ class HeartbeatMigrationTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
             channel_store.validate_heartbeat_schema(conn)
-        self.assertEqual(versions, [1, 2, 3, 4, 5])
+            channel_store.validate_heartbeat_hardening_schema(conn)
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
         self.assertTrue({
             "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
+            "heartbeat_schedule_revisions", "heartbeat_run_inputs",
         }.issubset(tables))
+
+    def test_v6_upgrade_preserves_v5_state_and_run_data(self):
+        channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:5])
+        stamp = channel_store.now_iso()
+        with channel_store.connect(self.path) as conn:
+            conn.execute(
+                """INSERT INTO heartbeat_state
+                   (state_key,last_tick_at,consecutive_failures,status,created_at,updated_at)
+                   VALUES('default',?,0,'observe',?,?)""",
+                (stamp, stamp, stamp),
+            )
+            conn.execute(
+                """INSERT INTO heartbeat_runs
+                   (run_id,dedupe_key,scheduled_at,started_at,completed_at,outcome,decision,
+                    metadata_json,attempt_count,created_at,updated_at)
+                   VALUES('legacy-run',?,?,?,?,'completed','observe','{}',1,?,?)""",
+                ("a" * 64, stamp, stamp, stamp, stamp, stamp),
+            )
+        channel_store.run_migrations(self.path)
+        with channel_store.connect(self.path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT last_tick_at FROM heartbeat_state"
+            ).fetchone()[0], stamp)
+            self.assertEqual(conn.execute(
+                "SELECT run_id FROM heartbeat_runs"
+            ).fetchone()[0], "legacy-run")
+            channel_store.validate_heartbeat_hardening_schema(conn)
+
+    def test_v6_hardening_validator_rejects_corruption(self):
+        cases = (
+            ("column", lambda ddl: ddl.replace("input_fingerprint", "request_fingerprint"), None),
+            ("check", lambda ddl: ddl.replace("length(input_fingerprint)=64", "length(input_fingerprint)=63"), None),
+            ("index", None, lambda ddl: ddl.replace(
+                "schedule_revision,heartbeat_run_id", "heartbeat_run_id,schedule_revision"
+            )),
+        )
+        for label, table_transform, index_transform in cases:
+            with self.subTest(label=label):
+                target = str(Path(self.temp.name) / f"hardening-corrupt-{label}.sqlite3")
+                with channel_store.connect(target) as conn:
+                    for name, ddl in channel_store.HEARTBEAT_HARDENING_TABLE_DDL.items():
+                        if name == "heartbeat_run_inputs" and table_transform:
+                            ddl = table_transform(ddl)
+                        conn.execute(ddl)
+                    for name, ddl in channel_store.HEARTBEAT_HARDENING_INDEX_DDL.items():
+                        if index_transform:
+                            ddl = index_transform(ddl)
+                        conn.execute(ddl)
+                with channel_store.connect(target) as conn, self.assertRaises(sqlite3.DatabaseError):
+                    channel_store.validate_heartbeat_hardening_schema(conn)
 
     def test_v4_upgrade_preserves_telegram_and_kelivo_data(self):
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:4])

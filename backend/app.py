@@ -947,6 +947,7 @@ def _database_ready() -> bool:
                 "telegram_completions", "delivery_parts", "external_messages",
                 "channel_accounts", "channel_conversations", "inbound_events",
                 "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
+                "heartbeat_schedule_revisions", "heartbeat_run_inputs",
             }
             if DEPLOYMENT.kelivo.enabled:
                 required_tables.update({
@@ -969,6 +970,7 @@ def _database_ready() -> bool:
             if DEPLOYMENT.kelivo.enabled:
                 channel_store.validate_kelivo_schema(conn)
             channel_store.validate_heartbeat_schema(conn)
+            channel_store.validate_heartbeat_hardening_schema(conn)
             return True
     except (OSError, sqlite3.Error, ValueError):
         return False

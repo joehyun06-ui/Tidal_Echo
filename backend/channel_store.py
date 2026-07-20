@@ -374,6 +374,45 @@ def _migration_005(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+HEARTBEAT_HARDENING_TABLE_DDL: dict[str, str] = {
+    "heartbeat_schedule_revisions": """CREATE TABLE heartbeat_schedule_revisions (
+            schedule_revision TEXT PRIMARY KEY
+                CHECK(length(schedule_revision) BETWEEN 1 AND 64
+                      AND schedule_revision NOT GLOB '*[^A-Za-z0-9._-]*'
+                      AND substr(schedule_revision,1,1) GLOB '[A-Za-z0-9]'),
+            schedule_fingerprint TEXT NOT NULL
+                CHECK(length(schedule_fingerprint)=64
+                      AND schedule_fingerprint NOT GLOB '*[^0-9a-f]*'),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)""",
+    "heartbeat_run_inputs": """CREATE TABLE heartbeat_run_inputs (
+            heartbeat_run_id INTEGER PRIMARY KEY,
+            schedule_revision TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL
+                CHECK(length(input_fingerprint)=64
+                      AND input_fingerprint NOT GLOB '*[^0-9a-f]*'),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(heartbeat_run_id) REFERENCES heartbeat_runs(id),
+            FOREIGN KEY(schedule_revision)
+                REFERENCES heartbeat_schedule_revisions(schedule_revision))""",
+}
+
+HEARTBEAT_HARDENING_INDEX_DDL: dict[str, str] = {
+    "idx_heartbeat_run_inputs_revision":
+        "CREATE INDEX idx_heartbeat_run_inputs_revision "
+        "ON heartbeat_run_inputs(schedule_revision,heartbeat_run_id)",
+}
+
+
+def _migration_006(conn: sqlite3.Connection) -> None:
+    """Bind logical ticks to validated schedule revisions and request fingerprints."""
+    validate_heartbeat_schema(conn)
+    for statement in (
+        *HEARTBEAT_HARDENING_TABLE_DDL.values(), *HEARTBEAT_HARDENING_INDEX_DDL.values(),
+    ):
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -691,12 +730,98 @@ def validate_heartbeat_schema(conn: sqlite3.Connection) -> None:
             raise sqlite3.DatabaseError(f"invalid heartbeat index fingerprint: {name}")
 
 
+def validate_heartbeat_hardening_schema(conn: sqlite3.Connection) -> None:
+    """Validate the v6 schedule-revision and logical-input schema."""
+    expected_columns = {
+        "heartbeat_schedule_revisions": {
+            "schedule_revision": ("TEXT", 0, None, 1),
+            "schedule_fingerprint": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "heartbeat_run_inputs": {
+            "heartbeat_run_id": ("INTEGER", 0, None, 1),
+            "schedule_revision": ("TEXT", 1, None, 0),
+            "input_fingerprint": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+    }
+    for table, expected in expected_columns.items():
+        rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if any(int(row["hidden"]) != 0 for row in rows):
+            raise sqlite3.DatabaseError(f"invalid hidden heartbeat hardening column: {table}")
+        actual = {
+            row["name"]: (
+                str(row["type"]).upper(), int(row["notnull"]), row["dflt_value"], int(row["pk"]),
+            )
+            for row in rows
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid heartbeat hardening schema: {table} columns")
+
+    expected_indexes = {
+        "heartbeat_schedule_revisions": {
+            "sqlite_autoindex_heartbeat_schedule_revisions_1": (
+                True, "pk", False, ("schedule_revision",),
+            ),
+        },
+        "heartbeat_run_inputs": {
+            "idx_heartbeat_run_inputs_revision": (
+                False, "c", False, ("schedule_revision", "heartbeat_run_id"),
+            ),
+        },
+    }
+    for table, expected in expected_indexes.items():
+        actual_rows = {row["name"]: row for row in conn.execute(f"PRAGMA index_list({table})")}
+        if set(actual_rows) != set(expected):
+            raise sqlite3.DatabaseError(f"invalid heartbeat hardening index set: {table}")
+        for name, (unique, origin, partial, columns) in expected.items():
+            row = actual_rows[name]
+            if (bool(row["unique"]), row["origin"], bool(row["partial"])) != (
+                unique, origin, partial,
+            ):
+                raise sqlite3.DatabaseError(f"invalid heartbeat hardening index attributes: {name}")
+            _validate_index_xinfo(conn, name, columns)
+
+    expected_fks = {
+        "heartbeat_schedule_revisions": set(),
+        "heartbeat_run_inputs": {
+            ("heartbeat_run_id", "heartbeat_runs", "id", "NO ACTION", "NO ACTION", "NONE"),
+            (
+                "schedule_revision", "heartbeat_schedule_revisions", "schedule_revision",
+                "NO ACTION", "NO ACTION", "NONE",
+            ),
+        },
+    }
+    for table, expected in expected_fks.items():
+        actual = {
+            (row["from"], row["table"], row["to"], row["on_update"], row["on_delete"], row["match"])
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid heartbeat hardening foreign key: {table}")
+
+    for table, expected_sql in HEARTBEAT_HARDENING_TABLE_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid heartbeat hardening table fingerprint: {table}")
+    for name, expected_sql in HEARTBEAT_HARDENING_INDEX_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,),
+        ).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid heartbeat hardening index fingerprint: {name}")
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "telegram_private_text_mvp", _migration_001),
     (2, "telegram_reliability", _migration_002),
     (3, "kelivo_nonstream_foundation", _migration_003),
     (4, "kelivo_automatic_idempotency", _migration_004),
     (5, "dylan_heartbeat_foundation", _migration_005),
+    (6, "dylan_heartbeat_hardening", _migration_006),
 )
 
 
@@ -727,6 +852,8 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 validate_kelivo_schema(conn, version=4 if int(latest) >= 4 else 3)
             if latest is not None and int(latest) >= 5:
                 validate_heartbeat_schema(conn)
+            if latest is not None and int(latest) >= 6:
+                validate_heartbeat_hardening_schema(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

@@ -145,6 +145,7 @@ class HeartbeatConfig:
     quiet_hours_start: time
     quiet_hours_end: time
     contact_cooldown_seconds: int
+    schedule_revision: str = "default"
 
 
 @dataclass(frozen=True)
@@ -201,7 +202,15 @@ def load_heartbeat_config(environ: Mapping[str, str] | None = None) -> Heartbeat
         env.get("HEARTBEAT_CONTACT_COOLDOWN_SECONDS", "21600"), 0, 2592000,
         "invalid_heartbeat_contact_cooldown_seconds",
     )
-    return HeartbeatConfig(enabled, interval, timezone_name, quiet_start, quiet_end, cooldown)
+    schedule_revision = str(env.get("HEARTBEAT_SCHEDULE_REVISION", "default"))
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", schedule_revision) is None
+        or not schedule_revision.isascii()
+    ):
+        raise DeploymentConfigError("invalid_heartbeat_schedule_revision")
+    return HeartbeatConfig(
+        enabled, interval, timezone_name, quiet_start, quiet_end, cooldown, schedule_revision,
+    )
 
 
 def load_server_persona(environ: Mapping[str, str] | None = None) -> tuple[str, str]:

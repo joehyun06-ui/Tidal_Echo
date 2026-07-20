@@ -85,6 +85,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "true" if auto_idempotency else "false",
         "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "600",
         "HEARTBEAT_ENABLED": "false",
+        "HEARTBEAT_SCHEDULE_REVISION": "test-default",
         "LLM_MODEL": "test-provider-model",
         "LLM_TEMPERATURE": "0.7",
         "LLM_MAX_TOKENS": "2000",
