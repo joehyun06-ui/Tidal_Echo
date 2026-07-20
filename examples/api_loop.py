@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hmac
 import json
 import os
 import re
@@ -59,7 +60,7 @@ RELAY_DB = os.environ.get("RELAY_DB", str(HERE.parent / "backend" / "relay.db"))
 RELAY_URL = os.environ.get("RELAY_URL", "http://127.0.0.1:3011").rstrip("/")
 RELAY_SECRET = os.environ.get("RELAY_SECRET", "")
 PERSONA_FILE = os.environ.get("PERSONA_FILE", "")
-PERSONA = os.environ.get("PERSONA", "").strip()
+PERSONA, PERSONA_SOURCE = deployment_config.load_server_persona()
 HISTORY_N = int(os.environ.get("HISTORY_N", "24"))
 MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
 TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
@@ -68,6 +69,19 @@ RENDER_TELEGRAM_MVP = deployment_config.parse_strict_bool(
     os.environ.get("RENDER_TELEGRAM_MVP", "false"), "invalid_render_telegram_mvp"
 )
 API_LOOP_INSTANCE_NONCE = os.environ.get("API_LOOP_INSTANCE_NONCE", "")
+API_LOOP_INTERNAL_TOKEN = os.environ.get("API_LOOP_INTERNAL_TOKEN", "")
+LOOP_INTERNAL_REQUEST_MAX_BYTES = deployment_config.parse_bounded_int(
+    os.environ.get("LOOP_INTERNAL_REQUEST_MAX_BYTES", "1048576"), 4096, 8 * 1024 * 1024,
+    "invalid_loop_internal_request_max_bytes",
+)
+LOOP_PROVIDER_RESPONSE_MAX_BYTES = deployment_config.parse_bounded_int(
+    os.environ.get("LOOP_PROVIDER_RESPONSE_MAX_BYTES", "1048576"), 4096, 8 * 1024 * 1024,
+    "invalid_loop_provider_response_max_bytes",
+)
+LOOP_ASSISTANT_MAX_CHARS = deployment_config.parse_bounded_int(
+    os.environ.get("LOOP_ASSISTANT_MAX_CHARS", "64000"), 1, 1_000_000,
+    "invalid_loop_assistant_max_chars",
+)
 LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = deployment_config.parse_positive_finite_float(
     os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"
 )
@@ -86,20 +100,10 @@ deployment_config.validate_loop_timeouts(
 )
 if RENDER_TELEGRAM_MVP and not API_LOOP_INSTANCE_NONCE:
     raise SystemExit("invalid deployment configuration: api_loop_instance_nonce_missing")
+if len(API_LOOP_INTERNAL_TOKEN) < 32:
+    raise SystemExit("invalid deployment configuration: api_loop_internal_token_missing")
 deployment_config.validate_loop_config_file(LOOP_CONFIG, render_mvp=RENDER_TELEGRAM_MVP)
 SAFE_FALLBACK_ERROR_CODES = {"model_not_found", "model_not_supported", "unsupported_model"}
-
-if not PERSONA and PERSONA_FILE:
-    try:
-        PERSONA = Path(PERSONA_FILE).read_text(encoding="utf-8").strip()
-    except OSError:
-        PERSONA = ""
-if not PERSONA:
-    PERSONA = (
-        "You are the user's private AI companion in a one-to-one chat. "
-        "Reply naturally, warmly, and concisely unless the user asks for detail."
-    )
-
 
 def env_routes() -> list[dict[str, str]]:
     routes: list[dict[str, str]] = []
@@ -160,6 +164,24 @@ def main_chain() -> list[dict[str, str]]:
         if rows:
             return rows
     return env_routes()
+
+
+def kelivo_primary_route(provider_model: str) -> dict[str, str] | None:
+    """Return only the configured primary route when it exactly matches the frozen model."""
+    cfg = load_config()
+    configured = cfg.get("main_chain")
+    route: object = configured[0] if isinstance(configured, list) and configured else None
+    if route is None:
+        routes = env_routes()
+        route = routes[0] if routes else None
+    if not isinstance(route, dict):
+        return None
+    if (
+        route.get("model") != provider_model or not route.get("url") or not route.get("key")
+        or set(route) - {"url", "key", "model"}
+    ):
+        return None
+    return {"url": str(route["url"]), "key": str(route["key"]), "model": provider_model}
 
 
 def history_n() -> int:
@@ -260,8 +282,10 @@ def relay_rows(before_id: int | None, session_id: str, limit: int) -> list[dict[
     return [dict(r) for r in reversed(rows)]
 
 
-def build_messages(text: str, *, before_id: int | None = None, session_id: str = "", use_context: bool = True) -> list[dict[str, str]]:
+def build_messages(text: str, *, before_id: int | None = None, session_id: str = "", use_context: bool = True,
+                   prefix_context: list[dict[str, str]] | None = None) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": PERSONA}]
+    messages.extend(prefix_context or [])
     if use_context:
         for row in relay_rows(before_id, session_id, history_n()):
             content = str(row.get("text") or "").strip()
@@ -436,22 +460,39 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
     return {"text": "".join(text_parts).strip(), "usage": usage}
 
 
-async def complete_chat(route: dict[str, str], messages: list[dict[str, str]]) -> dict[str, Any]:
+async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *,
+                        temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
     body = {
         "model": route["model"],
         "messages": messages,
-        "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE if temperature is None else temperature,
+        "max_tokens": MAX_TOKENS if max_tokens is None else max_tokens,
         "stream": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
-            resp = await client.post(
-                route["url"].rstrip("/") + "/chat/completions",
+        async with _provider_client(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with client.stream(
+                "POST", route["url"].rstrip("/") + "/chat/completions",
                 headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
-            )
-        await _check_provider_response(resp)
-        data = resp.json()
+            ) as resp:
+                raw = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > LOOP_PROVIDER_RESPONSE_MAX_BYTES:
+                        raise ModelRouteError("provider_response_too_large", "dispatch_uncertain")
+                if resp.status_code >= 400:
+                    code = ""
+                    if resp.status_code == 404:
+                        try:
+                            code = str(((json.loads(bytes(raw)).get("error") or {}).get("code") or "")).lower()
+                        except Exception:
+                            pass
+                    if code in SAFE_FALLBACK_ERROR_CODES:
+                        raise ModelRouteError("model_unsupported", "safe_to_fallback")
+                    if resp.status_code in {408, 429} or resp.status_code >= 500:
+                        raise ModelRouteError("provider_response_uncertain", "dispatch_uncertain")
+                    raise ModelRouteError("provider_explicit_rejection", "explicit_failed")
+                data = json.loads(bytes(raw))
     except asyncio.CancelledError:
         raise
     except ModelRouteError:
@@ -462,10 +503,18 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]]) -
     text = (msg.get("content") or "").strip()
     if not text:
         raise ModelRouteError("empty_model_response", "dispatch_uncertain")
+    if len(text) > LOOP_ASSISTANT_MAX_CHARS:
+        raise ModelRouteError("assistant_response_too_large", "dispatch_uncertain")
     return {"text": text, "usage": data.get("usage") or {}}
 
 
-async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", session_id: str = "", emit_stream: bool = False) -> dict[str, Any]:
+def _provider_client(**kwargs):
+    return httpx.AsyncClient(**kwargs)
+
+
+async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", session_id: str = "",
+                    emit_stream: bool = False, allow_fallback: bool = True,
+                    temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
     tried: list[str] = []
 
     async def execute() -> dict[str, Any]:
@@ -478,14 +527,20 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
                                          "done": False, "api_session": session_id})
                     out = await stream_chat(route, messages, sink)
                 else:
-                    out = await complete_chat(route, messages)
+                    if temperature is None and max_tokens is None:
+                        out = await complete_chat(route, messages)
+                    else:
+                        out = await complete_chat(
+                            route, messages, temperature=temperature, max_tokens=max_tokens
+                        )
             except asyncio.CancelledError:
                 raise
             except ModelRouteError as exc:
-                if exc.outcome == "safe_to_fallback":
+                if exc.outcome == "safe_to_fallback" and allow_fallback:
                     continue
                 _safe_log(exc.category)
-                return {"outcome": exc.outcome, "error": exc.category, "tried": tried}
+                outcome = "explicit_failed" if exc.outcome == "safe_to_fallback" else exc.outcome
+                return {"outcome": outcome, "error": exc.category, "tried": tried}
             except Exception:
                 _safe_log("model_unexpected_uncertain")
                 return {"outcome": "dispatch_uncertain", "error": "model_unexpected_uncertain", "tried": tried}
@@ -499,6 +554,37 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
     except TimeoutError:
         _safe_log("model_timeout")
         return {"outcome": "dispatch_uncertain", "error": "model_timeout", "tried": tried}
+
+
+async def run_kelivo_provider_contract(
+    provider_model: str, messages: list[dict[str, str]], *, temperature: float, max_tokens: int,
+) -> dict[str, Any]:
+    """Execute exactly the authenticated frozen Kelivo contract without fallback/default resolution."""
+    try:
+        allowed = deployment_config.resolve_kelivo_provider_contract_defaults(os.environ, LOOP_CONFIG)
+        route = kelivo_primary_route(provider_model)
+    except (deployment_config.DeploymentConfigError, OSError, ValueError):
+        return {"outcome": "explicit_failed", "error": "provider_contract_unavailable", "tried": []}
+    if (
+        provider_model != allowed.provider_model or route is None
+    ):
+        return {"outcome": "explicit_failed", "error": "provider_model_mismatch", "tried": []}
+    try:
+        async with asyncio.timeout(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS):
+            out = await complete_chat(
+                route, messages, temperature=temperature, max_tokens=max_tokens,
+            )
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError:
+        return {"outcome": "dispatch_uncertain", "error": "model_timeout", "tried": [provider_model]}
+    except ModelRouteError as exc:
+        outcome = "explicit_failed" if exc.outcome == "safe_to_fallback" else exc.outcome
+        return {"outcome": outcome, "error": exc.category, "tried": [provider_model]}
+    except Exception:
+        return {"outcome": "dispatch_uncertain", "error": "model_unexpected_uncertain", "tried": [provider_model]}
+    out.update({"outcome": "success", "model": provider_model, "tried": []})
+    return out
 
 
 async def handle_ingest(
@@ -561,6 +647,35 @@ async def handle_ingest(
 app = FastAPI(title="companion-api-loop")
 
 
+def check_internal_auth(request: Request) -> None:
+    token = request.headers.get("x-api-loop-internal-token", "")
+    if not token or not hmac.compare_digest(token, API_LOOP_INTERNAL_TOKEN):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+async def read_internal_json(request: Request) -> Any:
+    encoding = request.headers.get("content-encoding", "").strip().lower()
+    if encoding not in {"", "identity"}:
+        raise HTTPException(status_code=415, detail="content encoding not supported")
+    content_length = request.headers.get("content-length")
+    if content_length:
+        if not content_length.isascii() or not content_length.isdecimal():
+            raise HTTPException(status_code=400, detail="invalid content length")
+        if int(content_length) > LOOP_INTERNAL_REQUEST_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="request too large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > LOOP_INTERNAL_REQUEST_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="request too large")
+    if content_length and int(content_length) != len(raw):
+        raise HTTPException(status_code=400, detail="content length mismatch")
+    try:
+        return json.loads(bytes(raw))
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        raise HTTPException(status_code=400, detail="malformed json") from None
+
+
 @app.get("/healthz")
 async def healthz():
     if RENDER_TELEGRAM_MVP:
@@ -575,23 +690,27 @@ async def healthz():
 
 
 @app.get("/loop/config")
-async def loop_config():
+async def loop_config(request: Request):
+    check_internal_auth(request)
     return public_config()
 
 
 @app.post("/loop/config")
 async def loop_config_update(request: Request):
-    return update_config(await request.json())
+    check_internal_auth(request)
+    return update_config(await read_internal_json(request))
 
 
 @app.get("/loop/sessions")
-async def loop_sessions():
+async def loop_sessions(request: Request):
+    check_internal_auth(request)
     return sessions_public()
 
 
 @app.post("/loop/sessions")
 async def loop_sessions_create(request: Request):
-    body = await request.json()
+    check_internal_auth(request)
+    body = await read_internal_json(request)
     row = create_session(
         title=str(body.get("title") or "New chat"),
         since_id=int(body.get("since_id") or 0),
@@ -602,18 +721,56 @@ async def loop_sessions_create(request: Request):
 
 @app.patch("/loop/sessions/{session_id}")
 async def loop_sessions_patch(session_id: str, request: Request):
-    return patch_session(session_id, await request.json())
+    check_internal_auth(request)
+    return patch_session(session_id, await read_internal_json(request))
 
 
 @app.post("/loop/chat")
 async def loop_chat(request: Request):
-    body = await request.json()
-    text = str(body.get("text") or body.get("message") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="empty text")
-    session_id = str(body.get("session_id") or body.get("api_session") or active_session_id() or "").strip()
-    messages = build_messages(text, before_id=None, session_id=session_id, use_context=bool(body.get("use_context", True)))
-    out = await run_model(messages, emit_stream=False)
+    check_internal_auth(request)
+    body = await read_internal_json(request)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid body")
+    allowed = {
+        "provider_messages", "provider_model", "prompt_contract_version", "use_default_persona", "session_id",
+        "single_route", "temperature", "max_tokens",
+    }
+    if set(body) - allowed or body.get("prompt_contract_version") != "kelivo-provider-prompt-v1":
+        raise HTTPException(status_code=400, detail="invalid_prompt_contract")
+    if body.get("use_default_persona") is not False:
+        raise HTTPException(status_code=400, detail="invalid_prompt_contract")
+    session_id = str(body.get("session_id") or "").strip()
+    provider_messages = body.get("provider_messages")
+    provider_model = body.get("provider_model")
+    if not isinstance(provider_model, str) or not provider_model or provider_model != provider_model.strip():
+        raise HTTPException(status_code=400, detail="invalid_provider_model")
+    if not isinstance(provider_messages, list) or not provider_messages or len(provider_messages) > 101 or any(
+        not isinstance(item, dict)
+        or set(item) != {"role", "content"}
+        or item.get("role") not in {"system", "developer", "user", "assistant"}
+        or not isinstance(item.get("content"), str)
+        or len(item["content"]) > 32000
+        for item in provider_messages
+    ):
+        raise HTTPException(status_code=400, detail="invalid_messages")
+    if provider_messages[-1]["role"] != "user" or not provider_messages[-1]["content"].strip():
+        raise HTTPException(status_code=400, detail="last_message_must_be_user")
+    temperature = body.get("temperature")
+    max_tokens = body.get("max_tokens")
+    if temperature is not None and (
+        isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2
+    ):
+        raise HTTPException(status_code=400, detail="invalid_temperature")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 32768
+    ):
+        raise HTTPException(status_code=400, detail="invalid_max_tokens")
+    if temperature is None or max_tokens is None:
+        raise HTTPException(status_code=400, detail="incomplete_provider_contract")
+    out = await run_kelivo_provider_contract(
+        provider_model, provider_messages,
+        temperature=float(temperature), max_tokens=max_tokens,
+    )
     if out.get("outcome") != "success":
         return JSONResponse({"ok": False, "dispatch_uncertain": out.get("outcome") == "dispatch_uncertain",
                              "error": out.get("error")}, status_code=504 if out.get("outcome") == "dispatch_uncertain" else 502)
@@ -622,7 +779,8 @@ async def loop_chat(request: Request):
 
 @app.post("/loop/ingest")
 async def loop_ingest(request: Request):
-    body = await request.json()
+    check_internal_auth(request)
+    body = await read_internal_json(request)
     text = str(body.get("text") or body.get("message") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty text")
@@ -651,4 +809,4 @@ async def loop_ingest(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=LOOP_PORT)
+    uvicorn.run(app, host="127.0.0.1", port=LOOP_PORT, access_log=False)

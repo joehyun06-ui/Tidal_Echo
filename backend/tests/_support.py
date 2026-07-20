@@ -55,7 +55,8 @@ class NoNetworkMixin:
             self.addCleanup(patcher.stop)
 
 
-def load_app(root: str, *, telegram: bool = True, brain: str = "loop"):
+def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False,
+             auto_idempotency: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -76,9 +77,20 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop"):
         "TELEGRAM_TEST_MODE": "true",
         "TELEGRAM_MAX_TEXT_LENGTH": "32",
         "TELEGRAM_WORKER_POLL_SECONDS": "0.05",
+        "KELIVO_ENABLED": "true" if kelivo else "false",
+        "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+        "KELIVO_CLIENT_ID": "primary-kelivo",
+        "KELIVO_API_SESSION": "shared-test-session",
+        "KELIVO_MODEL_ALIAS": "ouou-home",
+        "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "true" if auto_idempotency else "false",
+        "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "600",
+        "LLM_MODEL": "test-provider-model",
+        "LLM_TEMPERATURE": "0.7",
+        "LLM_MAX_TOKENS": "2000",
+        "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
     }
     os.environ.update(values)
-    for name in ("backend.app", "backend.telegram_integration", "backend.channel_store"):
+    for name in ("backend.app", "backend.telegram_integration", "backend.channel_store", "backend.kelivo_service"):
         sys.modules.pop(name, None)
     module = importlib.import_module("backend.app")
     module.telegram_integration = importlib.import_module("backend.telegram_integration")

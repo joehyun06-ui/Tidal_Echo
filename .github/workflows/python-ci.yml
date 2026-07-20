@@ -1,0 +1,106 @@
+name: Python CI
+
+on:
+  pull_request:
+    branches:
+      - feat/render-telegram-deployment
+  push:
+    branches:
+      - feat/kelivo-heartbeat-foundation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s backend/tests -p "test_*.py"
+
+      - name: Compile Python sources
+        run: python -m compileall backend examples scripts
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Validate Render configuration invariants
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          blueprint = json.loads(Path("render.yaml").read_text(encoding="utf-8"))
+          services = blueprint.get("services")
+          assert isinstance(services, list) and len(services) == 1
+          service = services[0]
+          assert service.get("type") == "web"
+          assert service.get("plan") == "starter"
+          assert service.get("numInstances") == 1
+          assert service.get("autoDeploy") is False
+          assert isinstance(service.get("disk"), dict)
+          assert service.get("branch") == "feat/render-telegram-deployment"
+
+          env = {item["key"]: item for item in service.get("envVars", [])}
+          assert env["KELIVO_ENABLED"].get("value") == "false"
+          assert env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"].get("value") == "false"
+          assert env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"].get("value") == "300"
+          assert env["KELIVO_API_KEY"].get("sync") is False
+          assert env["KELIVO_API_SESSION"].get("sync") is False
+
+      - name: Reject secrets and generated artifacts
+        shell: python
+        run: |
+          import re
+          import subprocess
+          from pathlib import Path, PurePosixPath
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          tracked = [name for name in tracked if name]
+          forbidden_names = {".env", ".coverage", "coverage.xml"}
+          forbidden_dirs = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov"}
+          forbidden_suffixes = {".db", ".sqlite", ".sqlite3", ".pem", ".key", ".log", ".pyc", ".pyo"}
+          private_key = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
+          telegram_token = re.compile(rb"(?<![0-9A-Za-z_-])[0-9]{8,10}:[0-9A-Za-z_-]{30,}(?![0-9A-Za-z_-])")
+
+          rejected = []
+          for name in tracked:
+              path = PurePosixPath(name)
+              if (
+                  path.name in forbidden_names
+                  or forbidden_dirs.intersection(path.parts)
+                  or path.suffix.lower() in forbidden_suffixes
+              ):
+                  rejected.append(name)
+                  continue
+              data = Path(name).read_bytes()
+              if private_key.search(data) or telegram_token.search(data):
+                  rejected.append(name)
+          assert not rejected, "forbidden tracked artifacts: " + ", ".join(rejected)
+
+      - name: Verify web tree remains unchanged
+        run: test -z "$(git status --porcelain -- web)"

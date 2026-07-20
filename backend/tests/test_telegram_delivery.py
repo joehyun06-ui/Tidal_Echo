@@ -13,7 +13,7 @@ class FakeResponse:
         self.payload = json.dumps({"ok": True, "result": {"message_id": message_id}}).encode()
     def __enter__(self): return self
     def __exit__(self, *args): return False
-    def read(self): return self.payload
+    def read(self, size=-1): return self.payload if size < 0 else self.payload[:size]
 
 
 class TelegramDeliveryTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
