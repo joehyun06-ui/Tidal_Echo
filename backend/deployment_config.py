@@ -9,8 +9,10 @@ import tempfile
 import urllib.parse
 import re
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -136,6 +138,17 @@ class KelivoConfig:
 
 
 @dataclass(frozen=True)
+class HeartbeatConfig:
+    enabled: bool
+    interval_seconds: int
+    timezone: str
+    quiet_hours_start: time
+    quiet_hours_end: time
+    contact_cooldown_seconds: int
+    schedule_revision: str = "default"
+
+
+@dataclass(frozen=True)
 class DeploymentConfig:
     render_telegram_mvp: bool
     persistent_root: Path
@@ -148,6 +161,56 @@ class DeploymentConfig:
     timeouts: LoopTimeouts
     sqlite_busy_timeout_seconds: float
     kelivo: KelivoConfig
+    heartbeat: HeartbeatConfig
+
+
+def _parse_heartbeat_time(value: object, category: str) -> time:
+    raw = str(value if value is not None else "")
+    match = re.fullmatch(r"([01][0-9]|2[0-3]):([0-5][0-9])", raw)
+    if match is None or not raw.isascii():
+        raise DeploymentConfigError(category)
+    return time(int(match.group(1)), int(match.group(2)))
+
+
+def load_heartbeat_config(environ: Mapping[str, str] | None = None) -> HeartbeatConfig:
+    """Load the disabled-by-default, network-free heartbeat foundation settings."""
+    env = os.environ if environ is None else environ
+    enabled = parse_strict_bool(env.get("HEARTBEAT_ENABLED", "false"), "invalid_heartbeat_enabled")
+    interval = parse_bounded_int(
+        env.get("HEARTBEAT_INTERVAL_SECONDS", "300"), 30, 86400,
+        "invalid_heartbeat_interval_seconds",
+    )
+    timezone_name = str(env.get("HEARTBEAT_TIMEZONE", "UTC"))
+    if (
+        not timezone_name or timezone_name != timezone_name.strip()
+        or not timezone_name.isascii() or len(timezone_name) > 128
+    ):
+        raise DeploymentConfigError("invalid_heartbeat_timezone")
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise DeploymentConfigError("invalid_heartbeat_timezone") from None
+    quiet_start = _parse_heartbeat_time(
+        env.get("HEARTBEAT_QUIET_HOURS_START", "22:00"), "invalid_heartbeat_quiet_hours_start"
+    )
+    quiet_end = _parse_heartbeat_time(
+        env.get("HEARTBEAT_QUIET_HOURS_END", "08:00"), "invalid_heartbeat_quiet_hours_end"
+    )
+    if quiet_start == quiet_end:
+        raise DeploymentConfigError("invalid_heartbeat_quiet_hours_relationship")
+    cooldown = parse_bounded_int(
+        env.get("HEARTBEAT_CONTACT_COOLDOWN_SECONDS", "21600"), 0, 2592000,
+        "invalid_heartbeat_contact_cooldown_seconds",
+    )
+    schedule_revision = str(env.get("HEARTBEAT_SCHEDULE_REVISION", "default"))
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", schedule_revision) is None
+        or not schedule_revision.isascii()
+    ):
+        raise DeploymentConfigError("invalid_heartbeat_schedule_revision")
+    return HeartbeatConfig(
+        enabled, interval, timezone_name, quiet_start, quiet_end, cooldown, schedule_revision,
+    )
 
 
 def load_server_persona(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
@@ -269,6 +332,7 @@ def load_deployment_config(
     environ: Mapping[str, str] | None = None,
 ) -> DeploymentConfig:
     env = os.environ if environ is None else environ
+    heartbeat_config = load_heartbeat_config(env)
     render_mvp = parse_strict_bool(env.get("RENDER_TELEGRAM_MVP", "false"), "invalid_render_telegram_mvp")
     telegram_enabled = parse_strict_bool(env.get("TELEGRAM_ENABLED", "false"), "invalid_telegram_enabled")
     telegram_test_mode = parse_strict_bool(env.get("TELEGRAM_TEST_MODE", "false"), "invalid_telegram_test_mode")
@@ -464,6 +528,7 @@ def load_deployment_config(
             auto_idempotency_enabled=kelivo_auto_idempotency,
             auto_idempotency_replay_seconds=kelivo_auto_replay_seconds,
         ),
+        heartbeat=heartbeat_config,
     )
 
 

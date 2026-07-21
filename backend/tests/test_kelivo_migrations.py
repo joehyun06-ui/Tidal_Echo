@@ -42,13 +42,13 @@ class KelivoMigrationTests(unittest.TestCase):
                     target.execute(sql)
         return target_path
 
-    def test_v4_upgrades_empty_database_and_is_repeatable(self):
+    def test_latest_upgrades_empty_database_and_is_repeatable(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
         self.assertTrue({"kelivo_clients", "kelivo_requests", "companion_context_snapshots",
                          "kelivo_rate_limits"}.issubset(tables))
 
@@ -232,7 +232,7 @@ class KelivoMigrationTests(unittest.TestCase):
             versions = [item[0] for item in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )]
-        self.assertEqual(versions, [1, 2, 3, 4])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
         self.assertEqual((row["idempotency_key"], row["generation_id"], row["idempotency_mode"]),
                          ("explicit-key-0001", "generation-v3", "explicit"))
         self.assertIsNone(row["automatic_fingerprint"])
@@ -376,10 +376,14 @@ class KelivoMigrationTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='kelivo_clients'"
             ).fetchone())
 
-    def test_v3_has_no_future_phase_tables(self):
+    def test_latest_uses_explicit_heartbeat_table_names(self):
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({
+            "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
+            "heartbeat_schedule_revisions", "heartbeat_run_inputs",
+        } <= tables)
         self.assertFalse({"heartbeat", "journal", "timeline"} & tables)
 
 
