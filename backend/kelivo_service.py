@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ ALLOWED_REQUEST_KEYS = frozenset({
     "model", "messages", "tools", "temperature", "max_tokens", "stream", "stream_options",
 })
 PROMPT_CONTRACT_VERSION = "kelivo-provider-prompt-v1"
+OPERIT_SHARE_PREFIX = "[Operit Share]\n"
+OPERIT_SHARE_IDENTITY_SCOPE = {"channel": "operit_share", "source": "operit"}
 
 
 class KelivoError(Exception):
@@ -88,6 +91,7 @@ class FrozenRequestContract:
     context_bundle: dict[str, Any]
     context_bundle_hash: str
     request_identity_hash: str
+    automatic_fingerprint: str = ""
 
 
 GenerationCallable = Callable[
@@ -113,6 +117,7 @@ def build_request_identity_hash(
     mapping_revision: int, persona_hash: str, snapshot_correlations: dict[str, Any],
     provider_messages: tuple[dict[str, str], ...] | list[dict[str, str]],
     effective_temperature: float, effective_max_tokens: int,
+    identity_scope: dict[str, str] | None = None,
 ) -> str:
     """Build the sole deterministic identity used by prepare, lookup, and tests."""
     hash_input = {
@@ -128,6 +133,8 @@ def build_request_identity_hash(
         "effective_temperature": effective_temperature,
         "effective_max_tokens": effective_max_tokens,
     }
+    if identity_scope is not None:
+        hash_input["identity_scope"] = identity_scope
     return content_hash(hash_input)[1]
 
 
@@ -148,6 +155,8 @@ def build_frozen_prompt_contract(
     validated: ValidatedCompletion, *, persona_text: str, persona_source: str,
     client_id: str, api_session: str, mapping_revision: int, provider_model: str,
     effective_temperature: float, effective_max_tokens: int, snapshot_rows: list[sqlite3.Row],
+    identity_scope: dict[str, str] | None = None,
+    automatic_fingerprint: str = "",
 ) -> tuple[tuple[dict[str, str], ...], dict[str, Any], str, str]:
     """Build the sole persisted contract used for hashing and provider dispatch."""
     persona_hash = text_sha256(persona_text)
@@ -174,6 +183,10 @@ def build_frozen_prompt_contract(
         "effective_temperature": effective_temperature,
         "effective_max_tokens": effective_max_tokens,
     }
+    if identity_scope is not None:
+        bundle["identity_scope"] = identity_scope
+    if automatic_fingerprint:
+        bundle["automatic_fingerprint"] = automatic_fingerprint
     bundle_json, bundle_hash = content_hash(bundle)
     request_identity_hash = build_request_identity_hash(
         virtual_model=validated.normalized_request["model"], provider_model=provider_model,
@@ -181,6 +194,7 @@ def build_frozen_prompt_contract(
         persona_hash=persona_hash, snapshot_correlations=_snapshot_correlations(bundle),
         provider_messages=provider_messages, effective_temperature=effective_temperature,
         effective_max_tokens=effective_max_tokens,
+        identity_scope=identity_scope,
     )
     return provider_messages, json.loads(bundle_json), bundle_hash, request_identity_hash
 
@@ -268,6 +282,89 @@ def validate_completion(payload: Any, model_alias: str) -> ValidatedCompletion:
     _, digest = content_hash(normalized)
     return ValidatedCompletion(normalized, digest, tuple(messages), messages[-1]["content"],
                                tuple(snapshots), temperature, max_tokens)
+
+
+def validate_operit_share(payload: Any, model_alias: str) -> ValidatedCompletion:
+    """Validate the deliberately narrow, text-only Operit share contract."""
+    if not isinstance(payload, dict):
+        raise KelivoError(422, "invalid_request_error")
+    if set(payload) - ALLOWED_REQUEST_KEYS:
+        raise KelivoError(422, "invalid_request_error")
+    if payload.get("model") != model_alias:
+        raise KelivoError(422, "unsupported_model")
+    if payload.get("stream", False) is not False:
+        raise KelivoError(422, "unsupported_stream")
+    tools = payload.get("tools", [])
+    if not isinstance(tools, list) or tools:
+        raise KelivoError(422, "unsupported_tools")
+
+    source_messages = payload.get("messages")
+    if not isinstance(source_messages, list) or not source_messages:
+        raise KelivoError(422, "invalid_request_error")
+    if len(source_messages) > MAX_MESSAGES:
+        raise KelivoError(413, "request_too_large")
+    total_chars = 0
+    for message in source_messages:
+        if not isinstance(message, dict):
+            raise KelivoError(422, "invalid_request_error")
+        if set(message) != {"role", "content"}:
+            if any(key in message for key in (
+                "image_url", "video_url", "input_audio", "file", "file_id", "attachments",
+            )):
+                raise KelivoError(422, "unsupported_multimodal")
+            raise KelivoError(422, "invalid_request_error")
+        role, content = message.get("role"), message.get("content")
+        if role == "tool":
+            raise KelivoError(422, "unsupported_tools")
+        if role not in ALLOWED_ROLES:
+            raise KelivoError(422, "invalid_request_error")
+        if not isinstance(content, str):
+            raise KelivoError(422, "unsupported_multimodal")
+        if re.search(r"(?i)(?<![A-Za-z0-9_])data:[^\s,]*,", content):
+            raise KelivoError(422, "unsupported_multimodal")
+        if re.search(r"(?i)(?<![A-Za-z0-9_])(?:file|content)://\S+", content):
+            raise KelivoError(422, "unsupported_multimodal")
+        if re.search(r"(?i)(?<![A-Za-z0-9_])blob:(?://|https?://)\S+", content):
+            raise KelivoError(422, "unsupported_multimodal")
+        if any(
+            unicodedata.category(char) in {"Cc", "Cf"} and char not in {"\r", "\n", "\t"}
+            for char in content
+        ):
+            raise KelivoError(422, "invalid_request_error")
+        if len(content) > MAX_CONTENT_CHARS:
+            raise KelivoError(413, "request_too_large")
+        total_chars += len(content)
+        if total_chars > MAX_TOTAL_CONTENT_CHARS:
+            raise KelivoError(413, "request_too_large")
+    last = source_messages[-1]
+    if last["role"] != "user":
+        raise KelivoError(422, "invalid_request_error")
+    share_text = unicodedata.normalize(
+        "NFC", last["content"].replace("\r\n", "\n").replace("\r", "\n")
+    ).strip()
+    if not share_text or not any(
+        not char.isspace() and unicodedata.category(char) not in {"Mn", "Mc", "Me"}
+        for char in share_text
+    ):
+        raise KelivoError(422, "empty_share")
+    canonical_text = OPERIT_SHARE_PREFIX + share_text
+    if len(canonical_text) > MAX_CONTENT_CHARS:
+        raise KelivoError(413, "request_too_large")
+
+    normalized_payload: dict[str, Any] = {
+        "model": model_alias,
+        "messages": [{"role": "user", "content": canonical_text}],
+        "stream": False,
+    }
+    for key in ("temperature", "max_tokens", "stream_options"):
+        if key in payload:
+            normalized_payload[key] = payload[key]
+    try:
+        return validate_completion(normalized_payload, model_alias)
+    except KelivoError as exc:
+        if exc.category in {"message_too_long", "messages_too_large"}:
+            raise KelivoError(413, "request_too_large") from None
+        raise KelivoError(422, "invalid_request_error") from None
 
 
 def validate_idempotency_key(value: str | None) -> str:
@@ -535,10 +632,62 @@ def prepare_request(
         )
 
 
+def _canonical_history_messages(
+    conn: sqlite3.Connection, api_session: str, current_text: str,
+) -> tuple[dict[str, str], ...]:
+    remaining_chars = MAX_TOTAL_CONTENT_CHARS - len(current_text)
+    if remaining_chars <= 0:
+        return ()
+    rows = conn.execute(
+        """SELECT direction,text FROM messages
+           WHERE json_valid(meta) AND json_extract(meta,'$.api_session')=?
+             AND kind IN ('user','voice','reply')
+           ORDER BY id DESC LIMIT ?""",
+        (api_session, MAX_MESSAGES - 1),
+    ).fetchall()
+    newest_first: list[dict[str, str]] = []
+    for row in rows:
+        text = row["text"]
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if len(text) > MAX_CONTENT_CHARS or len(text) > remaining_chars:
+            break
+        newest_first.append({
+            "role": "assistant" if row["direction"] == "out" else "user",
+            "content": text,
+        })
+        remaining_chars -= len(text)
+    return tuple(reversed(newest_first))
+
+
+def _scoped_automatic_fingerprint(
+    *, client_id: str, api_session: str, model_alias: str,
+    mapping_revision: int, share_text: str, identity_scope: dict[str, str],
+    provider_model: str, effective_temperature: float, effective_max_tokens: int,
+    persona_text: str, persona_source: str,
+) -> str:
+    return content_hash({
+        "prompt_contract_version": PROMPT_CONTRACT_VERSION,
+        "client_id": client_id,
+        "api_session": api_session,
+        "mapping_revision": mapping_revision,
+        "model": model_alias,
+        "share_text": share_text,
+        "identity_scope": identity_scope,
+        "provider_model": provider_model,
+        "effective_temperature": effective_temperature,
+        "effective_max_tokens": effective_max_tokens,
+        "persona_hash": text_sha256(persona_text),
+        "persona_source": persona_source,
+    })[1]
+
+
 def freeze_automatic_request(
     path: str, client_id: str, validated: ValidatedCompletion, *, persona_text: str = "",
     persona_source: str = "default", provider_model: str = "test-provider",
     effective_temperature: float = 0.7, effective_max_tokens: int = 2000,
+    identity_scope: dict[str, str] | None = None,
+    include_canonical_history: bool = False,
 ) -> FrozenRequestContract:
     """Persist/deduplicate snapshot correlations and build the existing frozen identity once."""
     with channel_store.connect(path) as conn:
@@ -550,28 +699,62 @@ def freeze_automatic_request(
         if not mapping:
             raise KelivoError(503, "client_mapping_unavailable")
         api_session = mapping["api_session"]
+        contract_validated = validated
+        automatic_fingerprint = ""
+        if identity_scope is not None:
+            automatic_fingerprint = _scoped_automatic_fingerprint(
+                client_id=client_id, api_session=api_session,
+                model_alias=validated.normalized_request["model"],
+                mapping_revision=int(mapping["mapping_revision"]),
+                share_text=validated.user_text, identity_scope=identity_scope,
+                provider_model=provider_model,
+                effective_temperature=effective_temperature,
+                effective_max_tokens=effective_max_tokens,
+                persona_text=persona_text, persona_source=persona_source,
+            )
+        if include_canonical_history:
+            history = _canonical_history_messages(conn, api_session, validated.user_text)
+            contract_validated = ValidatedCompletion(
+                validated.normalized_request,
+                validated.request_payload_hash,
+                (*history, validated.messages[-1]),
+                validated.user_text,
+                (),
+                validated.temperature,
+                validated.max_tokens,
+            )
         snapshot_rows = [
             store_snapshot(conn, api_session, snapshot_type, value)
-            for snapshot_type, value in validated.snapshots
+            for snapshot_type, value in contract_validated.snapshots
         ]
         provider_messages, bundle, bundle_hash, request_identity_hash = build_frozen_prompt_contract(
-            validated, persona_text=persona_text, persona_source=persona_source,
+            contract_validated, persona_text=persona_text, persona_source=persona_source,
             client_id=client_id, api_session=api_session,
             mapping_revision=int(mapping["mapping_revision"]), provider_model=provider_model,
             effective_temperature=effective_temperature, effective_max_tokens=effective_max_tokens,
             snapshot_rows=snapshot_rows,
+            identity_scope=identity_scope,
+            automatic_fingerprint=automatic_fingerprint,
         )
         conn.execute("COMMIT")
     return FrozenRequestContract(
         api_session, int(mapping["mapping_revision"]), provider_messages, bundle,
-        bundle_hash, request_identity_hash,
+        bundle_hash, request_identity_hash, automatic_fingerprint or request_identity_hash,
     )
 
 
 def _automatic_row_result(row: sqlite3.Row, now: datetime) -> PreparedRequest | None:
     if row["idempotency_mode"] != "automatic":
         raise KelivoError(503, "stored_contract_invalid")
-    if not hmac.compare_digest(row["automatic_fingerprint"], row["request_identity_hash"]):
+    try:
+        bundle = json.loads(row["context_bundle_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise KelivoError(503, "stored_contract_invalid") from None
+    expected_fingerprint = bundle.get("automatic_fingerprint", row["request_identity_hash"])
+    if (
+        not isinstance(expected_fingerprint, str)
+        or not hmac.compare_digest(row["automatic_fingerprint"], expected_fingerprint)
+    ):
         raise KelivoError(503, "stored_contract_invalid")
     common = {
         "idempotency_key": row["idempotency_key"],
@@ -583,9 +766,14 @@ def _automatic_row_result(row: sqlite3.Row, now: datetime) -> PreparedRequest | 
             error_category="idempotency_in_progress", **common,
         )
     if row["status"] == "dispatch_uncertain":
+        category = (
+            "dispatch_uncertain"
+            if bundle.get("identity_scope") == OPERIT_SHARE_IDENTITY_SCOPE
+            else row["error_category"] or "dispatch_uncertain"
+        )
         return PreparedRequest(
             "blocked", row["generation_id"], row["api_session"],
-            error_category=row["error_category"] or "dispatch_uncertain", **common,
+            error_category=category, **common,
         )
     try:
         replay_until = datetime.fromisoformat(row["automatic_replay_until"])
@@ -626,7 +814,8 @@ def prepare_automatic_request(
     effective_max_tokens: int = 2000, replay_seconds: int = 300,
     rate_limit: int = 10, rate_window_seconds: int = 60, now: datetime | None = None,
 ) -> PreparedRequest:
-    if not hmac.compare_digest(automatic_fingerprint, contract.request_identity_hash):
+    expected_fingerprint = contract.automatic_fingerprint or contract.request_identity_hash
+    if not hmac.compare_digest(automatic_fingerprint, expected_fingerprint):
         raise KelivoError(409, "automatic_identity_changed")
     bundle = contract.context_bundle
     persona = bundle.get("persona") if isinstance(bundle, dict) else None
@@ -787,7 +976,15 @@ def _safe_usage(value: Any) -> dict[str, int]:
 
 def complete_request(
     path: str, client_id: str, idempotency_key: str, model_alias: str, result: dict[str, Any],
+    *, channel: str = "kelivo", source: str | None = None,
 ) -> dict[str, Any]:
+    if channel not in {"kelivo", "operit_share"}:
+        raise KelivoError(503, "stored_contract_invalid")
+    if (
+        (channel == "operit_share" and source != "operit")
+        or (channel == "kelivo" and source is not None)
+    ):
+        raise KelivoError(503, "stored_contract_invalid")
     text = result.get("text")
     if not isinstance(text, str) or not text.strip():
         raise GenerationError("empty_model_response", True)
@@ -807,8 +1004,13 @@ def complete_request(
         prompt_messages = json.loads(request["provider_messages_json"])
         user_text = prompt_messages[-1]["content"]
         stamp = channel_store.now_iso()
-        meta = normalized_json({"api_session": request["api_session"], "channel": "kelivo",
-                                "generation_id": request["generation_id"]})
+        meta_payload = {
+            "api_session": request["api_session"], "channel": channel,
+            "generation_id": request["generation_id"],
+        }
+        if source is not None:
+            meta_payload["source"] = source
+        meta = normalized_json(meta_payload)
         user = conn.execute(
             "INSERT INTO messages(ts,direction,kind,text,meta) VALUES(?,?,?,?,?)",
             (stamp, "in", "user", user_text, meta),

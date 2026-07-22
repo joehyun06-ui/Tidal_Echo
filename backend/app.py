@@ -18,6 +18,7 @@ variables (see .env.example). Nothing identifying is hard-coded.
 """
 
 import asyncio
+import hashlib
 import mimetypes
 import hmac
 import json
@@ -110,7 +111,10 @@ try:
     DEPLOYMENT = deployment_config.load_deployment_config(TELEGRAM)
     if DEPLOYMENT.render_telegram_mvp and not API_LOOP_EXPECTED_NONCE:
         raise deployment_config.DeploymentConfigError("api_loop_expected_nonce_missing")
-    if (LOOP_TARGET_REQUESTED or DEPLOYMENT.render_telegram_mvp or DEPLOYMENT.kelivo.enabled) and len(API_LOOP_INTERNAL_TOKEN) < 32:
+    if (
+        LOOP_TARGET_REQUESTED or DEPLOYMENT.render_telegram_mvp
+        or DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled
+    ) and len(API_LOOP_INTERNAL_TOKEN) < 32:
         raise deployment_config.DeploymentConfigError("api_loop_internal_token_missing")
     deployment_config.prepare_persistent_paths(DEPLOYMENT)
     deployment_config.initialize_brain_target(DEPLOYMENT)
@@ -190,6 +194,10 @@ def init_db() -> None:
             allowed_account_ids=frozenset({TELEGRAM.account_id}),
             allowed_chat_ids=frozenset(str(value) for value in TELEGRAM.allowed_chat_ids),
             allowed_user_ids=frozenset(str(value) for value in TELEGRAM.allowed_user_ids),
+        )
+    if DEPLOYMENT.operit_share.enabled:
+        kelivo_service.initialize_client_mapping(
+            DB_PATH, DEPLOYMENT.operit_share.client_id, DEPLOYMENT.operit_share.api_session,
         )
 
 
@@ -807,6 +815,29 @@ def check_kelivo_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def check_operit_share_auth(request: Request) -> None:
+    if not DEPLOYMENT.operit_share.enabled:
+        raise HTTPException(status_code=404, detail="not found")
+    values = request.headers.getlist("authorization")
+    if len(values) != 1:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    auth = values[0]
+    if (
+        len(auth) > 519
+        or not auth.isascii()
+        or any(ord(char) < 32 or ord(char) == 127 for char in auth)
+        or not auth.startswith("Bearer ")
+    ):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token = auth[7:]
+    if not token or any(char.isspace() for char in token):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    supplied = hashlib.sha256(token.encode("ascii")).digest()
+    expected = hashlib.sha256(DEPLOYMENT.operit_share.api_key.encode("ascii")).digest()
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
 def kelivo_error(status_code: int, category: str, *, retry_after: int | None = None) -> JSONResponse:
     error_type = "authentication_error" if status_code == 401 else (
         "rate_limit_error" if status_code == 429 else "invalid_request_error"
@@ -859,7 +890,7 @@ KELIVO_GENERATOR = (
         LOOP_INGEST_URL, LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, API_LOOP_INTERNAL_TOKEN,
         DEPLOYMENT.kelivo.internal_response_max_bytes,
     ).generate
-    if DEPLOYMENT.kelivo.enabled else None
+    if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled else None
 )
 KELIVO_ADMISSION = kelivo_service.KelivoAdmissionController(
     DEPLOYMENT.kelivo.global_concurrency,
@@ -924,6 +955,27 @@ app = FastAPI(
     redoc_url=None if DEPLOYMENT.render_telegram_mvp else "/redoc",
     openapi_url=None if DEPLOYMENT.render_telegram_mvp else "/openapi.json",
 )
+
+
+class OperitQueryRedactionMiddleware:
+    """Discard query strings before routing and before Uvicorn formats its access line."""
+
+    def __init__(self, wrapped_app):
+        self.wrapped_app = wrapped_app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") == "http"
+            and scope.get("path") == "/v1/operit/share"
+            and scope.get("query_string")
+        ):
+            # Uvicorn retains this same scope object until access logging. Mutating it
+            # prevents a rejected ?token= value or shared URL from entering that log.
+            scope["query_string"] = b""
+        await self.wrapped_app(scope, receive, send)
+
+
+app.add_middleware(OperitQueryRedactionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
@@ -949,7 +1001,7 @@ def _database_ready() -> bool:
                 "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
                 "heartbeat_schedule_revisions", "heartbeat_run_inputs",
             }
-            if DEPLOYMENT.kelivo.enabled:
+            if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled:
                 required_tables.update({
                     "kelivo_clients", "kelivo_requests", "companion_context_snapshots", "kelivo_rate_limits"
                 })
@@ -967,7 +1019,7 @@ def _database_ready() -> bool:
             ).fetchone()
             if row is None or row[0] != "applied":
                 return False
-            if DEPLOYMENT.kelivo.enabled:
+            if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled:
                 channel_store.validate_kelivo_schema(conn)
             channel_store.validate_heartbeat_schema(conn)
             channel_store.validate_heartbeat_hardening_schema(conn)
@@ -1029,12 +1081,225 @@ async def readyz():
             DEPLOYMENT.kelivo.client_id,
             DEPLOYMENT.kelivo.api_session,
         )
+    if DEPLOYMENT.operit_share.enabled:
+        checks["operit_share"] = await asyncio.to_thread(
+            kelivo_service.client_mapping_ready,
+            DB_PATH,
+            DEPLOYMENT.operit_share.client_id,
+            DEPLOYMENT.operit_share.api_session,
+        )
     ready = all(checks.values())
     payload = {"ready": ready, "checks": checks, "status": "ready" if ready else "not_ready"}
     return JSONResponse(payload, status_code=200 if ready else 503)
 
 
 # ---- Kelivo OpenAI-compatible API ----------------------------------------
+
+def _completion_error(
+    channel: str, status_code: int, category: str, *, retry_after: int | None = None,
+) -> JSONResponse:
+    if channel == "operit_share":
+        if status_code == 429:
+            category = "rate_limit_error"
+        elif category in {
+            "idempotency_in_progress", "idempotency_conflict", "request_not_dispatchable",
+            "automatic_identity_changed", "failed",
+        }:
+            category = "idempotency_conflict"
+        elif "uncertain" in category or status_code == 504:
+            category = "dispatch_uncertain"
+        elif status_code >= 500:
+            category = "service_unavailable"
+    return kelivo_error(status_code, category, retry_after=retry_after)
+
+
+async def _run_completion_state_machine(
+    validated: kelivo_service.ValidatedCompletion,
+    *, client_id: str, model_alias: str,
+    provider_defaults: deployment_config.KelivoProviderDefaults,
+    effective_temperature: float, effective_max_tokens: int,
+    persona_source: str, idempotency_key: str = "",
+    automatic_contract: kelivo_service.FrozenRequestContract | None = None,
+    channel: str = "kelivo", source: str | None = None,
+) -> JSONResponse:
+    try:
+        automatic_fingerprint = ""
+        if automatic_contract is not None:
+            automatic_fingerprint = (
+                automatic_contract.automatic_fingerprint
+                or automatic_contract.request_identity_hash
+            )
+        lock_key = automatic_fingerprint if automatic_contract is not None else idempotency_key
+        async with KELIVO_KEY_LOCKS.hold(client_id, lock_key):
+            if automatic_contract is not None:
+                prepared = await asyncio.to_thread(
+                    kelivo_service.lookup_automatic_request,
+                    DB_PATH, client_id, automatic_fingerprint,
+                )
+            else:
+                prepared = await asyncio.to_thread(
+                    kelivo_service.lookup_request, DB_PATH, client_id,
+                    idempotency_key, validated, KELIVO_PERSONA,
+                    provider_defaults.provider_model, effective_temperature, effective_max_tokens,
+                )
+            if prepared is None:
+                if automatic_contract is not None:
+                    prepare_task = asyncio.create_task(asyncio.to_thread(
+                        kelivo_service.prepare_automatic_request,
+                        DB_PATH, client_id, automatic_fingerprint, validated, automatic_contract,
+                        persona_source=persona_source,
+                        provider_model=provider_defaults.provider_model,
+                        effective_temperature=effective_temperature,
+                        effective_max_tokens=effective_max_tokens,
+                        replay_seconds=DEPLOYMENT.kelivo.auto_idempotency_replay_seconds,
+                        rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
+                    ))
+                else:
+                    prepare_task = asyncio.create_task(asyncio.to_thread(
+                        kelivo_service.prepare_request, DB_PATH, client_id,
+                        idempotency_key, validated, persona_text=KELIVO_PERSONA,
+                        persona_source=persona_source,
+                        provider_model=provider_defaults.provider_model,
+                        effective_temperature=effective_temperature,
+                        effective_max_tokens=effective_max_tokens,
+                        rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
+                    ))
+                try:
+                    prepared = await asyncio.shield(prepare_task)
+                except asyncio.CancelledError:
+                    prepared = await asyncio.shield(prepare_task)
+                    if prepared.idempotency_key:
+                        idempotency_key = prepared.idempotency_key
+                    if prepared.action == "prepared":
+                        await asyncio.to_thread(
+                            kelivo_service.fail_request, DB_PATH, client_id,
+                            idempotency_key, "request_cancelled_before_dispatch", False,
+                        )
+                    raise
+            if prepared.idempotency_key:
+                idempotency_key = prepared.idempotency_key
+    except kelivo_service.KelivoError as exc:
+        return _completion_error(
+            channel, exc.status_code, exc.category, retry_after=exc.retry_after,
+        )
+    except (sqlite3.Error, OSError):
+        return _completion_error(channel, 503, "temporarily_unavailable")
+    if prepared.action == "replay":
+        return JSONResponse(prepared.response)
+    if prepared.action == "blocked":
+        return _completion_error(
+            channel, 409, prepared.error_category or "request_not_dispatchable",
+        )
+
+    lease = None
+    try:
+        lease = await KELIVO_ADMISSION.acquire(client_id)
+        prepared = await asyncio.to_thread(
+            kelivo_service.begin_dispatch, DB_PATH, client_id,
+            idempotency_key, stale_seconds=DEPLOYMENT.kelivo.stale_dispatch_seconds,
+        )
+    except kelivo_service.KelivoError as exc:
+        if lease:
+            lease.release()
+        try:
+            await asyncio.to_thread(
+                kelivo_service.fail_request, DB_PATH, client_id,
+                idempotency_key, exc.category, False,
+            )
+        except Exception:
+            pass
+        return _completion_error(
+            channel, exc.status_code, exc.category, retry_after=exc.retry_after,
+        )
+    except (sqlite3.Error, OSError):
+        if lease:
+            lease.release()
+        try:
+            await asyncio.to_thread(
+                kelivo_service.fail_request, DB_PATH, client_id,
+                idempotency_key, "dispatch_state_unavailable", False,
+            )
+        except Exception:
+            pass
+        return _completion_error(channel, 503, "temporarily_unavailable")
+    except asyncio.CancelledError:
+        if lease:
+            lease.release()
+        try:
+            await asyncio.shield(asyncio.to_thread(
+                kelivo_service.fail_request, DB_PATH, client_id,
+                idempotency_key, "request_cancelled_before_dispatch", False,
+            ))
+        except Exception:
+            pass
+        raise
+    if prepared.action == "replay":
+        lease.release()
+        return JSONResponse(prepared.response)
+    if prepared.action == "blocked":
+        lease.release()
+        return _completion_error(
+            channel, 409, prepared.error_category or "request_not_dispatchable",
+        )
+
+    dispatch_started = False
+    try:
+        if KELIVO_GENERATOR is None:
+            raise kelivo_service.GenerationError("generation_service_unavailable", False)
+        dispatch_started = True
+        result = await KELIVO_GENERATOR(
+            prepared.messages,
+            prepared.api_session,
+            prepared.provider_model,
+            prepared.temperature,
+            prepared.max_tokens,
+            prepared.context_bundle or {},
+        )
+        completion_task = asyncio.create_task(asyncio.to_thread(
+            kelivo_service.complete_request, DB_PATH, client_id,
+            idempotency_key, model_alias, result, channel=channel, source=source,
+        ))
+        try:
+            response = await asyncio.shield(completion_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(completion_task)
+            raise
+    except kelivo_service.GenerationError as exc:
+        try:
+            await asyncio.to_thread(
+                kelivo_service.fail_request, DB_PATH, client_id,
+                idempotency_key, exc.category, exc.uncertain,
+            )
+        except Exception:
+            pass
+        return _completion_error(channel, 504 if exc.uncertain else 502, exc.category)
+    except kelivo_service.KelivoError as exc:
+        return _completion_error(
+            channel, exc.status_code, exc.category, retry_after=exc.retry_after,
+        )
+    except asyncio.CancelledError:
+        if dispatch_started:
+            try:
+                await asyncio.shield(asyncio.to_thread(
+                    kelivo_service.fail_request, DB_PATH, client_id,
+                    idempotency_key, "client_cancelled_after_dispatch", True,
+                ))
+            except Exception:
+                pass
+        raise
+    except Exception:
+        try:
+            await asyncio.to_thread(
+                kelivo_service.fail_request, DB_PATH, client_id, idempotency_key,
+                "unexpected_generation_error", True,
+            )
+        except Exception:
+            pass
+        return _completion_error(channel, 504, "unexpected_generation_error")
+    finally:
+        if lease:
+            lease.release()
+    return JSONResponse(response)
 
 @app.get("/v1/models")
 async def kelivo_models(request: Request):
@@ -1125,170 +1390,110 @@ async def kelivo_chat_completions(request: Request):
         return kelivo_error(503, "provider_contract_unavailable")
     except (sqlite3.Error, OSError):
         return kelivo_error(503, "temporarily_unavailable")
+    return await _run_completion_state_machine(
+        validated,
+        client_id=DEPLOYMENT.kelivo.client_id,
+        model_alias=DEPLOYMENT.kelivo.model_alias,
+        provider_defaults=provider_defaults,
+        effective_temperature=effective_temperature,
+        effective_max_tokens=effective_max_tokens,
+        persona_source=KELIVO_PERSONA_SOURCE,
+        idempotency_key=idempotency_key,
+        automatic_contract=automatic_contract,
+    )
+
+
+@app.post("/v1/operit/share")
+async def operit_share(request: Request):
     try:
-        lock_key = (
-            automatic_contract.request_identity_hash
-            if automatic_contract is not None else idempotency_key
+        check_operit_share_auth(request)
+    except HTTPException as exc:
+        category = "authentication_error" if exc.status_code == 401 else "endpoint_disabled"
+        return kelivo_error(exc.status_code, category)
+
+    encodings = request.headers.getlist("content-encoding")
+    if len(encodings) > 1:
+        return kelivo_error(422, "invalid_request_error")
+    encoding = (encodings[0] if encodings else "").strip().lower()
+    if encoding not in {"", "identity"}:
+        return kelivo_error(422, "invalid_request_error")
+    content_lengths = request.headers.getlist("content-length")
+    if len(content_lengths) > 1:
+        return kelivo_error(422, "invalid_request_error")
+    content_length = content_lengths[0] if content_lengths else None
+    if content_length and (
+        len(content_length) > 20
+        or not content_length.isascii()
+        or not content_length.isdecimal()
+    ):
+        return kelivo_error(422, "invalid_request_error")
+    if content_length and int(content_length) > kelivo_service.MAX_BODY_BYTES:
+        return kelivo_error(413, "request_too_large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > kelivo_service.MAX_BODY_BYTES:
+            return kelivo_error(413, "request_too_large")
+    try:
+        payload = json.loads(
+            bytes(raw), object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
         )
-        async with KELIVO_KEY_LOCKS.hold(DEPLOYMENT.kelivo.client_id, lock_key):
-            if automatic_contract is not None:
-                prepared = await asyncio.to_thread(
-                    kelivo_service.lookup_automatic_request,
-                    DB_PATH, DEPLOYMENT.kelivo.client_id, automatic_contract.request_identity_hash,
-                )
-            else:
-                prepared = await asyncio.to_thread(
-                    kelivo_service.lookup_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                    idempotency_key, validated, KELIVO_PERSONA,
-                    provider_defaults.provider_model, effective_temperature, effective_max_tokens,
-                )
-            if prepared is None:
-                if automatic_contract is not None:
-                    prepare_task = asyncio.create_task(asyncio.to_thread(
-                        kelivo_service.prepare_automatic_request,
-                        DB_PATH, DEPLOYMENT.kelivo.client_id,
-                        automatic_contract.request_identity_hash, validated, automatic_contract,
-                        persona_source=KELIVO_PERSONA_SOURCE,
-                        provider_model=provider_defaults.provider_model,
-                        effective_temperature=effective_temperature,
-                        effective_max_tokens=effective_max_tokens,
-                        replay_seconds=DEPLOYMENT.kelivo.auto_idempotency_replay_seconds,
-                        rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
-                    ))
-                else:
-                    prepare_task = asyncio.create_task(asyncio.to_thread(
-                        kelivo_service.prepare_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                        idempotency_key, validated, persona_text=KELIVO_PERSONA,
-                        persona_source=KELIVO_PERSONA_SOURCE,
-                        provider_model=provider_defaults.provider_model,
-                        effective_temperature=effective_temperature,
-                        effective_max_tokens=effective_max_tokens,
-                        rate_limit=DEPLOYMENT.kelivo.rate_limit_per_minute, rate_window_seconds=60,
-                    ))
-                try:
-                    prepared = await asyncio.shield(prepare_task)
-                except asyncio.CancelledError:
-                    prepared = await asyncio.shield(prepare_task)
-                    if prepared.idempotency_key:
-                        idempotency_key = prepared.idempotency_key
-                    if prepared.action == "prepared":
-                        await asyncio.to_thread(
-                            kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                            idempotency_key, "request_cancelled_before_dispatch", False,
-                        )
-                    raise
-            if prepared.idempotency_key:
-                idempotency_key = prepared.idempotency_key
+        _validate_json_complexity(payload)
+        validated = kelivo_service.validate_operit_share(
+            payload, DEPLOYMENT.operit_share.model_alias,
+        )
+        provider_defaults = await asyncio.to_thread(
+            deployment_config.resolve_kelivo_provider_contract_defaults,
+            os.environ, DEPLOYMENT.loop_config,
+        )
+        effective_temperature = (
+            validated.temperature
+            if validated.temperature is not None else provider_defaults.temperature
+        )
+        effective_max_tokens = (
+            validated.max_tokens
+            if validated.max_tokens is not None else provider_defaults.max_tokens
+        )
+        await asyncio.to_thread(
+            kelivo_service.recover_dispatching_requests, DB_PATH,
+            stale_seconds=DEPLOYMENT.kelivo.stale_dispatch_seconds,
+            category="dispatch_expired",
+        )
+        automatic_contract = await asyncio.to_thread(
+            kelivo_service.freeze_automatic_request,
+            DB_PATH, DEPLOYMENT.operit_share.client_id, validated,
+            persona_text=KELIVO_PERSONA, persona_source=KELIVO_PERSONA_SOURCE,
+            provider_model=provider_defaults.provider_model,
+            effective_temperature=effective_temperature,
+            effective_max_tokens=effective_max_tokens,
+            identity_scope=kelivo_service.OPERIT_SHARE_IDENTITY_SCOPE,
+            include_canonical_history=True,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+        return kelivo_error(422, "invalid_request_error")
+    except MemoryError:
+        return kelivo_error(413, "request_too_large")
     except kelivo_service.KelivoError as exc:
-        return kelivo_error(exc.status_code, exc.category, retry_after=exc.retry_after)
+        category = "request_too_large" if exc.category.startswith("json_") else exc.category
+        status_code = 413 if category == "request_too_large" else exc.status_code
+        return kelivo_error(status_code, category, retry_after=exc.retry_after)
+    except deployment_config.DeploymentConfigError:
+        return kelivo_error(503, "service_unavailable")
     except (sqlite3.Error, OSError):
-        return kelivo_error(503, "temporarily_unavailable")
-    if prepared.action == "replay":
-        return JSONResponse(prepared.response)
-    if prepared.action == "blocked":
-        return kelivo_error(409, prepared.error_category or "request_not_dispatchable")
-    lease = None
-    try:
-        lease = await KELIVO_ADMISSION.acquire(DEPLOYMENT.kelivo.client_id)
-        prepared = await asyncio.to_thread(
-            kelivo_service.begin_dispatch, DB_PATH, DEPLOYMENT.kelivo.client_id,
-            idempotency_key, stale_seconds=DEPLOYMENT.kelivo.stale_dispatch_seconds,
-        )
-    except kelivo_service.KelivoError as exc:
-        if lease:
-            lease.release()
-        try:
-            await asyncio.to_thread(
-                kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                idempotency_key, exc.category, False,
-            )
-        except Exception:
-            pass
-        return kelivo_error(exc.status_code, exc.category, retry_after=exc.retry_after)
-    except (sqlite3.Error, OSError):
-        if lease:
-            lease.release()
-        try:
-            await asyncio.to_thread(
-                kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                idempotency_key, "dispatch_state_unavailable", False,
-            )
-        except Exception:
-            pass
-        return kelivo_error(503, "temporarily_unavailable")
-    except asyncio.CancelledError:
-        if lease:
-            lease.release()
-        try:
-            await asyncio.shield(asyncio.to_thread(
-                kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                idempotency_key, "request_cancelled_before_dispatch", False,
-            ))
-        except Exception:
-            pass
-        raise
-    if prepared.action == "replay":
-        lease.release()
-        return JSONResponse(prepared.response)
-    if prepared.action == "blocked":
-        lease.release()
-        return kelivo_error(409, prepared.error_category or "request_not_dispatchable")
-    dispatch_started = False
-    try:
-        if KELIVO_GENERATOR is None:
-            raise kelivo_service.GenerationError("generation_service_unavailable", False)
-        dispatch_started = True
-        result = await KELIVO_GENERATOR(
-            prepared.messages,
-            prepared.api_session,
-            prepared.provider_model,
-            prepared.temperature,
-            prepared.max_tokens,
-            prepared.context_bundle or {},
-        )
-        completion_task = asyncio.create_task(asyncio.to_thread(
-            kelivo_service.complete_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-            idempotency_key, DEPLOYMENT.kelivo.model_alias, result,
-        ))
-        try:
-            response = await asyncio.shield(completion_task)
-        except asyncio.CancelledError:
-            await asyncio.shield(completion_task)
-            raise
-    except kelivo_service.GenerationError as exc:
-        try:
-            await asyncio.to_thread(
-                kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                idempotency_key, exc.category, exc.uncertain
-            )
-        except Exception:
-            pass
-        return kelivo_error(504 if exc.uncertain else 502, exc.category)
-    except kelivo_service.KelivoError as exc:
-        return kelivo_error(exc.status_code, exc.category, retry_after=exc.retry_after)
-    except asyncio.CancelledError:
-        if dispatch_started:
-            try:
-                await asyncio.shield(asyncio.to_thread(
-                    kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id,
-                    idempotency_key, "client_cancelled_after_dispatch", True,
-                ))
-            except Exception:
-                pass
-        raise
-    except Exception:
-        try:
-            await asyncio.to_thread(
-                kelivo_service.fail_request, DB_PATH, DEPLOYMENT.kelivo.client_id, idempotency_key,
-                "unexpected_generation_error", True,
-            )
-        except Exception:
-            pass
-        return kelivo_error(504, "unexpected_generation_error")
-    finally:
-        if lease:
-            lease.release()
-    return JSONResponse(response)
+        return kelivo_error(503, "service_unavailable")
+    return await _run_completion_state_machine(
+        validated,
+        client_id=DEPLOYMENT.operit_share.client_id,
+        model_alias=DEPLOYMENT.operit_share.model_alias,
+        provider_defaults=provider_defaults,
+        effective_temperature=effective_temperature,
+        effective_max_tokens=effective_max_tokens,
+        persona_source=KELIVO_PERSONA_SOURCE,
+        automatic_contract=automatic_contract,
+        channel="operit_share",
+        source="operit",
+    )
 
 
 # ---- AI side ---------------------------------------------------------------

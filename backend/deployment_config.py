@@ -138,6 +138,15 @@ class KelivoConfig:
 
 
 @dataclass(frozen=True)
+class OperitShareConfig:
+    enabled: bool
+    api_key: str
+    client_id: str
+    api_session: str
+    model_alias: str
+
+
+@dataclass(frozen=True)
 class HeartbeatConfig:
     enabled: bool
     interval_seconds: int
@@ -161,6 +170,7 @@ class DeploymentConfig:
     timeouts: LoopTimeouts
     sqlite_busy_timeout_seconds: float
     kelivo: KelivoConfig
+    operit_share: OperitShareConfig
     heartbeat: HeartbeatConfig
 
 
@@ -337,6 +347,9 @@ def load_deployment_config(
     telegram_enabled = parse_strict_bool(env.get("TELEGRAM_ENABLED", "false"), "invalid_telegram_enabled")
     telegram_test_mode = parse_strict_bool(env.get("TELEGRAM_TEST_MODE", "false"), "invalid_telegram_test_mode")
     kelivo_enabled = parse_strict_bool(env.get("KELIVO_ENABLED", "false"), "invalid_kelivo_enabled")
+    operit_share_enabled = parse_strict_bool(
+        env.get("OPERIT_SHARE_ENABLED", "false"), "invalid_operit_share_enabled"
+    )
     if telegram_enabled != bool(telegram_config.requested):
         raise DeploymentConfigError("telegram_config_invalid")
 
@@ -366,6 +379,11 @@ def load_deployment_config(
     kelivo_client_id = str(env.get("KELIVO_CLIENT_ID", "primary-kelivo")).strip()
     kelivo_api_session = str(env.get("KELIVO_API_SESSION", "")).strip()
     kelivo_model_alias = str(env.get("KELIVO_MODEL_ALIAS", "ouou-home")).strip()
+    operit_share_key = str(env.get("OPERIT_SHARE_API_KEY", "")).strip()
+    operit_share_client_id = str(
+        env.get("OPERIT_SHARE_CLIENT_ID", "primary-operit-share")
+    ).strip()
+    operit_share_model_alias = str(env.get("OPERIT_SHARE_MODEL_ALIAS", "ouou-home")).strip()
     kelivo_allow_remap = parse_strict_bool(
         env.get("KELIVO_ALLOW_SESSION_REMAP", "false"), "invalid_kelivo_allow_session_remap"
     )
@@ -435,6 +453,40 @@ def load_deployment_config(
         protected.discard("")
         if kelivo_key in protected:
             raise DeploymentConfigError("kelivo_api_key_must_be_distinct")
+    if operit_share_enabled:
+        if (
+            len(operit_share_key) < 32
+            or len(operit_share_key) > 512
+            or not operit_share_key.isascii()
+            or any(ord(char) < 33 or ord(char) > 126 for char in operit_share_key)
+        ):
+            raise DeploymentConfigError("operit_share_api_key_missing")
+        if any(safe_identifier.fullmatch(item) is None for item in (
+            operit_share_client_id, kelivo_api_session, operit_share_model_alias,
+        )):
+            raise DeploymentConfigError("operit_share_identity_invalid")
+        if operit_share_model_alias != "ouou-home":
+            raise DeploymentConfigError("operit_share_identity_invalid")
+        protected = {
+            kelivo_key,
+            str(env.get("RELAY_SECRET", "")).strip(),
+            str(env.get("TELEGRAM_BOT_TOKEN", "")).strip(),
+            str(env.get("TELEGRAM_WEBHOOK_SECRET", "")).strip(),
+            str(env.get("CHANNEL_AUDIT_HMAC_SECRET", "")).strip(),
+            str(env.get("LLM_API_KEY", "")).strip(),
+            str(env.get("LLM_API_KEY_2", "")).strip(),
+            str(env.get("LLM_API_KEY_3", "")).strip(),
+            str(env.get("LLM_API_KEY_4", "")).strip(),
+            str(env.get("MINIMAX_API_KEY", "")).strip(),
+            str(env.get("API_LOOP_INTERNAL_TOKEN", "")).strip(),
+            str(env.get("API_LOOP_EXPECTED_NONCE", "")).strip(),
+            str(env.get("API_LOOP_INSTANCE_NONCE", "")).strip(),
+        }
+        protected.discard("")
+        if operit_share_key in protected:
+            raise DeploymentConfigError("operit_share_api_key_must_be_distinct")
+        if operit_share_client_id == kelivo_client_id:
+            raise DeploymentConfigError("operit_share_identity_invalid")
 
     try:
         timeouts = LoopTimeouts(
@@ -496,7 +548,7 @@ def load_deployment_config(
                 raise DeploymentConfigError("model_fallback_not_allowed")
         validate_loop_config_file(loop_config, render_mvp=True)
 
-    if kelivo_enabled:
+    if kelivo_enabled or operit_share_enabled:
         resolve_kelivo_provider_contract_defaults(env, loop_config)
 
     return DeploymentConfig(
@@ -527,6 +579,13 @@ def load_deployment_config(
             require_telegram_session=kelivo_require_telegram,
             auto_idempotency_enabled=kelivo_auto_idempotency,
             auto_idempotency_replay_seconds=kelivo_auto_replay_seconds,
+        ),
+        operit_share=OperitShareConfig(
+            enabled=operit_share_enabled,
+            api_key=operit_share_key,
+            client_id=operit_share_client_id,
+            api_session=kelivo_api_session,
+            model_alias=operit_share_model_alias,
         ),
         heartbeat=heartbeat_config,
     )
