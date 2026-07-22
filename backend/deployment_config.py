@@ -454,18 +454,33 @@ def load_deployment_config(
         if kelivo_key in protected:
             raise DeploymentConfigError("kelivo_api_key_must_be_distinct")
     if operit_share_enabled:
-        if len(operit_share_key) < 32 or len(operit_share_key) > 512:
+        if (
+            len(operit_share_key) < 32
+            or len(operit_share_key) > 512
+            or not operit_share_key.isascii()
+            or any(ord(char) < 33 or ord(char) > 126 for char in operit_share_key)
+        ):
             raise DeploymentConfigError("operit_share_api_key_missing")
         if any(safe_identifier.fullmatch(item) is None for item in (
             operit_share_client_id, kelivo_api_session, operit_share_model_alias,
         )):
             raise DeploymentConfigError("operit_share_identity_invalid")
+        if operit_share_model_alias != "ouou-home":
+            raise DeploymentConfigError("operit_share_identity_invalid")
         protected = {
             kelivo_key,
             str(env.get("RELAY_SECRET", "")).strip(),
+            str(env.get("TELEGRAM_BOT_TOKEN", "")).strip(),
             str(env.get("TELEGRAM_WEBHOOK_SECRET", "")).strip(),
             str(env.get("CHANNEL_AUDIT_HMAC_SECRET", "")).strip(),
             str(env.get("LLM_API_KEY", "")).strip(),
+            str(env.get("LLM_API_KEY_2", "")).strip(),
+            str(env.get("LLM_API_KEY_3", "")).strip(),
+            str(env.get("LLM_API_KEY_4", "")).strip(),
+            str(env.get("MINIMAX_API_KEY", "")).strip(),
+            str(env.get("API_LOOP_INTERNAL_TOKEN", "")).strip(),
+            str(env.get("API_LOOP_EXPECTED_NONCE", "")).strip(),
+            str(env.get("API_LOOP_INSTANCE_NONCE", "")).strip(),
         }
         protected.discard("")
         if operit_share_key in protected:

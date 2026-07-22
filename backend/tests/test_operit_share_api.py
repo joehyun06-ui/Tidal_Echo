@@ -48,9 +48,18 @@ class OperitShareConfigurationTests(unittest.TestCase):
                     deployment_config.DeploymentConfigError, "operit_share_api_key_missing",
                 ):
                     self.load(candidate)
+        for value in ("a" * 31 + "\n", "a" * 31 + " ", "密" * 32, "a" * 31 + "\x00"):
+            with self.subTest(invalid_format=repr(value)):
+                candidate = dict(env); candidate["OPERIT_SHARE_API_KEY"] = value
+                with self.assertRaisesRegex(
+                    deployment_config.DeploymentConfigError, "operit_share_api_key_missing",
+                ):
+                    self.load(candidate)
         for name in (
-            "KELIVO_API_KEY", "RELAY_SECRET", "TELEGRAM_WEBHOOK_SECRET",
-            "CHANNEL_AUDIT_HMAC_SECRET", "LLM_API_KEY",
+            "KELIVO_API_KEY", "RELAY_SECRET", "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_WEBHOOK_SECRET", "CHANNEL_AUDIT_HMAC_SECRET", "LLM_API_KEY",
+            "LLM_API_KEY_2", "LLM_API_KEY_3", "LLM_API_KEY_4", "MINIMAX_API_KEY",
+            "API_LOOP_INTERNAL_TOKEN", "API_LOOP_EXPECTED_NONCE", "API_LOOP_INSTANCE_NONCE",
         ):
             with self.subTest(name=name):
                 candidate = dict(env); candidate[name] = candidate["OPERIT_SHARE_API_KEY"]
@@ -63,6 +72,7 @@ class OperitShareConfigurationTests(unittest.TestCase):
             ("KELIVO_API_SESSION", ""),
             ("OPERIT_SHARE_CLIENT_ID", "bad identity"),
             ("OPERIT_SHARE_MODEL_ALIAS", "bad/model"),
+            ("OPERIT_SHARE_MODEL_ALIAS", "other-safe-alias"),
         ):
             with self.subTest(name=name):
                 candidate = dict(env); candidate[name] = value
@@ -86,17 +96,24 @@ class OperitShareDisabledTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase)
         self.module.KELIVO_GENERATOR = generate
 
     async def test_disabled_endpoint_is_hidden_and_has_no_side_effects(self):
-        response = await request(
-            self.module, "POST", "/v1/operit/share",
-            headers={"Authorization": f"Bearer {OPERIT_KEY}"},
-            json={
-                "model": "ouou-home",
-                "messages": [{"role": "user", "content": "hello"}],
-                "stream": False,
-            },
+        body = {
+            "model": "ouou-home",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+        attempts = (
+            ({}, "/v1/operit/share"),
+            ({"Authorization": f"Bearer {OPERIT_KEY}"}, "/v1/operit/share"),
+            ({"Authorization": "Bearer wrong"}, "/v1/operit/share"),
+            ({"Cookie": f"token={OPERIT_KEY}"}, "/v1/operit/share"),
+            ({}, f"/v1/operit/share?token={OPERIT_KEY}"),
         )
-        self.assertEqual((response.status_code, response.json()["error"]["code"]),
-                         (404, "endpoint_disabled"))
+        for headers, path in attempts:
+            response = await request(
+                self.module, "POST", path, headers=headers, json=body,
+            )
+            self.assertEqual((response.status_code, response.json()["error"]["code"]),
+                             (404, "endpoint_disabled"))
         with self.module.db() as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0], 0)
             self.assertIsNone(conn.execute(
@@ -184,9 +201,17 @@ class OperitShareApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             (self.payload(messages=[{"role": "user", "content": [{"type": "text", "text": "x"}]}]),
              "unsupported_multimodal"),
             (self.payload("data:image/png;base64,AAAA"), "unsupported_multimodal"),
+            (self.payload("data:,plain"), "unsupported_multimodal"),
+            (self.payload("[data:,plain]"), "unsupported_multimodal"),
             (self.payload("content://media/external/video/1"), "unsupported_multimodal"),
+            (self.payload("file://local/private"), "unsupported_multimodal"),
+            (self.payload("blob:https://operit.test/id"), "unsupported_multimodal"),
+            (self.payload("[blob:https://operit.test/id]"), "unsupported_multimodal"),
             (self.payload(messages=[{"role": "assistant", "content": "x"}]), "invalid_request_error"),
             (self.payload(" \r\n "), "empty_share"),
+            (self.payload("\u0301"), "empty_share"),
+            (self.payload("\u0000"), "invalid_request_error"),
+            (self.payload("\u200b"), "invalid_request_error"),
             ({**self.payload(), "reasoning_effort": "high"}, "invalid_request_error"),
             ({**self.payload(), "metadata": {}}, "invalid_request_error"),
             ({**self.payload(), "api_session": "attacker"}, "invalid_request_error"),
@@ -276,7 +301,7 @@ class OperitShareApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         second = await self.post(self.payload(messages=[
             {"role": "assistant", "content": "different local context"},
             {"role": "user", "content": "same share"},
-        ], temperature=1.2))
+        ]))
         self.assertEqual((first.status_code, second.status_code), (200, 200))
         self.assertEqual(first.json(), second.json())
         self.assertEqual(len(self.calls), 1)
@@ -287,6 +312,33 @@ class OperitShareApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM messages WHERE json_extract(meta,'$.channel')='operit_share'"
             ).fetchone()[0], 2)
+
+    async def test_provider_affecting_values_are_part_of_automatic_identity(self):
+        requests = (
+            self.payload("semantic share", temperature=0.2, max_tokens=111),
+            self.payload("semantic share", temperature=0.3, max_tokens=111),
+            self.payload("semantic share", temperature=0.3, max_tokens=112),
+        )
+        responses = [await self.post(body) for body in requests]
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(len(self.calls), 3)
+        with self.module.db() as conn:
+            rows = conn.execute(
+                "SELECT automatic_fingerprint,effective_temperature,effective_max_tokens "
+                "FROM kelivo_requests WHERE client_id='primary-operit-share' ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len({row["automatic_fingerprint"] for row in rows}), 3)
+        self.assertEqual(
+            [(row["effective_temperature"], row["effective_max_tokens"]) for row in rows],
+            [(0.2, 111), (0.3, 111), (0.3, 112)],
+        )
+
+    async def test_nfc_newline_equivalents_share_one_identity(self):
+        variants = (" Cafe\u0301\r\nline ", "Caf\u00e9\nline", "Caf\u00e9\rline")
+        responses = [await self.post(self.payload(value)) for value in variants]
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(all(response.json() == responses[0].json() for response in responses))
 
     async def test_different_share_creates_an_independent_request(self):
         first = await self.post(self.payload("first share"))

@@ -18,6 +18,7 @@ variables (see .env.example). Nothing identifying is hard-coded.
 """
 
 import asyncio
+import hashlib
 import mimetypes
 import hmac
 import json
@@ -817,9 +818,23 @@ def check_kelivo_auth(request: Request) -> None:
 def check_operit_share_auth(request: Request) -> None:
     if not DEPLOYMENT.operit_share.enabled:
         raise HTTPException(status_code=404, detail="not found")
-    auth = request.headers.get("authorization", "")
-    token = auth[7:] if auth.startswith("Bearer ") else ""
-    if not token or not hmac.compare_digest(token, DEPLOYMENT.operit_share.api_key):
+    values = request.headers.getlist("authorization")
+    if len(values) != 1:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    auth = values[0]
+    if (
+        len(auth) > 519
+        or not auth.isascii()
+        or any(ord(char) < 32 or ord(char) == 127 for char in auth)
+        or not auth.startswith("Bearer ")
+    ):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token = auth[7:]
+    if not token or any(char.isspace() for char in token):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    supplied = hashlib.sha256(token.encode("ascii")).digest()
+    expected = hashlib.sha256(DEPLOYMENT.operit_share.api_key.encode("ascii")).digest()
+    if not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -940,6 +955,27 @@ app = FastAPI(
     redoc_url=None if DEPLOYMENT.render_telegram_mvp else "/redoc",
     openapi_url=None if DEPLOYMENT.render_telegram_mvp else "/openapi.json",
 )
+
+
+class OperitQueryRedactionMiddleware:
+    """Discard query strings before routing and before Uvicorn formats its access line."""
+
+    def __init__(self, wrapped_app):
+        self.wrapped_app = wrapped_app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") == "http"
+            and scope.get("path") == "/v1/operit/share"
+            and scope.get("query_string")
+        ):
+            # Uvicorn retains this same scope object until access logging. Mutating it
+            # prevents a rejected ?token= value or shared URL from entering that log.
+            scope["query_string"] = b""
+        await self.wrapped_app(scope, receive, send)
+
+
+app.add_middleware(OperitQueryRedactionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
@@ -1375,12 +1411,20 @@ async def operit_share(request: Request):
         category = "authentication_error" if exc.status_code == 401 else "endpoint_disabled"
         return kelivo_error(exc.status_code, category)
 
-    encoding = request.headers.get("content-encoding", "").strip().lower()
+    encodings = request.headers.getlist("content-encoding")
+    if len(encodings) > 1:
+        return kelivo_error(422, "invalid_request_error")
+    encoding = (encodings[0] if encodings else "").strip().lower()
     if encoding not in {"", "identity"}:
         return kelivo_error(422, "invalid_request_error")
-    content_length = request.headers.get("content-length")
+    content_lengths = request.headers.getlist("content-length")
+    if len(content_lengths) > 1:
+        return kelivo_error(422, "invalid_request_error")
+    content_length = content_lengths[0] if content_lengths else None
     if content_length and (
-        not content_length.isascii() or not content_length.isdecimal()
+        len(content_length) > 20
+        or not content_length.isascii()
+        or not content_length.isdecimal()
     ):
         return kelivo_error(422, "invalid_request_error")
     if content_length and int(content_length) > kelivo_service.MAX_BODY_BYTES:
@@ -1419,7 +1463,7 @@ async def operit_share(request: Request):
         automatic_contract = await asyncio.to_thread(
             kelivo_service.freeze_automatic_request,
             DB_PATH, DEPLOYMENT.operit_share.client_id, validated,
-            persona_text=KELIVO_PERSONA, persona_source="operit",
+            persona_text=KELIVO_PERSONA, persona_source=KELIVO_PERSONA_SOURCE,
             provider_model=provider_defaults.provider_model,
             effective_temperature=effective_temperature,
             effective_max_tokens=effective_max_tokens,
@@ -1431,7 +1475,7 @@ async def operit_share(request: Request):
     except MemoryError:
         return kelivo_error(413, "request_too_large")
     except kelivo_service.KelivoError as exc:
-        category = "request_too_large" if exc.category == "json_too_complex" else exc.category
+        category = "request_too_large" if exc.category.startswith("json_") else exc.category
         status_code = 413 if category == "request_too_large" else exc.status_code
         return kelivo_error(status_code, category, retry_after=exc.retry_after)
     except deployment_config.DeploymentConfigError:
@@ -1445,7 +1489,7 @@ async def operit_share(request: Request):
         provider_defaults=provider_defaults,
         effective_temperature=effective_temperature,
         effective_max_tokens=effective_max_tokens,
-        persona_source="operit",
+        persona_source=KELIVO_PERSONA_SOURCE,
         automatic_contract=automatic_contract,
         channel="operit_share",
         source="operit",

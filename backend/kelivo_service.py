@@ -320,10 +320,17 @@ def validate_operit_share(payload: Any, model_alias: str) -> ValidatedCompletion
             raise KelivoError(422, "invalid_request_error")
         if not isinstance(content, str):
             raise KelivoError(422, "unsupported_multimodal")
-        if re.search(r"(?i)(?:^|[\s(])data:[a-z0-9.+/-]+(?:;[^,\s]*)?,", content):
+        if re.search(r"(?i)(?<![A-Za-z0-9_])data:[^\s,]*,", content):
             raise KelivoError(422, "unsupported_multimodal")
-        if re.search(r"(?i)(?:^|[\s(])(?:file|content|blob)://\S+", content):
+        if re.search(r"(?i)(?<![A-Za-z0-9_])(?:file|content)://\S+", content):
             raise KelivoError(422, "unsupported_multimodal")
+        if re.search(r"(?i)(?<![A-Za-z0-9_])blob:(?://|https?://)\S+", content):
+            raise KelivoError(422, "unsupported_multimodal")
+        if any(
+            unicodedata.category(char) in {"Cc", "Cf"} and char not in {"\r", "\n", "\t"}
+            for char in content
+        ):
+            raise KelivoError(422, "invalid_request_error")
         if len(content) > MAX_CONTENT_CHARS:
             raise KelivoError(413, "request_too_large")
         total_chars += len(content)
@@ -335,7 +342,10 @@ def validate_operit_share(payload: Any, model_alias: str) -> ValidatedCompletion
     share_text = unicodedata.normalize(
         "NFC", last["content"].replace("\r\n", "\n").replace("\r", "\n")
     ).strip()
-    if not share_text:
+    if not share_text or not any(
+        not char.isspace() and unicodedata.category(char) not in {"Mn", "Mc", "Me"}
+        for char in share_text
+    ):
         raise KelivoError(422, "empty_share")
     canonical_text = OPERIT_SHARE_PREFIX + share_text
     if len(canonical_text) > MAX_CONTENT_CHARS:
@@ -652,14 +662,23 @@ def _canonical_history_messages(
 
 def _scoped_automatic_fingerprint(
     *, client_id: str, api_session: str, model_alias: str,
-    share_text: str, identity_scope: dict[str, str],
+    mapping_revision: int, share_text: str, identity_scope: dict[str, str],
+    provider_model: str, effective_temperature: float, effective_max_tokens: int,
+    persona_text: str, persona_source: str,
 ) -> str:
     return content_hash({
+        "prompt_contract_version": PROMPT_CONTRACT_VERSION,
         "client_id": client_id,
         "api_session": api_session,
+        "mapping_revision": mapping_revision,
         "model": model_alias,
         "share_text": share_text,
         "identity_scope": identity_scope,
+        "provider_model": provider_model,
+        "effective_temperature": effective_temperature,
+        "effective_max_tokens": effective_max_tokens,
+        "persona_hash": text_sha256(persona_text),
+        "persona_source": persona_source,
     })[1]
 
 
@@ -686,7 +705,12 @@ def freeze_automatic_request(
             automatic_fingerprint = _scoped_automatic_fingerprint(
                 client_id=client_id, api_session=api_session,
                 model_alias=validated.normalized_request["model"],
+                mapping_revision=int(mapping["mapping_revision"]),
                 share_text=validated.user_text, identity_scope=identity_scope,
+                provider_model=provider_model,
+                effective_temperature=effective_temperature,
+                effective_max_tokens=effective_max_tokens,
+                persona_text=persona_text, persona_source=persona_source,
             )
         if include_canonical_history:
             history = _canonical_history_messages(conn, api_session, validated.user_text)
