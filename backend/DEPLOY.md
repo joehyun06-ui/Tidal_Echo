@@ -239,6 +239,11 @@ Back up the database as one consistent file, including migrations, mappings, job
 
 Run exactly one production relay/Telegram worker instance with SQLite. The test suite uses ASGI in-memory transports and blocks all real network access, including loopback.
 
+### Operit Share MVP（可选）
+
+Operit 的专用分享入口与 Kelivo 通用聊天入口是两套隔离的认证面；完整的 MVP
+契约、Android 手工配置与安全边界见 [`OPERIT_SHARE.md`](OPERIT_SHARE.md)。
+
 ### Kelivo OpenAI-compatible 非流式 API（可选）
 
 Kelivo 默认关闭。只有设置 `KELIVO_ENABLED=true`、一把全新的

@@ -56,7 +56,7 @@ class NoNetworkMixin:
 
 
 def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False,
-             auto_idempotency: bool = False):
+             auto_idempotency: bool = False, operit_share: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -84,6 +84,10 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "KELIVO_MODEL_ALIAS": "ouou-home",
         "KELIVO_AUTO_IDEMPOTENCY_ENABLED": "true" if auto_idempotency else "false",
         "KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS": "600",
+        "OPERIT_SHARE_ENABLED": "true" if operit_share else "false",
+        "OPERIT_SHARE_API_KEY": "test-operit-share-key-distinct-1234567890",
+        "OPERIT_SHARE_CLIENT_ID": "primary-operit-share",
+        "OPERIT_SHARE_MODEL_ALIAS": "ouou-home",
         "HEARTBEAT_ENABLED": "false",
         "HEARTBEAT_SCHEDULE_REVISION": "test-default",
         "LLM_MODEL": "test-provider-model",
