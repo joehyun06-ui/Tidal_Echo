@@ -15,6 +15,24 @@ FAKE_USER = 11001
 FAKE_CHAT = 22001
 
 
+def clear_backend_app_modules():
+    """Give synthetic app imports the isolation of a fresh process."""
+    module_names = (
+        "backend.app", "backend.telegram_integration", "backend.channel_store",
+        "backend.kelivo_service", "backend.heartbeat_service",
+        "backend.memory_policy", "backend.memory_runtime",
+        "backend.memory_store", "backend.memory_service",
+    )
+    for name in module_names:
+        sys.modules.pop(name, None)
+    package = sys.modules.get("backend")
+    if package is not None:
+        for name in module_names:
+            attribute = name.rsplit(".", 1)[-1]
+            if hasattr(package, attribute):
+                delattr(package, attribute)
+
+
 class NoNetworkMixin:
     """Fail the test immediately if production code attempts a real socket."""
     def setUp(self):
@@ -56,7 +74,9 @@ class NoNetworkMixin:
 
 
 def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False,
-             auto_idempotency: bool = False, operit_share: bool = False):
+             auto_idempotency: bool = False, operit_share: bool = False,
+             memory: bool = False, memory_writes: bool = False,
+             memory_sensitive: bool = False, memory_secret: str = ""):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -90,15 +110,20 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "OPERIT_SHARE_MODEL_ALIAS": "ouou-home",
         "HEARTBEAT_ENABLED": "false",
         "HEARTBEAT_SCHEDULE_REVISION": "test-default",
+        "MEMORY_CORE_ENABLED": "true" if memory else "false",
+        "MEMORY_EXPLICIT_WRITES_ENABLED": "true" if memory_writes else "false",
+        "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
+        "MEMORY_MAX_ITEM_CHARS": "1000",
+        "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",
+        "MEMORY_FINGERPRINT_KEY_ID": "phase1-test-key",
+        "MEMORY_FINGERPRINT_HMAC_SECRET": memory_secret,
         "LLM_MODEL": "test-provider-model",
         "LLM_TEMPERATURE": "0.7",
         "LLM_MAX_TOKENS": "2000",
         "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
     }
     os.environ.update(values)
-    for name in ("backend.app", "backend.telegram_integration", "backend.channel_store",
-                 "backend.kelivo_service", "backend.heartbeat_service"):
-        sys.modules.pop(name, None)
+    clear_backend_app_modules()
     module = importlib.import_module("backend.app")
     module.telegram_integration = importlib.import_module("backend.telegram_integration")
     module.init_db()

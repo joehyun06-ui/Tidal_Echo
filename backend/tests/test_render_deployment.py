@@ -16,7 +16,12 @@ from backend import deployment_config
 from scripts import render_start
 from scripts import configure_telegram_webhook
 
-from backend.tests._support import NoNetworkMixin, load_app, request
+from backend.tests._support import (
+    NoNetworkMixin,
+    clear_backend_app_modules,
+    load_app,
+    request,
+)
 
 
 def render_env(root: Path) -> dict[str, str]:
@@ -362,8 +367,7 @@ class ReadinessTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as root:
             env = render_env(Path(root)); env["RELAY_PORT"] = "10000"; env["API_LOOP_EXPECTED_NONCE"] = "nonce"
             with mock.patch.dict(os.environ, env, clear=True):
-                for name in ("backend.app", "backend.telegram_integration", "backend.channel_store"):
-                    sys.modules.pop(name, None)
+                clear_backend_app_modules()
                 module = importlib.import_module("backend.app")
             paths = {route.path for route in module.app.routes}
             self.assertNotIn("/docs", paths)

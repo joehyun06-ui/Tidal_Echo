@@ -244,6 +244,93 @@ Run exactly one production relay/Telegram worker instance with SQLite. The test 
 Operit 的专用分享入口与 Kelivo 通用聊天入口是两套隔离的认证面；完整的 MVP
 契约、Android 手工配置与安全边界见 [`OPERIT_SHARE.md`](OPERIT_SHARE.md)。
 
+### Memory Core Phase 1（默认关闭）
+
+Migration v7 仅增加五张 Memory 表、严格索引和 evidence 不可变 trigger，不修改
+v1–v6 表或既有消息。
+Phase 1 不调用模型、不自动扫描历史、不向 prompt 注入记忆，也不开放 Memory
+HTTP API。完整的数据边界、显式 create/correct/forget、provenance、suppression
+与隐私契约见 [`MEMORY_CORE.md`](MEMORY_CORE.md)。
+
+保持 `MEMORY_CORE_ENABLED=false` 和
+`MEMORY_EXPLICIT_WRITES_ENABLED=false` 时，不应用或校验可选 v7，不需要
+fingerprint profile、Key ID 或 HMAC Secret；Memory-only 表、索引或约束缺失/
+损坏不会阻塞 v1–v6 核心 readiness，且会安全报告 `memory_core=false`。这只隔离
+optional v7：startup 与 `/readyz` 始终使用同一个严格 v1–v6 validator 验证
+migration markers、tables/columns、PK/default/CHECK/FK、unique/partial indexes、
+explicit indexes 和 trigger 集合；任何核心缺失或损坏均 fail closed 为
+`core_schema_invalid`，不会用 `CREATE TABLE IF NOT EXISTS` 静默重建。只有在
+后续独立阶段启用显式写入时，才设置稳定的
+`MEMORY_FINGERPRINT_KEY_ID`，并创建一把与 relay、Telegram、Kelivo、
+Operit、模型、审计和 API-loop 凭据均不同的专用
+`MEMORY_FINGERPRINT_HMAC_SECRET`。
+
+Phase 1 的威胁模型把与 backend 同处一个 Python 解释器、可 import 生产模块并执行
+任意 Python 的仓库代码、composition root，以及经代码审查进入生产的内部模块视为
+可信计算基。HTTP、Telegram、Kelivo、Operit、Galatea 客户端输入，canonical
+正文/metadata、Memory 正文、外部 URL、工具指令、prompt injection、可能损坏或
+伪造的数据库状态，以及重放、并发、超时和网络不确定结果均不可信。
+
+Python 模块私有变量、下划线名称、闭包和对象 identity 不是针对任意同进程代码
+执行者的安全隔离边界。Runtime Policy、Privileged Actions 与 Action Capability
+用于建立清晰的应用组合边界、防止普通路径误接线、绑定具体动作、拒绝外部伪造/
+篡改/过期/重放，并保证一次消费和数据库事务原子性；它们不是同进程 Python
+sandbox。未来若要隔离不可信内部组件，必须改用独立进程/服务、独立凭据与 OS 级
+边界。本次威胁模型校正不削弱任何外部输入、数据完整性、并发或隐私边界。
+
+应用启动时只允许通过正式 deployment loader 执行一次
+`bootstrap_memory_runtime_from_environment(...)`。它冻结不可变 Runtime Policy
+并生成独立的进程级随机 Action HMAC；重复 bootstrap 稳定拒绝，启动后修改环境
+变量不能替换既有 authority 或 policy。`MemoryStore` 不再接受调用方提供的
+Memory config；composition root 将该进程 bootstrap 创建的 authority 交给
+Store。这是可信进程内的组合与防误用控制，不是针对任意同进程 Python 的隔离。
+
+普通 `MemoryReadService` 只有 readiness、受限读取与 provenance 查询，没有
+create/correct/forget。写操作只存在于语义固定的 `PrivilegedMemoryActions`：
+显式 user remember/correct/forget、确认 project decision、记录 assistant
+experience。正式 App 只保留 Read Service；privileged actions/runtime authority
+不在其独立只读 query object 的对象图中，也不会放入 HTTP route、`app.state`、
+Telegram、Kelivo、Operit 或 Galatea adapter。
+
+每次 privileged action 即时签发短期、一次性、完整绑定的 Action Capability，
+绑定 action ID/type、canonical reference、kind、scope、规范化正文、
+sensitivity、必要的 memory key、版本和有效期。Store 在最终
+`BEGIN IMMEDIATE` 事务内重新计算绑定并用 constant-time HMAC 验证，随后验证
+profile/canonical provenance、计算 fingerprint、检查 suppression 并原子写入。
+调用方不能传入 fingerprint、policy flag、evidence semantics、channel/source
+或 role；普通 canonical row 本身没有 grant。生产签发与验证均在内部直接读取
+`time.monotonic_ns()`，不接受调用方 clock/`now_ns`。Phase 1 固定 TTL 上限为
+30 秒；future-issued、过期、顺序错误、超过 TTL，以及负数、布尔、非整数和超大
+时间字段都会被稳定拒绝，精确落在签发时刻或到期时刻的边界仍有效。
+
+首次成功写入会在同一个 `BEGIN IMMEDIATE` 事务内创建唯一 fingerprint profile、
+带唯一 action ID/type/binding version 的不可变 evidence event、memory item 与
+source；capability/policy/provenance/后续写入失败不会留下 profile 或 event，
+失败动作不会被错误消费。suppression 命中不会留下 event/profile 孤儿，但该
+一次性 capability 会在当前进程耗尽。额外、损坏、缺失但已有 Memory 状态或配置不匹配的 profile
+均使 readiness 与写入 fail closed。Key ID、Secret verifier、
+normalization version 或 fingerprint/domain version 任一不匹配都会使 Memory
+写入和其 readiness fail closed。Phase 1 不支持无迁移直接轮换 Secret 或更改
+normalization；这些变更必须由单独审查的显式迁移处理。
+
+Evidence 只由语义固定的 privileged internal action API 创建，并在同一事务立即
+绑定；evidence event 是成功 action 的不可变审计记录，不是可复用 grant。没有
+通用 event 创建器，也不能跨 action/content/kind/scope/sensitivity/memory key
+复用 capability；能力过期、重复消费或进程重启后均失效。当前 Phase 1
+未把这些 action 接入 Telegram、Kelivo、Operit 或 Galatea 聊天路径。普通旧
+canonical message 默认不授予 Memory 写入，也不从普通历史自动判断玩笑/虚构。
+Telegram/Kelivo canonical meta 缺失、null 或空 `source` 会规范化为 `""`；
+channel 仍要求安全非空，Operit 的非空 `operit` source 保持不变。
+同正文 reclassification 只能按 `normal < sensitive < restricted` 上调。
+
+部署包含 v7 的代码前应创建一致的 SQLite 备份。v7 是纯加法，关闭 Memory
+功能后旧 v6 应用代码可继续使用既有表；这属于应用回滚，不会移除 v7 表。
+如需物理 schema downgrade，应恢复上线前整库备份，不得只删除 migration
+marker 或手工拆表。
+
+本轮威胁模型校正与 capability 时间验证修复已实现，但聚焦独立复审尚未完成；
+不得声称所有 finding 已关闭。PR 必须继续保持 Draft，不得 merge 或部署。
+
 ### Kelivo OpenAI-compatible 非流式 API（可选）
 
 Kelivo 默认关闭。只有设置 `KELIVO_ENABLED=true`、一把全新的

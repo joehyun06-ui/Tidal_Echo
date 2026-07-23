@@ -37,32 +37,55 @@ def connect(path: str) -> sqlite3.Connection:
     return conn
 
 
-def _migration_001(conn: sqlite3.Connection) -> None:
-    statements = (
-        """CREATE TABLE channel_accounts (
+SCHEMA_MIGRATIONS_DDL = """CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL)"""
+
+RELAY_TABLE_DDL: dict[str, str] = {
+    "messages": """CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            meta TEXT NOT NULL DEFAULT '{}')""",
+    "push_subscriptions": """CREATE TABLE push_subscriptions (
+            endpoint TEXT PRIMARY KEY,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            ua TEXT,
+            created TEXT NOT NULL,
+            last_ok TEXT)""",
+}
+
+CORE_V1_TABLE_DDL: dict[str, str] = {
+    "channel_accounts": """CREATE TABLE channel_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(channel, external_account_id))""",
-        """CREATE TABLE channel_conversations (
+    "channel_conversations": """CREATE TABLE channel_conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, external_conversation_id TEXT NOT NULL,
             conversation_type TEXT NOT NULL, api_session TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(channel, external_account_id, external_conversation_id))""",
-        """CREATE TABLE inbound_events (
+    "inbound_events": """CREATE TABLE inbound_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, update_id TEXT NOT NULL, event_type TEXT NOT NULL,
             status TEXT NOT NULL, error_category TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(channel, external_account_id, update_id))""",
-        """CREATE TABLE external_messages (
+    "external_messages": """CREATE TABLE external_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, external_conversation_id TEXT NOT NULL,
             external_message_id TEXT NOT NULL, direction TEXT NOT NULL,
             canonical_message_id INTEGER, generation_id TEXT, status TEXT NOT NULL,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(channel, external_account_id, external_conversation_id, external_message_id))""",
-        """CREATE TABLE generation_jobs (
+    "generation_jobs": """CREATE TABLE generation_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, inbound_message_id INTEGER NOT NULL UNIQUE,
             canonical_message_id INTEGER NOT NULL, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, external_conversation_id TEXT NOT NULL,
@@ -71,37 +94,34 @@ def _migration_001(conn: sqlite3.Connection) -> None:
             attempt_count INTEGER NOT NULL DEFAULT 0, error_category TEXT,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             FOREIGN KEY(inbound_message_id) REFERENCES external_messages(id))""",
-        """CREATE TABLE delivery_attempts (
+    "delivery_attempts": """CREATE TABLE delivery_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, generation_job_id INTEGER NOT NULL,
             idempotency_key TEXT NOT NULL UNIQUE, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, external_conversation_id TEXT NOT NULL,
             payload_text TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
             external_message_id TEXT, error_category TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             FOREIGN KEY(generation_job_id) REFERENCES generation_jobs(id))""",
-        """CREATE TABLE channel_audit_events (
+    "channel_audit_events": """CREATE TABLE channel_audit_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, channel TEXT NOT NULL,
             external_id_hash TEXT, request_job_id TEXT, status TEXT NOT NULL, error_category TEXT,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
-        """CREATE TABLE channel_rate_limits (
+    "channel_rate_limits": """CREATE TABLE channel_rate_limits (
             id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
             external_account_id TEXT NOT NULL, external_user_id TEXT NOT NULL,
             window_started_at TEXT NOT NULL, event_count INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(channel, external_account_id, external_user_id))""",
+}
+
+CORE_V1_INDEX_DDL: dict[str, str] = {
+    "idx_generation_jobs_status_lease":
         "CREATE INDEX idx_generation_jobs_status_lease ON generation_jobs(status, lease_until, id)",
+    "idx_delivery_attempts_status":
         "CREATE INDEX idx_delivery_attempts_status ON delivery_attempts(status, id)",
-    )
-    for statement in statements:
-        conn.execute(statement)
+}
 
-
-def _migration_002(conn: sqlite3.Connection) -> None:
-    # v1 is immutable. New state-machine columns and tables live in v2.
-    conn.execute("ALTER TABLE generation_jobs ADD COLUMN dispatch_started_at TEXT")
-    conn.execute("ALTER TABLE generation_jobs ADD COLUMN awaiting_reply_since TEXT")
-    conn.execute("ALTER TABLE delivery_attempts ADD COLUMN retry_after_seconds INTEGER")
-    conn.execute("ALTER TABLE channel_conversations ADD COLUMN external_user_id TEXT")
-    conn.execute("""CREATE TABLE IF NOT EXISTS telegram_completions (
+CORE_V2_TABLE_DDL: dict[str, str] = {
+    "telegram_completions": """CREATE TABLE telegram_completions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         completion_identity TEXT NOT NULL UNIQUE,
         generation_job_id INTEGER NOT NULL UNIQUE,
@@ -109,8 +129,8 @@ def _migration_002(conn: sqlite3.Connection) -> None:
         delivery_id INTEGER NOT NULL UNIQUE,
         created_at TEXT NOT NULL,
         FOREIGN KEY(generation_job_id) REFERENCES generation_jobs(id),
-        FOREIGN KEY(delivery_id) REFERENCES delivery_attempts(id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS delivery_parts (
+        FOREIGN KEY(delivery_id) REFERENCES delivery_attempts(id))""",
+    "delivery_parts": """CREATE TABLE delivery_parts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         delivery_id INTEGER NOT NULL,
         part_index INTEGER NOT NULL,
@@ -125,8 +145,28 @@ def _migration_002(conn: sqlite3.Connection) -> None:
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(delivery_id, part_index),
-        FOREIGN KEY(delivery_id) REFERENCES delivery_attempts(id))""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_parts_status ON delivery_parts(delivery_id,status,part_index)")
+        FOREIGN KEY(delivery_id) REFERENCES delivery_attempts(id))""",
+}
+
+CORE_V2_INDEX_DDL: dict[str, str] = {
+    "idx_delivery_parts_status":
+        "CREATE INDEX idx_delivery_parts_status ON delivery_parts(delivery_id,status,part_index)",
+}
+
+
+def _migration_001(conn: sqlite3.Connection) -> None:
+    for statement in (*CORE_V1_TABLE_DDL.values(), *CORE_V1_INDEX_DDL.values()):
+        conn.execute(statement)
+
+
+def _migration_002(conn: sqlite3.Connection) -> None:
+    # v1 is immutable. New state-machine columns and tables live in v2.
+    conn.execute("ALTER TABLE generation_jobs ADD COLUMN dispatch_started_at TEXT")
+    conn.execute("ALTER TABLE generation_jobs ADD COLUMN awaiting_reply_since TEXT")
+    conn.execute("ALTER TABLE delivery_attempts ADD COLUMN retry_after_seconds INTEGER")
+    conn.execute("ALTER TABLE channel_conversations ADD COLUMN external_user_id TEXT")
+    for statement in (*CORE_V2_TABLE_DDL.values(), *CORE_V2_INDEX_DDL.values()):
+        conn.execute(statement)
 
 
 KELIVO_V3_TABLE_DDL: dict[str, str] = {
@@ -413,6 +453,182 @@ def _migration_006(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+MEMORY_TABLE_DDL: dict[str, str] = {
+    "memory_items": """CREATE TABLE memory_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_key TEXT NOT NULL UNIQUE
+                CHECK(length(memory_key) BETWEEN 32 AND 96
+                      AND memory_key NOT GLOB '*[^A-Za-z0-9_-]*'),
+            kind TEXT NOT NULL CHECK(kind IN
+                ('user_preference','user_profile','relationship','shared_episode',
+                 'project','decision','task_or_progress','assistant_experience')),
+            scope_type TEXT NOT NULL CHECK(scope_type IN
+                ('global_user','channel','session','project')),
+            scope_ref TEXT NOT NULL,
+            normalized_content TEXT,
+            normalized_fingerprint BLOB,
+            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version > 0),
+            status TEXT NOT NULL CHECK(status IN
+                ('candidate','active','superseded','forgotten','rejected')),
+            explicitness TEXT NOT NULL CHECK(explicitness IN ('explicit','inferred')),
+            confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            sensitivity TEXT NOT NULL CHECK(sensitivity IN ('normal','sensitive','restricted')),
+            first_observed_at TEXT NOT NULL,
+            last_confirmed_at TEXT NOT NULL,
+            superseded_by_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK(
+                (scope_type='global_user' AND scope_ref='')
+                OR
+                (scope_type!='global_user' AND length(scope_ref) BETWEEN 1 AND 128
+                 AND scope_ref NOT GLOB '*[^A-Za-z0-9._:-]*')
+            ),
+            CHECK(
+                (status IN ('candidate','active','rejected')
+                 AND normalized_content IS NOT NULL AND length(normalized_content)>0
+                 AND normalized_fingerprint IS NOT NULL
+                 AND typeof(normalized_fingerprint)='blob' AND length(normalized_fingerprint)=32
+                 AND superseded_by_id IS NULL)
+                OR
+                (status='superseded'
+                 AND normalized_content IS NOT NULL AND length(normalized_content)>0
+                 AND normalized_fingerprint IS NOT NULL
+                 AND typeof(normalized_fingerprint)='blob' AND length(normalized_fingerprint)=32
+                 AND superseded_by_id IS NOT NULL)
+                OR
+                (status='forgotten' AND normalized_content IS NULL
+                 AND normalized_fingerprint IS NULL AND superseded_by_id IS NULL)
+            ),
+            CHECK(superseded_by_id IS NULL OR superseded_by_id != id),
+            FOREIGN KEY(superseded_by_id) REFERENCES memory_items(id) ON DELETE RESTRICT)""",
+    "memory_fingerprint_profile": """CREATE TABLE memory_fingerprint_profile (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            key_id TEXT NOT NULL
+                CHECK(length(key_id) BETWEEN 1 AND 64
+                      AND key_id NOT GLOB '*[^A-Za-z0-9._:-]*'),
+            key_check BLOB NOT NULL
+                CHECK(typeof(key_check)='blob' AND length(key_check)=32),
+            normalization_version INTEGER NOT NULL CHECK(normalization_version > 0),
+            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)""",
+    "memory_evidence_events": """CREATE TABLE memory_evidence_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_message_id INTEGER NOT NULL UNIQUE,
+            action_id TEXT NOT NULL UNIQUE
+                CHECK(length(action_id) BETWEEN 24 AND 96
+                      AND action_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+            action_type TEXT NOT NULL CHECK(action_type IN
+                ('remember_explicit_user','confirm_project_decision',
+                 'correct_explicit_user','forget_explicit_user',
+                 'record_assistant_experience')),
+            action_binding_version INTEGER NOT NULL
+                CHECK(action_binding_version=1),
+            evidence_type TEXT NOT NULL CHECK(evidence_type IN
+                ('explicit_user_memory','confirmed_user_fact',
+                 'confirmed_project_decision','explicit_user_correction',
+                 'user_forget','assistant_experience')),
+            reality_scope TEXT NOT NULL CHECK(reality_scope IN
+                ('real','roleplay','joke','fiction','third_party')),
+            subject_scope TEXT NOT NULL CHECK(subject_scope IN
+                ('user','project','assistant','third_party')),
+            created_by_component TEXT NOT NULL CHECK(created_by_component IN
+                ('memory_admin','web_adapter','telegram_adapter','kelivo_adapter',
+                 'operit_adapter','galatea_adapter','assistant_runtime')),
+            created_at TEXT NOT NULL,
+            UNIQUE(id,canonical_message_id,evidence_type),
+            FOREIGN KEY(canonical_message_id) REFERENCES messages(id) ON DELETE RESTRICT)""",
+    "memory_sources": """CREATE TABLE memory_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            canonical_message_id INTEGER NOT NULL,
+            evidence_event_id INTEGER NOT NULL,
+            channel TEXT NOT NULL
+                CHECK(length(channel) BETWEEN 1 AND 64
+                      AND channel NOT GLOB '*[^A-Za-z0-9._:-]*'),
+            source TEXT NOT NULL DEFAULT ''
+                CHECK(length(source)<=64
+                      AND source NOT GLOB '*[^A-Za-z0-9._:-]*'),
+            evidence_role TEXT NOT NULL CHECK(evidence_role IN ('user','assistant')),
+            evidence_type TEXT NOT NULL CHECK(evidence_type IN
+                ('explicit_user_memory','confirmed_user_fact',
+                 'confirmed_project_decision','explicit_user_correction',
+                 'user_forget','assistant_experience')),
+            created_at TEXT NOT NULL,
+            UNIQUE(memory_id,evidence_event_id),
+            FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE RESTRICT,
+            FOREIGN KEY(canonical_message_id) REFERENCES messages(id) ON DELETE RESTRICT,
+            FOREIGN KEY(evidence_event_id,canonical_message_id,evidence_type)
+                REFERENCES memory_evidence_events(id,canonical_message_id,evidence_type)
+                ON DELETE RESTRICT)""",
+    "memory_suppressions": """CREATE TABLE memory_suppressions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_type TEXT NOT NULL CHECK(scope_type IN
+                ('global_user','channel','session','project')),
+            scope_ref TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN
+                ('user_preference','user_profile','relationship','shared_episode',
+                 'project','decision','task_or_progress','assistant_experience')),
+            normalized_fingerprint BLOB NOT NULL
+                CHECK(typeof(normalized_fingerprint)='blob'
+                      AND length(normalized_fingerprint)=32),
+            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version > 0),
+            reason_category TEXT NOT NULL CHECK(reason_category IN
+                ('user_forget','user_reject','privacy_policy','corrected_obsolete')),
+            created_at TEXT NOT NULL,
+            CHECK(
+                (scope_type='global_user' AND scope_ref='')
+                OR
+                (scope_type!='global_user' AND length(scope_ref) BETWEEN 1 AND 128
+                 AND scope_ref NOT GLOB '*[^A-Za-z0-9._:-]*')
+            ),
+            UNIQUE(scope_type,scope_ref,kind,fingerprint_version,normalized_fingerprint))""",
+}
+
+MEMORY_INDEX_DDL: dict[str, str] = {
+    "idx_memory_items_active_lookup":
+        "CREATE INDEX idx_memory_items_active_lookup "
+        "ON memory_items(status,scope_type,scope_ref,kind,sensitivity,last_confirmed_at,id)",
+    "idx_memory_items_superseded_by":
+        "CREATE INDEX idx_memory_items_superseded_by ON memory_items(superseded_by_id)",
+    "idx_memory_items_live_fingerprint":
+        "CREATE UNIQUE INDEX idx_memory_items_live_fingerprint "
+        "ON memory_items(scope_type,scope_ref,kind,fingerprint_version,normalized_fingerprint) "
+        "WHERE status IN ('active','candidate')",
+    "idx_memory_sources_memory":
+        "CREATE INDEX idx_memory_sources_memory ON memory_sources(memory_id,id)",
+    "idx_memory_sources_canonical":
+        "CREATE INDEX idx_memory_sources_canonical ON memory_sources(canonical_message_id,id)",
+}
+
+MEMORY_TRIGGER_DDL: dict[str, str] = {
+    "memory_evidence_events_immutable_update":
+        """CREATE TRIGGER memory_evidence_events_immutable_update
+           BEFORE UPDATE ON memory_evidence_events
+           BEGIN
+             SELECT RAISE(ABORT,'memory_evidence_event_immutable');
+           END""",
+    "memory_evidence_events_immutable_delete":
+        """CREATE TRIGGER memory_evidence_events_immutable_delete
+           BEFORE DELETE ON memory_evidence_events
+           BEGIN
+             SELECT RAISE(ABORT,'memory_evidence_event_immutable');
+           END""",
+}
+
+
+def _migration_007(conn: sqlite3.Connection) -> None:
+    """Add the disabled-by-default, explicit derived Memory Core foundation."""
+    validate_heartbeat_hardening_schema(conn)
+    for statement in (
+        *MEMORY_TABLE_DDL.values(),
+        *MEMORY_INDEX_DDL.values(),
+        *MEMORY_TRIGGER_DDL.values(),
+    ):
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -471,7 +687,7 @@ def _sql_fingerprint(sql: str) -> tuple[str, ...]:
             tokens.append(operator)
             index += 2
             continue
-        if char in "(),=><+-*/":
+        if char in "(),=><+-*/;":
             tokens.append(char)
             index += 1
             continue
@@ -815,6 +1031,634 @@ def validate_heartbeat_hardening_schema(conn: sqlite3.Connection) -> None:
             raise sqlite3.DatabaseError(f"invalid heartbeat hardening index fingerprint: {name}")
 
 
+def validate_core_schema_v1_v6(
+    conn: sqlite3.Connection,
+    *,
+    require_relay_tables: bool = False,
+) -> None:
+    """Validate every v1-v6 migration-owned object and, optionally, relay tables."""
+    migration_columns = {
+        "version": ("INTEGER", 0, None, 1),
+        "name": ("TEXT", 1, None, 0),
+        "status": ("TEXT", 1, None, 0),
+        "created_at": ("TEXT", 1, None, 0),
+        "updated_at": ("TEXT", 1, None, 0),
+    }
+    expected_columns = {
+        "channel_accounts": {
+            "id": ("INTEGER", 0, None, 1),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "status": ("TEXT", 1, "'active'", 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "channel_conversations": {
+            "id": ("INTEGER", 0, None, 1),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "external_conversation_id": ("TEXT", 1, None, 0),
+            "conversation_type": ("TEXT", 1, None, 0),
+            "api_session": ("TEXT", 1, None, 0),
+            "status": ("TEXT", 1, "'active'", 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+            "external_user_id": ("TEXT", 0, None, 0),
+        },
+        "inbound_events": {
+            "id": ("INTEGER", 0, None, 1),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "update_id": ("TEXT", 1, None, 0),
+            "event_type": ("TEXT", 1, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "error_category": ("TEXT", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "external_messages": {
+            "id": ("INTEGER", 0, None, 1),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "external_conversation_id": ("TEXT", 1, None, 0),
+            "external_message_id": ("TEXT", 1, None, 0),
+            "direction": ("TEXT", 1, None, 0),
+            "canonical_message_id": ("INTEGER", 0, None, 0),
+            "generation_id": ("TEXT", 0, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "generation_jobs": {
+            "id": ("INTEGER", 0, None, 1),
+            "inbound_message_id": ("INTEGER", 1, None, 0),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "external_conversation_id": ("TEXT", 1, None, 0),
+            "api_session": ("TEXT", 1, None, 0),
+            "stream_id": ("TEXT", 0, None, 0),
+            "generation_id": ("TEXT", 0, None, 0),
+            "reply_to": ("TEXT", 0, None, 0),
+            "reply_message_id": ("INTEGER", 0, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "lease_until": ("TEXT", 0, None, 0),
+            "attempt_count": ("INTEGER", 1, "0", 0),
+            "error_category": ("TEXT", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+            "dispatch_started_at": ("TEXT", 0, None, 0),
+            "awaiting_reply_since": ("TEXT", 0, None, 0),
+        },
+        "delivery_attempts": {
+            "id": ("INTEGER", 0, None, 1),
+            "generation_job_id": ("INTEGER", 1, None, 0),
+            "idempotency_key": ("TEXT", 1, None, 0),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "external_conversation_id": ("TEXT", 1, None, 0),
+            "payload_text": ("TEXT", 1, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "attempt_count": ("INTEGER", 1, "0", 0),
+            "external_message_id": ("TEXT", 0, None, 0),
+            "error_category": ("TEXT", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+            "retry_after_seconds": ("INTEGER", 0, None, 0),
+        },
+        "channel_audit_events": {
+            "id": ("INTEGER", 0, None, 1),
+            "event_type": ("TEXT", 1, None, 0),
+            "channel": ("TEXT", 1, None, 0),
+            "external_id_hash": ("TEXT", 0, None, 0),
+            "request_job_id": ("TEXT", 0, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "error_category": ("TEXT", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "channel_rate_limits": {
+            "id": ("INTEGER", 0, None, 1),
+            "channel": ("TEXT", 1, None, 0),
+            "external_account_id": ("TEXT", 1, None, 0),
+            "external_user_id": ("TEXT", 1, None, 0),
+            "window_started_at": ("TEXT", 1, None, 0),
+            "event_count": ("INTEGER", 1, None, 0),
+            "status": ("TEXT", 1, "'active'", 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "telegram_completions": {
+            "id": ("INTEGER", 0, None, 1),
+            "completion_identity": ("TEXT", 1, None, 0),
+            "generation_job_id": ("INTEGER", 1, None, 0),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "delivery_id": ("INTEGER", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+        "delivery_parts": {
+            "id": ("INTEGER", 0, None, 1),
+            "delivery_id": ("INTEGER", 1, None, 0),
+            "part_index": ("INTEGER", 1, None, 0),
+            "total_parts": ("INTEGER", 1, None, 0),
+            "text_hash": ("TEXT", 1, None, 0),
+            "text_length": ("INTEGER", 1, None, 0),
+            "payload_text": ("TEXT", 1, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "telegram_message_id": ("TEXT", 0, None, 0),
+            "error_category": ("TEXT", 0, None, 0),
+            "retry_after_seconds": ("INTEGER", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+    }
+    expected_indexes = {
+        "channel_accounts": {
+            "sqlite_autoindex_channel_accounts_1":
+                (True, "u", False, ("channel", "external_account_id")),
+        },
+        "channel_conversations": {
+            "sqlite_autoindex_channel_conversations_1":
+                (True, "u", False, ("api_session",)),
+            "sqlite_autoindex_channel_conversations_2":
+                (True, "u", False, (
+                    "channel", "external_account_id", "external_conversation_id",
+                )),
+        },
+        "inbound_events": {
+            "sqlite_autoindex_inbound_events_1":
+                (True, "u", False, (
+                    "channel", "external_account_id", "update_id",
+                )),
+        },
+        "external_messages": {
+            "sqlite_autoindex_external_messages_1":
+                (True, "u", False, (
+                    "channel", "external_account_id",
+                    "external_conversation_id", "external_message_id",
+                )),
+        },
+        "generation_jobs": {
+            "sqlite_autoindex_generation_jobs_1":
+                (True, "u", False, ("inbound_message_id",)),
+            "sqlite_autoindex_generation_jobs_2":
+                (True, "u", False, ("generation_id",)),
+            "idx_generation_jobs_status_lease":
+                (False, "c", False, ("status", "lease_until", "id")),
+        },
+        "delivery_attempts": {
+            "sqlite_autoindex_delivery_attempts_1":
+                (True, "u", False, ("idempotency_key",)),
+            "idx_delivery_attempts_status":
+                (False, "c", False, ("status", "id")),
+        },
+        "channel_audit_events": {},
+        "channel_rate_limits": {
+            "sqlite_autoindex_channel_rate_limits_1":
+                (True, "u", False, (
+                    "channel", "external_account_id", "external_user_id",
+                )),
+        },
+        "telegram_completions": {
+            "sqlite_autoindex_telegram_completions_1":
+                (True, "u", False, ("completion_identity",)),
+            "sqlite_autoindex_telegram_completions_2":
+                (True, "u", False, ("generation_job_id",)),
+            "sqlite_autoindex_telegram_completions_3":
+                (True, "u", False, ("canonical_message_id",)),
+            "sqlite_autoindex_telegram_completions_4":
+                (True, "u", False, ("delivery_id",)),
+        },
+        "delivery_parts": {
+            "sqlite_autoindex_delivery_parts_1":
+                (True, "u", False, ("delivery_id", "part_index")),
+            "idx_delivery_parts_status":
+                (False, "c", False, (
+                    "delivery_id", "status", "part_index",
+                )),
+        },
+    }
+    expected_fks = {
+        "channel_accounts": set(),
+        "channel_conversations": set(),
+        "inbound_events": set(),
+        "external_messages": set(),
+        "generation_jobs": {
+            (
+                "inbound_message_id", "external_messages", "id",
+                "NO ACTION", "NO ACTION", "NONE",
+            ),
+        },
+        "delivery_attempts": {
+            (
+                "generation_job_id", "generation_jobs", "id",
+                "NO ACTION", "NO ACTION", "NONE",
+            ),
+        },
+        "channel_audit_events": set(),
+        "channel_rate_limits": set(),
+        "telegram_completions": {
+            (
+                "generation_job_id", "generation_jobs", "id",
+                "NO ACTION", "NO ACTION", "NONE",
+            ),
+            (
+                "delivery_id", "delivery_attempts", "id",
+                "NO ACTION", "NO ACTION", "NONE",
+            ),
+        },
+        "delivery_parts": {
+            (
+                "delivery_id", "delivery_attempts", "id",
+                "NO ACTION", "NO ACTION", "NONE",
+            ),
+        },
+    }
+
+    def validate_columns(table: str, expected: dict) -> None:
+        rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if any(int(row["hidden"]) != 0 for row in rows):
+            raise sqlite3.DatabaseError("invalid core schema")
+        actual = {
+            row["name"]: (
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in rows
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError("invalid core schema")
+
+    validate_columns("schema_migrations", migration_columns)
+    migration_index_rows = conn.execute(
+        "PRAGMA index_list(schema_migrations)"
+    ).fetchall()
+    if migration_index_rows:
+        raise sqlite3.DatabaseError("invalid core schema")
+    migration_sql = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type='table' AND name='schema_migrations'"""
+    ).fetchone()
+    if (
+        migration_sql is None
+        or _sql_fingerprint(str(migration_sql["sql"]))
+        != _sql_fingerprint(SCHEMA_MIGRATIONS_DDL)
+    ):
+        raise sqlite3.DatabaseError("invalid core schema")
+    for table, expected in expected_columns.items():
+        validate_columns(table, expected)
+    for table, expected in expected_indexes.items():
+        actual_rows = {
+            row["name"]: row
+            for row in conn.execute(f"PRAGMA index_list({table})")
+        }
+        if set(actual_rows) != set(expected):
+            raise sqlite3.DatabaseError("invalid core schema")
+        for name, (unique, origin, partial, columns) in expected.items():
+            row = actual_rows[name]
+            if (
+                bool(row["unique"]), row["origin"], bool(row["partial"])
+            ) != (unique, origin, partial):
+                raise sqlite3.DatabaseError("invalid core schema")
+            _validate_index_xinfo(conn, name, columns)
+    for table, expected in expected_fks.items():
+        actual = {
+            (
+                row["from"], row["table"], row["to"],
+                row["on_update"], row["on_delete"], row["match"],
+            )
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError("invalid core schema")
+
+    final_table_ddl = dict(CORE_V1_TABLE_DDL)
+    final_table_ddl["channel_conversations"] = (
+        CORE_V1_TABLE_DDL["channel_conversations"].replace(
+            "updated_at TEXT NOT NULL,\n            UNIQUE",
+            "updated_at TEXT NOT NULL, external_user_id TEXT,\n            UNIQUE",
+        )
+    )
+    final_table_ddl["generation_jobs"] = (
+        CORE_V1_TABLE_DDL["generation_jobs"].replace(
+            "updated_at TEXT NOT NULL,\n            FOREIGN KEY",
+            "updated_at TEXT NOT NULL, dispatch_started_at TEXT, "
+            "awaiting_reply_since TEXT,\n            FOREIGN KEY",
+        )
+    )
+    final_table_ddl["delivery_attempts"] = (
+        CORE_V1_TABLE_DDL["delivery_attempts"].replace(
+            "updated_at TEXT NOT NULL,\n            FOREIGN KEY",
+            "updated_at TEXT NOT NULL, retry_after_seconds INTEGER,\n"
+            "            FOREIGN KEY",
+        )
+    )
+    final_table_ddl.update(CORE_V2_TABLE_DDL)
+    for table, expected_sql in final_table_ddl.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if (
+            row is None
+            or _sql_fingerprint(str(row["sql"]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError("invalid core schema")
+    expected_index_ddl = {**CORE_V1_INDEX_DDL, **CORE_V2_INDEX_DDL}
+    for name, expected_sql in expected_index_ddl.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if (
+            row is None
+            or _sql_fingerprint(str(row["sql"]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError("invalid core schema")
+
+    marker_rows = conn.execute(
+        """SELECT version,name,status FROM schema_migrations
+           WHERE version BETWEEN 1 AND 6 ORDER BY version"""
+    ).fetchall()
+    expected_markers = [
+        (version, name, "applied")
+        for version, name, _apply in CORE_MIGRATIONS
+    ]
+    if [tuple(row) for row in marker_rows] != expected_markers:
+        raise sqlite3.DatabaseError("invalid core schema")
+
+    core_tables = set(expected_columns)
+    core_trigger_rows = conn.execute(
+        "SELECT tbl_name FROM sqlite_master WHERE type='trigger'"
+    ).fetchall()
+    if any(row["tbl_name"] in core_tables for row in core_trigger_rows):
+        raise sqlite3.DatabaseError("invalid core schema")
+
+    validate_kelivo_schema(conn, version=4)
+    validate_heartbeat_schema(conn)
+    validate_heartbeat_hardening_schema(conn)
+
+    if require_relay_tables:
+        relay_columns = {
+            "messages": {
+                "id": ("INTEGER", 0, None, 1),
+                "ts": ("TEXT", 1, None, 0),
+                "direction": ("TEXT", 1, None, 0),
+                "kind": ("TEXT", 1, None, 0),
+                "text": ("TEXT", 1, None, 0),
+                "meta": ("TEXT", 1, "'{}'", 0),
+            },
+            "push_subscriptions": {
+                "endpoint": ("TEXT", 0, None, 1),
+                "p256dh": ("TEXT", 1, None, 0),
+                "auth": ("TEXT", 1, None, 0),
+                "ua": ("TEXT", 0, None, 0),
+                "created": ("TEXT", 1, None, 0),
+                "last_ok": ("TEXT", 0, None, 0),
+            },
+        }
+        for table, expected in relay_columns.items():
+            validate_columns(table, expected)
+            actual_fks = conn.execute(
+                f"PRAGMA foreign_key_list({table})"
+            ).fetchall()
+            if actual_fks:
+                raise sqlite3.DatabaseError("invalid core schema")
+        if conn.execute("PRAGMA index_list(messages)").fetchall():
+            raise sqlite3.DatabaseError("invalid core schema")
+        push_indexes = {
+            row["name"]: row
+            for row in conn.execute("PRAGMA index_list(push_subscriptions)")
+        }
+        if set(push_indexes) != {"sqlite_autoindex_push_subscriptions_1"}:
+            raise sqlite3.DatabaseError("invalid core schema")
+        push_index = push_indexes["sqlite_autoindex_push_subscriptions_1"]
+        if (
+            bool(push_index["unique"]),
+            push_index["origin"],
+            bool(push_index["partial"]),
+        ) != (True, "pk", False):
+            raise sqlite3.DatabaseError("invalid core schema")
+        _validate_index_xinfo(
+            conn, "sqlite_autoindex_push_subscriptions_1", ("endpoint",),
+        )
+        for table, expected_sql in RELAY_TABLE_DDL.items():
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if (
+                row is None
+                or _sql_fingerprint(str(row["sql"]))
+                != _sql_fingerprint(expected_sql)
+            ):
+                raise sqlite3.DatabaseError("invalid core schema")
+
+
+def validate_memory_schema(conn: sqlite3.Connection) -> None:
+    """Reject a v7 marker unless the complete Memory Core structure is exact."""
+    expected_columns = {
+        "memory_items": {
+            "id": ("INTEGER", 0, None, 1),
+            "memory_key": ("TEXT", 1, None, 0),
+            "kind": ("TEXT", 1, None, 0),
+            "scope_type": ("TEXT", 1, None, 0),
+            "scope_ref": ("TEXT", 1, None, 0),
+            "normalized_content": ("TEXT", 0, None, 0),
+            "normalized_fingerprint": ("BLOB", 0, None, 0),
+            "fingerprint_version": ("INTEGER", 1, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "explicitness": ("TEXT", 1, None, 0),
+            "confidence": ("REAL", 1, None, 0),
+            "sensitivity": ("TEXT", 1, None, 0),
+            "first_observed_at": ("TEXT", 1, None, 0),
+            "last_confirmed_at": ("TEXT", 1, None, 0),
+            "superseded_by_id": ("INTEGER", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "memory_fingerprint_profile": {
+            "singleton": ("INTEGER", 0, None, 1),
+            "key_id": ("TEXT", 1, None, 0),
+            "key_check": ("BLOB", 1, None, 0),
+            "normalization_version": ("INTEGER", 1, None, 0),
+            "fingerprint_version": ("INTEGER", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "memory_evidence_events": {
+            "id": ("INTEGER", 0, None, 1),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "action_id": ("TEXT", 1, None, 0),
+            "action_type": ("TEXT", 1, None, 0),
+            "action_binding_version": ("INTEGER", 1, None, 0),
+            "evidence_type": ("TEXT", 1, None, 0),
+            "reality_scope": ("TEXT", 1, None, 0),
+            "subject_scope": ("TEXT", 1, None, 0),
+            "created_by_component": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+        "memory_sources": {
+            "id": ("INTEGER", 0, None, 1),
+            "memory_id": ("INTEGER", 1, None, 0),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "evidence_event_id": ("INTEGER", 1, None, 0),
+            "channel": ("TEXT", 1, None, 0),
+            "source": ("TEXT", 1, "''", 0),
+            "evidence_role": ("TEXT", 1, None, 0),
+            "evidence_type": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+        "memory_suppressions": {
+            "id": ("INTEGER", 0, None, 1),
+            "scope_type": ("TEXT", 1, None, 0),
+            "scope_ref": ("TEXT", 1, None, 0),
+            "kind": ("TEXT", 1, None, 0),
+            "normalized_fingerprint": ("BLOB", 1, None, 0),
+            "fingerprint_version": ("INTEGER", 1, None, 0),
+            "reason_category": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+    }
+    for table, expected in expected_columns.items():
+        rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if any(int(row["hidden"]) != 0 for row in rows):
+            raise sqlite3.DatabaseError(f"invalid hidden memory column: {table}")
+        actual = {
+            row["name"]: (
+                str(row["type"]).upper(), int(row["notnull"]), row["dflt_value"], int(row["pk"]),
+            )
+            for row in rows
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid memory schema: {table} columns")
+
+    expected_indexes = {
+        "memory_items": {
+            "sqlite_autoindex_memory_items_1": (
+                True, "u", False, ("memory_key",),
+            ),
+            "idx_memory_items_active_lookup": (
+                False, "c", False,
+                ("status", "scope_type", "scope_ref", "kind", "sensitivity",
+                 "last_confirmed_at", "id"),
+            ),
+            "idx_memory_items_superseded_by": (
+                False, "c", False, ("superseded_by_id",),
+            ),
+            "idx_memory_items_live_fingerprint": (
+                True, "c", True,
+                ("scope_type", "scope_ref", "kind", "fingerprint_version",
+                 "normalized_fingerprint"),
+            ),
+        },
+        "memory_fingerprint_profile": {},
+        "memory_evidence_events": {
+            "sqlite_autoindex_memory_evidence_events_1": (
+                True, "u", False, ("canonical_message_id",),
+            ),
+            "sqlite_autoindex_memory_evidence_events_2": (
+                True, "u", False, ("action_id",),
+            ),
+            "sqlite_autoindex_memory_evidence_events_3": (
+                True, "u", False, ("id", "canonical_message_id", "evidence_type"),
+            ),
+        },
+        "memory_sources": {
+            "sqlite_autoindex_memory_sources_1": (
+                True, "u", False, ("memory_id", "evidence_event_id"),
+            ),
+            "idx_memory_sources_memory": (
+                False, "c", False, ("memory_id", "id"),
+            ),
+            "idx_memory_sources_canonical": (
+                False, "c", False, ("canonical_message_id", "id"),
+            ),
+        },
+        "memory_suppressions": {
+            "sqlite_autoindex_memory_suppressions_1": (
+                True, "u", False,
+                ("scope_type", "scope_ref", "kind", "fingerprint_version",
+                 "normalized_fingerprint"),
+            ),
+        },
+    }
+    for table, expected in expected_indexes.items():
+        actual_rows = {row["name"]: row for row in conn.execute(f"PRAGMA index_list({table})")}
+        if set(actual_rows) != set(expected):
+            raise sqlite3.DatabaseError(f"invalid memory index set: {table}")
+        for name, (unique, origin, partial, columns) in expected.items():
+            row = actual_rows[name]
+            if (bool(row["unique"]), row["origin"], bool(row["partial"])) != (
+                unique, origin, partial,
+            ):
+                raise sqlite3.DatabaseError(f"invalid memory index attributes: {name}")
+            _validate_index_xinfo(conn, name, columns)
+
+    expected_fks = {
+        "memory_items": {
+            ("superseded_by_id", "memory_items", "id", "NO ACTION", "RESTRICT", "NONE"),
+        },
+        "memory_fingerprint_profile": set(),
+        "memory_evidence_events": {
+            ("canonical_message_id", "messages", "id", "NO ACTION", "RESTRICT", "NONE"),
+        },
+        "memory_sources": {
+            ("memory_id", "memory_items", "id", "NO ACTION", "RESTRICT", "NONE"),
+            ("canonical_message_id", "messages", "id", "NO ACTION", "RESTRICT", "NONE"),
+            (
+                "evidence_event_id", "memory_evidence_events", "id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+            (
+                "canonical_message_id", "memory_evidence_events", "canonical_message_id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+            (
+                "evidence_type", "memory_evidence_events", "evidence_type",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+        },
+        "memory_suppressions": set(),
+    }
+    for table, expected in expected_fks.items():
+        actual = {
+            (row["from"], row["table"], row["to"], row["on_update"], row["on_delete"], row["match"])
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid memory foreign key: {table}")
+
+    for table, expected_sql in MEMORY_TABLE_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid memory table fingerprint: {table}")
+    for name, expected_sql in MEMORY_INDEX_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,),
+        ).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid memory index fingerprint: {name}")
+    actual_triggers = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            """SELECT name,sql FROM sqlite_master
+               WHERE type='trigger' AND tbl_name='memory_evidence_events'"""
+        )
+    }
+    if set(actual_triggers) != set(MEMORY_TRIGGER_DDL):
+        raise sqlite3.DatabaseError("invalid memory trigger set")
+    for name, expected_sql in MEMORY_TRIGGER_DDL.items():
+        if _sql_fingerprint(str(actual_triggers[name])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid memory trigger fingerprint: {name}")
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "telegram_private_text_mvp", _migration_001),
     (2, "telegram_reliability", _migration_002),
@@ -822,11 +1666,15 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
     (4, "kelivo_automatic_idempotency", _migration_004),
     (5, "dylan_heartbeat_foundation", _migration_005),
     (6, "dylan_heartbeat_hardening", _migration_006),
+    (7, "explicit_memory_core_foundation", _migration_007),
 )
+CORE_MIGRATIONS = MIGRATIONS[:6]
 
 
 def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sqlite3.Connection], None]]] = MIGRATIONS) -> None:
     """Apply versions under a SQLite write lock; concurrent starters re-read state."""
+    migrations = tuple(migrations)
+    requested_latest = max((version for version, _name, _apply in migrations), default=0)
     with connect(path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -845,15 +1693,14 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                     "INSERT INTO schema_migrations(version,name,status,created_at,updated_at) VALUES(?,?,?,?,?)",
                     (version, name, "applied", stamp, stamp),
                 )
-            latest = conn.execute(
-                "SELECT MAX(version) FROM schema_migrations WHERE status='applied'"
-            ).fetchone()[0]
-            if latest is not None and int(latest) >= 3:
-                validate_kelivo_schema(conn, version=4 if int(latest) >= 4 else 3)
-            if latest is not None and int(latest) >= 5:
+            if requested_latest >= 3:
+                validate_kelivo_schema(conn, version=4 if requested_latest >= 4 else 3)
+            if requested_latest >= 5:
                 validate_heartbeat_schema(conn)
-            if latest is not None and int(latest) >= 6:
-                validate_heartbeat_hardening_schema(conn)
+            if requested_latest >= 6:
+                validate_core_schema_v1_v6(conn)
+            if requested_latest >= 7:
+                validate_memory_schema(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

@@ -974,10 +974,14 @@ def _safe_usage(value: Any) -> dict[str, int]:
     }
 
 
-def complete_request(
-    path: str, client_id: str, idempotency_key: str, model_alias: str, result: dict[str, Any],
-    *, channel: str = "kelivo", source: str | None = None,
-) -> dict[str, Any]:
+def canonical_completion_meta(
+    *,
+    api_session: str,
+    generation_id: str,
+    channel: str = "kelivo",
+    source: str | None = None,
+) -> str:
+    """Build the exact canonical meta shape used by a completed internal request."""
     if channel not in {"kelivo", "operit_share"}:
         raise KelivoError(503, "stored_contract_invalid")
     if (
@@ -985,6 +989,27 @@ def complete_request(
         or (channel == "kelivo" and source is not None)
     ):
         raise KelivoError(503, "stored_contract_invalid")
+    meta_payload = {
+        "api_session": api_session,
+        "channel": channel,
+        "generation_id": generation_id,
+    }
+    if source is not None:
+        meta_payload["source"] = source
+    return normalized_json(meta_payload)
+
+
+def complete_request(
+    path: str, client_id: str, idempotency_key: str, model_alias: str, result: dict[str, Any],
+    *, channel: str = "kelivo", source: str | None = None,
+) -> dict[str, Any]:
+    # Validate the channel/source contract before entering the write transaction.
+    canonical_completion_meta(
+        api_session="validation",
+        generation_id="validation",
+        channel=channel,
+        source=source,
+    )
     text = result.get("text")
     if not isinstance(text, str) or not text.strip():
         raise GenerationError("empty_model_response", True)
@@ -1004,13 +1029,12 @@ def complete_request(
         prompt_messages = json.loads(request["provider_messages_json"])
         user_text = prompt_messages[-1]["content"]
         stamp = channel_store.now_iso()
-        meta_payload = {
-            "api_session": request["api_session"], "channel": channel,
-            "generation_id": request["generation_id"],
-        }
-        if source is not None:
-            meta_payload["source"] = source
-        meta = normalized_json(meta_payload)
+        meta = canonical_completion_meta(
+            api_session=request["api_session"],
+            generation_id=request["generation_id"],
+            channel=channel,
+            source=source,
+        )
         user = conn.execute(
             "INSERT INTO messages(ts,direction,kind,text,meta) VALUES(?,?,?,?,?)",
             (stamp, "in", "user", user_text, meta),
