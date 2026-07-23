@@ -265,21 +265,41 @@ explicit indexes 和 trigger 集合；任何核心缺失或损坏均 fail closed
 Operit、模型、审计和 API-loop 凭据均不同的专用
 `MEMORY_FINGERPRINT_HMAC_SECRET`。
 
-`MemoryStore` 是最终写入 enforcement point。调用方不能传入 fingerprint、
-policy flag、sensitivity 开关、evidence semantics、channel/source 或 role；
-Store 从冻结启动配置重建 policy，并在自己的最终事务内重读 canonical
-provenance、验证 profile、计算 fingerprint、检查 suppression。
+应用启动时只允许通过正式 deployment loader 执行一次
+`bootstrap_memory_runtime_from_environment(...)`。它冻结不可变 Runtime Policy
+并生成独立的进程级随机 Action HMAC；重复 bootstrap 稳定拒绝，启动后修改环境
+变量不能替换既有 authority 或 policy。`MemoryStore` 不再接受调用方提供的
+Memory config，只接受该进程 bootstrap 创建的 authority。
+
+普通 `MemoryReadService` 只有 readiness、受限读取与 provenance 查询，没有
+create/correct/forget。写操作只存在于语义固定的 `PrivilegedMemoryActions`：
+显式 user remember/correct/forget、确认 project decision、记录 assistant
+experience。正式 App 只保留 Read Service；privileged actions/runtime authority
+不在其独立只读 query object 的对象图中，也不会放入 HTTP route、`app.state`、
+Telegram、Kelivo、Operit 或 Galatea adapter。
+
+每次 privileged action 即时签发短期、一次性、完整绑定的 Action Capability，
+绑定 action ID/type、canonical reference、kind、scope、规范化正文、
+sensitivity、必要的 memory key、版本和有效期。Store 在最终
+`BEGIN IMMEDIATE` 事务内重新计算绑定并用 constant-time HMAC 验证，随后验证
+profile/canonical provenance、计算 fingerprint、检查 suppression 并原子写入。
+调用方不能传入 fingerprint、policy flag、evidence semantics、channel/source
+或 role；普通 canonical row 本身没有 grant。
 
 首次成功写入会在同一个 `BEGIN IMMEDIATE` 事务内创建唯一 fingerprint profile、
-不可变 evidence event、memory item 与 source；policy/provenance/后续写入失败不会
-留下 profile 或 event。额外、损坏、缺失但已有 Memory 状态或配置不匹配的 profile
+带唯一 action ID/type/binding version 的不可变 evidence event、memory item 与
+source；capability/policy/provenance/后续写入失败不会留下 profile 或 event，
+失败动作不会被错误消费。suppression 命中不会留下 event/profile 孤儿，但该
+一次性 capability 会在当前进程耗尽。额外、损坏、缺失但已有 Memory 状态或配置不匹配的 profile
 均使 readiness 与写入 fail closed。Key ID、Secret verifier、
 normalization version 或 fingerprint/domain version 任一不匹配都会使 Memory
 写入和其 readiness fail closed。Phase 1 不支持无迁移直接轮换 Secret 或更改
 normalization；这些变更必须由单独审查的显式迁移处理。
 
 Evidence 只由语义固定的 privileged internal action API 创建，并在同一事务立即
-绑定；没有通用 event 创建器或可跨 kind/scope/content 复用的 grant。当前 Phase 1
+绑定；evidence event 是成功 action 的不可变审计记录，不是可复用 grant。没有
+通用 event 创建器，也不能跨 action/content/kind/scope/sensitivity/memory key
+复用 capability；能力过期、重复消费或进程重启后均失效。当前 Phase 1
 未把这些 action 接入 Telegram、Kelivo、Operit 或 Galatea 聊天路径。普通旧
 canonical message 默认不授予 Memory 写入，也不从普通历史自动判断玩笑/虚构。
 Telegram/Kelivo canonical meta 缺失、null 或空 `source` 会规范化为 `""`；
@@ -291,8 +311,8 @@ channel 仍要求安全非空，Operit 的非空 `operit` source 保持不变。
 如需物理 schema downgrade，应恢复上线前整库备份，不得只删除 migration
 marker 或手工拆表。
 
-第二轮修复已实现，但下一次独立复审尚未完成；PR 必须继续保持 Draft，不得 merge
-或部署。
+第三轮定向修复已实现，但最终独立复审尚未完成；不得声称所有 finding 已关闭。
+PR 必须继续保持 Draft，不得 merge 或部署。
 
 ### Kelivo OpenAI-compatible 非流式 API（可选）
 

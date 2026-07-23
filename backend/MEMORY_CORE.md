@@ -12,10 +12,12 @@ correlation. Memory Core never silently edits a canonical message.
 
 `memory_items` contains derived, normalized facts. A memory may be corrected,
 superseded, rejected, or forgotten without rewriting its canonical source.
-`memory_evidence_events` records a closed, server-owned grant for a canonical
-message without copying message text or external identity. `memory_sources`
-links each memory to those immutable grants. Database triggers reject every
-update or deletion of an evidence event, whether or not it is referenced.
+`memory_evidence_events` records a completed, server-authorized action for a
+canonical message without copying message text or external identity. Every
+event has a unique action ID, a fixed action type, and the action-binding
+version; it is an immutable audit record, not a reusable grant.
+`memory_sources` links each memory to those events. Database triggers reject
+every update or deletion of an evidence event, whether or not it is referenced.
 `memory_suppressions` prevents a
 forgotten or obsolete fact from being recreated. The singleton
 `memory_fingerprint_profile` pins the keyed fingerprint contract.
@@ -25,7 +27,8 @@ layers. They are not automatically promoted to user facts.
 
 ## Phase 1 scope
 
-Phase 1 provides internal Python operations for:
+Phase 1 exposes an ordinary internal read service for bounded queries. A
+separate privileged object provides fixed-purpose operations for:
 
 - explicit create;
 - correction through a new revision and supersession link;
@@ -58,38 +61,86 @@ server's known channel names. Session and project references are internal,
 validated opaque identifiers. They are not accepted from an external client in
 Phase 1 and must not be logged.
 
-## Provenance and evidence
+## Runtime authority and service boundary
 
-Every explicit user fact requires at least one canonical user message with a
+Application startup calls
+`bootstrap_memory_runtime_from_environment(...)` exactly once. That composition
+root invokes the formal deployment configuration loader itself and freezes a
+`MemoryRuntimePolicy`; `MemoryStore` no longer accepts caller-provided Memory
+configuration. Its constructor requires the process-local authority created by
+that bootstrap, and repeated bootstrap attempts are rejected without replacing
+the current authority. Later environment mutation cannot change the frozen
+policy.
+
+The bootstrap also creates an independent random action HMAC secret. It is
+generated anew for every process, is separate from the fingerprint secret, and
+is never placed in configuration, SQLite, logs, errors, readiness, or object
+representations. The application retains only `MemoryReadService`, backed by a
+separate read-only query object whose object graph contains neither the
+writable Store nor Runtime Authority. It discards `PrivilegedMemoryActions` and
+does not place the runtime authority or privileged object in a route,
+`app.state`, Telegram, Kelivo, Operit, Galatea, or another adapter.
+
+`MemoryReadService` has no create, correct, forget, or grant method. The
+privileged object has only these fixed-semantics actions:
+
+- remember an explicit user message;
+- confirm a project decision;
+- correct an explicit user memory;
+- forget a memory at an explicit user request;
+- record an assistant experience.
+
+There is no production testing override, trusted boolean, generic action-type
+selector, or caller-configured Store path to writing authority.
+
+## Provenance, action capability, and evidence
+
+Every action requires exactly one new canonical action message and a
 server-owned evidence event of one of these types:
 
 - `explicit_user_memory`
-- `confirmed_user_fact`
 - `confirmed_project_decision`
 - `explicit_user_correction` (correction only)
+- `user_forget` (forget only)
+- `assistant_experience` (assistant-only)
 
-The Memory action input contains only business fields and canonical message
-references. Callers cannot supply or override a fingerprint, policy flag,
-evidence type, reality scope, subject scope, component, channel, source, or
-role. `MemoryStore` is the final enforcement point: it reconstructs its policy
-from the frozen application configuration, rereads canonical rows, derives
-role/channel/source, computes the keyed fingerprint, validates the profile, and
-checks suppression inside its own write path. A service preflight is only an
-early error path and is never trusted as authorization.
+After a narrow privileged method receives a trusted explicit action, it creates
+a short-lived one-use capability and immediately invokes the Store. The
+capability binds a random action ID, fixed action type, canonical message ID,
+kind, scope type/reference, normalized content, sensitivity, correction/forget
+memory key, normalization/fingerprint domain versions, issue time, expiry, and
+binding version using unambiguous canonical JSON and the process-only action
+HMAC. The capability is never returned to an ordinary caller and cannot
+survive process restart.
+
+`MemoryStore` is the final enforcement point. Inside the final
+`BEGIN IMMEDIATE` transaction it verifies the runtime authority and frozen
+flags, recomputes the complete business binding, verifies the capability with
+constant-time signature comparison, reserves its action ID once, validates the
+fingerprint profile, rereads and validates the canonical role/channel/source,
+creates the evidence event, applies policy/fingerprint/suppression, writes the
+item/source state, and commits. Any failure rolls back the profile, event,
+item, source, and suppression and releases the in-process reservation. A
+successful action records its unique action ID in the immutable event. A
+suppression result rolls back the would-be event/profile and consumes the
+one-use capability in memory so it cannot be retried in that process.
 
 Evidence is created only by narrow privileged internal action methods whose
 names fix their meaning: explicit user memory, explicit user correction,
-confirmed project decision, or assistant experience. Each action hard-codes
-its evidence/reality/subject/component contract and atomically creates and
-immediately binds the event to the resulting memory/source. There is no generic
-`create_evidence_event(type=...)` interface and no reusable unconsumed grant.
-An existing grant can only replay its already-bound action; attempting to reuse
-it for another kind, scope, or content fails closed.
+explicit user forget, confirmed project decision, or assistant experience.
+Each action hard-codes its evidence/reality/subject/component contract and
+atomically creates and immediately binds the event to the resulting
+memory/source. There is no generic `create_evidence_event(type=...)` interface,
+no conversion of an ordinary canonical row into evidence, and no reusable
+grant. Missing, forged, changed, expired, cross-purpose, restarted-process, or
+already consumed capabilities fail with stable data-free categories and do not
+write Memory state.
 
 Ordinary legacy canonical rows have no Memory authorization on their own.
 Phase 1 does not wire these privileged actions into Telegram, Kelivo, Operit,
-Galatea, or another chat adapter. A future adapter may call only the narrow
-method corresponding to an explicit user action. The system does not infer
+Galatea, an HTTP route, or another chat adapter. A future adapter may receive
+only the narrow method corresponding to a reviewed explicit user action. The
+system does not infer
 whether an ordinary historical message is real, roleplay, a joke, fiction, or
 third-party content.
 
@@ -121,8 +172,9 @@ singleton profile. They are compared fail closed (digest comparison is
 constant-time). Phase 1 has no online key/version migration: changing the
 Secret, Key ID, normalization version, or domain/fingerprint version requires a
 separately reviewed explicit migration. It must never be changed directly.
-Concurrent identical creates and first profile initialization are serialized by
-SQLite; a partial unique index also covers live active/candidate fingerprints.
+Concurrent authorized creates and first profile initialization are serialized
+by SQLite; a partial unique index also covers live active/candidate
+fingerprints.
 The profile is not initialized at service construction. Deterministic content
 policy runs first, then the first successful action creates the only profile,
 evidence event, item, and source in one `BEGIN IMMEDIATE` transaction. Invalid
@@ -133,11 +185,12 @@ event fail closed.
 
 ## Create, correct, and forget
 
-Create writes an active item and all validated sources in one transaction.
-An identical live fingerprint returns the existing public `memory_key` and may
-add new valid provenance. Its sensitivity is atomically raised to the highest
-requested classification and never lowered. Similar text is not automatically
-merged.
+Create writes an active item and its single authorized action source in one
+transaction. A later distinct explicit action with an identical live
+fingerprint returns the existing public `memory_key` and adds its new audit
+source. Reusing the same canonical action is rejected. Sensitivity is
+atomically raised to the highest requested classification and never lowered.
+Similar text is not automatically merged.
 
 Correct requires an active public `memory_key`. Identical normalized content is
 an idempotent no-op. Different content creates a new item, changes the old item
@@ -147,10 +200,12 @@ available for audit but is never returned by active retrieval. Same-content
 correction atomically adds provenance and applies any sensitivity upgrade.
 Correction never lowers an existing sensitivity level.
 
-Forget changes an active item to `forgotten`, clears both derived content and
-the item fingerprint, retains its non-content audit metadata and provenance,
-and creates a `user_forget` suppression atomically. Repeated forget is
-idempotent. Phase 1 has no restore or unsuppress operation.
+Forget requires a new explicit user-forget action, changes an active item to
+`forgotten`, clears both derived content and the item fingerprint, retains its
+non-content audit metadata and provenance, records the `user_forget` evidence,
+and creates a `user_forget` suppression atomically. A later separately
+authorized forget is an idempotent state operation and adds its own audit
+event/source. Phase 1 has no restore or unsuppress operation.
 
 Canonical source messages remain unchanged. Memory forget is therefore not
 canonical transcript deletion. SQLite files, WALs, and backups can retain
@@ -223,7 +278,9 @@ writes.
 Migration v7 only adds `memory_items`, `memory_fingerprint_profile`,
 `memory_evidence_events`, `memory_sources`, `memory_suppressions`, and their
 indexes and evidence-immutability triggers. It does not rebuild or modify v1-v6
-tables or data. The validator
+tables or data. Evidence events include unique non-secret `action_id`,
+fixed `action_type`, and `action_binding_version=1`; no capability signature or
+process secret is persisted. The validator
 checks exact columns, CHECK constraints, unique constraints, index
 attributes/columns/partial predicates, foreign keys, triggers, and normalized
 DDL.
@@ -247,6 +304,6 @@ implemented or enabled by this change.
 
 ## Review status
 
-The second-round fixes are implemented, but the next independent review has
-not yet completed. This branch remains Draft and is not ready to merge or
-deploy.
+The third targeted fixes are implemented, but final independent review has not
+yet completed. This branch remains Draft and is not ready to merge or deploy;
+this document does not claim that every finding is closed.

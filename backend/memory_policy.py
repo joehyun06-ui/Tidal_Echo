@@ -30,9 +30,11 @@ USER_EVIDENCE_TYPES = frozenset({
     "explicit_user_memory", "confirmed_user_fact", "confirmed_project_decision",
 })
 CORRECTION_EVIDENCE_TYPES = frozenset({"explicit_user_correction"})
+FORGET_EVIDENCE_TYPES = frozenset({"user_forget"})
 ASSISTANT_EVIDENCE_TYPES = frozenset({"assistant_experience"})
 ALL_EVIDENCE_TYPES = (
-    USER_EVIDENCE_TYPES | CORRECTION_EVIDENCE_TYPES | ASSISTANT_EVIDENCE_TYPES
+    USER_EVIDENCE_TYPES | CORRECTION_EVIDENCE_TYPES | FORGET_EVIDENCE_TYPES
+    | ASSISTANT_EVIDENCE_TYPES
 )
 REALITY_SCOPES = frozenset({"real", "roleplay", "joke", "fiction", "third_party"})
 SUBJECT_SCOPES = frozenset({"user", "project", "assistant", "third_party"})

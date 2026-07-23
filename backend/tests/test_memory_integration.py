@@ -226,6 +226,17 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             module = load_app(root, memory=True)
         paths = {route.path for route in module.app.routes}
         self.assertFalse(any("memory" in path.lower() for path in paths))
+        for name in (
+            "create_explicit_memory",
+            "correct_memory",
+            "forget_memory",
+            "remember_explicit_user_message",
+        ):
+            self.assertFalse(hasattr(module.MEMORY_SERVICE, name))
+        self.assertFalse(hasattr(module.MEMORY_SERVICE, "_authority"))
+        self.assertFalse(hasattr(module.MEMORY_SERVICE, "_store"))
+        self.assertFalse(hasattr(module.app.state, "memory_runtime"))
+        self.assertFalse(hasattr(module.app.state, "privileged_memory_actions"))
 
 
 if __name__ == "__main__":

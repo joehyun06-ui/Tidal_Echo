@@ -516,10 +516,19 @@ MEMORY_TABLE_DDL: dict[str, str] = {
     "memory_evidence_events": """CREATE TABLE memory_evidence_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             canonical_message_id INTEGER NOT NULL UNIQUE,
+            action_id TEXT NOT NULL UNIQUE
+                CHECK(length(action_id) BETWEEN 24 AND 96
+                      AND action_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+            action_type TEXT NOT NULL CHECK(action_type IN
+                ('remember_explicit_user','confirm_project_decision',
+                 'correct_explicit_user','forget_explicit_user',
+                 'record_assistant_experience')),
+            action_binding_version INTEGER NOT NULL
+                CHECK(action_binding_version=1),
             evidence_type TEXT NOT NULL CHECK(evidence_type IN
                 ('explicit_user_memory','confirmed_user_fact',
                  'confirmed_project_decision','explicit_user_correction',
-                 'assistant_experience')),
+                 'user_forget','assistant_experience')),
             reality_scope TEXT NOT NULL CHECK(reality_scope IN
                 ('real','roleplay','joke','fiction','third_party')),
             subject_scope TEXT NOT NULL CHECK(subject_scope IN
@@ -545,7 +554,7 @@ MEMORY_TABLE_DDL: dict[str, str] = {
             evidence_type TEXT NOT NULL CHECK(evidence_type IN
                 ('explicit_user_memory','confirmed_user_fact',
                  'confirmed_project_decision','explicit_user_correction',
-                 'assistant_experience')),
+                 'user_forget','assistant_experience')),
             created_at TEXT NOT NULL,
             UNIQUE(memory_id,evidence_event_id),
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE RESTRICT,
@@ -1484,6 +1493,9 @@ def validate_memory_schema(conn: sqlite3.Connection) -> None:
         "memory_evidence_events": {
             "id": ("INTEGER", 0, None, 1),
             "canonical_message_id": ("INTEGER", 1, None, 0),
+            "action_id": ("TEXT", 1, None, 0),
+            "action_type": ("TEXT", 1, None, 0),
+            "action_binding_version": ("INTEGER", 1, None, 0),
             "evidence_type": ("TEXT", 1, None, 0),
             "reality_scope": ("TEXT", 1, None, 0),
             "subject_scope": ("TEXT", 1, None, 0),
@@ -1550,6 +1562,9 @@ def validate_memory_schema(conn: sqlite3.Connection) -> None:
                 True, "u", False, ("canonical_message_id",),
             ),
             "sqlite_autoindex_memory_evidence_events_2": (
+                True, "u", False, ("action_id",),
+            ),
+            "sqlite_autoindex_memory_evidence_events_3": (
                 True, "u", False, ("id", "canonical_message_id", "evidence_type"),
             ),
         },

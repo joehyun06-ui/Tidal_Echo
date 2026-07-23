@@ -12,10 +12,11 @@ from enum import Enum
 from typing import Iterable, Sequence
 
 try:
-    from . import channel_store, memory_policy
+    from . import channel_store, memory_policy, memory_runtime
 except ImportError:  # support direct module execution in local tooling
     import channel_store
     import memory_policy
+    import memory_runtime
 
 
 class MemoryStoreError(RuntimeError):
@@ -59,37 +60,75 @@ class _ValidatedSource:
 
 class _GrantKind(Enum):
     EXPLICIT_USER_MEMORY = (
+        memory_runtime.ACTION_REMEMBER_USER,
         "explicit_user_memory", "user", "real", "user", "memory_admin",
     )
     EXPLICIT_USER_CORRECTION = (
+        memory_runtime.ACTION_CORRECT_USER,
         "explicit_user_correction", "user", "real", "user", "memory_admin",
     )
+    EXPLICIT_USER_FORGET = (
+        memory_runtime.ACTION_FORGET_USER,
+        "user_forget", "user", "real", "user", "memory_admin",
+    )
     CONFIRMED_PROJECT_DECISION = (
+        memory_runtime.ACTION_CONFIRM_DECISION,
         "confirmed_project_decision", "user", "real", "project", "memory_admin",
     )
     ASSISTANT_EXPERIENCE = (
+        memory_runtime.ACTION_ASSISTANT_EXPERIENCE,
         "assistant_experience", "assistant", "real", "assistant", "assistant_runtime",
     )
 
     @property
-    def evidence_type(self) -> str:
+    def action_type(self) -> str:
         return str(self.value[0])
 
     @property
-    def expected_role(self) -> str:
+    def evidence_type(self) -> str:
         return str(self.value[1])
 
     @property
-    def reality_scope(self) -> str:
+    def expected_role(self) -> str:
         return str(self.value[2])
 
     @property
-    def subject_scope(self) -> str:
+    def reality_scope(self) -> str:
         return str(self.value[3])
 
     @property
-    def component(self) -> str:
+    def subject_scope(self) -> str:
         return str(self.value[4])
+
+    @property
+    def component(self) -> str:
+        return str(self.value[5])
+
+
+def _single_source(
+    sources: Sequence[memory_policy.ProvenanceInput],
+) -> memory_policy.ProvenanceInput:
+    if len(sources) != 1:
+        raise MemoryStoreError("invalid_provenance")
+    return sources[0]
+
+
+def _binding_source(
+    sources: Iterable[memory_policy.ProvenanceInput],
+) -> tuple[memory_policy.ProvenanceInput, tuple[memory_policy.ProvenanceInput, ...]]:
+    try:
+        materialized = tuple(sources)
+    except TypeError:
+        raise MemoryStoreError("invalid_provenance") from None
+    source = _single_source(materialized)
+    if (
+        not isinstance(source, memory_policy.ProvenanceInput)
+        or not isinstance(source.canonical_message_id, int)
+        or isinstance(source.canonical_message_id, bool)
+        or source.canonical_message_id <= 0
+    ):
+        raise MemoryStoreError("invalid_provenance")
+    return source, materialized
 
 
 MAX_CANONICAL_META_BYTES = 16 * 1024
@@ -184,14 +223,19 @@ class MemoryStore:
 
     HARD_MAX_ITEMS = 100
 
-    def __init__(self, path: str, config):
+    def __init__(self, path: str, authority: object):
+        try:
+            runtime_policy = memory_runtime.require_runtime_authority(authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
         self.path = path
-        self.config = config
+        self._authority = authority
+        self._runtime_policy = runtime_policy
 
     def _trusted_policy(self) -> memory_policy.MemoryPolicy:
         return memory_policy.MemoryPolicy(
-            max_item_chars=self.config.max_item_chars,
-            sensitive_storage_enabled=self.config.sensitive_storage_enabled,
+            max_item_chars=self._runtime_policy.max_item_chars,
+            sensitive_storage_enabled=self._runtime_policy.sensitive_storage_enabled,
         )
 
     @property
@@ -208,15 +252,27 @@ class MemoryStore:
             return False
 
     def _require_write_runtime(self) -> None:
-        if not self.config.enabled:
+        try:
+            policy = memory_runtime.require_runtime_authority(self._authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+        if policy is not self._runtime_policy:
+            raise MemoryStoreError("runtime_authority_invalid")
+        if not policy.enabled:
             raise MemoryStoreError("feature_disabled")
-        if not self.config.configuration_valid:
+        if not policy.configuration_valid:
             raise MemoryStoreError("memory_configuration_invalid")
-        if not self.config.explicit_writes_enabled:
+        if not policy.explicit_writes_enabled:
             raise MemoryStoreError("explicit_writes_disabled")
+        if (
+            policy.normalization_version != memory_policy.NORMALIZATION_VERSION
+            or policy.fingerprint_version != memory_policy.FINGERPRINT_VERSION
+            or policy.fingerprint_domain != memory_policy.FINGERPRINT_DOMAIN
+        ):
+            raise MemoryStoreError("memory_configuration_invalid")
         try:
             memory_policy.fingerprint_profile_check(
-                self.config.fingerprint_hmac_secret
+                policy.fingerprint_hmac_secret
             )
         except memory_policy.MemoryPolicyError:
             raise MemoryStoreError("memory_configuration_invalid") from None
@@ -224,12 +280,12 @@ class MemoryStore:
     def _profile_parameters(self) -> tuple[str, bytes, int, int]:
         try:
             return (
-                self.config.fingerprint_key_id,
+                self._runtime_policy.fingerprint_key_id,
                 memory_policy.fingerprint_profile_check(
-                    self.config.fingerprint_hmac_secret
+                    self._runtime_policy.fingerprint_hmac_secret
                 ),
-                memory_policy.NORMALIZATION_VERSION,
-                memory_policy.FINGERPRINT_VERSION,
+                self._runtime_policy.normalization_version,
+                self._runtime_policy.fingerprint_version,
             )
         except memory_policy.MemoryPolicyError:
             raise MemoryStoreError("memory_configuration_invalid") from None
@@ -379,6 +435,7 @@ class MemoryStore:
         *,
         canonical_message_id: int,
         grant_kind: _GrantKind,
+        action_id: str,
         stamp: str,
     ) -> _PreparedGrant:
         canonical = cls._read_canonical_action(
@@ -386,103 +443,33 @@ class MemoryStore:
             canonical_message_id=canonical_message_id,
             expected_role=grant_kind.expected_role,
         )
-        row = conn.execute(
-            """SELECT id,evidence_type,reality_scope,subject_scope,
-                      created_by_component
-               FROM memory_evidence_events WHERE canonical_message_id=?""",
-            (canonical_message_id,),
-        ).fetchone()
-        if row is None:
-            cursor = conn.execute(
-                """INSERT INTO memory_evidence_events
-                   (canonical_message_id,evidence_type,reality_scope,subject_scope,
-                    created_by_component,created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (
-                    canonical_message_id,
-                    grant_kind.evidence_type,
-                    grant_kind.reality_scope,
-                    grant_kind.subject_scope,
-                    grant_kind.component,
-                    stamp,
-                ),
-            )
-            evidence_event_id = int(cursor.lastrowid)
-            created_in_transaction = True
-        else:
-            if (
-                row["evidence_type"] != grant_kind.evidence_type
-                or row["reality_scope"] != grant_kind.reality_scope
-                or row["subject_scope"] != grant_kind.subject_scope
-                or row["created_by_component"] != grant_kind.component
-            ):
-                raise MemoryStoreError("unsupported_evidence")
-            evidence_event_id = int(row["id"])
-            created_in_transaction = False
+        if conn.execute(
+            """SELECT 1 FROM memory_evidence_events
+               WHERE canonical_message_id=? OR action_id=?""",
+            (canonical_message_id, action_id),
+        ).fetchone() is not None:
+            raise MemoryStoreError("authorization_replayed")
+        cursor = conn.execute(
+            """INSERT INTO memory_evidence_events
+               (canonical_message_id,action_id,action_type,action_binding_version,
+                evidence_type,reality_scope,subject_scope,created_by_component,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                canonical_message_id,
+                action_id,
+                grant_kind.action_type,
+                memory_runtime.ACTION_BINDING_VERSION,
+                grant_kind.evidence_type,
+                grant_kind.reality_scope,
+                grant_kind.subject_scope,
+                grant_kind.component,
+                stamp,
+            ),
+        )
         return _PreparedGrant(
             canonical=canonical,
-            evidence_event_id=evidence_event_id,
-            created_in_transaction=created_in_transaction,
-        )
-
-    @classmethod
-    def _grant_explicit_user_memory_action(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        canonical_message_id: int,
-        stamp: str,
-    ) -> _PreparedGrant:
-        return cls._prepare_grant(
-            conn,
-            canonical_message_id=canonical_message_id,
-            grant_kind=_GrantKind.EXPLICIT_USER_MEMORY,
-            stamp=stamp,
-        )
-
-    @classmethod
-    def _grant_explicit_user_correction_action(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        canonical_message_id: int,
-        stamp: str,
-    ) -> _PreparedGrant:
-        return cls._prepare_grant(
-            conn,
-            canonical_message_id=canonical_message_id,
-            grant_kind=_GrantKind.EXPLICIT_USER_CORRECTION,
-            stamp=stamp,
-        )
-
-    @classmethod
-    def _grant_confirmed_project_decision_action(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        canonical_message_id: int,
-        stamp: str,
-    ) -> _PreparedGrant:
-        return cls._prepare_grant(
-            conn,
-            canonical_message_id=canonical_message_id,
-            grant_kind=_GrantKind.CONFIRMED_PROJECT_DECISION,
-            stamp=stamp,
-        )
-
-    @classmethod
-    def _grant_assistant_experience_action(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        canonical_message_id: int,
-        stamp: str,
-    ) -> _PreparedGrant:
-        return cls._prepare_grant(
-            conn,
-            canonical_message_id=canonical_message_id,
-            grant_kind=_GrantKind.ASSISTANT_EXPERIENCE,
-            stamp=stamp,
+            evidence_event_id=int(cursor.lastrowid),
+            created_in_transaction=True,
         )
 
     @classmethod
@@ -492,26 +479,17 @@ class MemoryStore:
         *,
         sources: Sequence[memory_policy.ProvenanceInput],
         grant_kind: _GrantKind,
+        action_id: str,
         stamp: str,
     ) -> tuple[_PreparedGrant, ...]:
-        method = {
-            _GrantKind.EXPLICIT_USER_MEMORY:
-                cls._grant_explicit_user_memory_action,
-            _GrantKind.EXPLICIT_USER_CORRECTION:
-                cls._grant_explicit_user_correction_action,
-            _GrantKind.CONFIRMED_PROJECT_DECISION:
-                cls._grant_confirmed_project_decision_action,
-            _GrantKind.ASSISTANT_EXPERIENCE:
-                cls._grant_assistant_experience_action,
-        }[grant_kind]
-        return tuple(
-            method(
-                conn,
-                canonical_message_id=source.canonical_message_id,
-                stamp=stamp,
-            )
-            for source in sources
-        )
+        source = _single_source(sources)
+        return (cls._prepare_grant(
+            conn,
+            canonical_message_id=source.canonical_message_id,
+            grant_kind=grant_kind,
+            action_id=action_id,
+            stamp=stamp,
+        ),)
 
     @classmethod
     def _bind_prepared_grants(
@@ -673,6 +651,32 @@ class MemoryStore:
             return MemoryStoreError("conflict")
         return MemoryStoreError("storage_unavailable")
 
+    def _begin_action(
+        self,
+        authorization: object | None,
+        binding: memory_runtime.MemoryActionBinding,
+    ) -> str:
+        try:
+            return memory_runtime.begin_action_consumption(
+                self._authority,
+                authorization,
+                expected_binding=binding,
+            )
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+
+    def _finish_action(self, action_id: str | None, *, consumed: bool) -> None:
+        if action_id is None:
+            return
+        try:
+            memory_runtime.finish_action_consumption(
+                self._authority,
+                action_id,
+                consumed=consumed,
+            )
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+
     def _create_from_action(
         self,
         *,
@@ -683,36 +687,58 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         grant_kind: _GrantKind,
+        authorization: object | None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
-        try:
-            normalized_content, validated_inputs = policy.validate_explicit_create(
-                kind=kind,
-                scope_type=scope_type,
-                scope_ref=scope_ref,
-                content=content,
-                sensitivity=sensitivity,
-                sources=sources,
-                allow_existing_reclassification=True,
-            )
-        except memory_policy.MemoryPolicyError as error:
-            raise MemoryStoreError(error.category) from None
+        action_id: str | None = None
+        consumed = False
         try:
             with channel_store.connect(self.path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
+                    if authorization is None:
+                        raise MemoryStoreError("authorization_required")
+                    source, source_inputs = _binding_source(sources)
+                    normalized_binding_content = memory_policy.normalize_content(
+                        content,
+                        max_chars=self._runtime_policy.max_item_chars,
+                    )
+                    binding = memory_runtime.MemoryActionBinding(
+                        action_type=grant_kind.action_type,
+                        canonical_message_id=source.canonical_message_id,
+                        kind=kind,
+                        scope_type=scope_type,
+                        scope_ref=scope_ref,
+                        normalized_content=normalized_binding_content,
+                        sensitivity=sensitivity,
+                    )
+                    action_id = self._begin_action(authorization, binding)
+                    normalized_content, validated_inputs = (
+                        policy.validate_explicit_create(
+                            kind=kind,
+                            scope_type=scope_type,
+                            scope_ref=scope_ref,
+                            content=content,
+                            sensitivity=sensitivity,
+                            sources=source_inputs,
+                            allow_existing_reclassification=True,
+                        )
+                    )
+                    if normalized_content != normalized_binding_content:
+                        raise MemoryStoreError("authorization_invalid")
                     self._validate_or_initialize_profile(conn, initialize=True)
                     stamp = channel_store.now_iso()
                     prepared_grants = self._grant_action_sources(
                         conn,
                         sources=validated_inputs,
                         grant_kind=grant_kind,
+                        action_id=action_id,
                         stamp=stamp,
                     )
                     fingerprint = memory_policy.fingerprint_content(
-                        self.config.fingerprint_hmac_secret,
+                        self._runtime_policy.fingerprint_hmac_secret,
                         scope_type=scope_type,
                         scope_ref=scope_ref,
                         kind=kind,
@@ -727,100 +753,107 @@ class MemoryStore:
                         fingerprint_version=memory_policy.FINGERPRINT_VERSION,
                     ):
                         conn.execute("ROLLBACK")
-                        return StoreResult("suppressed")
-                    existing = self._find_live_by_fingerprint(
-                        conn,
-                        scope_type=scope_type,
-                        scope_ref=scope_ref,
-                        kind=kind,
-                        fingerprint=fingerprint,
-                        fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                    )
-                    if existing is not None:
-                        if existing["normalized_content"] != normalized_content:
-                            raise MemoryStoreError("conflict")
-                        existing_rank = _SENSITIVITY_RANK.get(existing["sensitivity"])
-                        requested_rank = _SENSITIVITY_RANK.get(sensitivity)
-                        if existing_rank is None or requested_rank is None:
-                            raise MemoryStoreError("invalid_state")
-                        sources_to_insert = self._bind_prepared_grants(
+                        consumed = True
+                        result = StoreResult("suppressed")
+                    else:
+                        existing = self._find_live_by_fingerprint(
                             conn,
-                            grants=prepared_grants,
-                            memory_id=int(existing["id"]),
-                            grant_kind=grant_kind,
+                            scope_type=scope_type,
+                            scope_ref=scope_ref,
+                            kind=kind,
+                            fingerprint=fingerprint,
+                            fingerprint_version=self._runtime_policy.fingerprint_version,
                         )
-                        if requested_rank > existing_rank:
-                            conn.execute(
-                                """UPDATE memory_items
-                                   SET sensitivity=?,last_confirmed_at=?,updated_at=?
-                                   WHERE id=?""",
-                                (sensitivity, stamp, stamp, int(existing["id"])),
+                        if existing is not None:
+                            if existing["normalized_content"] != normalized_content:
+                                raise MemoryStoreError("conflict")
+                            existing_rank = _SENSITIVITY_RANK.get(existing["sensitivity"])
+                            requested_rank = _SENSITIVITY_RANK.get(sensitivity)
+                            if existing_rank is None or requested_rank is None:
+                                raise MemoryStoreError("invalid_state")
+                            sources_to_insert = self._bind_prepared_grants(
+                                conn,
+                                grants=prepared_grants,
+                                memory_id=int(existing["id"]),
+                                grant_kind=grant_kind,
                             )
-                        self._insert_sources(
-                            conn, int(existing["id"]), sources_to_insert, stamp,
-                        )
-                        existing = conn.execute(
-                            "SELECT * FROM memory_items WHERE id=?",
-                            (int(existing["id"]),),
-                        ).fetchone()
-                        conn.execute("COMMIT")
-                        return StoreResult(
-                            "idempotent_existing", _safe_item(existing),
-                        )
-
-                    if (
-                        sensitivity != "normal"
-                        and not self.config.sensitive_storage_enabled
-                    ):
-                        raise MemoryStoreError("sensitive_storage_disabled")
-                    memory_key = secrets.token_urlsafe(24)
-                    cursor = conn.execute(
-                        """INSERT INTO memory_items
-                           (memory_key,kind,scope_type,scope_ref,normalized_content,
-                            normalized_fingerprint,fingerprint_version,status,explicitness,
-                            confidence,sensitivity,first_observed_at,last_confirmed_at,
-                            superseded_by_id,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?,?,'active','explicit',1.0,?,?,?,NULL,?,?)""",
-                        (
-                            memory_key,
-                            kind,
-                            scope_type,
-                            scope_ref,
-                            normalized_content,
-                            fingerprint,
-                            memory_policy.FINGERPRINT_VERSION,
-                            sensitivity,
-                            stamp,
-                            stamp,
-                            stamp,
-                            stamp,
-                        ),
-                    )
-                    memory_id = int(cursor.lastrowid)
-                    sources_to_insert = self._bind_prepared_grants(
-                        conn,
-                        grants=prepared_grants,
-                        memory_id=memory_id,
-                        grant_kind=grant_kind,
-                    )
-                    self._insert_sources(
-                        conn, memory_id, sources_to_insert, stamp,
-                    )
-                    row = conn.execute(
-                        "SELECT * FROM memory_items WHERE id=?", (memory_id,),
-                    ).fetchone()
-                    conn.execute("COMMIT")
-                    return StoreResult("created", _safe_item(row))
+                            if requested_rank > existing_rank:
+                                conn.execute(
+                                    """UPDATE memory_items
+                                       SET sensitivity=?,last_confirmed_at=?,updated_at=?
+                                       WHERE id=?""",
+                                    (sensitivity, stamp, stamp, int(existing["id"])),
+                                )
+                            self._insert_sources(
+                                conn, int(existing["id"]), sources_to_insert, stamp,
+                            )
+                            existing = conn.execute(
+                                "SELECT * FROM memory_items WHERE id=?",
+                                (int(existing["id"]),),
+                            ).fetchone()
+                            conn.execute("COMMIT")
+                            consumed = True
+                            result = StoreResult(
+                                "idempotent_existing", _safe_item(existing),
+                            )
+                        else:
+                            if (
+                                sensitivity != "normal"
+                                and not self._runtime_policy.sensitive_storage_enabled
+                            ):
+                                raise MemoryStoreError("sensitive_storage_disabled")
+                            memory_key = secrets.token_urlsafe(24)
+                            cursor = conn.execute(
+                                """INSERT INTO memory_items
+                                   (memory_key,kind,scope_type,scope_ref,normalized_content,
+                                    normalized_fingerprint,fingerprint_version,status,explicitness,
+                                    confidence,sensitivity,first_observed_at,last_confirmed_at,
+                                    superseded_by_id,created_at,updated_at)
+                                   VALUES(?,?,?,?,?,?,?,'active','explicit',1.0,?,?,?,NULL,?,?)""",
+                                (
+                                    memory_key,
+                                    kind,
+                                    scope_type,
+                                    scope_ref,
+                                    normalized_content,
+                                    fingerprint,
+                                    self._runtime_policy.fingerprint_version,
+                                    sensitivity,
+                                    stamp,
+                                    stamp,
+                                    stamp,
+                                    stamp,
+                                ),
+                            )
+                            memory_id = int(cursor.lastrowid)
+                            sources_to_insert = self._bind_prepared_grants(
+                                conn,
+                                grants=prepared_grants,
+                                memory_id=memory_id,
+                                grant_kind=grant_kind,
+                            )
+                            self._insert_sources(
+                                conn, memory_id, sources_to_insert, stamp,
+                            )
+                            row = conn.execute(
+                                "SELECT * FROM memory_items WHERE id=?", (memory_id,),
+                            ).fetchone()
+                            conn.execute("COMMIT")
+                            consumed = True
+                            result = StoreResult("created", _safe_item(row))
                 except Exception:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
                     raise
+            return result
         except MemoryStoreError:
             raise
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
+        finally:
+            self._finish_action(action_id, consumed=consumed)
 
     def create_explicit_memory_from_user_action(
         self,
@@ -831,8 +864,9 @@ class MemoryStore:
         content: str,
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
+        authorization: object | None = None,
     ) -> StoreResult:
-        if kind == "assistant_experience":
+        if kind in {"assistant_experience", "decision"}:
             raise MemoryStoreError("unsupported_evidence")
         return self._create_from_action(
             kind=kind,
@@ -842,6 +876,7 @@ class MemoryStore:
             sensitivity=sensitivity,
             sources=sources,
             grant_kind=_GrantKind.EXPLICIT_USER_MEMORY,
+            authorization=authorization,
         )
 
     def create_confirmed_project_decision_from_action(
@@ -853,6 +888,7 @@ class MemoryStore:
         content: str,
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
+        authorization: object | None = None,
     ) -> StoreResult:
         if kind != "decision":
             raise MemoryStoreError("unsupported_evidence")
@@ -864,6 +900,7 @@ class MemoryStore:
             sensitivity=sensitivity,
             sources=sources,
             grant_kind=_GrantKind.CONFIRMED_PROJECT_DECISION,
+            authorization=authorization,
         )
 
     def create_assistant_experience_from_action(
@@ -875,6 +912,7 @@ class MemoryStore:
         content: str,
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
+        authorization: object | None = None,
     ) -> StoreResult:
         if kind != "assistant_experience":
             raise MemoryStoreError("unsupported_evidence")
@@ -886,6 +924,7 @@ class MemoryStore:
             sensitivity=sensitivity,
             sources=sources,
             grant_kind=_GrantKind.ASSISTANT_EXPERIENCE,
+            authorization=authorization,
         )
 
     def correct_memory_from_user_action(
@@ -895,26 +934,19 @@ class MemoryStore:
         content: str,
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
+        authorization: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
-        try:
-            # Content and credentials are rejected before any profile transaction.
-            normalized_preflight = policy.validate_content(
-                content,
-                sensitivity,
-                allow_existing_reclassification=True,
-            )
-            validated_inputs = policy.validate_provenance_inputs(
-                "project", sources,
-            )
-        except memory_policy.MemoryPolicyError as error:
-            raise MemoryStoreError(error.category) from None
+        action_id: str | None = None
+        consumed = False
         try:
             with channel_store.connect(self.path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
+                    if authorization is None:
+                        raise MemoryStoreError("authorization_required")
                     old = conn.execute(
                         "SELECT * FROM memory_items WHERE memory_key=?",
                         (memory_key,),
@@ -923,28 +955,53 @@ class MemoryStore:
                         raise MemoryStoreError("not_found")
                     if old["status"] != "active":
                         raise MemoryStoreError("invalid_state")
-                    try:
-                        policy.validate_kind(old["kind"])
-                        policy.validate_scope(
-                            old["scope_type"], old["scope_ref"],
-                        )
-                        normalized_content = policy.validate_content(
-                            normalized_preflight,
-                            sensitivity,
-                            allow_existing_reclassification=True,
-                        )
-                    except memory_policy.MemoryPolicyError as error:
-                        raise MemoryStoreError(error.category) from None
+                    if old["kind"] == "assistant_experience":
+                        raise MemoryStoreError("unsupported_evidence")
+                    source, source_inputs = _binding_source(sources)
+                    normalized_binding_content = memory_policy.normalize_content(
+                        content,
+                        max_chars=self._runtime_policy.max_item_chars,
+                    )
+                    binding = memory_runtime.MemoryActionBinding(
+                        action_type=memory_runtime.ACTION_CORRECT_USER,
+                        canonical_message_id=source.canonical_message_id,
+                        kind=old["kind"],
+                        scope_type=old["scope_type"],
+                        scope_ref=old["scope_ref"],
+                        normalized_content=normalized_binding_content,
+                        sensitivity=sensitivity,
+                        memory_key=memory_key,
+                    )
+                    action_id = self._begin_action(authorization, binding)
+                    policy.validate_kind(old["kind"])
+                    policy.validate_scope(old["scope_type"], old["scope_ref"])
+                    normalized_content = policy.validate_content(
+                        content,
+                        sensitivity,
+                        allow_existing_reclassification=True,
+                    )
+                    if normalized_content != normalized_binding_content:
+                        raise MemoryStoreError("authorization_invalid")
+                    validated_inputs = policy.validate_provenance_inputs(
+                        old["kind"], source_inputs,
+                    )
+                    existing_rank = _SENSITIVITY_RANK.get(old["sensitivity"])
+                    requested_rank = _SENSITIVITY_RANK.get(sensitivity)
+                    if existing_rank is None or requested_rank is None:
+                        raise MemoryStoreError("invalid_state")
+                    if requested_rank < existing_rank:
+                        raise MemoryStoreError("sensitivity_downgrade")
                     self._validate_or_initialize_profile(conn, initialize=True)
                     stamp = channel_store.now_iso()
                     prepared_grants = self._grant_action_sources(
                         conn,
                         sources=validated_inputs,
                         grant_kind=_GrantKind.EXPLICIT_USER_CORRECTION,
+                        action_id=action_id,
                         stamp=stamp,
                     )
                     fingerprint = memory_policy.fingerprint_content(
-                        self.config.fingerprint_hmac_secret,
+                        self._runtime_policy.fingerprint_hmac_secret,
                         scope_type=old["scope_type"],
                         scope_ref=old["scope_ref"],
                         kind=old["kind"],
@@ -953,12 +1010,6 @@ class MemoryStore:
                     old_fingerprint = old["normalized_fingerprint"]
                     if not isinstance(old_fingerprint, bytes):
                         raise MemoryStoreError("invalid_state")
-                    existing_rank = _SENSITIVITY_RANK.get(old["sensitivity"])
-                    requested_rank = _SENSITIVITY_RANK.get(sensitivity)
-                    if existing_rank is None or requested_rank is None:
-                        raise MemoryStoreError("invalid_state")
-                    if requested_rank < existing_rank:
-                        raise MemoryStoreError("sensitivity_downgrade")
                     if memory_policy.secure_digest_equal(
                         old_fingerprint, fingerprint,
                     ):
@@ -985,156 +1036,216 @@ class MemoryStore:
                             (int(old["id"]),),
                         ).fetchone()
                         conn.execute("COMMIT")
-                        return StoreResult("idempotent_noop", _safe_item(old))
-                    if (
-                        sensitivity != "normal"
-                        and not self.config.sensitive_storage_enabled
-                    ):
-                        raise MemoryStoreError("sensitive_storage_disabled")
-                    if self._is_suppressed_conn(
-                        conn,
-                        scope_type=old["scope_type"],
-                        scope_ref=old["scope_ref"],
-                        kind=old["kind"],
-                        fingerprint=fingerprint,
-                        fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                    ):
-                        conn.execute("ROLLBACK")
-                        return StoreResult("suppressed")
-                    if self._find_live_by_fingerprint(
-                        conn,
-                        scope_type=old["scope_type"],
-                        scope_ref=old["scope_ref"],
-                        kind=old["kind"],
-                        fingerprint=fingerprint,
-                        fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                    ) is not None:
-                        raise MemoryStoreError("conflict")
-                    new_key = secrets.token_urlsafe(24)
-                    cursor = conn.execute(
-                        """INSERT INTO memory_items
-                           (memory_key,kind,scope_type,scope_ref,normalized_content,
-                            normalized_fingerprint,fingerprint_version,status,explicitness,
-                            confidence,sensitivity,first_observed_at,last_confirmed_at,
-                            superseded_by_id,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?,?,'active','explicit',1.0,?,?,?,NULL,?,?)""",
-                        (
-                            new_key,
-                            old["kind"],
-                            old["scope_type"],
-                            old["scope_ref"],
-                            normalized_content,
-                            fingerprint,
-                            memory_policy.FINGERPRINT_VERSION,
-                            sensitivity,
-                            stamp,
-                            stamp,
-                            stamp,
-                            stamp,
-                        ),
-                    )
-                    new_id = int(cursor.lastrowid)
-                    sources_to_insert = self._bind_prepared_grants(
-                        conn,
-                        grants=prepared_grants,
-                        memory_id=new_id,
-                        grant_kind=_GrantKind.EXPLICIT_USER_CORRECTION,
-                    )
-                    self._insert_sources(conn, new_id, sources_to_insert, stamp)
-                    updated = conn.execute(
-                        """UPDATE memory_items
-                           SET status='superseded',superseded_by_id=?,updated_at=?
-                           WHERE id=? AND status='active'
-                             AND superseded_by_id IS NULL""",
-                        (new_id, stamp, int(old["id"])),
-                    )
-                    if updated.rowcount != 1:
-                        raise MemoryStoreError("conflict")
-                    self._insert_suppression(
-                        conn,
-                        scope_type=old["scope_type"],
-                        scope_ref=old["scope_ref"],
-                        kind=old["kind"],
-                        fingerprint=old_fingerprint,
-                        fingerprint_version=int(old["fingerprint_version"]),
-                        reason_category="corrected_obsolete",
-                        stamp=stamp,
-                    )
-                    row = conn.execute(
-                        "SELECT * FROM memory_items WHERE id=?", (new_id,),
-                    ).fetchone()
-                    conn.execute("COMMIT")
-                    return StoreResult("corrected", _safe_item(row))
+                        consumed = True
+                        result = StoreResult("idempotent_noop", _safe_item(old))
+                    else:
+                        if (
+                            sensitivity != "normal"
+                            and not self._runtime_policy.sensitive_storage_enabled
+                        ):
+                            raise MemoryStoreError("sensitive_storage_disabled")
+                        if self._is_suppressed_conn(
+                            conn,
+                            scope_type=old["scope_type"],
+                            scope_ref=old["scope_ref"],
+                            kind=old["kind"],
+                            fingerprint=fingerprint,
+                            fingerprint_version=self._runtime_policy.fingerprint_version,
+                        ):
+                            conn.execute("ROLLBACK")
+                            consumed = True
+                            result = StoreResult("suppressed")
+                        else:
+                            if self._find_live_by_fingerprint(
+                                conn,
+                                scope_type=old["scope_type"],
+                                scope_ref=old["scope_ref"],
+                                kind=old["kind"],
+                                fingerprint=fingerprint,
+                                fingerprint_version=self._runtime_policy.fingerprint_version,
+                            ) is not None:
+                                raise MemoryStoreError("conflict")
+                            new_key = secrets.token_urlsafe(24)
+                            cursor = conn.execute(
+                                """INSERT INTO memory_items
+                                   (memory_key,kind,scope_type,scope_ref,normalized_content,
+                                    normalized_fingerprint,fingerprint_version,status,explicitness,
+                                    confidence,sensitivity,first_observed_at,last_confirmed_at,
+                                    superseded_by_id,created_at,updated_at)
+                                   VALUES(?,?,?,?,?,?,?,'active','explicit',1.0,?,?,?,NULL,?,?)""",
+                                (
+                                    new_key,
+                                    old["kind"],
+                                    old["scope_type"],
+                                    old["scope_ref"],
+                                    normalized_content,
+                                    fingerprint,
+                                    self._runtime_policy.fingerprint_version,
+                                    sensitivity,
+                                    stamp,
+                                    stamp,
+                                    stamp,
+                                    stamp,
+                                ),
+                            )
+                            new_id = int(cursor.lastrowid)
+                            sources_to_insert = self._bind_prepared_grants(
+                                conn,
+                                grants=prepared_grants,
+                                memory_id=new_id,
+                                grant_kind=_GrantKind.EXPLICIT_USER_CORRECTION,
+                            )
+                            self._insert_sources(conn, new_id, sources_to_insert, stamp)
+                            updated = conn.execute(
+                                """UPDATE memory_items
+                                   SET status='superseded',superseded_by_id=?,updated_at=?
+                                   WHERE id=? AND status='active'
+                                     AND superseded_by_id IS NULL""",
+                                (new_id, stamp, int(old["id"])),
+                            )
+                            if updated.rowcount != 1:
+                                raise MemoryStoreError("conflict")
+                            self._insert_suppression(
+                                conn,
+                                scope_type=old["scope_type"],
+                                scope_ref=old["scope_ref"],
+                                kind=old["kind"],
+                                fingerprint=old_fingerprint,
+                                fingerprint_version=int(old["fingerprint_version"]),
+                                reason_category="corrected_obsolete",
+                                stamp=stamp,
+                            )
+                            row = conn.execute(
+                                "SELECT * FROM memory_items WHERE id=?", (new_id,),
+                            ).fetchone()
+                            conn.execute("COMMIT")
+                            consumed = True
+                            result = StoreResult("corrected", _safe_item(row))
                 except Exception:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
                     raise
+            return result
         except MemoryStoreError:
             raise
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
+        finally:
+            self._finish_action(action_id, consumed=consumed)
 
-    def forget_memory_atomic(self, *, memory_key: str) -> StoreResult:
+    def forget_memory_atomic(
+        self,
+        *,
+        memory_key: str,
+        sources: Iterable[memory_policy.ProvenanceInput],
+        authorization: object | None = None,
+    ) -> StoreResult:
         self._require_write_runtime()
+        policy = self._trusted_policy()
+        action_id: str | None = None
+        consumed = False
         try:
             with channel_store.connect(self.path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
-                    self._validate_or_initialize_profile(conn, initialize=True)
+                    if authorization is None:
+                        raise MemoryStoreError("authorization_required")
                     row = conn.execute(
                         "SELECT * FROM memory_items WHERE memory_key=?",
                         (memory_key,),
                     ).fetchone()
                     if row is None:
                         raise MemoryStoreError("not_found")
-                    if row["status"] == "forgotten":
-                        conn.execute("COMMIT")
-                        return StoreResult(
-                            "already_forgotten", _safe_item(row),
-                        )
-                    if row["status"] != "active":
+                    if row["status"] not in {"active", "forgotten"}:
                         raise MemoryStoreError("invalid_state")
-                    fingerprint = row["normalized_fingerprint"]
-                    if not isinstance(fingerprint, bytes):
-                        raise MemoryStoreError("invalid_state")
-                    stamp = channel_store.now_iso()
-                    self._insert_suppression(
-                        conn,
+                    source, source_inputs = _binding_source(sources)
+                    binding = memory_runtime.MemoryActionBinding(
+                        action_type=memory_runtime.ACTION_FORGET_USER,
+                        canonical_message_id=source.canonical_message_id,
+                        kind=row["kind"],
                         scope_type=row["scope_type"],
                         scope_ref=row["scope_ref"],
-                        kind=row["kind"],
-                        fingerprint=fingerprint,
-                        fingerprint_version=int(row["fingerprint_version"]),
-                        reason_category="user_forget",
+                        normalized_content=row["normalized_content"],
+                        sensitivity=row["sensitivity"],
+                        memory_key=memory_key,
+                    )
+                    action_id = self._begin_action(authorization, binding)
+                    policy.validate_kind(row["kind"])
+                    policy.validate_scope(row["scope_type"], row["scope_ref"])
+                    validated_inputs = policy.validate_provenance_inputs(
+                        row["kind"], source_inputs,
+                    )
+                    self._validate_or_initialize_profile(conn, initialize=True)
+                    stamp = channel_store.now_iso()
+                    prepared_grants = self._grant_action_sources(
+                        conn,
+                        sources=validated_inputs,
+                        grant_kind=_GrantKind.EXPLICIT_USER_FORGET,
+                        action_id=action_id,
                         stamp=stamp,
                     )
-                    updated = conn.execute(
-                        """UPDATE memory_items
-                           SET status='forgotten',normalized_content=NULL,
-                               normalized_fingerprint=NULL,
-                               superseded_by_id=NULL,updated_at=?
-                           WHERE id=? AND status='active'""",
-                        (stamp, int(row["id"])),
+                    sources_to_insert = self._bind_prepared_grants(
+                        conn,
+                        grants=prepared_grants,
+                        memory_id=int(row["id"]),
+                        grant_kind=_GrantKind.EXPLICIT_USER_FORGET,
                     )
-                    if updated.rowcount != 1:
-                        raise MemoryStoreError("conflict")
-                    forgotten = conn.execute(
-                        "SELECT * FROM memory_items WHERE id=?",
-                        (int(row["id"]),),
-                    ).fetchone()
-                    conn.execute("COMMIT")
-                    return StoreResult("forgotten", _safe_item(forgotten))
+                    self._insert_sources(
+                        conn, int(row["id"]), sources_to_insert, stamp,
+                    )
+                    if row["status"] == "forgotten":
+                        conn.execute("COMMIT")
+                        consumed = True
+                        result = StoreResult(
+                            "already_forgotten", _safe_item(row),
+                        )
+                    else:
+                        fingerprint = row["normalized_fingerprint"]
+                        if not isinstance(fingerprint, bytes):
+                            raise MemoryStoreError("invalid_state")
+                        self._insert_suppression(
+                            conn,
+                            scope_type=row["scope_type"],
+                            scope_ref=row["scope_ref"],
+                            kind=row["kind"],
+                            fingerprint=fingerprint,
+                            fingerprint_version=int(row["fingerprint_version"]),
+                            reason_category="user_forget",
+                            stamp=stamp,
+                        )
+                        updated = conn.execute(
+                            """UPDATE memory_items
+                               SET status='forgotten',normalized_content=NULL,
+                                   normalized_fingerprint=NULL,
+                                   superseded_by_id=NULL,updated_at=?
+                               WHERE id=? AND status='active'""",
+                            (stamp, int(row["id"])),
+                        )
+                        if updated.rowcount != 1:
+                            raise MemoryStoreError("conflict")
+                        forgotten = conn.execute(
+                            "SELECT * FROM memory_items WHERE id=?",
+                            (int(row["id"]),),
+                        ).fetchone()
+                        conn.execute("COMMIT")
+                        consumed = True
+                        result = StoreResult("forgotten", _safe_item(forgotten))
                 except Exception:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
                     raise
+            return result
         except MemoryStoreError:
             raise
+        except memory_policy.MemoryPolicyError as error:
+            raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
+        finally:
+            self._finish_action(action_id, consumed=consumed)
 
     def get_item_by_key(self, memory_key: str) -> dict | None:
         try:
@@ -1210,5 +1321,61 @@ class MemoryStore:
             with channel_store.connect(self.path) as conn:
                 rows = conn.execute(sql, tuple(parameters)).fetchall()
             return [_safe_item(row) for row in rows]
+        except (OSError, sqlite3.Error, ValueError):
+            raise MemoryStoreError("storage_unavailable") from None
+
+
+class MemoryReader:
+    """Read-only query object with no Runtime Authority or fingerprint secret."""
+
+    HARD_MAX_ITEMS = MemoryStore.HARD_MAX_ITEMS
+    __slots__ = ("path", "_expected_profile")
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        expected_profile: tuple[str, bytes, int, int] | None,
+    ):
+        self.path = path
+        self._expected_profile = expected_profile
+
+    def __repr__(self) -> str:
+        return "<MemoryReader>"
+
+    validate_schema = MemoryStore.validate_schema
+    get_item_by_key = MemoryStore.get_item_by_key
+    get_sources = MemoryStore.get_sources
+    get_active_items = MemoryStore.get_active_items
+
+    def validate_runtime_profile_state(self) -> bool:
+        expected = self._expected_profile
+        if expected is None:
+            raise MemoryStoreError("memory_fingerprint_profile_mismatch")
+        key_id, key_check, normalization_version, fingerprint_version = expected
+        try:
+            with channel_store.connect(self.path) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM memory_fingerprint_profile ORDER BY singleton"
+                ).fetchall()
+                if len(rows) > 1:
+                    raise MemoryStoreError("memory_fingerprint_profile_mismatch")
+                if not rows:
+                    if MemoryStore._memory_state_count(conn):
+                        raise MemoryStoreError(
+                            "memory_fingerprint_profile_mismatch"
+                        )
+                    return True
+                if not MemoryStore._profile_matches(
+                    rows[0],
+                    key_id=key_id,
+                    key_check=key_check,
+                    normalization_version=normalization_version,
+                    fingerprint_version=fingerprint_version,
+                ):
+                    raise MemoryStoreError("memory_fingerprint_profile_mismatch")
+                return True
+        except MemoryStoreError:
+            raise
         except (OSError, sqlite3.Error, ValueError):
             raise MemoryStoreError("storage_unavailable") from None

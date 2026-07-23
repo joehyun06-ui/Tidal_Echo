@@ -202,10 +202,12 @@ class MemoryMigrationTests(unittest.TestCase):
             message_id = conn.execute("SELECT id FROM messages").fetchone()[0]
             evidence_cursor = conn.execute(
                 """INSERT INTO memory_evidence_events
-                   (canonical_message_id,evidence_type,reality_scope,subject_scope,
+                   (canonical_message_id,action_id,action_type,action_binding_version,
+                    evidence_type,reality_scope,subject_scope,
                     created_by_component,created_at)
-                   VALUES(?,'explicit_user_memory','real','user','memory_admin',?)""",
-                (message_id, stamp),
+                   VALUES(?,?,'remember_explicit_user',1,
+                          'explicit_user_memory','real','user','memory_admin',?)""",
+                (message_id, "A" * 32, stamp),
             )
             conn.execute(
                 """INSERT INTO memory_sources

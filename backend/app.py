@@ -41,10 +41,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 try:
-    from . import channel_store, deployment_config, kelivo_service, memory_service
+    from . import channel_store, deployment_config, kelivo_service, memory_runtime
     from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 except ImportError:  # support `python backend/app.py`
-    import channel_store, deployment_config, kelivo_service, memory_service
+    import channel_store, deployment_config, kelivo_service, memory_runtime
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 
 try:
@@ -128,7 +128,9 @@ LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = DEPLOYMENT.timeouts.safety_margin
 LOOP_DISPATCH_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.dispatch
 validate_loop_timeouts = deployment_config.validate_loop_timeouts
 KELIVO_PERSONA, KELIVO_PERSONA_SOURCE = deployment_config.load_server_persona()
-MEMORY_SERVICE = memory_service.MemoryService(DB_PATH, DEPLOYMENT.memory)
+MEMORY_SERVICE = (
+    memory_runtime.bootstrap_memory_runtime_from_environment(TELEGRAM).read_service
+)
 MEMORY_STARTUP_ERROR = ""
 CORE_STARTUP_ERROR = ""
 

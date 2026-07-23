@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from backend import (
@@ -17,6 +19,7 @@ from backend import (
     deployment_config,
     kelivo_service,
     memory_policy,
+    memory_runtime,
     memory_service,
     memory_store,
 )
@@ -48,6 +51,107 @@ def memory_config(
     )
 
 
+def bootstrap_runtime(path: str, config: deployment_config.MemoryConfig):
+    global channel_store, memory_policy, memory_runtime, memory_service, memory_store
+    memory_runtime = importlib.import_module("backend.memory_runtime")
+    memory_runtime = importlib.reload(memory_runtime)
+    channel_store = importlib.import_module("backend.channel_store")
+    memory_policy = importlib.import_module("backend.memory_policy")
+    memory_store = importlib.import_module("backend.memory_store")
+    memory_service = importlib.import_module("backend.memory_service")
+    deployment = SimpleNamespace(memory=config, db_path=Path(path))
+    with mock.patch.object(
+        deployment_config,
+        "load_deployment_config",
+        return_value=deployment,
+    ):
+        return memory_runtime.bootstrap_memory_runtime_from_environment(object())
+
+
+class TestOnlyMemoryFacade:
+    """Keeps legacy test scenarios concise without widening production APIs."""
+
+    __test__ = False
+
+    def __init__(self, runtime, message_factory):
+        self.read = runtime.read_service
+        self.actions = runtime.privileged_actions
+        self.store = self.actions._store
+        self._message_factory = message_factory
+
+    def readiness(self):
+        return self.read.readiness()
+
+    def create_explicit_memory(
+        self,
+        *,
+        kind,
+        scope_type,
+        scope_ref,
+        content,
+        sensitivity,
+        sources,
+    ):
+        source = tuple(sources)
+        if len(source) != 1:
+            raise memory_service.MemoryServiceError("unsupported_evidence")
+        canonical_message_id = source[0].canonical_message_id
+        if kind == "assistant_experience":
+            return self.actions.record_assistant_experience(
+                scope_type=scope_type,
+                scope_ref=scope_ref,
+                content=content,
+                sensitivity=sensitivity,
+                canonical_message_id=canonical_message_id,
+            )
+        if kind == "decision":
+            return self.actions.confirm_project_decision(
+                scope_type=scope_type,
+                scope_ref=scope_ref,
+                content=content,
+                sensitivity=sensitivity,
+                canonical_message_id=canonical_message_id,
+            )
+        return self.actions.remember_explicit_user_message(
+            kind=kind,
+            scope_type=scope_type,
+            scope_ref=scope_ref,
+            content=content,
+            sensitivity=sensitivity,
+            canonical_message_id=canonical_message_id,
+        )
+
+    def correct_memory(self, *, memory_key, content, sensitivity, sources):
+        source = tuple(sources)
+        if len(source) != 1:
+            raise memory_service.MemoryServiceError("unsupported_evidence")
+        canonical_message_id = source[0].canonical_message_id
+        return self.actions.correct_explicit_user_memory(
+            memory_key=memory_key,
+            content=content,
+            sensitivity=sensitivity,
+            canonical_message_id=canonical_message_id,
+        )
+
+    def forget_memory(self, *, memory_key):
+        return self.actions.forget_explicit_user_memory(
+            memory_key=memory_key,
+            canonical_message_id=self._message_factory(),
+        )
+
+    def get_active_memories(self, **kwargs):
+        return self.read.get_active_memories(**kwargs)
+
+    def get_memory_provenance(self, **kwargs):
+        return self.read.get_memory_provenance(**kwargs)
+
+    def propose_memory_candidate(self, **kwargs):
+        return self.read.propose_memory_candidate(**kwargs)
+
+    def confirm_memory(self, **kwargs):
+        return self.read.confirm_memory(**kwargs)
+
+
 class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -60,7 +164,12 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                 ts TEXT NOT NULL,direction TEXT NOT NULL,kind TEXT NOT NULL,
                 text TEXT NOT NULL,meta TEXT NOT NULL DEFAULT '{}')""")
         channel_store.run_migrations(self.path)
-        self.service = memory_service.MemoryService(self.path, memory_config())
+        self.runtime = bootstrap_runtime(self.path, memory_config())
+        self.service = TestOnlyMemoryFacade(self.runtime, self.message)
+
+    def service_for(self, config: deployment_config.MemoryConfig, path: str | None = None):
+        runtime = bootstrap_runtime(path or self.path, config)
+        return TestOnlyMemoryFacade(runtime, self.message)
 
     def message(
         self,
@@ -152,13 +261,23 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         message_id = self.message()
 
         def create_once():
-            return self.create(message_id=message_id)
+            try:
+                return self.create(message_id=message_id)
+            except memory_service.MemoryServiceError as error:
+                return {"outcome": error.category, "memory": None}
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda _index: create_once(), range(8)))
-        keys = {result["memory"]["memory_key"] for result in results}
+        keys = {
+            result["memory"]["memory_key"]
+            for result in results if result["memory"] is not None
+        }
         self.assertEqual(len(keys), 1)
         self.assertEqual(sum(result["outcome"] == "created" for result in results), 1)
+        self.assertEqual(
+            sum(result["outcome"] == "authorization_replayed" for result in results),
+            7,
+        )
         with channel_store.connect(self.path) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM memory_items").fetchone()[0], 1)
             self.assertEqual(
@@ -170,7 +289,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
 
     def test_fingerprint_profile_initializes_once_and_same_profile_restarts(self):
         created = self.create()
-        restarted = memory_service.MemoryService(self.path, memory_config())
+        restarted = self.service_for(memory_config())
         self.assertEqual(restarted.readiness(), (True, ""))
         replay = restarted.create_explicit_memory(
             kind="project",
@@ -195,9 +314,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
     def test_fingerprint_profile_changes_fail_closed_without_mutation_or_leak(self):
         created = self.create("Synthetic profile-protected fact")
         rotated_secret = "Rotated-Memory-HMAC-Key-2026-Beta!Y8w6"
-        active_rotated = memory_service.MemoryService(
-            self.path, memory_config(secret=rotated_secret)
-        )
+        active_rotated = self.service_for(memory_config(secret=rotated_secret))
         with self.assertRaisesRegex(
             memory_service.MemoryServiceError,
             "memory_fingerprint_profile_mismatch",
@@ -217,14 +334,15 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
-        self.service.forget_memory(memory_key=created["memory"]["memory_key"])
+        original_profile = self.service_for(memory_config())
+        original_profile.forget_memory(memory_key=created["memory"]["memory_key"])
         cases = (
             memory_config(secret=rotated_secret),
             memory_config(key_id="phase1-rotated-key"),
         )
         for config in cases:
             with self.subTest(config=config):
-                service = memory_service.MemoryService(self.path, config)
+                service = self.service_for(config)
                 before = self.counts()
                 output = io.StringIO()
                 with (
@@ -252,7 +370,8 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                 self.assertNotIn(config.fingerprint_key_id, leaked)
 
     def test_normalization_and_profile_domain_changes_fail_closed(self):
-        self.create()
+        created = self.create()
+        memory_key = created["memory"]["memory_key"]
         cases = (
             (memory_policy, "NORMALIZATION_VERSION", 2),
             (
@@ -263,7 +382,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         )
         for target, name, value in cases:
             with self.subTest(name=name), mock.patch.object(target, name, value):
-                service = memory_service.MemoryService(self.path, memory_config())
+                service = self.service_for(memory_config())
                 self.assertEqual(
                     service.readiness(),
                     (False, "memory_fingerprint_profile_mismatch"),
@@ -273,9 +392,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                     "memory_fingerprint_profile_mismatch",
                 ):
                     service.forget_memory(
-                        memory_key=self.service.get_active_memories(
-                            scope_type="global_user", scope_ref=""
-                        )[0]["memory_key"]
+                        memory_key=memory_key
                     )
 
     def test_similar_text_scope_and_kind_do_not_fuzzy_merge(self):
@@ -775,7 +892,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             outcomes = set(pool.map(create, range(2)))
-        self.assertEqual(outcomes, {"created", "unsupported_evidence"})
+        self.assertEqual(outcomes, {"created", "authorization_replayed"})
         with channel_store.connect(self.path) as conn:
             item_count = conn.execute(
                 "SELECT count(*) FROM memory_items"
@@ -815,7 +932,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                 "SELECT count(*) FROM memory_suppressions"
             ).fetchone()[0]
         self.assertEqual(tuple(item), ("forgotten", None, None))
-        self.assertEqual(source_count, 1)
+        self.assertEqual(source_count, 3)
         self.assertEqual(canonical, "synthetic source remains")
         self.assertEqual(suppression_count, 1)
         with channel_store.connect(self.path) as conn:
@@ -828,7 +945,10 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(
             self.service.get_active_memories(scope_type="global_user", scope_ref=""), []
         )
-        recreated = self.create("Synthetic fact to forget", message_id=message_id)
+        recreated = self.create(
+            "Synthetic fact to forget",
+            message_id=self.message(text="synthetic recreate action"),
+        )
         self.assertEqual(recreated["outcome"], "suppressed")
 
     def test_forget_failure_rolls_back_suppression_and_item(self):
@@ -958,9 +1078,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         )
 
     def test_sensitive_items_are_never_returned_by_phase1_retrieval(self):
-        service = memory_service.MemoryService(
-            self.path, memory_config(sensitive=True)
-        )
+        service = self.service_for(memory_config(sensitive=True))
         message_id = self.message()
         created = service.create_explicit_memory(
             kind="relationship",
@@ -1060,13 +1178,11 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(after["memory_sources"], before["memory_sources"])
 
     def test_concurrent_sensitivity_replays_keep_highest_classification(self):
-        service = memory_service.MemoryService(
-            self.path, memory_config(sensitive=True)
-        )
-        message_id = self.message()
+        service = self.service_for(memory_config(sensitive=True))
         barrier = threading.Barrier(12)
 
-        def create_once(sensitivity: str):
+        def create_once(entry):
+            sensitivity, message_id = entry
             barrier.wait()
             return service.create_explicit_memory(
                 kind="project",
@@ -1078,8 +1194,9 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             )
 
         levels = ("normal", "sensitive", "restricted") * 4
+        entries = tuple((level, self.message()) for level in levels)
         with ThreadPoolExecutor(max_workers=len(levels)) as pool:
-            results = list(pool.map(create_once, levels))
+            results = list(pool.map(create_once, entries))
         self.assertEqual({item["outcome"] for item in results}, {
             "created", "idempotent_existing",
         })
@@ -1118,9 +1235,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(source_count, 1)
 
     def test_correction_cannot_downgrade_sensitivity(self):
-        service = memory_service.MemoryService(
-            self.path, memory_config(sensitive=True)
-        )
+        service = self.service_for(memory_config(sensitive=True))
         message_id = self.message()
         created = service.create_explicit_memory(
             kind="relationship",
@@ -1141,7 +1256,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             )
 
     def test_direct_store_rejects_policy_bypasses_without_profile_side_effect(self):
-        store = memory_store.MemoryStore(self.path, memory_config())
+        store = self.service.store
         cases = (
             "api_key=synthetic-secret-value-12345",
             "%3Ftoken%3Dsynthetic-secret-value-12345",
@@ -1149,7 +1264,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         for index, content in enumerate(cases):
             before = self.counts()
             with self.subTest(index=index), self.assertRaisesRegex(
-                memory_store.MemoryStoreError, "secret_detected",
+                memory_store.MemoryStoreError, "authorization_required",
             ):
                 store.create_explicit_memory_from_user_action(
                     kind="project",
@@ -1173,24 +1288,17 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
 
     def test_direct_store_owns_runtime_flags_and_sensitive_policy(self):
         message_id = self.message()
-        disabled = memory_store.MemoryStore(
-            self.path,
-            memory_config(enabled=False, writes=False, secret=""),
-        )
+        before = self.counts()
         with self.assertRaisesRegex(
-            memory_store.MemoryStoreError, "feature_disabled",
+            memory_store.MemoryStoreError, "runtime_authority_invalid",
         ):
-            disabled.create_explicit_memory_from_user_action(
-                kind="project",
-                scope_type="global_user",
-                scope_ref="",
-                content="Synthetic disabled direct write",
-                sensitivity="normal",
-                sources=[self.provenance(message_id)],
+            memory_store.MemoryStore(
+                self.path,
+                memory_config(enabled=False, writes=False, secret=""),
             )
-        store = memory_store.MemoryStore(self.path, memory_config())
+        store = self.service.store
         with self.assertRaisesRegex(
-            memory_store.MemoryStoreError, "sensitive_storage_disabled",
+            memory_store.MemoryStoreError, "authorization_required",
         ):
             store.create_explicit_memory_from_user_action(
                 kind="relationship",
@@ -1200,21 +1308,18 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                 sensitivity="sensitive",
                 sources=[self.provenance(message_id)],
             )
-        with channel_store.connect(self.path) as conn:
-            for table in (
-                "memory_fingerprint_profile",
-                "memory_evidence_events",
-                "memory_items",
-                "memory_sources",
-            ):
-                self.assertEqual(
-                    conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0],
-                    0,
-                )
+        after = self.counts()
+        for table in (
+            "memory_fingerprint_profile",
+            "memory_evidence_events",
+            "memory_items",
+            "memory_sources",
+        ):
+            self.assertEqual(after[table], before[table])
 
     def test_direct_store_api_rejects_fingerprint_and_policy_arguments(self):
         message_id = self.message()
-        store = memory_store.MemoryStore(self.path, memory_config())
+        store = self.service.store
         forbidden = {
             "normalized_content": "Synthetic pre-normalized",
             "normalized_fingerprint": b"x" * 32,
@@ -1243,9 +1348,9 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             )
 
     def test_first_invalid_provenance_and_injected_failure_rollback_profile_and_grant(self):
-        store = memory_store.MemoryStore(self.path, memory_config())
+        store = self.service.store
         with self.assertRaisesRegex(
-            memory_store.MemoryStoreError, "invalid_provenance",
+            memory_store.MemoryStoreError, "authorization_required",
         ):
             store.create_explicit_memory_from_user_action(
                 kind="project",
@@ -1262,9 +1367,9 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             side_effect=memory_store.MemoryStoreError("injected_failure"),
         ):
             with self.assertRaisesRegex(
-                memory_store.MemoryStoreError, "injected_failure",
+                memory_service.MemoryServiceError, "injected_failure",
             ):
-                store.create_explicit_memory_from_user_action(
+                self.service.create_explicit_memory(
                     kind="project",
                     scope_type="global_user",
                     scope_ref="",
@@ -1295,7 +1400,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                     fingerprint_version,created_at,updated_at)
                    VALUES(2,'synthetic-extra',zeroblob(32),1,1,'x','x')"""
             )
-        service = memory_service.MemoryService(self.path, memory_config())
+        service = self.service_for(memory_config())
         self.assertEqual(
             service.readiness(),
             (False, "memory_fingerprint_profile_mismatch"),
@@ -1323,9 +1428,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                 "UPDATE memory_fingerprint_profile SET key_id=''"
             )
         self.assertEqual(
-            memory_service.MemoryService(
-                self.path, memory_config(),
-            ).readiness(),
+            self.service_for(memory_config()).readiness(),
             (False, "memory_fingerprint_profile_mismatch"),
         )
 
@@ -1333,7 +1436,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
         created = self.create("Synthetic missing-profile item")
         with channel_store.connect(self.path) as conn:
             conn.execute("DELETE FROM memory_fingerprint_profile")
-        service = memory_service.MemoryService(self.path, memory_config())
+        service = self.service_for(memory_config())
         self.assertEqual(
             service.readiness(),
             (False, "memory_fingerprint_profile_mismatch"),
@@ -1361,7 +1464,18 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                     ts TEXT NOT NULL,direction TEXT NOT NULL,kind TEXT NOT NULL,
                     text TEXT NOT NULL,meta TEXT NOT NULL DEFAULT '{}')""")
             channel_store.run_migrations(path)
-            other = memory_service.MemoryService(path, memory_config())
+            other_runtime = bootstrap_runtime(path, memory_config())
+
+            def other_message():
+                with channel_store.connect(path) as conn:
+                    return int(conn.execute(
+                        """INSERT INTO messages(ts,direction,kind,text,meta)
+                           VALUES(?,'in','user','synthetic',
+                                  '{"channel":"web","source":"relay"}')""",
+                        (channel_store.now_iso(),),
+                    ).lastrowid)
+
+            other = TestOnlyMemoryFacade(other_runtime, other_message)
             with channel_store.connect(path) as conn:
                 stamp = channel_store.now_iso()
                 message_id = int(conn.execute(
@@ -1382,9 +1496,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             with channel_store.connect(path) as conn:
                 conn.execute("DELETE FROM memory_fingerprint_profile")
             self.assertEqual(
-                memory_service.MemoryService(
-                    path, memory_config(),
-                ).readiness(),
+                self.service_for(memory_config(), path).readiness(),
                 (False, "memory_fingerprint_profile_mismatch"),
             )
 
@@ -1421,13 +1533,12 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                    WHERE id=?""",
                 (message_id,),
             )
-        replay = self.create(
-            "Synthetic reaction-stable grant", message_id=message_id,
-        )
-        self.assertEqual(replay["outcome"], "idempotent_existing")
-        self.assertEqual(
-            replay["memory"]["memory_key"], first["memory"]["memory_key"],
-        )
+        with self.assertRaisesRegex(
+            memory_service.MemoryServiceError, "authorization_replayed",
+        ):
+            self.create(
+                "Synthetic reaction-stable grant", message_id=message_id,
+            )
         with channel_store.connect(self.path) as conn:
             self.assertEqual(
                 conn.execute(
@@ -1535,7 +1646,6 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
 
     def test_locked_write_returns_stable_error_without_automatic_retry(self):
         message_id = self.message()
-        store = memory_store.MemoryStore(self.path, memory_config())
         blocker = sqlite3.connect(self.path, isolation_level=None)
         self.addCleanup(blocker.close)
         blocker.execute("BEGIN IMMEDIATE")
@@ -1551,11 +1661,11 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                     wraps=channel_store.connect,
                 ) as connect_call,
                 self.assertRaisesRegex(
-                    memory_store.MemoryStoreError,
+                    memory_service.MemoryServiceError,
                     "storage_unavailable",
                 ),
             ):
-                store.create_explicit_memory_from_user_action(
+                self.service.create_explicit_memory(
                     kind="project",
                     scope_type="global_user",
                     scope_ref="",
@@ -1585,7 +1695,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             (memory_config(writes=False, secret=""), "explicit_writes_disabled"),
             (memory_config(secret="", valid=False), "memory_configuration_invalid"),
         ):
-            service = memory_service.MemoryService(self.path, config)
+            service = self.service_for(config)
             with self.subTest(category=category), self.assertRaisesRegex(
                 memory_service.MemoryServiceError, category
             ):
@@ -1598,8 +1708,8 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
                     sources=[self.provenance(message_id)],
                 )
         self.assertEqual(
-            memory_service.MemoryService(
-                self.path, memory_config(writes=False, secret="")
+            self.service_for(
+                memory_config(writes=False, secret="")
             ).get_active_memories(scope_type="global_user", scope_ref=""),
             [],
         )

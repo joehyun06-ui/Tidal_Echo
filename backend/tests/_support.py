@@ -15,6 +15,24 @@ FAKE_USER = 11001
 FAKE_CHAT = 22001
 
 
+def clear_backend_app_modules():
+    """Give synthetic app imports the isolation of a fresh process."""
+    module_names = (
+        "backend.app", "backend.telegram_integration", "backend.channel_store",
+        "backend.kelivo_service", "backend.heartbeat_service",
+        "backend.memory_policy", "backend.memory_runtime",
+        "backend.memory_store", "backend.memory_service",
+    )
+    for name in module_names:
+        sys.modules.pop(name, None)
+    package = sys.modules.get("backend")
+    if package is not None:
+        for name in module_names:
+            attribute = name.rsplit(".", 1)[-1]
+            if hasattr(package, attribute):
+                delattr(package, attribute)
+
+
 class NoNetworkMixin:
     """Fail the test immediately if production code attempts a real socket."""
     def setUp(self):
@@ -105,10 +123,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
     }
     os.environ.update(values)
-    for name in ("backend.app", "backend.telegram_integration", "backend.channel_store",
-                 "backend.kelivo_service", "backend.heartbeat_service",
-                 "backend.memory_policy", "backend.memory_store", "backend.memory_service"):
-        sys.modules.pop(name, None)
+    clear_backend_app_modules()
     module = importlib.import_module("backend.app")
     module.telegram_integration = importlib.import_module("backend.telegram_integration")
     module.init_db()

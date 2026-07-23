@@ -1,14 +1,15 @@
-"""Internal-only orchestration for explicit Memory Core operations."""
+"""Read-only Memory service and authority-bound privileged actions."""
 
 from __future__ import annotations
 
 import re
-from typing import Iterable, Sequence
+from typing import Sequence
 
 try:
-    from . import memory_policy, memory_store
+    from . import memory_policy, memory_runtime, memory_store
 except ImportError:  # support direct module execution in local tooling
     import memory_policy
+    import memory_runtime
     import memory_store
 
 
@@ -23,44 +24,28 @@ class MemoryServiceError(RuntimeError):
         self.category = category
 
 
-class MemoryService:
-    """Phase 1 service: explicit create/correct/forget and bounded internal reads."""
+class MemoryReadService:
+    """The only Memory service exposed to ordinary application components."""
 
     HARD_MAX_RETRIEVAL_ITEMS = 20
     HARD_MAX_RETRIEVAL_CHARS = 8000
 
-    def __init__(self, path: str, config):
-        self.config = config
-        self.store = memory_store.MemoryStore(path, config)
-        self.policy = self.store.policy
-
-    def readiness(self) -> tuple[bool, str]:
-        if not self.config.enabled:
-            return False, ""
-        if not self.config.configuration_valid:
-            return False, self.config.error_category or "memory_configuration_invalid"
-        if not self.store.validate_schema():
-            return False, "memory_schema_invalid"
-        if self.config.explicit_writes_enabled:
-            try:
-                if not self.store.validate_runtime_profile_state():
-                    return False, "memory_fingerprint_profile_mismatch"
-            except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
-                return False, getattr(
-                    exc, "category", "memory_fingerprint_profile_mismatch"
-                )
-        return True, ""
-
-    def _require_enabled(self) -> None:
-        if not self.config.enabled:
-            raise MemoryServiceError("feature_disabled")
-        if not self.config.configuration_valid:
-            raise MemoryServiceError("memory_configuration_invalid")
-
-    def _require_write(self) -> None:
-        self._require_enabled()
-        if not self.config.explicit_writes_enabled:
-            raise MemoryServiceError("explicit_writes_disabled")
+    def __init__(
+        self,
+        reader: memory_store.MemoryReader,
+        *,
+        enabled: bool,
+        configuration_valid: bool,
+        error_category: str,
+        explicit_writes_enabled: bool,
+        policy: memory_policy.MemoryPolicy,
+    ):
+        self._reader = reader
+        self._enabled = bool(enabled)
+        self._configuration_valid = bool(configuration_valid)
+        self._error_category = str(error_category)
+        self._explicit_writes_enabled = bool(explicit_writes_enabled)
+        self._policy = policy
 
     @staticmethod
     def _validate_memory_key(memory_key: str) -> str:
@@ -70,109 +55,32 @@ class MemoryService:
 
     @staticmethod
     def _translate_error(error: Exception) -> MemoryServiceError:
-        category = getattr(error, "category", "memory_operation_failed")
-        return MemoryServiceError(str(category))
+        return MemoryServiceError(str(
+            getattr(error, "category", "memory_operation_failed")
+        ))
 
-    def create_explicit_memory(
-        self,
-        *,
-        kind: str,
-        scope_type: str,
-        scope_ref: str,
-        content: str,
-        sensitivity: str,
-        sources: Iterable[memory_policy.ProvenanceInput],
-    ) -> dict:
-        self._require_write()
-        try:
-            source_inputs = tuple(sources)
-            # A pure preflight can return stable policy errors earlier. The Store
-            # repeats every check and is the final enforcement point.
-            self.policy.validate_explicit_create(
-                kind=kind,
-                scope_type=scope_type,
-                scope_ref=scope_ref,
-                content=content,
-                sensitivity=sensitivity,
-                sources=source_inputs,
-                allow_existing_reclassification=True,
-            )
-            action = (
-                self.store.create_assistant_experience_from_action
-                if kind == "assistant_experience"
-                else self.store.create_confirmed_project_decision_from_action
-                if kind == "decision"
-                else self.store.create_explicit_memory_from_user_action
-            )
-            result = action(
-                kind=kind,
-                scope_type=scope_type,
-                scope_ref=scope_ref,
-                content=content,
-                sensitivity=sensitivity,
-                sources=source_inputs,
-            )
-            return {"outcome": result.outcome, "memory": result.item}
-        except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
-            raise self._translate_error(exc) from None
+    def _require_enabled(self) -> None:
+        if not self._enabled:
+            raise MemoryServiceError("feature_disabled")
+        if not self._configuration_valid:
+            raise MemoryServiceError("memory_configuration_invalid")
 
-    def correct_memory(
-        self,
-        *,
-        memory_key: str,
-        content: str,
-        sensitivity: str,
-        sources: Iterable[memory_policy.ProvenanceInput],
-    ) -> dict:
-        self._require_write()
-        self._validate_memory_key(memory_key)
-        try:
-            source_inputs = tuple(sources)
-            # The Store rereads the current item and repeats the complete policy
-            # and transaction enforcement. This lookup is only an early preflight.
-            current = self.store.get_item_by_key(memory_key)
-            if current is None:
-                raise MemoryServiceError("not_found")
-            if current["status"] != "active":
-                raise MemoryServiceError("invalid_state")
-            sensitivity_rank = {"normal": 0, "sensitive": 1, "restricted": 2}
-            if (
-                sensitivity not in sensitivity_rank
-                or sensitivity_rank[sensitivity] < sensitivity_rank[current["sensitivity"]]
-            ):
-                raise MemoryServiceError("sensitivity_downgrade")
-            self.policy.validate_explicit_create(
-                kind=current["kind"],
-                scope_type=current["scope_type"],
-                scope_ref=current["scope_ref"],
-                content=content,
-                sensitivity=sensitivity,
-                sources=source_inputs,
-                allow_existing_reclassification=True,
-            )
-            result = self.store.correct_memory_from_user_action(
-                memory_key=memory_key,
-                content=content,
-                sensitivity=sensitivity,
-                sources=source_inputs,
-            )
-            return {"outcome": result.outcome, "memory": result.item}
-        except MemoryServiceError:
-            raise
-        except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
-            raise self._translate_error(exc) from None
-
-    def forget_memory(self, *, memory_key: str) -> dict:
-        self._require_write()
-        self._validate_memory_key(memory_key)
-        try:
-            result = self.store.forget_memory_atomic(memory_key=memory_key)
-            return {
-                "outcome": result.outcome,
-                "memory_key": result.item["memory_key"] if result.item is not None else memory_key,
-            }
-        except memory_store.MemoryStoreError as exc:
-            raise self._translate_error(exc) from None
+    def readiness(self) -> tuple[bool, str]:
+        if not self._enabled:
+            return False, ""
+        if not self._configuration_valid:
+            return False, self._error_category or "memory_configuration_invalid"
+        if not self._reader.validate_schema():
+            return False, "memory_schema_invalid"
+        if self._explicit_writes_enabled:
+            try:
+                if not self._reader.validate_runtime_profile_state():
+                    return False, "memory_fingerprint_profile_mismatch"
+            except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
+                return False, getattr(
+                    exc, "category", "memory_fingerprint_profile_mismatch"
+                )
+        return True, ""
 
     def get_active_memories(
         self,
@@ -186,7 +94,7 @@ class MemoryService:
     ) -> list[dict]:
         self._require_enabled()
         try:
-            self.policy.validate_scope(scope_type, scope_ref)
+            self._policy.validate_scope(scope_type, scope_ref)
         except memory_policy.MemoryPolicyError as exc:
             raise self._translate_error(exc) from None
         if include_sensitive:
@@ -203,7 +111,7 @@ class MemoryService:
         limit = min(limit, self.HARD_MAX_RETRIEVAL_ITEMS)
         character_budget = min(character_budget, self.HARD_MAX_RETRIEVAL_CHARS)
         try:
-            items = self.store.get_active_items(
+            items = self._reader.get_active_items(
                 scope_type=scope_type,
                 scope_ref=scope_ref,
                 kinds=kinds,
@@ -219,7 +127,7 @@ class MemoryService:
                 if used + len(content) > character_budget:
                     break
                 safe = dict(item)
-                safe["provenance"] = self.store.get_sources(item["memory_key"])
+                safe["provenance"] = self._reader.get_sources(item["memory_key"])
                 result.append(safe)
                 used += len(content)
             return result
@@ -230,9 +138,9 @@ class MemoryService:
         self._require_enabled()
         self._validate_memory_key(memory_key)
         try:
-            if self.store.get_item_by_key(memory_key) is None:
+            if self._reader.get_item_by_key(memory_key) is None:
                 raise MemoryServiceError("not_found")
-            return self.store.get_sources(memory_key)
+            return self._reader.get_sources(memory_key)
         except MemoryServiceError:
             raise
         except memory_store.MemoryStoreError as exc:
@@ -243,3 +151,298 @@ class MemoryService:
 
     def confirm_memory(self, **_kwargs):
         raise MemoryServiceError("not_implemented_phase_1")
+
+
+class _PrivilegedServiceBase:
+    def __init__(self, store: memory_store.MemoryStore, authority: object):
+        try:
+            policy = memory_runtime.require_runtime_authority(authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryServiceError(error.category) from None
+        self._store = store
+        self._authority = authority
+        self._policy = store.policy
+
+    @staticmethod
+    def _validate_memory_key(memory_key: str) -> str:
+        if not isinstance(memory_key, str) or _MEMORY_KEY.fullmatch(memory_key) is None:
+            raise MemoryServiceError("invalid_memory_key")
+        return memory_key
+
+    @staticmethod
+    def _translate_error(error: Exception) -> MemoryServiceError:
+        return MemoryServiceError(str(
+            getattr(error, "category", "memory_operation_failed")
+        ))
+
+    def _require_enabled(self) -> None:
+        try:
+            policy = memory_runtime.require_runtime_authority(self._authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise self._translate_error(error) from None
+        if not policy.enabled:
+            raise MemoryServiceError("feature_disabled")
+        if not policy.configuration_valid:
+            raise MemoryServiceError("memory_configuration_invalid")
+
+
+class PrivilegedMemoryActions(_PrivilegedServiceBase):
+    """Narrow fixed-semantics actions retained only by the composition root."""
+
+    def _binding(
+        self,
+        *,
+        action_type: str,
+        canonical_message_id: int,
+        kind: str,
+        scope_type: str,
+        scope_ref: str,
+        normalized_content: str | None,
+        sensitivity: str,
+        memory_key: str = "",
+    ) -> memory_runtime.MemoryActionBinding:
+        return memory_runtime.MemoryActionBinding(
+            action_type=action_type,
+            canonical_message_id=canonical_message_id,
+            kind=kind,
+            scope_type=scope_type,
+            scope_ref=scope_ref,
+            normalized_content=normalized_content,
+            sensitivity=sensitivity,
+            memory_key=memory_key,
+        )
+
+    @staticmethod
+    def _one_source(
+        canonical_message_id: int,
+    ) -> tuple[memory_policy.ProvenanceInput, ...]:
+        return (memory_policy.ProvenanceInput(
+            canonical_message_id=canonical_message_id,
+        ),)
+
+    def _execute_create(
+        self,
+        *,
+        action_type: str,
+        method,
+        kind: str,
+        scope_type: str,
+        scope_ref: str,
+        content: str,
+        sensitivity: str,
+        canonical_message_id: int,
+    ) -> dict:
+        self._require_enabled()
+        sources = self._one_source(canonical_message_id)
+        try:
+            normalized, validated = self._policy.validate_explicit_create(
+                kind=kind,
+                scope_type=scope_type,
+                scope_ref=scope_ref,
+                content=content,
+                sensitivity=sensitivity,
+                sources=sources,
+                allow_existing_reclassification=True,
+            )
+            envelope = memory_runtime.issue_action_envelope(
+                self._authority,
+                self._binding(
+                    action_type=action_type,
+                    canonical_message_id=canonical_message_id,
+                    kind=kind,
+                    scope_type=scope_type,
+                    scope_ref=scope_ref,
+                    normalized_content=normalized,
+                    sensitivity=sensitivity,
+                ),
+            )
+            result = method(
+                kind=kind,
+                scope_type=scope_type,
+                scope_ref=scope_ref,
+                content=content,
+                sensitivity=sensitivity,
+                sources=validated,
+                authorization=envelope,
+            )
+            return {"outcome": result.outcome, "memory": result.item}
+        except (
+            memory_policy.MemoryPolicyError,
+            memory_runtime.MemoryRuntimeError,
+            memory_store.MemoryStoreError,
+        ) as exc:
+            raise self._translate_error(exc) from None
+
+    def remember_explicit_user_message(
+        self,
+        *,
+        kind: str,
+        scope_type: str,
+        scope_ref: str,
+        content: str,
+        sensitivity: str,
+        canonical_message_id: int,
+    ) -> dict:
+        if kind in {"decision", "assistant_experience"}:
+            raise MemoryServiceError("unsupported_evidence")
+        return self._execute_create(
+            action_type=memory_runtime.ACTION_REMEMBER_USER,
+            method=self._store.create_explicit_memory_from_user_action,
+            kind=kind,
+            scope_type=scope_type,
+            scope_ref=scope_ref,
+            content=content,
+            sensitivity=sensitivity,
+            canonical_message_id=canonical_message_id,
+        )
+
+    def confirm_project_decision(
+        self,
+        *,
+        scope_type: str,
+        scope_ref: str,
+        content: str,
+        sensitivity: str,
+        canonical_message_id: int,
+    ) -> dict:
+        return self._execute_create(
+            action_type=memory_runtime.ACTION_CONFIRM_DECISION,
+            method=self._store.create_confirmed_project_decision_from_action,
+            kind="decision",
+            scope_type=scope_type,
+            scope_ref=scope_ref,
+            content=content,
+            sensitivity=sensitivity,
+            canonical_message_id=canonical_message_id,
+        )
+
+    def record_assistant_experience(
+        self,
+        *,
+        scope_type: str,
+        scope_ref: str,
+        content: str,
+        sensitivity: str,
+        canonical_message_id: int,
+    ) -> dict:
+        return self._execute_create(
+            action_type=memory_runtime.ACTION_ASSISTANT_EXPERIENCE,
+            method=self._store.create_assistant_experience_from_action,
+            kind="assistant_experience",
+            scope_type=scope_type,
+            scope_ref=scope_ref,
+            content=content,
+            sensitivity=sensitivity,
+            canonical_message_id=canonical_message_id,
+        )
+
+    def correct_explicit_user_memory(
+        self,
+        *,
+        memory_key: str,
+        content: str,
+        sensitivity: str,
+        canonical_message_id: int,
+    ) -> dict:
+        self._require_enabled()
+        self._validate_memory_key(memory_key)
+        sources = self._one_source(canonical_message_id)
+        try:
+            current = self._store.get_item_by_key(memory_key)
+            if current is None:
+                raise MemoryServiceError("not_found")
+            if current["status"] != "active":
+                raise MemoryServiceError("invalid_state")
+            if current["kind"] == "assistant_experience":
+                raise MemoryServiceError("unsupported_evidence")
+            normalized = self._policy.validate_content(
+                content,
+                sensitivity,
+                allow_existing_reclassification=True,
+            )
+            validated = self._policy.validate_provenance_inputs(
+                current["kind"], sources,
+            )
+            envelope = memory_runtime.issue_action_envelope(
+                self._authority,
+                self._binding(
+                    action_type=memory_runtime.ACTION_CORRECT_USER,
+                    canonical_message_id=canonical_message_id,
+                    kind=current["kind"],
+                    scope_type=current["scope_type"],
+                    scope_ref=current["scope_ref"],
+                    normalized_content=normalized,
+                    sensitivity=sensitivity,
+                    memory_key=memory_key,
+                ),
+            )
+            result = self._store.correct_memory_from_user_action(
+                memory_key=memory_key,
+                content=content,
+                sensitivity=sensitivity,
+                sources=validated,
+                authorization=envelope,
+            )
+            return {"outcome": result.outcome, "memory": result.item}
+        except MemoryServiceError:
+            raise
+        except (
+            memory_policy.MemoryPolicyError,
+            memory_runtime.MemoryRuntimeError,
+            memory_store.MemoryStoreError,
+        ) as exc:
+            raise self._translate_error(exc) from None
+
+    def forget_explicit_user_memory(
+        self,
+        *,
+        memory_key: str,
+        canonical_message_id: int,
+    ) -> dict:
+        self._require_enabled()
+        self._validate_memory_key(memory_key)
+        sources = self._one_source(canonical_message_id)
+        try:
+            current = self._store.get_item_by_key(memory_key)
+            if current is None:
+                raise MemoryServiceError("not_found")
+            validated = self._policy.validate_provenance_inputs(
+                current["kind"], sources,
+            )
+            envelope = memory_runtime.issue_action_envelope(
+                self._authority,
+                self._binding(
+                    action_type=memory_runtime.ACTION_FORGET_USER,
+                    canonical_message_id=canonical_message_id,
+                    kind=current["kind"],
+                    scope_type=current["scope_type"],
+                    scope_ref=current["scope_ref"],
+                    normalized_content=current["normalized_content"],
+                    sensitivity=current["sensitivity"],
+                    memory_key=memory_key,
+                ),
+            )
+            result = self._store.forget_memory_atomic(
+                memory_key=memory_key,
+                sources=validated,
+                authorization=envelope,
+            )
+            return {
+                "outcome": result.outcome,
+                "memory_key": (
+                    result.item["memory_key"]
+                    if result.item is not None else memory_key
+                ),
+            }
+        except MemoryServiceError:
+            raise
+        except (
+            memory_policy.MemoryPolicyError,
+            memory_runtime.MemoryRuntimeError,
+            memory_store.MemoryStoreError,
+        ) as exc:
+            raise self._translate_error(exc) from None
+
+
+# Compatibility name for importers; it deliberately has no write methods.
+MemoryService = MemoryReadService
