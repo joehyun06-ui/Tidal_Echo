@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import hmac
 import importlib
+import inspect
 import json
 import os
 import tempfile
@@ -159,6 +162,74 @@ class MemoryAuthorityTests(NoNetworkMixin, unittest.TestCase):
             sources=(memory_policy.ProvenanceInput(message_id),),
             authorization=authorization,
         )
+
+    def issue_at(self, binding, issued_at_ns: int):
+        with mock.patch.object(
+            memory_runtime.time,
+            "monotonic_ns",
+            return_value=issued_at_ns,
+        ):
+            return memory_runtime.issue_action_envelope(
+                self.actions._authority,
+                binding,
+            )
+
+    def direct_create_at(
+        self,
+        message_id: int,
+        authorization: object,
+        current_ns: object,
+    ):
+        with mock.patch.object(
+            memory_runtime.time,
+            "monotonic_ns",
+            return_value=current_ns,
+        ):
+            return self.direct_create(message_id, authorization)
+
+    def resign(self, envelope, **changes):
+        updated = dataclasses.replace(envelope, **changes)
+        payload = memory_runtime._binding_payload(
+            action_id=updated.action_id,
+            binding=updated.binding,
+            issued_at_ns=updated.issued_at_ns,
+            expires_at_ns=updated.expires_at_ns,
+        )
+        signature = hmac.new(
+            self.actions._authority._action_secret,
+            payload,
+            hashlib.sha256,
+        ).digest()
+        return dataclasses.replace(updated, signature=signature)
+
+    def signature_for_payload(self, payload: dict[str, object]) -> bytes:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hmac.new(
+            self.actions._authority._action_secret,
+            encoded,
+            hashlib.sha256,
+        ).digest()
+
+    def assert_rejected_without_state(
+        self,
+        category: str,
+        message_id: int,
+        envelope: object,
+        *,
+        current_ns: object,
+    ):
+        before = self.counts()
+        with self.assertRaisesRegex(
+            memory_store.MemoryStoreError,
+            f"^{category}$",
+        ):
+            self.direct_create_at(message_id, envelope, current_ns)
+        self.assertEqual(self.counts(), before)
 
     def test_caller_config_injection_and_fake_authority_are_rejected(self):
         @dataclasses.dataclass(frozen=True)
@@ -411,18 +482,285 @@ class MemoryAuthorityTests(NoNetworkMixin, unittest.TestCase):
             (memory_runtime.ACTION_REMEMBER_USER, 1),
         )
 
+    def test_production_capability_apis_do_not_accept_caller_clocks(self):
+        issue_parameters = inspect.signature(
+            memory_runtime.issue_action_envelope
+        ).parameters
+        consume_parameters = inspect.signature(
+            memory_runtime.begin_action_consumption
+        ).parameters
+        for forbidden in ("now_ns", "clock", "time_callback"):
+            self.assertNotIn(forbidden, issue_parameters)
+            self.assertNotIn(forbidden, consume_parameters)
+
+        message_id = self.message()
+        binding = self.binding(message_id)
+        with self.assertRaises(TypeError):
+            memory_runtime.issue_action_envelope(
+                self.actions._authority,
+                binding,
+                now_ns=lambda: 1,
+            )
+        envelope = memory_runtime.issue_action_envelope(
+            self.actions._authority,
+            binding,
+        )
+        with self.assertRaises(TypeError):
+            memory_runtime.begin_action_consumption(
+                self.actions._authority,
+                envelope,
+                expected_binding=binding,
+                now_ns=lambda: 1,
+            )
+        self.assert_zero_state()
+
+    def test_future_issued_capability_is_not_yet_valid_without_side_effects(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        envelope = self.issue_at(self.binding(message_id), issued_at_ns)
+        self.assert_rejected_without_state(
+            "authorization_not_yet_valid",
+            message_id,
+            envelope,
+            current_ns=issued_at_ns - 1,
+        )
+
+    def test_issued_at_equal_to_current_is_valid(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        envelope = self.issue_at(self.binding(message_id), issued_at_ns)
+        created = self.direct_create_at(
+            message_id,
+            envelope,
+            issued_at_ns,
+        )
+        self.assertEqual(created.outcome, "created")
+
+    def test_expires_at_equal_to_current_is_valid(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        expires_at_ns = issued_at_ns + 1
+        envelope = self.resign(
+            self.issue_at(self.binding(message_id), issued_at_ns),
+            expires_at_ns=expires_at_ns,
+        )
+        created = self.direct_create_at(
+            message_id,
+            envelope,
+            expires_at_ns,
+        )
+        self.assertEqual(created.outcome, "created")
+
+    def test_invalid_time_types_ranges_and_order_have_no_side_effects(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        binding = self.binding(message_id)
+        envelope = self.issue_at(binding, issued_at_ns)
+        invalid_values = (
+            None,
+            True,
+            False,
+            1.5,
+            "5000000000000",
+            -1,
+            1 << 63,
+        )
+        for value in invalid_values:
+            with (
+                self.subTest(issuer=repr(value)),
+                mock.patch.object(
+                    memory_runtime.time,
+                    "monotonic_ns",
+                    return_value=value,
+                ),
+                self.assertRaisesRegex(
+                    memory_runtime.MemoryRuntimeError,
+                    "^authorization_invalid$",
+                ),
+            ):
+                memory_runtime.issue_action_envelope(
+                    self.actions._authority,
+                    binding,
+                )
+            self.assert_zero_state()
+
+        for field in ("issued_at_ns", "expires_at_ns"):
+            for value in invalid_values:
+                tampered = dataclasses.replace(envelope, **{field: value})
+                with self.subTest(field=field, value=repr(value)):
+                    self.assert_rejected_without_state(
+                        "authorization_invalid",
+                        message_id,
+                        tampered,
+                        current_ns=issued_at_ns,
+                    )
+
+        for value in invalid_values:
+            with self.subTest(current=repr(value)):
+                self.assert_rejected_without_state(
+                    "authorization_invalid",
+                    message_id,
+                    envelope,
+                    current_ns=value,
+                )
+
+        for name, tampered in (
+            (
+                "ttl_plus_one",
+                self.resign(
+                    envelope,
+                    expires_at_ns=(
+                        issued_at_ns
+                        + memory_runtime.ACTION_CAPABILITY_TTL_NS
+                        + 1
+                    ),
+                ),
+            ),
+            (
+                "expires_before_issued",
+                self.resign(
+                    envelope,
+                    expires_at_ns=issued_at_ns - 1,
+                ),
+            ),
+            (
+                "expires_equal_issued",
+                self.resign(
+                    envelope,
+                    expires_at_ns=issued_at_ns,
+                ),
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assert_rejected_without_state(
+                    "authorization_invalid",
+                    message_id,
+                    tampered,
+                    current_ns=issued_at_ns,
+                )
+
+    def test_signature_shape_matrix_has_no_side_effects(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        envelope = self.issue_at(self.binding(message_id), issued_at_ns)
+        signature = envelope.signature
+        mutations = (
+            b"",
+            signature[:-1],
+            signature + b"x",
+            b"x" * len(signature),
+            "not-bytes",
+            bytearray(signature),
+            memoryview(signature),
+            None,
+        )
+        for value in mutations:
+            with self.subTest(value_type=type(value).__name__, length=getattr(
+                value, "__len__", lambda: -1
+            )()):
+                self.assert_rejected_without_state(
+                    "authorization_invalid",
+                    message_id,
+                    dataclasses.replace(envelope, signature=value),
+                    current_ns=issued_at_ns,
+                )
+
+    def test_payload_shape_and_binding_version_forgery_have_no_side_effects(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        envelope = self.issue_at(self.binding(message_id), issued_at_ns)
+        payload = json.loads(memory_runtime._binding_payload(
+            action_id=envelope.action_id,
+            binding=envelope.binding,
+            issued_at_ns=envelope.issued_at_ns,
+            expires_at_ns=envelope.expires_at_ns,
+        ))
+        malformed_payloads = []
+        missing = dict(payload)
+        missing.pop("scope_ref")
+        malformed_payloads.append(("missing_field", missing))
+        extra = dict(payload)
+        extra["authority"] = "externally-supplied"
+        malformed_payloads.append(("extra_security_field", extra))
+        wrong_version = dict(payload)
+        wrong_version["binding_version"] = (
+            memory_runtime.ACTION_BINDING_VERSION + 1
+        )
+        malformed_payloads.append(("wrong_binding_version", wrong_version))
+
+        for name, malformed_payload in malformed_payloads:
+            forged = dataclasses.replace(
+                envelope,
+                signature=self.signature_for_payload(malformed_payload),
+            )
+            with self.subTest(name=name):
+                self.assert_rejected_without_state(
+                    "authorization_invalid",
+                    message_id,
+                    forged,
+                    current_ns=issued_at_ns,
+                )
+
+    def test_malformed_envelope_is_rejected_without_side_effects(self):
+        message_id = self.message()
+        issued_at_ns = 5_000_000_000_000
+        envelope = self.issue_at(self.binding(message_id), issued_at_ns)
+        for field, value in (
+            ("action_id", ""),
+            ("action_id", "x" * 23),
+            ("action_id", "不安全" * 12),
+            ("action_id", None),
+            ("binding", None),
+        ):
+            with self.subTest(field=field, value_type=type(value).__name__):
+                self.assert_rejected_without_state(
+                    "authorization_invalid",
+                    message_id,
+                    dataclasses.replace(envelope, **{field: value}),
+                    current_ns=issued_at_ns,
+                )
+        with self.assertRaises(AttributeError):
+            object.__setattr__(
+                envelope,
+                "externally_supplied_authority",
+                object(),
+            )
+        with self.assertRaises(AttributeError):
+            object.__setattr__(
+                envelope.binding,
+                "externally_supplied_policy",
+                object(),
+            )
+        self.assert_zero_state()
+
+        missing_binding = object.__new__(memory_runtime.MemoryActionBinding)
+        self.assert_rejected_without_state(
+            "authorization_invalid",
+            message_id,
+            dataclasses.replace(envelope, binding=missing_binding),
+            current_ns=issued_at_ns,
+        )
+        malformed = object.__new__(memory_runtime._MemoryActionEnvelope)
+        self.assert_rejected_without_state(
+            "authorization_invalid",
+            message_id,
+            malformed,
+            current_ns=5_000_000_000_000,
+        )
+
     def test_expired_and_previous_process_capabilities_are_rejected(self):
         message_id = self.message()
-        expired = memory_runtime.issue_action_envelope(
-            self.actions._authority,
+        issued_at_ns = 5_000_000_000_000
+        expired = self.issue_at(
             self.binding(message_id),
-            now_ns=lambda: 1,
+            issued_at_ns,
         )
-        with self.assertRaisesRegex(
-            memory_store.MemoryStoreError, "authorization_expired",
-        ):
-            self.direct_create(message_id, expired)
-        self.assert_zero_state()
+        self.assert_rejected_without_state(
+            "authorization_expired",
+            message_id,
+            expired,
+            current_ns=expired.expires_at_ns + 1,
+        )
 
         prior_process = memory_runtime.issue_action_envelope(
             self.actions._authority, self.binding(message_id),
@@ -533,6 +871,10 @@ class MemoryAuthorityTests(NoNetworkMixin, unittest.TestCase):
             "Synthetic authority-bound memory",
             "canonical_message_id",
             "scope_ref",
+            envelope.action_id,
+            str(envelope.issued_at_ns),
+            str(envelope.expires_at_ns),
+            envelope.signature.hex(),
         ):
             self.assertNotIn(forbidden, rendered)
         try:

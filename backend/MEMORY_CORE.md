@@ -61,16 +61,49 @@ server's known channel names. Session and project references are internal,
 validated opaque identifiers. They are not accepted from an external client in
 Phase 1 and must not be logged.
 
+## Threat model
+
+Phase 1 trusts the reviewed repository code that runs in the same Python
+interpreter as the backend application, including the application composition
+root and internal modules admitted to production through code review. Code that
+can import production modules and execute arbitrary Python in that interpreter
+is therefore inside the trusted computing base.
+
+Phase 1 treats all of the following as untrusted:
+
+- HTTP, Telegram, Kelivo, Operit, and Galatea client input;
+- canonical message text and metadata, and Memory item text;
+- external URLs, tool instructions, and prompt-injection content;
+- database state that may be corrupt or forged;
+- replays, concurrency, timeouts, and uncertain network outcomes.
+
+Python module-private variables, underscore-prefixed names, closures, and object
+identity are not security isolation boundaries against an arbitrary
+same-interpreter code executor. Runtime Policy, Privileged Actions, and Action
+Capabilities instead provide a clear application composition boundary, keep
+ordinary paths from accidentally acquiring writes, bind authorization to one
+specific action, reject external forgery/tampering/expiry/replay, and preserve
+one-use and database-transaction atomicity. They do not claim to sandbox or
+contain a malicious module that already has arbitrary code execution in the
+backend interpreter.
+
+If a future architecture must run an untrusted internal component, that
+component must move behind a separate process or service, separate credentials,
+and operating-system isolation. That is outside Phase 1. Correcting this threat
+model does not relax any external-input, database-integrity, concurrency, or
+privacy boundary described below.
+
 ## Runtime authority and service boundary
 
 Application startup calls
 `bootstrap_memory_runtime_from_environment(...)` exactly once. That composition
 root invokes the formal deployment configuration loader itself and freezes a
 `MemoryRuntimePolicy`; `MemoryStore` no longer accepts caller-provided Memory
-configuration. Its constructor requires the process-local authority created by
-that bootstrap, and repeated bootstrap attempts are rejected without replacing
-the current authority. Later environment mutation cannot change the frozen
-policy.
+configuration. The composition root supplies the process-local authority to the
+Store, repeated bootstrap attempts are rejected without replacing the current
+authority, and later environment mutation cannot change the frozen policy.
+These are application wiring and misuse controls within the trusted process,
+not a sandbox for arbitrary same-process Python.
 
 The bootstrap also creates an independent random action HMAC secret. It is
 generated anew for every process, is separate from the fingerprint secret, and
@@ -109,9 +142,13 @@ a short-lived one-use capability and immediately invokes the Store. The
 capability binds a random action ID, fixed action type, canonical message ID,
 kind, scope type/reference, normalized content, sensitivity, correction/forget
 memory key, normalization/fingerprint domain versions, issue time, expiry, and
-binding version using unambiguous canonical JSON and the process-only action
+binding version using unambiguous canonical JSON and the process-lifetime action
 HMAC. The capability is never returned to an ordinary caller and cannot
-survive process restart.
+survive process restart. Production issuance and verification read
+`time.monotonic_ns()` internally; callers cannot provide a clock. The fixed
+Phase 1 lifetime ceiling is 30 seconds. Verification rejects malformed,
+negative, Boolean, non-integer, oversized, reversed, overlong, future-issued,
+or expired time bounds. Exact issue-time and expiry-time boundaries are valid.
 
 `MemoryStore` is the final enforcement point. Inside the final
 `BEGIN IMMEDIATE` transaction it verifies the runtime authority and frozen
@@ -132,9 +169,9 @@ Each action hard-codes its evidence/reality/subject/component contract and
 atomically creates and immediately binds the event to the resulting
 memory/source. There is no generic `create_evidence_event(type=...)` interface,
 no conversion of an ordinary canonical row into evidence, and no reusable
-grant. Missing, forged, changed, expired, cross-purpose, restarted-process, or
-already consumed capabilities fail with stable data-free categories and do not
-write Memory state.
+grant. Missing, forged, changed, not-yet-valid, expired, cross-purpose,
+restarted-process, or already consumed capabilities fail with stable data-free
+categories and do not write Memory state.
 
 Ordinary legacy canonical rows have no Memory authorization on their own.
 Phase 1 does not wire these privileged actions into Telegram, Kelivo, Operit,

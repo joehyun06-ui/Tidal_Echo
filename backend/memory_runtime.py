@@ -10,7 +10,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 try:
     from . import deployment_config, memory_policy
@@ -20,7 +19,10 @@ except ImportError:  # support direct module execution in local tooling
 
 
 ACTION_BINDING_VERSION = 1
-ACTION_CAPABILITY_TTL_SECONDS = 30.0
+ACTION_CAPABILITY_TTL_SECONDS = 30
+ACTION_CAPABILITY_TTL_NS = ACTION_CAPABILITY_TTL_SECONDS * 1_000_000_000
+_MAX_MONOTONIC_NS = (1 << 63) - 1
+_ACTION_SIGNATURE_BYTES = hashlib.sha256().digest_size
 
 ACTION_REMEMBER_USER = "remember_explicit_user"
 ACTION_CONFIRM_DECISION = "confirm_project_decision"
@@ -61,7 +63,7 @@ class MemoryRuntimePolicy:
     error_category: str
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(frozen=True, repr=False, slots=True)
 class MemoryActionBinding:
     action_type: str
     canonical_message_id: int
@@ -73,7 +75,7 @@ class MemoryActionBinding:
     memory_key: str = field(default="", repr=False)
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(frozen=True, repr=False, slots=True)
 class _MemoryActionEnvelope:
     action_id: str = field(repr=False)
     binding: MemoryActionBinding = field(repr=False)
@@ -187,18 +189,59 @@ def _binding_payload(
     ).encode("utf-8")
 
 
+def _valid_monotonic_ns(value: object) -> bool:
+    return type(value) is int and 0 <= value <= _MAX_MONOTONIC_NS
+
+
+def _valid_action_id(value: object) -> bool:
+    return (
+        type(value) is str
+        and 24 <= len(value) <= 96
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "-_")
+            for character in value
+        )
+    )
+
+
+def _valid_binding_shape(value: object) -> bool:
+    if type(value) is not MemoryActionBinding:
+        return False
+    try:
+        return (
+            type(value.action_type) is str
+            and value.action_type in ACTION_TYPES
+            and type(value.canonical_message_id) is int
+            and value.canonical_message_id > 0
+            and type(value.kind) is str
+            and type(value.scope_type) is str
+            and type(value.scope_ref) is str
+            and (
+                value.normalized_content is None
+                or type(value.normalized_content) is str
+            )
+            and type(value.sensitivity) is str
+            and type(value.memory_key) is str
+        )
+    except (AttributeError, TypeError):
+        return False
+
+
 def issue_action_envelope(
     authority: object,
     binding: MemoryActionBinding,
-    *,
-    now_ns: Callable[[], int] = time.monotonic_ns,
 ) -> object:
     require_runtime_authority(authority)
-    if type(binding) is not MemoryActionBinding or binding.action_type not in ACTION_TYPES:
+    if not _valid_binding_shape(binding):
         raise MemoryRuntimeError("authorization_invalid")
     action_id = secrets.token_urlsafe(24)
-    issued_at_ns = int(now_ns())
-    expires_at_ns = issued_at_ns + int(ACTION_CAPABILITY_TTL_SECONDS * 1_000_000_000)
+    issued_at_ns = time.monotonic_ns()
+    if not _valid_monotonic_ns(issued_at_ns):
+        raise MemoryRuntimeError("authorization_invalid")
+    expires_at_ns = issued_at_ns + ACTION_CAPABILITY_TTL_NS
+    if not _valid_monotonic_ns(expires_at_ns):
+        raise MemoryRuntimeError("authorization_invalid")
     try:
         payload = _binding_payload(
             action_id=action_id,
@@ -227,25 +270,40 @@ def begin_action_consumption(
     envelope: object | None,
     *,
     expected_binding: MemoryActionBinding,
-    now_ns: Callable[[], int] = time.monotonic_ns,
 ) -> str:
     require_runtime_authority(authority)
     if envelope is None:
         raise MemoryRuntimeError("authorization_required")
     if type(envelope) is not _MemoryActionEnvelope:
         raise MemoryRuntimeError("authorization_invalid")
+    if not _valid_binding_shape(expected_binding):
+        raise MemoryRuntimeError("authorization_invalid")
+    try:
+        action_id = envelope.action_id
+        binding = envelope.binding
+        issued_at_ns = envelope.issued_at_ns
+        expires_at_ns = envelope.expires_at_ns
+        signature = envelope.signature
+    except (AttributeError, TypeError):
+        raise MemoryRuntimeError("authorization_invalid") from None
     if (
-        type(expected_binding) is not MemoryActionBinding
-        or expected_binding.action_type not in ACTION_TYPES
-        or envelope.binding != expected_binding
+        not _valid_binding_shape(binding)
+        or binding != expected_binding
+        or not _valid_action_id(action_id)
+        or type(signature) is not bytes
+        or len(signature) != _ACTION_SIGNATURE_BYTES
+        or not _valid_monotonic_ns(issued_at_ns)
+        or not _valid_monotonic_ns(expires_at_ns)
+        or expires_at_ns <= issued_at_ns
+        or expires_at_ns - issued_at_ns > ACTION_CAPABILITY_TTL_NS
     ):
         raise MemoryRuntimeError("authorization_invalid")
     try:
         payload = _binding_payload(
-            action_id=envelope.action_id,
-            binding=envelope.binding,
-            issued_at_ns=envelope.issued_at_ns,
-            expires_at_ns=envelope.expires_at_ns,
+            action_id=action_id,
+            binding=binding,
+            issued_at_ns=issued_at_ns,
+            expires_at_ns=expires_at_ns,
         )
     except (TypeError, ValueError, UnicodeError):
         raise MemoryRuntimeError("authorization_invalid") from None
@@ -254,29 +312,28 @@ def begin_action_consumption(
         payload,
         hashlib.sha256,
     ).digest()
-    if not (
-        isinstance(envelope.signature, bytes)
-        and hmac.compare_digest(envelope.signature, expected_signature)
-    ):
+    if not hmac.compare_digest(signature, expected_signature):
         raise MemoryRuntimeError("authorization_invalid")
-    current_ns = int(now_ns())
-    if current_ns > envelope.expires_at_ns:
+    current_ns = time.monotonic_ns()
+    if not _valid_monotonic_ns(current_ns):
+        raise MemoryRuntimeError("authorization_invalid")
+    if current_ns < issued_at_ns:
+        raise MemoryRuntimeError("authorization_not_yet_valid")
+    if current_ns > expires_at_ns:
         raise MemoryRuntimeError("authorization_expired")
     if (
-        envelope.issued_at_ns <= 0
-        or envelope.expires_at_ns <= envelope.issued_at_ns
-        or envelope.expires_at_ns - envelope.issued_at_ns
-        > int(ACTION_CAPABILITY_TTL_SECONDS * 1_000_000_000)
+        current_ns - issued_at_ns > ACTION_CAPABILITY_TTL_NS
+        or expires_at_ns - current_ns > ACTION_CAPABILITY_TTL_NS
     ):
         raise MemoryRuntimeError("authorization_invalid")
     with authority._action_lock:
         if (
-            envelope.action_id in authority._inflight_actions
-            or envelope.action_id in authority._consumed_actions
+            action_id in authority._inflight_actions
+            or action_id in authority._consumed_actions
         ):
             raise MemoryRuntimeError("authorization_replayed")
-        authority._inflight_actions.add(envelope.action_id)
-    return envelope.action_id
+        authority._inflight_actions.add(action_id)
+    return action_id
 
 
 def finish_action_consumption(

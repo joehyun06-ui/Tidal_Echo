@@ -265,11 +265,25 @@ explicit indexes 和 trigger 集合；任何核心缺失或损坏均 fail closed
 Operit、模型、审计和 API-loop 凭据均不同的专用
 `MEMORY_FINGERPRINT_HMAC_SECRET`。
 
+Phase 1 的威胁模型把与 backend 同处一个 Python 解释器、可 import 生产模块并执行
+任意 Python 的仓库代码、composition root，以及经代码审查进入生产的内部模块视为
+可信计算基。HTTP、Telegram、Kelivo、Operit、Galatea 客户端输入，canonical
+正文/metadata、Memory 正文、外部 URL、工具指令、prompt injection、可能损坏或
+伪造的数据库状态，以及重放、并发、超时和网络不确定结果均不可信。
+
+Python 模块私有变量、下划线名称、闭包和对象 identity 不是针对任意同进程代码
+执行者的安全隔离边界。Runtime Policy、Privileged Actions 与 Action Capability
+用于建立清晰的应用组合边界、防止普通路径误接线、绑定具体动作、拒绝外部伪造/
+篡改/过期/重放，并保证一次消费和数据库事务原子性；它们不是同进程 Python
+sandbox。未来若要隔离不可信内部组件，必须改用独立进程/服务、独立凭据与 OS 级
+边界。本次威胁模型校正不削弱任何外部输入、数据完整性、并发或隐私边界。
+
 应用启动时只允许通过正式 deployment loader 执行一次
 `bootstrap_memory_runtime_from_environment(...)`。它冻结不可变 Runtime Policy
 并生成独立的进程级随机 Action HMAC；重复 bootstrap 稳定拒绝，启动后修改环境
 变量不能替换既有 authority 或 policy。`MemoryStore` 不再接受调用方提供的
-Memory config，只接受该进程 bootstrap 创建的 authority。
+Memory config；composition root 将该进程 bootstrap 创建的 authority 交给
+Store。这是可信进程内的组合与防误用控制，不是针对任意同进程 Python 的隔离。
 
 普通 `MemoryReadService` 只有 readiness、受限读取与 provenance 查询，没有
 create/correct/forget。写操作只存在于语义固定的 `PrivilegedMemoryActions`：
@@ -284,7 +298,10 @@ sensitivity、必要的 memory key、版本和有效期。Store 在最终
 `BEGIN IMMEDIATE` 事务内重新计算绑定并用 constant-time HMAC 验证，随后验证
 profile/canonical provenance、计算 fingerprint、检查 suppression 并原子写入。
 调用方不能传入 fingerprint、policy flag、evidence semantics、channel/source
-或 role；普通 canonical row 本身没有 grant。
+或 role；普通 canonical row 本身没有 grant。生产签发与验证均在内部直接读取
+`time.monotonic_ns()`，不接受调用方 clock/`now_ns`。Phase 1 固定 TTL 上限为
+30 秒；future-issued、过期、顺序错误、超过 TTL，以及负数、布尔、非整数和超大
+时间字段都会被稳定拒绝，精确落在签发时刻或到期时刻的边界仍有效。
 
 首次成功写入会在同一个 `BEGIN IMMEDIATE` 事务内创建唯一 fingerprint profile、
 带唯一 action ID/type/binding version 的不可变 evidence event、memory item 与
@@ -311,8 +328,8 @@ channel 仍要求安全非空，Operit 的非空 `operit` source 保持不变。
 如需物理 schema downgrade，应恢复上线前整库备份，不得只删除 migration
 marker 或手工拆表。
 
-第三轮定向修复已实现，但最终独立复审尚未完成；不得声称所有 finding 已关闭。
-PR 必须继续保持 Draft，不得 merge 或部署。
+本轮威胁模型校正与 capability 时间验证修复已实现，但聚焦独立复审尚未完成；
+不得声称所有 finding 已关闭。PR 必须继续保持 Draft，不得 merge 或部署。
 
 ### Kelivo OpenAI-compatible 非流式 API（可选）
 
