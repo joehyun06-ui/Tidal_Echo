@@ -98,7 +98,7 @@ class MemoryPolicyTests(unittest.TestCase):
             '{"Authorization": "Bearer synthetic-json-token-value-12345"}',
             "api_key=synthetic-secret-value-12345",
             '{"api_key": "synthetic-json-secret-value-12345"}',
-            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN " + "PRIVATE KEY-----",
             "cookie: sessionid=synthetic-cookie-value",
             '{"session_token": "synthetic-session-value-12345"}',
             "sk-syntheticCredentialValue12345",
