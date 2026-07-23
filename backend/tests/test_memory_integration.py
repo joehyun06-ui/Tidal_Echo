@@ -184,6 +184,43 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("CREATE TABLE", str(payload))
                 self.assertNotIn(str(root), str(payload))
 
+    async def test_core_corruption_fails_startup_and_readiness_with_memory_disabled_or_enabled(self):
+        cases = (
+            ("rate_limits", "DROP TABLE channel_rate_limits"),
+            ("audit_events", "DROP TABLE channel_audit_events"),
+            (
+                "core_index",
+                "DROP INDEX idx_generation_jobs_status_lease",
+            ),
+        )
+        for memory_enabled in (False, True):
+            for name, sql in cases:
+                with (
+                    self.subTest(memory=memory_enabled, case=name),
+                    tempfile.TemporaryDirectory() as root,
+                ):
+                    initial = load_app(root, memory=memory_enabled)
+                    with closing(sqlite3.connect(initial.DB_PATH)) as conn:
+                        conn.execute(sql)
+                        conn.commit()
+                    restarted = load_app(root, memory=memory_enabled)
+                    response = await self._ready(restarted)
+                    payload = response.json()
+                    self.assertEqual(
+                        restarted.CORE_STARTUP_ERROR,
+                        "core_schema_invalid",
+                    )
+                    self.assertEqual(response.status_code, 503)
+                    self.assertFalse(payload["ready"])
+                    self.assertFalse(payload["checks"]["database"])
+                    self.assertEqual(
+                        payload["errors"]["database"],
+                        "core_schema_invalid",
+                    )
+                    self.assertNotIn("channel_", str(payload))
+                    self.assertNotIn("CREATE TABLE", str(payload))
+                    self.assertNotIn(str(root), str(payload))
+
     async def test_phase1_exposes_no_memory_http_route(self):
         with tempfile.TemporaryDirectory() as root:
             module = load_app(root, memory=True)

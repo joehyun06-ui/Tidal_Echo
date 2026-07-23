@@ -246,7 +246,8 @@ Operit 的专用分享入口与 Kelivo 通用聊天入口是两套隔离的认�
 
 ### Memory Core Phase 1（默认关闭）
 
-Migration v7 仅增加五张 Memory 表和严格索引，不修改 v1–v6 表或既有消息。
+Migration v7 仅增加五张 Memory 表、严格索引和 evidence 不可变 trigger，不修改
+v1–v6 表或既有消息。
 Phase 1 不调用模型、不自动扫描历史、不向 prompt 注入记忆，也不开放 Memory
 HTTP API。完整的数据边界、显式 create/correct/forget、provenance、suppression
 与隐私契约见 [`MEMORY_CORE.md`](MEMORY_CORE.md)。
@@ -254,23 +255,44 @@ HTTP API。完整的数据边界、显式 create/correct/forget、provenance、s
 保持 `MEMORY_CORE_ENABLED=false` 和
 `MEMORY_EXPLICIT_WRITES_ENABLED=false` 时，不应用或校验可选 v7，不需要
 fingerprint profile、Key ID 或 HMAC Secret；Memory-only 表、索引或约束缺失/
-损坏不会阻塞 v1–v6 核心 readiness，且会安全报告 `memory_core=false`。只有在
+损坏不会阻塞 v1–v6 核心 readiness，且会安全报告 `memory_core=false`。这只隔离
+optional v7：startup 与 `/readyz` 始终使用同一个严格 v1–v6 validator 验证
+migration markers、tables/columns、PK/default/CHECK/FK、unique/partial indexes、
+explicit indexes 和 trigger 集合；任何核心缺失或损坏均 fail closed 为
+`core_schema_invalid`，不会用 `CREATE TABLE IF NOT EXISTS` 静默重建。只有在
 后续独立阶段启用显式写入时，才设置稳定的
 `MEMORY_FINGERPRINT_KEY_ID`，并创建一把与 relay、Telegram、Kelivo、
 Operit、模型、审计和 API-loop 凭据均不同的专用
 `MEMORY_FINGERPRINT_HMAC_SECRET`。
 
-首次启用写入会原子创建持久化 fingerprint profile。Key ID、Secret verifier、
+`MemoryStore` 是最终写入 enforcement point。调用方不能传入 fingerprint、
+policy flag、sensitivity 开关、evidence semantics、channel/source 或 role；
+Store 从冻结启动配置重建 policy，并在自己的最终事务内重读 canonical
+provenance、验证 profile、计算 fingerprint、检查 suppression。
+
+首次成功写入会在同一个 `BEGIN IMMEDIATE` 事务内创建唯一 fingerprint profile、
+不可变 evidence event、memory item 与 source；policy/provenance/后续写入失败不会
+留下 profile 或 event。额外、损坏、缺失但已有 Memory 状态或配置不匹配的 profile
+均使 readiness 与写入 fail closed。Key ID、Secret verifier、
 normalization version 或 fingerprint/domain version 任一不匹配都会使 Memory
 写入和其 readiness fail closed。Phase 1 不支持无迁移直接轮换 Secret 或更改
-normalization；这些变更必须由单独审查的显式迁移处理。evidence 只来自
-server-owned action/event，普通旧 canonical message 默认不授予 Memory 写入。
+normalization；这些变更必须由单独审查的显式迁移处理。
+
+Evidence 只由语义固定的 privileged internal action API 创建，并在同一事务立即
+绑定；没有通用 event 创建器或可跨 kind/scope/content 复用的 grant。当前 Phase 1
+未把这些 action 接入 Telegram、Kelivo、Operit 或 Galatea 聊天路径。普通旧
+canonical message 默认不授予 Memory 写入，也不从普通历史自动判断玩笑/虚构。
+Telegram/Kelivo canonical meta 缺失、null 或空 `source` 会规范化为 `""`；
+channel 仍要求安全非空，Operit 的非空 `operit` source 保持不变。
 同正文 reclassification 只能按 `normal < sensitive < restricted` 上调。
 
 部署包含 v7 的代码前应创建一致的 SQLite 备份。v7 是纯加法，关闭 Memory
 功能后旧 v6 应用代码可继续使用既有表；这属于应用回滚，不会移除 v7 表。
 如需物理 schema downgrade，应恢复上线前整库备份，不得只删除 migration
 marker 或手工拆表。
+
+第二轮修复已实现，但下一次独立复审尚未完成；PR 必须继续保持 Draft，不得 merge
+或部署。
 
 ### Kelivo OpenAI-compatible 非流式 API（可选）
 

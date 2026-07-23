@@ -31,11 +31,8 @@ class MemoryService:
 
     def __init__(self, path: str, config):
         self.config = config
-        self.store = memory_store.MemoryStore(path)
-        self.policy = memory_policy.MemoryPolicy(
-            max_item_chars=config.max_item_chars,
-            sensitive_storage_enabled=config.sensitive_storage_enabled,
-        )
+        self.store = memory_store.MemoryStore(path, config)
+        self.policy = self.store.policy
 
     def readiness(self) -> tuple[bool, str]:
         if not self.config.enabled:
@@ -46,9 +43,7 @@ class MemoryService:
             return False, "memory_schema_invalid"
         if self.config.explicit_writes_enabled:
             try:
-                if not self.store.validate_fingerprint_profile(
-                    **self._fingerprint_profile_parameters()
-                ):
+                if not self.store.validate_runtime_profile_state():
                     return False, "memory_fingerprint_profile_mismatch"
             except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
                 return False, getattr(
@@ -66,31 +61,6 @@ class MemoryService:
         self._require_enabled()
         if not self.config.explicit_writes_enabled:
             raise MemoryServiceError("explicit_writes_disabled")
-        self.initialize_write_profile()
-
-    def _fingerprint_profile_parameters(self) -> dict:
-        return {
-            "key_id": self.config.fingerprint_key_id,
-            "key_check": memory_policy.fingerprint_profile_check(
-                self.config.fingerprint_hmac_secret
-            ),
-            "normalization_version": memory_policy.NORMALIZATION_VERSION,
-            "fingerprint_version": memory_policy.FINGERPRINT_VERSION,
-        }
-
-    def initialize_write_profile(self) -> None:
-        if not self.config.enabled or not self.config.explicit_writes_enabled:
-            return
-        if not self.config.configuration_valid:
-            raise MemoryServiceError(
-                self.config.error_category or "memory_configuration_invalid"
-            )
-        try:
-            self.store.ensure_fingerprint_profile(
-                **self._fingerprint_profile_parameters()
-            )
-        except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
-            raise self._translate_error(exc) from None
 
     @staticmethod
     def _validate_memory_key(memory_key: str) -> str:
@@ -102,20 +72,6 @@ class MemoryService:
     def _translate_error(error: Exception) -> MemoryServiceError:
         category = getattr(error, "category", "memory_operation_failed")
         return MemoryServiceError(str(category))
-
-    def _fingerprint(
-        self, *, scope_type: str, scope_ref: str, kind: str, normalized_content: str,
-    ) -> bytes:
-        try:
-            return memory_policy.fingerprint_content(
-                self.config.fingerprint_hmac_secret,
-                scope_type=scope_type,
-                scope_ref=scope_ref,
-                kind=kind,
-                normalized_content=normalized_content,
-            )
-        except memory_policy.MemoryPolicyError as exc:
-            raise self._translate_error(exc) from None
 
     def create_explicit_memory(
         self,
@@ -129,39 +85,32 @@ class MemoryService:
     ) -> dict:
         self._require_write()
         try:
-            normalized, validated_sources = self.policy.validate_explicit_create(
+            source_inputs = tuple(sources)
+            # A pure preflight can return stable policy errors earlier. The Store
+            # repeats every check and is the final enforcement point.
+            self.policy.validate_explicit_create(
                 kind=kind,
                 scope_type=scope_type,
                 scope_ref=scope_ref,
                 content=content,
                 sensitivity=sensitivity,
-                sources=sources,
+                sources=source_inputs,
                 allow_existing_reclassification=True,
             )
-            fingerprint = self._fingerprint(
-                scope_type=scope_type,
-                scope_ref=scope_ref,
-                kind=kind,
-                normalized_content=normalized,
+            action = (
+                self.store.create_assistant_experience_from_action
+                if kind == "assistant_experience"
+                else self.store.create_confirmed_project_decision_from_action
+                if kind == "decision"
+                else self.store.create_explicit_memory_from_user_action
             )
-            if self.store.is_suppressed(
-                scope_type=scope_type,
-                scope_ref=scope_ref,
-                kind=kind,
-                fingerprint=fingerprint,
-                fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-            ):
-                return {"outcome": "suppressed"}
-            result = self.store.create_item_with_sources(
+            result = action(
                 kind=kind,
                 scope_type=scope_type,
                 scope_ref=scope_ref,
-                normalized_content=normalized,
-                fingerprint=fingerprint,
-                fingerprint_version=memory_policy.FINGERPRINT_VERSION,
+                content=content,
                 sensitivity=sensitivity,
-                sources=validated_sources,
-                sensitive_storage_enabled=self.config.sensitive_storage_enabled,
+                sources=source_inputs,
             )
             return {"outcome": result.outcome, "memory": result.item}
         except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
@@ -178,6 +127,9 @@ class MemoryService:
         self._require_write()
         self._validate_memory_key(memory_key)
         try:
+            source_inputs = tuple(sources)
+            # The Store rereads the current item and repeats the complete policy
+            # and transaction enforcement. This lookup is only an early preflight.
             current = self.store.get_item_by_key(memory_key)
             if current is None:
                 raise MemoryServiceError("not_found")
@@ -189,29 +141,20 @@ class MemoryService:
                 or sensitivity_rank[sensitivity] < sensitivity_rank[current["sensitivity"]]
             ):
                 raise MemoryServiceError("sensitivity_downgrade")
-            normalized, validated_sources = self.policy.validate_explicit_create(
+            self.policy.validate_explicit_create(
                 kind=current["kind"],
                 scope_type=current["scope_type"],
                 scope_ref=current["scope_ref"],
                 content=content,
                 sensitivity=sensitivity,
-                sources=sources,
+                sources=source_inputs,
                 allow_existing_reclassification=True,
             )
-            fingerprint = self._fingerprint(
-                scope_type=current["scope_type"],
-                scope_ref=current["scope_ref"],
-                kind=current["kind"],
-                normalized_content=normalized,
-            )
-            result = self.store.correct_item_atomic(
+            result = self.store.correct_memory_from_user_action(
                 memory_key=memory_key,
-                normalized_content=normalized,
-                fingerprint=fingerprint,
-                fingerprint_version=memory_policy.FINGERPRINT_VERSION,
+                content=content,
                 sensitivity=sensitivity,
-                sources=validated_sources,
-                sensitive_storage_enabled=self.config.sensitive_storage_enabled,
+                sources=source_inputs,
             )
             return {"outcome": result.outcome, "memory": result.item}
         except MemoryServiceError:
@@ -223,7 +166,7 @@ class MemoryService:
         self._require_write()
         self._validate_memory_key(memory_key)
         try:
-            result = self.store.forget_item_atomic(memory_key=memory_key)
+            result = self.store.forget_memory_atomic(memory_key=memory_key)
             return {
                 "outcome": result.outcome,
                 "memory_key": result.item["memory_key"] if result.item is not None else memory_key,

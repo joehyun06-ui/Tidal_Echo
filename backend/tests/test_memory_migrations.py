@@ -154,6 +154,29 @@ class MemoryMigrationTests(unittest.TestCase):
         with self.assertRaises(sqlite3.DatabaseError):
             channel_store.run_migrations(self.path)
 
+    def test_validator_rejects_missing_or_modified_immutability_trigger(self):
+        for index, statement in enumerate((
+            "DROP TRIGGER memory_evidence_events_immutable_update",
+            """DROP TRIGGER memory_evidence_events_immutable_delete;
+               CREATE TRIGGER memory_evidence_events_immutable_delete
+               BEFORE DELETE ON memory_evidence_events
+               BEGIN SELECT RAISE(ABORT,'wrong_category'); END""",
+        )):
+            with self.subTest(index=index):
+                path = str(Path(self.temp.name) / f"trigger-{index}.sqlite3")
+                with channel_store.connect(path) as conn:
+                    conn.execute("""CREATE TABLE messages(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,direction TEXT NOT NULL,kind TEXT NOT NULL,
+                        text TEXT NOT NULL,meta TEXT NOT NULL DEFAULT '{}')""")
+                channel_store.run_migrations(path)
+                with channel_store.connect(path) as conn:
+                    conn.executescript(statement)
+                with channel_store.connect(path) as conn, self.assertRaisesRegex(
+                    sqlite3.DatabaseError, "memory trigger",
+                ):
+                    channel_store.validate_memory_schema(conn)
+
     def test_checks_partial_unique_and_restrict_fks_are_enforced(self):
         channel_store.run_migrations(self.path)
         stamp = channel_store.now_iso()

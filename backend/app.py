@@ -130,6 +130,7 @@ validate_loop_timeouts = deployment_config.validate_loop_timeouts
 KELIVO_PERSONA, KELIVO_PERSONA_SOURCE = deployment_config.load_server_persona()
 MEMORY_SERVICE = memory_service.MemoryService(DB_PATH, DEPLOYMENT.memory)
 MEMORY_STARTUP_ERROR = ""
+CORE_STARTUP_ERROR = ""
 
 if not SECRET:
     raise SystemExit("RELAY_SECRET is required (set it in the systemd EnvironmentFile)")
@@ -155,42 +156,49 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    global MEMORY_STARTUP_ERROR
+    global CORE_STARTUP_ERROR, MEMORY_STARTUP_ERROR
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    with db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts        TEXT NOT NULL,
-                direction TEXT NOT NULL,   -- 'in' (human -> AI) | 'out' (AI -> human)
-                kind      TEXT NOT NULL,   -- 'user' | 'reply' | 'thinking' | 'voice' | 'call' | ...
-                text      TEXT NOT NULL,
-                meta      TEXT NOT NULL DEFAULT '{}'
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS push_subscriptions (
-                endpoint TEXT PRIMARY KEY,
-                p256dh   TEXT NOT NULL,
-                auth     TEXT NOT NULL,
-                ua       TEXT,
-                created  TEXT NOT NULL,
-                last_ok  TEXT
-            )
-            """
-        )
-        conn.commit()
-    channel_store.run_migrations(DB_PATH, channel_store.CORE_MIGRATIONS)
+    CORE_STARTUP_ERROR = ""
     MEMORY_STARTUP_ERROR = ""
+    try:
+        with db() as conn:
+            migration_table_exists = bool(conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type='table' AND name='schema_migrations'"""
+            ).fetchone())
+            has_applied_core = (
+                bool(conn.execute(
+                    """SELECT 1 FROM schema_migrations
+                       WHERE version BETWEEN 1 AND 6 AND status='applied'
+                       LIMIT 1"""
+                ).fetchone())
+                if migration_table_exists
+                else False
+            )
+            # Only a new/legacy pre-migration database may create the relay
+            # tables. An applied core marker plus a missing object is corruption,
+            # not an invitation to silently recreate a data-bearing table.
+            if not has_applied_core:
+                for statement in channel_store.RELAY_TABLE_DDL.values():
+                    conn.execute(
+                        statement.replace(
+                            "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1,
+                        )
+                    )
+            conn.commit()
+        channel_store.run_migrations(
+            DB_PATH, channel_store.CORE_MIGRATIONS,
+        )
+        with db() as conn:
+            channel_store.validate_core_schema_v1_v6(
+                conn, require_relay_tables=True,
+            )
+    except (OSError, sqlite3.Error, ValueError):
+        CORE_STARTUP_ERROR = "core_schema_invalid"
+        return
     if DEPLOYMENT.memory.enabled:
         try:
             channel_store.run_migrations(DB_PATH)
-            MEMORY_SERVICE.initialize_write_profile()
-        except memory_service.MemoryServiceError as exc:
-            MEMORY_STARTUP_ERROR = exc.category
         except (OSError, sqlite3.Error, ValueError):
             MEMORY_STARTUP_ERROR = "memory_schema_invalid"
     channel_store.recover_inflight_generations(DB_PATH)
@@ -1002,39 +1010,15 @@ async def healthz():
 
 
 def _database_ready() -> bool:
+    if CORE_STARTUP_ERROR:
+        return False
     try:
         uri = Path(DB_PATH).resolve(strict=False).as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as conn:
             conn.row_factory = sqlite3.Row
-            required_tables = {
-                "messages", "schema_migrations", "generation_jobs", "delivery_attempts",
-                "telegram_completions", "delivery_parts", "external_messages",
-                "channel_accounts", "channel_conversations", "inbound_events",
-                "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
-                "heartbeat_schedule_revisions", "heartbeat_run_inputs",
-            }
-            if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled:
-                required_tables.update({
-                    "kelivo_clients", "kelivo_requests", "companion_context_snapshots", "kelivo_rate_limits"
-                })
-            found = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN (%s)"
-                    % ",".join("?" for _ in required_tables), tuple(required_tables)
-                )
-            }
-            if found != required_tables:
-                return False
-            latest = channel_store.CORE_MIGRATIONS[-1][0]
-            row = conn.execute(
-                "SELECT status FROM schema_migrations WHERE version=?", (latest,)
-            ).fetchone()
-            if row is None or row[0] != "applied":
-                return False
-            if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled:
-                channel_store.validate_kelivo_schema(conn)
-            channel_store.validate_heartbeat_schema(conn)
-            channel_store.validate_heartbeat_hardening_schema(conn)
+            channel_store.validate_core_schema_v1_v6(
+                conn, require_relay_tables=True,
+            )
             return True
     except (OSError, sqlite3.Error, ValueError):
         return False
@@ -1086,7 +1070,9 @@ async def readyz():
         "telegram_worker": worker_task is not None and not worker_task.done(),
         "api_loop": await _api_loop_ready(),
     }
-    if MEMORY_STARTUP_ERROR:
+    if not checks["database"]:
+        memory_ready, memory_error = False, ""
+    elif MEMORY_STARTUP_ERROR:
         memory_ready, memory_error = False, MEMORY_STARTUP_ERROR
     else:
         memory_ready, memory_error = await asyncio.to_thread(MEMORY_SERVICE.readiness)
@@ -1111,8 +1097,13 @@ async def readyz():
     }
     ready = all(gating_checks.values())
     payload = {"ready": ready, "checks": checks, "status": "ready" if ready else "not_ready"}
+    errors = {}
+    if not checks["database"]:
+        errors["database"] = "core_schema_invalid"
     if DEPLOYMENT.memory.enabled and memory_error:
-        payload["errors"] = {"memory_core": memory_error}
+        errors["memory_core"] = memory_error
+    if errors:
+        payload["errors"] = errors
     return JSONResponse(payload, status_code=200 if ready else 503)
 
 

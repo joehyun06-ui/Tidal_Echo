@@ -14,7 +14,9 @@ correlation. Memory Core never silently edits a canonical message.
 superseded, rejected, or forgotten without rewriting its canonical source.
 `memory_evidence_events` records a closed, server-owned grant for a canonical
 message without copying message text or external identity. `memory_sources`
-links each memory to those immutable grants. `memory_suppressions` prevents a
+links each memory to those immutable grants. Database triggers reject every
+update or deletion of an evidence event, whether or not it is referenced.
+`memory_suppressions` prevents a
 forgotten or obsolete fact from being recreated. The singleton
 `memory_fingerprint_profile` pins the keyed fingerprint contract.
 
@@ -66,15 +68,30 @@ server-owned evidence event of one of these types:
 - `confirmed_project_decision`
 - `explicit_user_correction` (correction only)
 
-The Memory service input contains only canonical message references. Callers
-cannot supply or override evidence type, reality scope, subject scope, channel,
-source, or role. The store rereads the canonical row and its immutable evidence
-event, derives role/channel/source, and checks the closed semantics. Ordinary
-legacy canonical rows have no grant. Missing events, role mismatch, roleplay,
-jokes, fiction, third-party claims, malformed metadata, or untrusted semantics
-fail the whole transaction closed. Phase 1 does not wire evidence creation into
-any existing chat adapter; a future trusted adapter must create an event only
-for an explicit remember/correct action.
+The Memory action input contains only business fields and canonical message
+references. Callers cannot supply or override a fingerprint, policy flag,
+evidence type, reality scope, subject scope, component, channel, source, or
+role. `MemoryStore` is the final enforcement point: it reconstructs its policy
+from the frozen application configuration, rereads canonical rows, derives
+role/channel/source, computes the keyed fingerprint, validates the profile, and
+checks suppression inside its own write path. A service preflight is only an
+early error path and is never trusted as authorization.
+
+Evidence is created only by narrow privileged internal action methods whose
+names fix their meaning: explicit user memory, explicit user correction,
+confirmed project decision, or assistant experience. Each action hard-codes
+its evidence/reality/subject/component contract and atomically creates and
+immediately binds the event to the resulting memory/source. There is no generic
+`create_evidence_event(type=...)` interface and no reusable unconsumed grant.
+An existing grant can only replay its already-bound action; attempting to reuse
+it for another kind, scope, or content fails closed.
+
+Ordinary legacy canonical rows have no Memory authorization on their own.
+Phase 1 does not wire these privileged actions into Telegram, Kelivo, Operit,
+Galatea, or another chat adapter. A future adapter may call only the narrow
+method corresponding to an explicit user action. The system does not infer
+whether an ordinary historical message is real, roleplay, a joke, fiction, or
+third-party content.
 
 `assistant_experience` follows a separate contract: all evidence must be a
 canonical assistant message with a server-owned `assistant_experience` event
@@ -106,6 +123,13 @@ Secret, Key ID, normalization version, or domain/fingerprint version requires a
 separately reviewed explicit migration. It must never be changed directly.
 Concurrent identical creates and first profile initialization are serialized by
 SQLite; a partial unique index also covers live active/candidate fingerprints.
+The profile is not initialized at service construction. Deterministic content
+policy runs first, then the first successful action creates the only profile,
+evidence event, item, and source in one `BEGIN IMMEDIATE` transaction. Invalid
+content or any later provenance/storage failure leaves no profile or grant.
+Readiness and every write inspect all profile rows; extra rows, corrupt fields,
+a mismatch, or a missing profile alongside any Memory item/source/suppression/
+event fail closed.
 
 ## Create, correct, and forget
 
@@ -160,7 +184,11 @@ control flow or select a tool, provider, extractor, scope policy, or SQL.
 Canonical metadata is checked before parsing and is limited to 16 KiB UTF-8,
 64 total object keys, nesting depth 8, and 4096 characters per key/string. The
 top level must be an object. Only bounded `channel` and `source` strings are
-used; the full metadata object is never copied into a result or error.
+used; the full metadata object is never copied into a result or error. Channel
+remains required, non-empty, and allowlisted. A missing, JSON-null, or empty
+source is normalized to `""`, matching canonical Telegram and Kelivo records;
+a non-empty source must pass the existing ASCII/length contract. Non-string and
+non-empty whitespace-padded sources fail closed. Operit retains `source=operit`.
 
 ## Configuration
 
@@ -176,7 +204,13 @@ MEMORY_FINGERPRINT_HMAC_SECRET=
 
 When Memory Core is disabled, no HMAC key is required and `/readyz` reports
 `memory_core=false` without making the service unready. Disabled startup applies
-and validates only core v1–v6; it neither requires nor repairs optional v7.
+and strictly validates core v1–v6; it neither requires nor repairs optional v7.
+The shared core validator checks every v1–v6 migration marker, table/column,
+primary key, default, CHECK, foreign key, unique/partial index, explicit index,
+and trigger set. A recorded migration with a missing or changed core object
+returns only `core_schema_invalid` and is never silently repaired by
+`CREATE TABLE IF NOT EXISTS`. Optional v7 damage remains isolated only while
+Memory is disabled.
 Enabled read-only mode atomically applies/validates v7 without requiring a key.
 Enabling explicit writes also requires a stable bounded Key ID and a dedicated,
 high-entropy 32–512 character printable-ASCII key distinct from all relay,
@@ -188,9 +222,11 @@ writes.
 
 Migration v7 only adds `memory_items`, `memory_fingerprint_profile`,
 `memory_evidence_events`, `memory_sources`, `memory_suppressions`, and their
-indexes. It does not rebuild or modify v1-v6 tables or data. The validator
+indexes and evidence-immutability triggers. It does not rebuild or modify v1-v6
+tables or data. The validator
 checks exact columns, CHECK constraints, unique constraints, index
-attributes/columns/partial predicates, foreign keys, and normalized DDL.
+attributes/columns/partial predicates, foreign keys, triggers, and normalized
+DDL.
 
 Old v6 application code ignores the additive tables and can continue to read
 its existing tables. Current code also treats Memory migration/validation as an
@@ -208,3 +244,9 @@ Phase 2 may add model-assisted candidate extraction with an independently
 audited provider call and fail-closed activation policy. Phase 3 may add
 bounded, policy-controlled retrieval and prompt context. Neither capability is
 implemented or enabled by this change.
+
+## Review status
+
+The second-round fixes are implemented, but the next independent review has
+not yet completed. This branch remains Draft and is not ready to merge or
+deploy.
