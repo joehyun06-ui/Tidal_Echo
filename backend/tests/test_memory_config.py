@@ -5,7 +5,8 @@ import unittest
 from backend import deployment_config
 
 
-TEST_HMAC_SECRET = "synthetic-memory-hmac-secret-000000000001"
+TEST_HMAC_SECRET = "Synthetic-Memory-HMAC-Key-2026-Alpha!Z9q7"
+TEST_KEY_ID = "phase1-test-key"
 
 
 class _TelegramDisabled:
@@ -25,6 +26,7 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.sensitive_storage_enabled)
         self.assertEqual(config.max_item_chars, 1000)
         self.assertEqual(config.forget_retention_policy, "tombstone_without_content")
+        self.assertEqual(config.fingerprint_key_id, "")
         self.assertEqual(config.fingerprint_hmac_secret, "")
         self.assertTrue(config.configuration_valid)
 
@@ -38,10 +40,17 @@ class MemoryConfigTests(unittest.TestCase):
         base = {
             "MEMORY_CORE_ENABLED": "true",
             "MEMORY_EXPLICIT_WRITES_ENABLED": "true",
+            "MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID,
         }
         for value, category in (
             ("", "memory_fingerprint_hmac_secret_missing"),
             ("short", "memory_fingerprint_hmac_secret_invalid"),
+            (" " * 40, "memory_fingerprint_hmac_secret_invalid"),
+            ("A" * 40, "memory_fingerprint_hmac_secret_invalid"),
+            (
+                "Replace-With-Random-Memory-Secret-2026!a",
+                "memory_fingerprint_hmac_secret_invalid",
+            ),
             (" " + TEST_HMAC_SECRET, "memory_fingerprint_hmac_secret_invalid"),
         ):
             with self.subTest(category=category):
@@ -53,6 +62,7 @@ class MemoryConfigTests(unittest.TestCase):
         config = self.load({
             "MEMORY_CORE_ENABLED": "true",
             "MEMORY_EXPLICIT_WRITES_ENABLED": "true",
+            "MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID,
             "MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET,
             "RELAY_SECRET": TEST_HMAC_SECRET,
         })
@@ -61,6 +71,24 @@ class MemoryConfigTests(unittest.TestCase):
             config.error_category, "memory_fingerprint_hmac_secret_must_be_distinct"
         )
         self.assertNotIn(TEST_HMAC_SECRET, repr(config))
+        self.assertNotIn(TEST_KEY_ID, repr(config))
+
+    def test_enabled_writes_require_bounded_fingerprint_key_id(self):
+        base = {
+            "MEMORY_CORE_ENABLED": "true",
+            "MEMORY_EXPLICIT_WRITES_ENABLED": "true",
+            "MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET,
+        }
+        for value, category in (
+            ("", "memory_fingerprint_key_id_missing"),
+            (" invalid", "memory_fingerprint_key_id_invalid"),
+            ("unsafe/key", "memory_fingerprint_key_id_invalid"),
+            ("x" * 65, "memory_fingerprint_key_id_invalid"),
+        ):
+            with self.subTest(value=value):
+                config = self.load({**base, "MEMORY_FINGERPRINT_KEY_ID": value})
+                self.assertFalse(config.configuration_valid)
+                self.assertEqual(config.error_category, category)
 
     def test_feature_relationship_limits_and_retention_are_strict(self):
         with self.assertRaisesRegex(

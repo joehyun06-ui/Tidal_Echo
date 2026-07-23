@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from backend import channel_store
@@ -36,7 +37,13 @@ class MemoryMigrationTests(unittest.TestCase):
             channel_store.validate_memory_schema(conn)
         self.assertEqual(versions, list(range(1, 8)))
         self.assertTrue(
-            {"memory_items", "memory_sources", "memory_suppressions"}.issubset(tables)
+            {
+                "memory_items",
+                "memory_fingerprint_profile",
+                "memory_evidence_events",
+                "memory_sources",
+                "memory_suppressions",
+            }.issubset(tables)
         )
 
     def test_every_synthetic_prior_version_upgrades_to_v7(self):
@@ -68,6 +75,22 @@ class MemoryMigrationTests(unittest.TestCase):
                     channel_store.validate_memory_schema(conn)
                 self.assertEqual(marker[0], "applied")
                 self.assertEqual(preserved, 1)
+
+    def test_concurrent_optional_v7_migration_applies_exactly_once(self):
+        channel_store.run_migrations(self.path, channel_store.CORE_MIGRATIONS)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(
+                lambda _index: channel_store.run_migrations(self.path),
+                range(16),
+            ))
+        with channel_store.connect(self.path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM schema_migrations WHERE version=7"
+                ).fetchone()[0],
+                1,
+            )
+            channel_store.validate_memory_schema(conn)
 
     def test_v6_relational_rows_are_preserved(self):
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:6])
@@ -154,11 +177,19 @@ class MemoryMigrationTests(unittest.TestCase):
                 "SELECT id FROM memory_items WHERE memory_key=?", ("A" * 32,)
             ).fetchone()[0]
             message_id = conn.execute("SELECT id FROM messages").fetchone()[0]
+            evidence_cursor = conn.execute(
+                """INSERT INTO memory_evidence_events
+                   (canonical_message_id,evidence_type,reality_scope,subject_scope,
+                    created_by_component,created_at)
+                   VALUES(?,'explicit_user_memory','real','user','memory_admin',?)""",
+                (message_id, stamp),
+            )
             conn.execute(
                 """INSERT INTO memory_sources
-                   (memory_id,canonical_message_id,channel,source,evidence_role,evidence_type,created_at)
-                   VALUES(?,?,'web','relay','user','user_explicit_statement',?)""",
-                (memory_id, message_id, stamp),
+                   (memory_id,evidence_event_id,canonical_message_id,channel,source,
+                    evidence_role,evidence_type,created_at)
+                   VALUES(?,?,?,'web','relay','user','explicit_user_memory',?)""",
+                (memory_id, int(evidence_cursor.lastrowid), message_id, stamp),
             )
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(

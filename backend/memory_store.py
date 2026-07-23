@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hmac
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass, field
@@ -29,10 +31,70 @@ class StoreResult:
     item: dict | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True, repr=False)
+class _ValidatedSource:
+    canonical_message_id: int
+    evidence_event_id: int
+    channel: str
+    source: str
+    evidence_role: str
+    evidence_type: str
+
+
+MAX_CANONICAL_META_BYTES = 16 * 1024
+MAX_CANONICAL_META_KEYS = 64
+MAX_CANONICAL_META_DEPTH = 8
+MAX_CANONICAL_META_STRING_CHARS = 4096
+_SAFE_META_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+_SENSITIVITY_RANK = {"normal": 0, "sensitive": 1, "restricted": 2}
+
+
 def _validate_digest(value: bytes) -> bytes:
     if not isinstance(value, bytes) or len(value) != 32:
         raise MemoryStoreError("invalid_fingerprint")
     return value
+
+
+def _load_bounded_meta(raw: object) -> dict:
+    if not isinstance(raw, str):
+        raise MemoryStoreError("invalid_provenance")
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeError:
+        raise MemoryStoreError("invalid_provenance") from None
+    if len(encoded) > MAX_CANONICAL_META_BYTES:
+        raise MemoryStoreError("invalid_provenance")
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise MemoryStoreError("invalid_provenance") from None
+    if not isinstance(payload, dict):
+        raise MemoryStoreError("invalid_provenance")
+    key_count = 0
+    stack: list[tuple[object, int]] = [(payload, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > MAX_CANONICAL_META_DEPTH:
+            raise MemoryStoreError("invalid_provenance")
+        if isinstance(value, dict):
+            key_count += len(value)
+            if key_count > MAX_CANONICAL_META_KEYS:
+                raise MemoryStoreError("invalid_provenance")
+            for key, nested in value.items():
+                if (
+                    not isinstance(key, str)
+                    or len(key) > MAX_CANONICAL_META_STRING_CHARS
+                ):
+                    raise MemoryStoreError("invalid_provenance")
+                stack.append((nested, depth + 1))
+        elif isinstance(value, list):
+            stack.extend((nested, depth + 1) for nested in value)
+        elif isinstance(value, str):
+            if len(value) > MAX_CANONICAL_META_STRING_CHARS:
+                raise MemoryStoreError("invalid_provenance")
+        elif value is not None and not isinstance(value, (bool, int, float)):
+            raise MemoryStoreError("invalid_provenance")
+    return payload
 
 
 def _safe_item(row: sqlite3.Row) -> dict:
@@ -76,51 +138,208 @@ class MemoryStore:
             return "user"
         if direction == "out" and kind in {"reply", "voice"}:
             return "assistant"
-        raise MemoryStoreError("invalid_source")
+        raise MemoryStoreError("invalid_provenance")
 
     @classmethod
     def _validate_sources(
-        cls, conn: sqlite3.Connection, sources: Iterable[memory_policy.ProvenanceInput],
-    ) -> tuple[memory_policy.ProvenanceInput, ...]:
-        unique: dict[tuple[int, str], memory_policy.ProvenanceInput] = {}
+        cls,
+        conn: sqlite3.Connection,
+        sources: Iterable[memory_policy.ProvenanceInput],
+        *,
+        memory_kind: str,
+        operation: str,
+    ) -> tuple[_ValidatedSource, ...]:
+        unique: dict[int, _ValidatedSource] = {}
         for source in sources:
-            key = (source.canonical_message_id, source.evidence_type)
-            previous = unique.get(key)
-            if previous is not None:
-                if previous != source:
-                    raise MemoryStoreError("invalid_source")
+            if source.canonical_message_id in unique:
                 continue
             row = conn.execute(
-                "SELECT direction,kind,meta FROM messages WHERE id=?",
+                """SELECT m.direction,m.kind,m.meta,
+                          e.id AS evidence_event_id,e.evidence_type,
+                          e.reality_scope,e.subject_scope,e.created_by_component
+                   FROM messages m
+                   LEFT JOIN memory_evidence_events e
+                     ON e.canonical_message_id=m.id
+                   WHERE m.id=?""",
                 (source.canonical_message_id,),
             ).fetchone()
             if row is None:
-                raise MemoryStoreError("invalid_source")
-            try:
-                meta = json.loads(row["meta"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                raise MemoryStoreError("invalid_source") from None
-            if not isinstance(meta, dict):
-                raise MemoryStoreError("invalid_source")
+                raise MemoryStoreError("invalid_provenance")
+            meta = _load_bounded_meta(row["meta"])
             actual_channel = meta.get("channel")
             actual_source = meta.get("source", "")
             if (
                 not isinstance(actual_channel, str)
                 or not actual_channel
                 or not isinstance(actual_source, str)
+                or _SAFE_META_VALUE.fullmatch(actual_channel) is None
+                or _SAFE_META_VALUE.fullmatch(actual_source) is None
+                or actual_channel not in memory_policy.KNOWN_CHANNELS
             ):
-                raise MemoryStoreError("invalid_source")
+                raise MemoryStoreError("invalid_provenance")
             actual_role = cls._derive_evidence_role(row["direction"], row["kind"])
+            evidence_event_id = row["evidence_event_id"]
+            evidence_type = row["evidence_type"]
+            reality_scope = row["reality_scope"]
+            subject_scope = row["subject_scope"]
+            component = row["created_by_component"]
             if (
-                actual_channel != source.channel
-                or actual_source != source.source
-                or actual_role != source.evidence_role
+                not isinstance(evidence_event_id, int)
+                or evidence_type not in memory_policy.ALL_EVIDENCE_TYPES
+                or reality_scope not in memory_policy.REALITY_SCOPES
+                or subject_scope not in memory_policy.SUBJECT_SCOPES
+                or component not in memory_policy.EVIDENCE_COMPONENTS
             ):
-                raise MemoryStoreError("invalid_source")
-            unique[key] = source
+                raise MemoryStoreError("unsupported_evidence")
+            if reality_scope != "real":
+                raise MemoryStoreError("unsupported_evidence")
+            if operation == "correct":
+                semantic_allowed = (
+                    actual_role == "user"
+                    and evidence_type in memory_policy.CORRECTION_EVIDENCE_TYPES
+                    and subject_scope in {"user", "project"}
+                )
+            elif memory_kind == "assistant_experience":
+                semantic_allowed = (
+                    actual_role == "assistant"
+                    and evidence_type in memory_policy.ASSISTANT_EVIDENCE_TYPES
+                    and subject_scope == "assistant"
+                    and component == "assistant_runtime"
+                )
+            else:
+                expected_subject = (
+                    "project"
+                    if evidence_type == "confirmed_project_decision"
+                    else "user"
+                )
+                semantic_allowed = (
+                    actual_role == "user"
+                    and evidence_type in memory_policy.USER_EVIDENCE_TYPES
+                    and subject_scope == expected_subject
+                )
+            if not semantic_allowed:
+                raise MemoryStoreError("unsupported_evidence")
+            unique[source.canonical_message_id] = _ValidatedSource(
+                canonical_message_id=source.canonical_message_id,
+                evidence_event_id=evidence_event_id,
+                channel=actual_channel,
+                source=actual_source,
+                evidence_role=actual_role,
+                evidence_type=evidence_type,
+            )
         if not unique:
-            raise MemoryStoreError("invalid_source")
+            raise MemoryStoreError("invalid_provenance")
         return tuple(unique.values())
+
+    @staticmethod
+    def _profile_matches(
+        row: sqlite3.Row,
+        *,
+        key_id: str,
+        key_check: bytes,
+        normalization_version: int,
+        fingerprint_version: int,
+    ) -> bool:
+        stored_key_id = row["key_id"]
+        stored_check = row["key_check"]
+        return (
+            isinstance(stored_key_id, str)
+            and hmac.compare_digest(stored_key_id, key_id)
+            and memory_policy.secure_digest_equal(stored_check, key_check)
+            and row["normalization_version"] == normalization_version
+            and row["fingerprint_version"] == fingerprint_version
+        )
+
+    def ensure_fingerprint_profile(
+        self,
+        *,
+        key_id: str,
+        key_check: bytes,
+        normalization_version: int,
+        fingerprint_version: int,
+    ) -> None:
+        _validate_digest(key_check)
+        try:
+            with channel_store.connect(self.path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM memory_fingerprint_profile WHERE singleton=1"
+                    ).fetchone()
+                    if row is None:
+                        derived_rows = sum(
+                            int(conn.execute(
+                                f"SELECT count(*) FROM {table}"
+                            ).fetchone()[0])
+                            for table in ("memory_items", "memory_suppressions")
+                        )
+                        if derived_rows:
+                            raise MemoryStoreError(
+                                "memory_fingerprint_profile_mismatch"
+                            )
+                        stamp = channel_store.now_iso()
+                        conn.execute(
+                            """INSERT INTO memory_fingerprint_profile
+                               (singleton,key_id,key_check,normalization_version,
+                                fingerprint_version,created_at,updated_at)
+                               VALUES(1,?,?,?,?,?,?)""",
+                            (
+                                key_id,
+                                key_check,
+                                normalization_version,
+                                fingerprint_version,
+                                stamp,
+                                stamp,
+                            ),
+                        )
+                    elif not self._profile_matches(
+                        row,
+                        key_id=key_id,
+                        key_check=key_check,
+                        normalization_version=normalization_version,
+                        fingerprint_version=fingerprint_version,
+                    ):
+                        raise MemoryStoreError(
+                            "memory_fingerprint_profile_mismatch"
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except MemoryStoreError:
+            raise
+        except sqlite3.IntegrityError:
+            raise MemoryStoreError("memory_fingerprint_profile_mismatch") from None
+        except (OSError, sqlite3.Error, ValueError):
+            raise MemoryStoreError("storage_unavailable") from None
+
+    def validate_fingerprint_profile(
+        self,
+        *,
+        key_id: str,
+        key_check: bytes,
+        normalization_version: int,
+        fingerprint_version: int,
+    ) -> bool:
+        _validate_digest(key_check)
+        try:
+            with channel_store.connect(self.path) as conn:
+                row = conn.execute(
+                    "SELECT * FROM memory_fingerprint_profile WHERE singleton=1"
+                ).fetchone()
+            return (
+                row is not None
+                and self._profile_matches(
+                    row,
+                    key_id=key_id,
+                    key_check=key_check,
+                    normalization_version=normalization_version,
+                    fingerprint_version=fingerprint_version,
+                )
+            )
+        except (OSError, sqlite3.Error, ValueError):
+            raise MemoryStoreError("storage_unavailable") from None
 
     @staticmethod
     def _find_live_by_fingerprint(
@@ -176,18 +395,25 @@ class MemoryStore:
     def _insert_sources(
         conn: sqlite3.Connection,
         memory_id: int,
-        sources: Sequence[memory_policy.ProvenanceInput],
+        sources: Sequence[_ValidatedSource],
         stamp: str,
     ) -> None:
         for source in sources:
             conn.execute(
                 """INSERT INTO memory_sources
-                   (memory_id,canonical_message_id,channel,source,evidence_role,evidence_type,created_at)
-                   VALUES(?,?,?,?,?,?,?)
-                   ON CONFLICT(memory_id,canonical_message_id,evidence_type) DO NOTHING""",
+                   (memory_id,evidence_event_id,canonical_message_id,channel,source,
+                    evidence_role,evidence_type,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(memory_id,evidence_event_id) DO NOTHING""",
                 (
-                    memory_id, source.canonical_message_id, source.channel, source.source,
-                    source.evidence_role, source.evidence_type, stamp,
+                    memory_id,
+                    source.evidence_event_id,
+                    source.canonical_message_id,
+                    source.channel,
+                    source.source,
+                    source.evidence_role,
+                    source.evidence_type,
+                    stamp,
                 ),
             )
 
@@ -252,6 +478,7 @@ class MemoryStore:
         fingerprint_version: int,
         sensitivity: str,
         sources: Sequence[memory_policy.ProvenanceInput],
+        sensitive_storage_enabled: bool,
         explicitness: str = "explicit",
         confidence: float = 1.0,
     ) -> StoreResult:
@@ -260,7 +487,12 @@ class MemoryStore:
             with channel_store.connect(self.path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    validated_sources = self._validate_sources(conn, sources)
+                    validated_sources = self._validate_sources(
+                        conn,
+                        sources,
+                        memory_kind=kind,
+                        operation="create",
+                    )
                     if self._is_suppressed_conn(
                         conn,
                         scope_type=scope_type,
@@ -283,10 +515,27 @@ class MemoryStore:
                     if existing is not None:
                         if existing["normalized_content"] != normalized_content:
                             raise MemoryStoreError("conflict")
+                        existing_rank = _SENSITIVITY_RANK.get(existing["sensitivity"])
+                        requested_rank = _SENSITIVITY_RANK.get(sensitivity)
+                        if existing_rank is None or requested_rank is None:
+                            raise MemoryStoreError("invalid_state")
+                        if requested_rank > existing_rank:
+                            conn.execute(
+                                """UPDATE memory_items
+                                   SET sensitivity=?,last_confirmed_at=?,updated_at=?
+                                   WHERE id=?""",
+                                (sensitivity, stamp, stamp, int(existing["id"])),
+                            )
                         self._insert_sources(conn, int(existing["id"]), validated_sources, stamp)
+                        existing = conn.execute(
+                            "SELECT * FROM memory_items WHERE id=?",
+                            (int(existing["id"]),),
+                        ).fetchone()
                         conn.execute("COMMIT")
                         return StoreResult("idempotent_existing", _safe_item(existing))
 
+                    if sensitivity != "normal" and not sensitive_storage_enabled:
+                        raise MemoryStoreError("sensitive_storage_disabled")
                     memory_key = secrets.token_urlsafe(24)
                     cursor = conn.execute(
                         """INSERT INTO memory_items
@@ -399,6 +648,7 @@ class MemoryStore:
         fingerprint_version: int,
         sensitivity: str,
         sources: Sequence[memory_policy.ProvenanceInput],
+        sensitive_storage_enabled: bool,
     ) -> StoreResult:
         _validate_digest(fingerprint)
         try:
@@ -412,17 +662,41 @@ class MemoryStore:
                         raise MemoryStoreError("not_found")
                     if old["status"] != "active":
                         raise MemoryStoreError("invalid_state")
-                    validated_sources = self._validate_sources(conn, sources)
+                    validated_sources = self._validate_sources(
+                        conn,
+                        sources,
+                        memory_kind=old["kind"],
+                        operation="correct",
+                    )
                     old_fingerprint = old["normalized_fingerprint"]
                     if not isinstance(old_fingerprint, bytes):
                         raise MemoryStoreError("invalid_state")
+                    existing_rank = _SENSITIVITY_RANK.get(old["sensitivity"])
+                    requested_rank = _SENSITIVITY_RANK.get(sensitivity)
+                    if existing_rank is None or requested_rank is None:
+                        raise MemoryStoreError("invalid_state")
+                    if requested_rank < existing_rank:
+                        raise MemoryStoreError("sensitivity_downgrade")
                     stamp = channel_store.now_iso()
                     if memory_policy.secure_digest_equal(old_fingerprint, fingerprint):
                         if old["normalized_content"] != normalized_content:
                             raise MemoryStoreError("conflict")
+                        if requested_rank > existing_rank:
+                            conn.execute(
+                                """UPDATE memory_items
+                                   SET sensitivity=?,last_confirmed_at=?,updated_at=?
+                                   WHERE id=?""",
+                                (sensitivity, stamp, stamp, int(old["id"])),
+                            )
                         self._insert_sources(conn, int(old["id"]), validated_sources, stamp)
+                        old = conn.execute(
+                            "SELECT * FROM memory_items WHERE id=?",
+                            (int(old["id"]),),
+                        ).fetchone()
                         conn.execute("COMMIT")
                         return StoreResult("idempotent_noop", _safe_item(old))
+                    if sensitivity != "normal" and not sensitive_storage_enabled:
+                        raise MemoryStoreError("sensitive_storage_disabled")
                     if self._is_suppressed_conn(
                         conn,
                         scope_type=old["scope_type"],

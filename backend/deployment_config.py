@@ -85,6 +85,29 @@ def parse_bounded_int(value: object, minimum: int, maximum: int, category: str) 
     return result
 
 
+def memory_fingerprint_secret_is_strong(value: str) -> bool:
+    if (
+        len(value) < 32
+        or len(value) > 512
+        or not value.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in value)
+    ):
+        return False
+    lowered = value.casefold()
+    if any(
+        marker in lowered
+        for marker in ("replace-with", "changeme", "placeholder", "example-secret")
+    ):
+        return False
+    character_classes = sum((
+        any(char.islower() for char in value),
+        any(char.isupper() for char in value),
+        any(char.isdigit() for char in value),
+        any(not char.isalnum() for char in value),
+    ))
+    return character_classes >= 3 and len(set(value)) >= 16
+
+
 def path_within_root(path: str | Path, root: str | Path) -> bool:
     try:
         raw_candidate = Path(path).expanduser()
@@ -165,6 +188,7 @@ class MemoryConfig:
     sensitive_storage_enabled: bool
     max_item_chars: int
     forget_retention_policy: str
+    fingerprint_key_id: str = field(repr=False)
     fingerprint_hmac_secret: str = field(repr=False)
     configuration_valid: bool = True
     error_category: str = ""
@@ -422,6 +446,8 @@ def load_deployment_config(
     operit_share_model_alias = str(env.get("OPERIT_SHARE_MODEL_ALIAS", "ouou-home")).strip()
     raw_memory_hmac_secret = str(env.get("MEMORY_FINGERPRINT_HMAC_SECRET", ""))
     memory_hmac_secret = raw_memory_hmac_secret.strip()
+    raw_memory_key_id = str(env.get("MEMORY_FINGERPRINT_KEY_ID", ""))
+    memory_key_id = raw_memory_key_id.strip()
     kelivo_allow_remap = parse_strict_bool(
         env.get("KELIVO_ALLOW_SESSION_REMAP", "false"), "invalid_kelivo_allow_session_remap"
     )
@@ -529,15 +555,23 @@ def load_deployment_config(
     memory_configuration_valid = True
     memory_error_category = ""
     if memory_enabled and memory_explicit_writes:
-        if not memory_hmac_secret:
+        if not memory_key_id:
+            memory_configuration_valid = False
+            memory_error_category = "memory_fingerprint_key_id_missing"
+        elif (
+            raw_memory_key_id != memory_key_id
+            or safe_identifier.fullmatch(memory_key_id) is None
+            or len(memory_key_id) > 64
+        ):
+            memory_configuration_valid = False
+            memory_error_category = "memory_fingerprint_key_id_invalid"
+        elif not raw_memory_hmac_secret:
             memory_configuration_valid = False
             memory_error_category = "memory_fingerprint_hmac_secret_missing"
         elif (
-            raw_memory_hmac_secret != memory_hmac_secret
-            or len(memory_hmac_secret) < 32
-            or len(memory_hmac_secret) > 512
-            or not memory_hmac_secret.isascii()
-            or any(ord(char) < 33 or ord(char) > 126 for char in memory_hmac_secret)
+            not memory_hmac_secret
+            or raw_memory_hmac_secret != memory_hmac_secret
+            or not memory_fingerprint_secret_is_strong(memory_hmac_secret)
         ):
             memory_configuration_valid = False
             memory_error_category = "memory_fingerprint_hmac_secret_invalid"
@@ -672,6 +706,7 @@ def load_deployment_config(
             sensitive_storage_enabled=memory_sensitive_storage,
             max_item_chars=memory_max_item_chars,
             forget_retention_policy=memory_forget_policy,
+            fingerprint_key_id=memory_key_id,
             fingerprint_hmac_secret=memory_hmac_secret,
             configuration_valid=memory_configuration_valid,
             error_category=memory_error_category,

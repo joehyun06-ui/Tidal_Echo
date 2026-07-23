@@ -462,10 +462,39 @@ MEMORY_TABLE_DDL: dict[str, str] = {
             ),
             CHECK(superseded_by_id IS NULL OR superseded_by_id != id),
             FOREIGN KEY(superseded_by_id) REFERENCES memory_items(id) ON DELETE RESTRICT)""",
+    "memory_fingerprint_profile": """CREATE TABLE memory_fingerprint_profile (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            key_id TEXT NOT NULL
+                CHECK(length(key_id) BETWEEN 1 AND 64
+                      AND key_id NOT GLOB '*[^A-Za-z0-9._:-]*'),
+            key_check BLOB NOT NULL
+                CHECK(typeof(key_check)='blob' AND length(key_check)=32),
+            normalization_version INTEGER NOT NULL CHECK(normalization_version > 0),
+            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)""",
+    "memory_evidence_events": """CREATE TABLE memory_evidence_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_message_id INTEGER NOT NULL UNIQUE,
+            evidence_type TEXT NOT NULL CHECK(evidence_type IN
+                ('explicit_user_memory','confirmed_user_fact',
+                 'confirmed_project_decision','explicit_user_correction',
+                 'assistant_experience')),
+            reality_scope TEXT NOT NULL CHECK(reality_scope IN
+                ('real','roleplay','joke','fiction','third_party')),
+            subject_scope TEXT NOT NULL CHECK(subject_scope IN
+                ('user','project','assistant','third_party')),
+            created_by_component TEXT NOT NULL CHECK(created_by_component IN
+                ('memory_admin','web_adapter','telegram_adapter','kelivo_adapter',
+                 'operit_adapter','galatea_adapter','assistant_runtime')),
+            created_at TEXT NOT NULL,
+            UNIQUE(id,canonical_message_id,evidence_type),
+            FOREIGN KEY(canonical_message_id) REFERENCES messages(id) ON DELETE RESTRICT)""",
     "memory_sources": """CREATE TABLE memory_sources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             memory_id INTEGER NOT NULL,
             canonical_message_id INTEGER NOT NULL,
+            evidence_event_id INTEGER NOT NULL,
             channel TEXT NOT NULL
                 CHECK(length(channel) BETWEEN 1 AND 64
                       AND channel NOT GLOB '*[^A-Za-z0-9._:-]*'),
@@ -474,13 +503,16 @@ MEMORY_TABLE_DDL: dict[str, str] = {
                       AND source NOT GLOB '*[^A-Za-z0-9._:-]*'),
             evidence_role TEXT NOT NULL CHECK(evidence_role IN ('user','assistant')),
             evidence_type TEXT NOT NULL CHECK(evidence_type IN
-                ('user_explicit_remember','user_explicit_statement','user_confirmed_decision',
-                 'assistant_experience','roleplay','fiction','third_party',
-                 'connection_test','error_log','raw_request')),
+                ('explicit_user_memory','confirmed_user_fact',
+                 'confirmed_project_decision','explicit_user_correction',
+                 'assistant_experience')),
             created_at TEXT NOT NULL,
-            UNIQUE(memory_id,canonical_message_id,evidence_type),
+            UNIQUE(memory_id,evidence_event_id),
             FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE RESTRICT,
-            FOREIGN KEY(canonical_message_id) REFERENCES messages(id) ON DELETE RESTRICT)""",
+            FOREIGN KEY(canonical_message_id) REFERENCES messages(id) ON DELETE RESTRICT,
+            FOREIGN KEY(evidence_event_id,canonical_message_id,evidence_type)
+                REFERENCES memory_evidence_events(id,canonical_message_id,evidence_type)
+                ON DELETE RESTRICT)""",
     "memory_suppressions": """CREATE TABLE memory_suppressions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scope_type TEXT NOT NULL CHECK(scope_type IN
@@ -953,10 +985,29 @@ def validate_memory_schema(conn: sqlite3.Connection) -> None:
             "created_at": ("TEXT", 1, None, 0),
             "updated_at": ("TEXT", 1, None, 0),
         },
+        "memory_fingerprint_profile": {
+            "singleton": ("INTEGER", 0, None, 1),
+            "key_id": ("TEXT", 1, None, 0),
+            "key_check": ("BLOB", 1, None, 0),
+            "normalization_version": ("INTEGER", 1, None, 0),
+            "fingerprint_version": ("INTEGER", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "memory_evidence_events": {
+            "id": ("INTEGER", 0, None, 1),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "evidence_type": ("TEXT", 1, None, 0),
+            "reality_scope": ("TEXT", 1, None, 0),
+            "subject_scope": ("TEXT", 1, None, 0),
+            "created_by_component": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
         "memory_sources": {
             "id": ("INTEGER", 0, None, 1),
             "memory_id": ("INTEGER", 1, None, 0),
             "canonical_message_id": ("INTEGER", 1, None, 0),
+            "evidence_event_id": ("INTEGER", 1, None, 0),
             "channel": ("TEXT", 1, None, 0),
             "source": ("TEXT", 1, "''", 0),
             "evidence_role": ("TEXT", 1, None, 0),
@@ -1006,9 +1057,18 @@ def validate_memory_schema(conn: sqlite3.Connection) -> None:
                  "normalized_fingerprint"),
             ),
         },
+        "memory_fingerprint_profile": {},
+        "memory_evidence_events": {
+            "sqlite_autoindex_memory_evidence_events_1": (
+                True, "u", False, ("canonical_message_id",),
+            ),
+            "sqlite_autoindex_memory_evidence_events_2": (
+                True, "u", False, ("id", "canonical_message_id", "evidence_type"),
+            ),
+        },
         "memory_sources": {
             "sqlite_autoindex_memory_sources_1": (
-                True, "u", False, ("memory_id", "canonical_message_id", "evidence_type"),
+                True, "u", False, ("memory_id", "evidence_event_id"),
             ),
             "idx_memory_sources_memory": (
                 False, "c", False, ("memory_id", "id"),
@@ -1041,9 +1101,25 @@ def validate_memory_schema(conn: sqlite3.Connection) -> None:
         "memory_items": {
             ("superseded_by_id", "memory_items", "id", "NO ACTION", "RESTRICT", "NONE"),
         },
+        "memory_fingerprint_profile": set(),
+        "memory_evidence_events": {
+            ("canonical_message_id", "messages", "id", "NO ACTION", "RESTRICT", "NONE"),
+        },
         "memory_sources": {
             ("memory_id", "memory_items", "id", "NO ACTION", "RESTRICT", "NONE"),
             ("canonical_message_id", "messages", "id", "NO ACTION", "RESTRICT", "NONE"),
+            (
+                "evidence_event_id", "memory_evidence_events", "id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+            (
+                "canonical_message_id", "memory_evidence_events", "canonical_message_id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+            (
+                "evidence_type", "memory_evidence_events", "evidence_type",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
         },
         "memory_suppressions": set(),
     }
@@ -1078,10 +1154,13 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
     (6, "dylan_heartbeat_hardening", _migration_006),
     (7, "explicit_memory_core_foundation", _migration_007),
 )
+CORE_MIGRATIONS = MIGRATIONS[:6]
 
 
 def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sqlite3.Connection], None]]] = MIGRATIONS) -> None:
     """Apply versions under a SQLite write lock; concurrent starters re-read state."""
+    migrations = tuple(migrations)
+    requested_latest = max((version for version, _name, _apply in migrations), default=0)
     with connect(path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1100,16 +1179,13 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                     "INSERT INTO schema_migrations(version,name,status,created_at,updated_at) VALUES(?,?,?,?,?)",
                     (version, name, "applied", stamp, stamp),
                 )
-            latest = conn.execute(
-                "SELECT MAX(version) FROM schema_migrations WHERE status='applied'"
-            ).fetchone()[0]
-            if latest is not None and int(latest) >= 3:
-                validate_kelivo_schema(conn, version=4 if int(latest) >= 4 else 3)
-            if latest is not None and int(latest) >= 5:
+            if requested_latest >= 3:
+                validate_kelivo_schema(conn, version=4 if requested_latest >= 4 else 3)
+            if requested_latest >= 5:
                 validate_heartbeat_schema(conn)
-            if latest is not None and int(latest) >= 6:
+            if requested_latest >= 6:
                 validate_heartbeat_hardening_schema(conn)
-            if latest is not None and int(latest) >= 7:
+            if requested_latest >= 7:
                 validate_memory_schema(conn)
             conn.execute("COMMIT")
         except Exception:

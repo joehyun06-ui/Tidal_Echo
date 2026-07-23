@@ -399,7 +399,7 @@ class OperitShareApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                                     "timeline_events", "heartbeat_schedule_revisions",
                                     "heartbeat_run_inputs",
                                 )]
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
         self.assertEqual(heartbeat_counts, [0, 0, 0, 0, 0, 0])
         self.assertFalse(self.module.DEPLOYMENT.heartbeat.enabled)
 

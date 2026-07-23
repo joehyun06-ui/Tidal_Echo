@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import unicodedata
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -14,7 +15,10 @@ from typing import Iterable
 NORMALIZATION_VERSION = 1
 FINGERPRINT_VERSION = 1
 FINGERPRINT_DOMAIN = "memory-core/fingerprint/v1"
+FINGERPRINT_PROFILE_DOMAIN = "memory-core/profile-check/v1"
 HMAC_DIGEST_BYTES = 32
+CREDENTIAL_DETECTION_MAX_CHARS = 4096
+CREDENTIAL_PERCENT_DECODE_ROUNDS = 2
 
 KINDS = frozenset({
     "user_preference", "user_profile", "relationship", "shared_episode",
@@ -22,23 +26,27 @@ KINDS = frozenset({
 })
 SCOPE_TYPES = frozenset({"global_user", "channel", "session", "project"})
 SENSITIVITIES = frozenset({"normal", "sensitive", "restricted"})
-EVIDENCE_ROLES = frozenset({"user", "assistant"})
 USER_EVIDENCE_TYPES = frozenset({
-    "user_explicit_remember", "user_explicit_statement", "user_confirmed_decision",
+    "explicit_user_memory", "confirmed_user_fact", "confirmed_project_decision",
 })
-FORBIDDEN_EVIDENCE_TYPES = frozenset({
-    "roleplay", "fiction", "third_party", "connection_test", "error_log", "raw_request",
+CORRECTION_EVIDENCE_TYPES = frozenset({"explicit_user_correction"})
+ASSISTANT_EVIDENCE_TYPES = frozenset({"assistant_experience"})
+ALL_EVIDENCE_TYPES = (
+    USER_EVIDENCE_TYPES | CORRECTION_EVIDENCE_TYPES | ASSISTANT_EVIDENCE_TYPES
+)
+REALITY_SCOPES = frozenset({"real", "roleplay", "joke", "fiction", "third_party"})
+SUBJECT_SCOPES = frozenset({"user", "project", "assistant", "third_party"})
+EVIDENCE_COMPONENTS = frozenset({
+    "memory_admin", "web_adapter", "telegram_adapter", "kelivo_adapter",
+    "operit_adapter", "galatea_adapter", "assistant_runtime",
 })
-ALL_EVIDENCE_TYPES = USER_EVIDENCE_TYPES | FORBIDDEN_EVIDENCE_TYPES | {
-    "assistant_experience",
-}
 KNOWN_CHANNELS = frozenset({
     "web", "relay", "telegram", "kelivo", "operit_share", "galatea", "mobile_executor",
 })
 
 _SCOPE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-_SAFE_PROVENANCE_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _WHITESPACE = re.compile(r"\s+", re.UNICODE)
+_JSON_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE),
@@ -108,10 +116,6 @@ class MemoryPolicyError(ValueError):
 @dataclass(frozen=True)
 class ProvenanceInput:
     canonical_message_id: int = field(repr=False)
-    channel: str
-    source: str
-    evidence_role: str
-    evidence_type: str
 
 
 def normalize_content(content: str, *, max_chars: int) -> str:
@@ -156,6 +160,26 @@ def fingerprint_content(
     return hmac.new(secret.encode("ascii"), payload, hashlib.sha256).digest()
 
 
+def fingerprint_profile_check(secret: str) -> bytes:
+    if not isinstance(secret, str) or len(secret) < 32 or not secret.isascii():
+        raise MemoryPolicyError("memory_configuration_invalid")
+    payload = json.dumps(
+        {
+            "fingerprint_domain": FINGERPRINT_DOMAIN,
+            "fingerprint_version": FINGERPRINT_VERSION,
+            "normalization_version": NORMALIZATION_VERSION,
+            "profile_domain": FINGERPRINT_PROFILE_DOMAIN,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hmac.new(
+        secret.encode("ascii"),
+        payload,
+        hashlib.sha256,
+    ).digest()
+
+
 def secure_digest_equal(left: bytes, right: bytes) -> bool:
     return (
         isinstance(left, bytes)
@@ -164,6 +188,43 @@ def secure_digest_equal(left: bytes, right: bytes) -> bool:
         and len(right) == HMAC_DIGEST_BYTES
         and hmac.compare_digest(left, right)
     )
+
+
+def _decode_json_unicode_escapes(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        codepoint = int(match.group(1), 16)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            return match.group(0)
+        return chr(codepoint)
+
+    return _JSON_UNICODE_ESCAPE.sub(replace, value)
+
+
+def credential_detection_views(normalized_content: str) -> tuple[str, ...]:
+    """Return bounded, non-persisted views used only for credential detection."""
+    if (
+        not isinstance(normalized_content, str)
+        or len(normalized_content) > CREDENTIAL_DETECTION_MAX_CHARS
+    ):
+        raise MemoryPolicyError("content_too_long")
+    candidates = [normalized_content]
+    current = normalized_content
+    for _round in range(CREDENTIAL_PERCENT_DECODE_ROUNDS):
+        decoded = urllib.parse.unquote(current, encoding="utf-8", errors="replace")
+        if decoded == current:
+            break
+        if len(decoded) > CREDENTIAL_DETECTION_MAX_CHARS:
+            raise MemoryPolicyError("content_too_long")
+        candidates.append(decoded)
+        current = decoded
+    for candidate in tuple(candidates):
+        decoded = _decode_json_unicode_escapes(candidate)
+        if (
+            decoded != candidate
+            and len(decoded) <= CREDENTIAL_DETECTION_MAX_CHARS
+        ):
+            candidates.append(decoded)
+    return tuple(dict.fromkeys(candidates))
 
 
 class MemoryPolicy:
@@ -192,7 +253,13 @@ class MemoryPolicy:
             raise MemoryPolicyError("invalid_kind")
         return kind
 
-    def validate_sensitivity(self, sensitivity: str, content: str) -> str:
+    def validate_sensitivity(
+        self,
+        sensitivity: str,
+        content: str,
+        *,
+        allow_existing_reclassification: bool = False,
+    ) -> str:
         if sensitivity not in SENSITIVITIES:
             raise MemoryPolicyError("invalid_sensitivity")
         if any(pattern.search(content) for pattern in _FORBIDDEN_SENSITIVE_PATTERNS):
@@ -200,15 +267,34 @@ class MemoryPolicy:
         high_sensitivity = any(pattern.search(content) for pattern in _HIGH_SENSITIVITY_PATTERNS)
         if high_sensitivity and sensitivity == "normal":
             raise MemoryPolicyError("sensitivity_downgrade")
-        if sensitivity != "normal" and not self.sensitive_storage_enabled:
+        if (
+            sensitivity != "normal"
+            and not self.sensitive_storage_enabled
+            and not allow_existing_reclassification
+        ):
             raise MemoryPolicyError("sensitive_storage_disabled")
-        if high_sensitivity and not self.sensitive_storage_enabled:
+        if (
+            high_sensitivity
+            and not self.sensitive_storage_enabled
+            and not allow_existing_reclassification
+        ):
             raise MemoryPolicyError("sensitive_storage_disabled")
         return sensitivity
 
-    def validate_content(self, content: str, sensitivity: str) -> str:
+    def validate_content(
+        self,
+        content: str,
+        sensitivity: str,
+        *,
+        allow_existing_reclassification: bool = False,
+    ) -> str:
         normalized = normalize_content(content, max_chars=self.max_item_chars)
-        if any(pattern.search(normalized) for pattern in _SECRET_PATTERNS):
+        detection_views = credential_detection_views(normalized)
+        if any(
+            pattern.search(view)
+            for view in detection_views
+            for pattern in _SECRET_PATTERNS
+        ):
             raise MemoryPolicyError("secret_detected")
         if any(pattern.search(normalized) for pattern in _TEST_PATTERNS):
             raise MemoryPolicyError("forbidden_test_content")
@@ -216,45 +302,30 @@ class MemoryPolicy:
             raise MemoryPolicyError("forbidden_log_content")
         if any(pattern.search(normalized) for pattern in _TECHNICAL_ID_PATTERNS):
             raise MemoryPolicyError("technical_identifier_forbidden")
-        self.validate_sensitivity(sensitivity, normalized)
+        self.validate_sensitivity(
+            sensitivity,
+            normalized,
+            allow_existing_reclassification=allow_existing_reclassification,
+        )
         return normalized
 
     def validate_provenance_inputs(
         self, kind: str, sources: Iterable[ProvenanceInput],
     ) -> tuple[ProvenanceInput, ...]:
-        result = tuple(sources)
-        if not result:
-            raise MemoryPolicyError("invalid_provenance")
-        for source in result:
-            if not isinstance(source, ProvenanceInput):
-                raise MemoryPolicyError("invalid_provenance")
+        self.validate_kind(kind)
+        result: dict[int, ProvenanceInput] = {}
+        for source in sources:
             if (
-                not isinstance(source.canonical_message_id, int)
+                not isinstance(source, ProvenanceInput)
+                or not isinstance(source.canonical_message_id, int)
                 or isinstance(source.canonical_message_id, bool)
                 or source.canonical_message_id <= 0
-                or source.channel not in KNOWN_CHANNELS
-                or (source.source and _SAFE_PROVENANCE_VALUE.fullmatch(source.source) is None)
-                or source.evidence_role not in EVIDENCE_ROLES
-                or source.evidence_type not in ALL_EVIDENCE_TYPES
             ):
                 raise MemoryPolicyError("invalid_provenance")
-            if source.evidence_type in FORBIDDEN_EVIDENCE_TYPES:
-                raise MemoryPolicyError("unsupported_evidence")
-
-        if kind == "assistant_experience":
-            if any(
-                source.evidence_role != "assistant"
-                or source.evidence_type != "assistant_experience"
-                for source in result
-            ):
-                raise MemoryPolicyError("unsupported_evidence")
-        elif any(
-            source.evidence_role != "user"
-            or source.evidence_type not in USER_EVIDENCE_TYPES
-            for source in result
-        ):
-            raise MemoryPolicyError("unsupported_evidence")
-        return result
+            result.setdefault(source.canonical_message_id, source)
+        if not result:
+            raise MemoryPolicyError("invalid_provenance")
+        return tuple(result.values())
 
     def validate_explicit_create(
         self,
@@ -265,9 +336,14 @@ class MemoryPolicy:
         content: str,
         sensitivity: str,
         sources: Iterable[ProvenanceInput],
+        allow_existing_reclassification: bool = False,
     ) -> tuple[str, tuple[ProvenanceInput, ...]]:
         self.validate_kind(kind)
         self.validate_scope(scope_type, scope_ref)
-        normalized = self.validate_content(content, sensitivity)
+        normalized = self.validate_content(
+            content,
+            sensitivity,
+            allow_existing_reclassification=allow_existing_reclassification,
+        )
         validated_sources = self.validate_provenance_inputs(kind, sources)
         return normalized, validated_sources

@@ -246,16 +246,26 @@ Operit 的专用分享入口与 Kelivo 通用聊天入口是两套隔离的认�
 
 ### Memory Core Phase 1（默认关闭）
 
-Migration v7 仅增加派生记忆表和严格索引，不修改 v1–v6 表或既有消息。
+Migration v7 仅增加五张 Memory 表和严格索引，不修改 v1–v6 表或既有消息。
 Phase 1 不调用模型、不自动扫描历史、不向 prompt 注入记忆，也不开放 Memory
 HTTP API。完整的数据边界、显式 create/correct/forget、provenance、suppression
 与隐私契约见 [`MEMORY_CORE.md`](MEMORY_CORE.md)。
 
 保持 `MEMORY_CORE_ENABLED=false` 和
-`MEMORY_EXPLICIT_WRITES_ENABLED=false` 时，不需要配置 HMAC Secret，readiness
-会报告 `memory_core=false` 但不因此失败。只有在后续独立阶段启用显式写入时，
-才创建一把与 relay、Telegram、Kelivo、Operit、模型、审计和 API-loop
-凭据均不同的专用 `MEMORY_FINGERPRINT_HMAC_SECRET`。
+`MEMORY_EXPLICIT_WRITES_ENABLED=false` 时，不应用或校验可选 v7，不需要
+fingerprint profile、Key ID 或 HMAC Secret；Memory-only 表、索引或约束缺失/
+损坏不会阻塞 v1–v6 核心 readiness，且会安全报告 `memory_core=false`。只有在
+后续独立阶段启用显式写入时，才设置稳定的
+`MEMORY_FINGERPRINT_KEY_ID`，并创建一把与 relay、Telegram、Kelivo、
+Operit、模型、审计和 API-loop 凭据均不同的专用
+`MEMORY_FINGERPRINT_HMAC_SECRET`。
+
+首次启用写入会原子创建持久化 fingerprint profile。Key ID、Secret verifier、
+normalization version 或 fingerprint/domain version 任一不匹配都会使 Memory
+写入和其 readiness fail closed。Phase 1 不支持无迁移直接轮换 Secret 或更改
+normalization；这些变更必须由单独审查的显式迁移处理。evidence 只来自
+server-owned action/event，普通旧 canonical message 默认不授予 Memory 写入。
+同正文 reclassification 只能按 `normal < sensitive < restricted` 上调。
 
 部署包含 v7 的代码前应创建一致的 SQLite 备份。v7 是纯加法，关闭 Memory
 功能后旧 v6 应用代码可继续使用既有表；这属于应用回滚，不会移除 v7 表。

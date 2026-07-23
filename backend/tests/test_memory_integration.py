@@ -9,7 +9,7 @@ from unittest import mock
 from backend.tests._support import NoNetworkMixin, load_app, request
 
 
-TEST_HMAC_SECRET = "synthetic-memory-hmac-secret-000000000001"
+TEST_HMAC_SECRET = "Synthetic-Memory-HMAC-Key-2026-Alpha!Z9q7"
 
 
 class _TaskState:
@@ -30,8 +30,9 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             module = load_app(root)
             response = await self._ready(module)
             with closing(sqlite3.connect(module.DB_PATH)) as conn:
-                memory_count = conn.execute(
-                    "SELECT count(*) FROM memory_items"
+                memory_tables = conn.execute(
+                    """SELECT count(*) FROM sqlite_master
+                       WHERE type='table' AND name LIKE 'memory_%'"""
                 ).fetchone()[0]
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ready"])
@@ -39,7 +40,7 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(module.DEPLOYMENT.memory.enabled)
         self.assertFalse(module.DEPLOYMENT.heartbeat.enabled)
         self.assertNotIn("errors", response.json())
-        self.assertEqual(memory_count, 0)
+        self.assertEqual(memory_tables, 0)
 
     async def test_disabled_memory_runtime_failure_does_not_block_chat_readiness(self):
         with tempfile.TemporaryDirectory() as root:
@@ -96,7 +97,7 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             "memory_fingerprint_hmac_secret_missing", ""
         ))
 
-    async def test_corrupt_memory_schema_fails_database_and_memory_checks(self):
+    async def test_corrupt_enabled_memory_schema_fails_only_optional_memory_check(self):
         with tempfile.TemporaryDirectory() as root:
             module = load_app(root, memory=True)
             with closing(sqlite3.connect(module.DB_PATH)) as conn:
@@ -104,11 +105,84 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                 conn.commit()
             response = await self._ready(module)
         self.assertEqual(response.status_code, 503)
-        self.assertFalse(response.json()["checks"]["database"])
+        self.assertTrue(response.json()["checks"]["database"])
         self.assertFalse(response.json()["checks"]["memory_core"])
         self.assertEqual(
             response.json()["errors"]["memory_core"], "memory_schema_invalid"
         )
+
+    async def test_corrupt_disabled_v7_does_not_block_core_startup_or_readiness(self):
+        with tempfile.TemporaryDirectory() as root:
+            enabled = load_app(root, memory=True)
+            with closing(sqlite3.connect(enabled.DB_PATH)) as conn:
+                conn.execute("DROP INDEX idx_memory_items_live_fingerprint")
+                conn.commit()
+            disabled = load_app(root, memory=False)
+            response = await self._ready(disabled)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ready"])
+        self.assertTrue(response.json()["checks"]["database"])
+        self.assertFalse(response.json()["checks"]["memory_core"])
+        self.assertNotIn("errors", response.json())
+
+    async def test_disabled_memory_schema_corruption_matrix_is_isolated(self):
+        cases = (
+            ("items_missing", "DROP TABLE memory_items"),
+            ("sources_missing", "DROP TABLE memory_sources"),
+            ("suppressions_missing", "DROP TABLE memory_suppressions"),
+            ("profile_missing", "DROP TABLE memory_fingerprint_profile"),
+            ("evidence_missing", "DROP TABLE memory_evidence_events"),
+            ("partial_index_missing", "DROP INDEX idx_memory_items_live_fingerprint"),
+            (
+                "sources_shape_corrupt",
+                """ALTER TABLE memory_sources RENAME TO memory_sources_original;
+                   CREATE TABLE memory_sources(id INTEGER PRIMARY KEY)""",
+            ),
+        )
+        for name, sql in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                enabled = load_app(root, memory=True)
+                with closing(sqlite3.connect(enabled.DB_PATH)) as conn:
+                    conn.executescript(sql)
+                    conn.commit()
+                disabled = load_app(root, memory=False)
+                response = await self._ready(disabled)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["checks"]["database"])
+                self.assertFalse(response.json()["checks"]["memory_core"])
+                self.assertNotIn("errors", response.json())
+
+    async def test_enabled_memory_schema_corruption_matrix_fails_closed(self):
+        cases = (
+            ("items_missing", "DROP TABLE memory_items"),
+            ("sources_missing", "DROP TABLE memory_sources"),
+            ("suppressions_missing", "DROP TABLE memory_suppressions"),
+            ("profile_missing", "DROP TABLE memory_fingerprint_profile"),
+            ("evidence_missing", "DROP TABLE memory_evidence_events"),
+            ("partial_index_missing", "DROP INDEX idx_memory_items_live_fingerprint"),
+            (
+                "sources_shape_corrupt",
+                """ALTER TABLE memory_sources RENAME TO memory_sources_original;
+                   CREATE TABLE memory_sources(id INTEGER PRIMARY KEY)""",
+            ),
+        )
+        for name, sql in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                initial = load_app(root, memory=True)
+                with closing(sqlite3.connect(initial.DB_PATH)) as conn:
+                    conn.executescript(sql)
+                    conn.commit()
+                enabled = load_app(root, memory=True)
+                response = await self._ready(enabled)
+                payload = response.json()
+                self.assertEqual(response.status_code, 503)
+                self.assertTrue(payload["checks"]["database"])
+                self.assertFalse(payload["checks"]["memory_core"])
+                self.assertEqual(
+                    payload["errors"]["memory_core"], "memory_schema_invalid"
+                )
+                self.assertNotIn("CREATE TABLE", str(payload))
+                self.assertNotIn(str(root), str(payload))
 
     async def test_phase1_exposes_no_memory_http_route(self):
         with tempfile.TemporaryDirectory() as root:

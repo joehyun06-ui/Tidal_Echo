@@ -129,6 +129,7 @@ LOOP_DISPATCH_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.dispatch
 validate_loop_timeouts = deployment_config.validate_loop_timeouts
 KELIVO_PERSONA, KELIVO_PERSONA_SOURCE = deployment_config.load_server_persona()
 MEMORY_SERVICE = memory_service.MemoryService(DB_PATH, DEPLOYMENT.memory)
+MEMORY_STARTUP_ERROR = ""
 
 if not SECRET:
     raise SystemExit("RELAY_SECRET is required (set it in the systemd EnvironmentFile)")
@@ -154,6 +155,7 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    global MEMORY_STARTUP_ERROR
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with db() as conn:
         conn.execute(
@@ -181,7 +183,16 @@ def init_db() -> None:
             """
         )
         conn.commit()
-    channel_store.run_migrations(DB_PATH)
+    channel_store.run_migrations(DB_PATH, channel_store.CORE_MIGRATIONS)
+    MEMORY_STARTUP_ERROR = ""
+    if DEPLOYMENT.memory.enabled:
+        try:
+            channel_store.run_migrations(DB_PATH)
+            MEMORY_SERVICE.initialize_write_profile()
+        except memory_service.MemoryServiceError as exc:
+            MEMORY_STARTUP_ERROR = exc.category
+        except (OSError, sqlite3.Error, ValueError):
+            MEMORY_STARTUP_ERROR = "memory_schema_invalid"
     channel_store.recover_inflight_generations(DB_PATH)
     channel_store.recover_inflight_deliveries(DB_PATH)
     # A process restart makes every prior in-flight dispatch uncertain; never
@@ -1001,7 +1012,6 @@ def _database_ready() -> bool:
                 "channel_accounts", "channel_conversations", "inbound_events",
                 "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
                 "heartbeat_schedule_revisions", "heartbeat_run_inputs",
-                "memory_items", "memory_sources", "memory_suppressions",
             }
             if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled:
                 required_tables.update({
@@ -1015,7 +1025,7 @@ def _database_ready() -> bool:
             }
             if found != required_tables:
                 return False
-            latest = channel_store.MIGRATIONS[-1][0]
+            latest = channel_store.CORE_MIGRATIONS[-1][0]
             row = conn.execute(
                 "SELECT status FROM schema_migrations WHERE version=?", (latest,)
             ).fetchone()
@@ -1025,7 +1035,6 @@ def _database_ready() -> bool:
                 channel_store.validate_kelivo_schema(conn)
             channel_store.validate_heartbeat_schema(conn)
             channel_store.validate_heartbeat_hardening_schema(conn)
-            channel_store.validate_memory_schema(conn)
             return True
     except (OSError, sqlite3.Error, ValueError):
         return False
@@ -1077,7 +1086,10 @@ async def readyz():
         "telegram_worker": worker_task is not None and not worker_task.done(),
         "api_loop": await _api_loop_ready(),
     }
-    memory_ready, memory_error = await asyncio.to_thread(MEMORY_SERVICE.readiness)
+    if MEMORY_STARTUP_ERROR:
+        memory_ready, memory_error = False, MEMORY_STARTUP_ERROR
+    else:
+        memory_ready, memory_error = await asyncio.to_thread(MEMORY_SERVICE.readiness)
     checks["memory_core"] = memory_ready
     if DEPLOYMENT.kelivo.enabled:
         checks["kelivo"] = await asyncio.to_thread(

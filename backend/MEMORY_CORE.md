@@ -12,9 +12,11 @@ correlation. Memory Core never silently edits a canonical message.
 
 `memory_items` contains derived, normalized facts. A memory may be corrected,
 superseded, rejected, or forgotten without rewriting its canonical source.
-`memory_sources` links each memory to one or more canonical messages without
-copying message text or technical identity fields. `memory_suppressions`
-prevents a forgotten or obsolete fact from being recreated from an old source.
+`memory_evidence_events` records a closed, server-owned grant for a canonical
+message without copying message text or external identity. `memory_sources`
+links each memory to those immutable grants. `memory_suppressions` prevents a
+forgotten or obsolete fact from being recreated. The singleton
+`memory_fingerprint_profile` pins the keyed fingerprint contract.
 
 Provider request context and Heartbeat journal/timeline rows are separate
 layers. They are not automatically promoted to user facts.
@@ -56,21 +58,28 @@ Phase 1 and must not be logged.
 
 ## Provenance and evidence
 
-Every explicit user fact requires at least one canonical user message with one
-of these evidence types:
+Every explicit user fact requires at least one canonical user message with a
+server-owned evidence event of one of these types:
 
-- `user_explicit_remember`
-- `user_explicit_statement`
-- `user_confirmed_decision`
+- `explicit_user_memory`
+- `confirmed_user_fact`
+- `confirmed_project_decision`
+- `explicit_user_correction` (correction only)
 
-The store rereads the canonical row and derives its role, channel, and source.
-The supplied provenance must match exactly. Missing rows, malformed metadata,
-role mismatch, channel/source spoofing, roleplay, fiction, third-party claims,
-connection tests, error logs, and raw request bodies fail closed.
+The Memory service input contains only canonical message references. Callers
+cannot supply or override evidence type, reality scope, subject scope, channel,
+source, or role. The store rereads the canonical row and its immutable evidence
+event, derives role/channel/source, and checks the closed semantics. Ordinary
+legacy canonical rows have no grant. Missing events, role mismatch, roleplay,
+jokes, fiction, third-party claims, malformed metadata, or untrusted semantics
+fail the whole transaction closed. Phase 1 does not wire evidence creation into
+any existing chat adapter; a future trusted adapter must create an event only
+for an explicit remember/correct action.
 
 `assistant_experience` follows a separate contract: all evidence must be a
-canonical assistant message explicitly labeled `assistant_experience`.
-Assistant-only evidence can never create a user fact.
+canonical assistant message with a server-owned `assistant_experience` event
+created by the assistant runtime and scoped to the assistant. Assistant-only
+evidence can never create a user fact.
 
 Provenance queries return only channel, source, evidence role/type, and creation
 time. They never return canonical text, canonical IDs, session IDs, Telegram or
@@ -87,23 +96,32 @@ domain-separated canonical payload containing scope, kind, normalization
 version, and normalized content. It uses a dedicated secret and is compared
 with constant-time digest comparison. A plain content SHA is never used.
 
-The HMAC key is not stored in SQLite and neither the key nor a fingerprint is
-returned, logged, included in exceptions, or exposed by object `repr`.
-Concurrent identical creates are serialized by SQLite and protected by a
-partial unique index covering active/candidate items.
+The HMAC key is not stored in SQLite and neither the key, its verifier, nor a
+fingerprint is returned, logged, included in exceptions, or exposed by object
+`repr`. A separately domain-separated HMAC verifier, stable Key ID,
+normalization version, and fingerprint/domain version are stored in the
+singleton profile. They are compared fail closed (digest comparison is
+constant-time). Phase 1 has no online key/version migration: changing the
+Secret, Key ID, normalization version, or domain/fingerprint version requires a
+separately reviewed explicit migration. It must never be changed directly.
+Concurrent identical creates and first profile initialization are serialized by
+SQLite; a partial unique index also covers live active/candidate fingerprints.
 
 ## Create, correct, and forget
 
 Create writes an active item and all validated sources in one transaction.
 An identical live fingerprint returns the existing public `memory_key` and may
-add new valid provenance. Similar text is not automatically merged.
+add new valid provenance. Its sensitivity is atomically raised to the highest
+requested classification and never lowered. Similar text is not automatically
+merged.
 
 Correct requires an active public `memory_key`. Identical normalized content is
 an idempotent no-op. Different content creates a new item, changes the old item
 to `superseded`, links it to the new row, and creates a
 `corrected_obsolete` suppression in one transaction. The old revision remains
-available for audit but is never returned by active retrieval. Correction may
-raise sensitivity but cannot silently downgrade an existing sensitivity level.
+available for audit but is never returned by active retrieval. Same-content
+correction atomically adds provenance and applies any sensitivity upgrade.
+Correction never lowers an existing sensitivity level.
 
 Forget changes an active item to `forgotten`, clears both derived content and
 the item fingerprint, retains its non-content audit metadata and provenance,
@@ -124,13 +142,25 @@ The deterministic policy rejects credentials, Authorization/Bearer values,
 cookies/session credentials, private keys, common secret formats, financial
 credentials, precise coordinate pairs, technical identity values, test/E2E
 markers, connection tests, and error-log bodies. Error categories never echo
-matched content.
+matched content. Credential scanning checks the preserved normalized content
+plus bounded, detection-only views: at most two percent-decoding rounds and a
+bounded JSON Unicode-key escape view. These views are never persisted and
+never rewrite the normalized memory. Malformed encodings remain inert and do
+not produce data-bearing errors.
 
 Sensitive and restricted storage is disabled by default. Sensitive content
-cannot be silently downgraded to normal. Phase 1 retrieval always excludes
-sensitive/restricted items; its internal opt-in retrieval path remains disabled.
+cannot be silently downgraded to normal. Existing identical content may still
+be reclassified upward while sensitive storage is disabled because that
+reduces access; new sensitive/restricted content remains rejected. Phase 1
+retrieval always excludes sensitive/restricted items; its internal opt-in
+retrieval path remains disabled.
 Prompt-injection-looking text is treated only as inert data and cannot change
 control flow or select a tool, provider, extractor, scope policy, or SQL.
+
+Canonical metadata is checked before parsing and is limited to 16 KiB UTF-8,
+64 total object keys, nesting depth 8, and 4096 characters per key/string. The
+top level must be an object. Only bounded `channel` and `source` strings are
+used; the full metadata object is never copied into a result or error.
 
 ## Configuration
 
@@ -140,28 +170,37 @@ MEMORY_EXPLICIT_WRITES_ENABLED=false
 MEMORY_SENSITIVE_STORAGE_ENABLED=false
 MEMORY_MAX_ITEM_CHARS=1000
 MEMORY_FORGET_RETENTION_POLICY=tombstone_without_content
+MEMORY_FINGERPRINT_KEY_ID=
 MEMORY_FINGERPRINT_HMAC_SECRET=
 ```
 
 When Memory Core is disabled, no HMAC key is required and `/readyz` reports
-`memory_core=false` without making the service unready. Enabled read-only mode
-validates the v7 schema without requiring a key. Enabling explicit writes
-requires a dedicated 32-512 character printable-ASCII key distinct from all
-relay, channel, model, audit, and API-loop credentials. Invalid enabled-write
-configuration reports only a safe readiness category and rejects writes.
+`memory_core=false` without making the service unready. Disabled startup applies
+and validates only core v1–v6; it neither requires nor repairs optional v7.
+Enabled read-only mode atomically applies/validates v7 without requiring a key.
+Enabling explicit writes also requires a stable bounded Key ID and a dedicated,
+high-entropy 32–512 character printable-ASCII key distinct from all relay,
+channel, model, audit, and API-loop credentials. Invalid configuration or
+profile mismatch reports only a safe readiness category and rejects all Memory
+writes.
 
 ## Migration and rollback
 
-Migration v7 only adds `memory_items`, `memory_sources`,
-`memory_suppressions`, and their indexes. It does not rebuild or modify v1-v6
-tables or data. The validator checks exact columns, CHECK constraints, index
+Migration v7 only adds `memory_items`, `memory_fingerprint_profile`,
+`memory_evidence_events`, `memory_sources`, `memory_suppressions`, and their
+indexes. It does not rebuild or modify v1-v6 tables or data. The validator
+checks exact columns, CHECK constraints, unique constraints, index
 attributes/columns/partial predicates, foreign keys, and normalized DDL.
 
 Old v6 application code ignores the additive tables and can continue to read
-its existing tables. Application rollback is therefore compatible while all
-Memory features are disabled, but it does not remove the v7 schema marker or
-tables. Restore a consistent pre-v7 backup if a physical schema downgrade is
-required; never delete only a migration marker or hand-edit the tables.
+its existing tables. Current code also treats Memory migration/validation as an
+optional atomic path: when Memory is disabled, absent or damaged v7 objects do
+not block core v1–v6 startup/readiness. When Memory is enabled, any v7 schema,
+configuration, or profile fault fails only Memory readiness closed. Application
+rollback is compatible while all Memory features are disabled, but it does not
+remove the v7 schema marker or tables. Restore a consistent pre-v7 backup if a
+physical schema downgrade is required; never delete only a migration marker or
+hand-edit the tables.
 
 ## Deferred phases
 

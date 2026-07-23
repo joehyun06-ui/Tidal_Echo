@@ -97,6 +97,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
         "MEMORY_MAX_ITEM_CHARS": "1000",
         "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",
+        "MEMORY_FINGERPRINT_KEY_ID": "phase1-test-key",
         "MEMORY_FINGERPRINT_HMAC_SECRET": memory_secret,
         "LLM_MODEL": "test-provider-model",
         "LLM_TEMPERATURE": "0.7",

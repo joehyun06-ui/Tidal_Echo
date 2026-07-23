@@ -44,6 +44,16 @@ class MemoryService:
             return False, self.config.error_category or "memory_configuration_invalid"
         if not self.store.validate_schema():
             return False, "memory_schema_invalid"
+        if self.config.explicit_writes_enabled:
+            try:
+                if not self.store.validate_fingerprint_profile(
+                    **self._fingerprint_profile_parameters()
+                ):
+                    return False, "memory_fingerprint_profile_mismatch"
+            except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
+                return False, getattr(
+                    exc, "category", "memory_fingerprint_profile_mismatch"
+                )
         return True, ""
 
     def _require_enabled(self) -> None:
@@ -56,6 +66,31 @@ class MemoryService:
         self._require_enabled()
         if not self.config.explicit_writes_enabled:
             raise MemoryServiceError("explicit_writes_disabled")
+        self.initialize_write_profile()
+
+    def _fingerprint_profile_parameters(self) -> dict:
+        return {
+            "key_id": self.config.fingerprint_key_id,
+            "key_check": memory_policy.fingerprint_profile_check(
+                self.config.fingerprint_hmac_secret
+            ),
+            "normalization_version": memory_policy.NORMALIZATION_VERSION,
+            "fingerprint_version": memory_policy.FINGERPRINT_VERSION,
+        }
+
+    def initialize_write_profile(self) -> None:
+        if not self.config.enabled or not self.config.explicit_writes_enabled:
+            return
+        if not self.config.configuration_valid:
+            raise MemoryServiceError(
+                self.config.error_category or "memory_configuration_invalid"
+            )
+        try:
+            self.store.ensure_fingerprint_profile(
+                **self._fingerprint_profile_parameters()
+            )
+        except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
+            raise self._translate_error(exc) from None
 
     @staticmethod
     def _validate_memory_key(memory_key: str) -> str:
@@ -101,6 +136,7 @@ class MemoryService:
                 content=content,
                 sensitivity=sensitivity,
                 sources=sources,
+                allow_existing_reclassification=True,
             )
             fingerprint = self._fingerprint(
                 scope_type=scope_type,
@@ -125,6 +161,7 @@ class MemoryService:
                 fingerprint_version=memory_policy.FINGERPRINT_VERSION,
                 sensitivity=sensitivity,
                 sources=validated_sources,
+                sensitive_storage_enabled=self.config.sensitive_storage_enabled,
             )
             return {"outcome": result.outcome, "memory": result.item}
         except (memory_policy.MemoryPolicyError, memory_store.MemoryStoreError) as exc:
@@ -159,6 +196,7 @@ class MemoryService:
                 content=content,
                 sensitivity=sensitivity,
                 sources=sources,
+                allow_existing_reclassification=True,
             )
             fingerprint = self._fingerprint(
                 scope_type=current["scope_type"],
@@ -173,6 +211,7 @@ class MemoryService:
                 fingerprint_version=memory_policy.FINGERPRINT_VERSION,
                 sensitivity=sensitivity,
                 sources=validated_sources,
+                sensitive_storage_enabled=self.config.sensitive_storage_enabled,
             )
             return {"outcome": result.outcome, "memory": result.item}
         except MemoryServiceError:
