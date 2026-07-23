@@ -1,0 +1,171 @@
+# Memory Core Phase 1
+
+Memory Core is a disabled-by-default, internal-only derived memory layer. It is
+not an automatic memory feature and is not connected to any chat or provider
+path in Phase 1.
+
+## Data boundaries
+
+The canonical `messages` table is the provenance ledger. It keeps the original
+user and assistant messages, stable order, channel/source metadata, and session
+correlation. Memory Core never silently edits a canonical message.
+
+`memory_items` contains derived, normalized facts. A memory may be corrected,
+superseded, rejected, or forgotten without rewriting its canonical source.
+`memory_sources` links each memory to one or more canonical messages without
+copying message text or technical identity fields. `memory_suppressions`
+prevents a forgotten or obsolete fact from being recreated from an old source.
+
+Provider request context and Heartbeat journal/timeline rows are separate
+layers. They are not automatically promoted to user facts.
+
+## Phase 1 scope
+
+Phase 1 provides internal Python operations for:
+
+- explicit create;
+- correction through a new revision and supersession link;
+- forget through a content-free tombstone and suppression;
+- bounded read-only queries and minimal provenance summaries.
+
+It deliberately provides no public Memory HTTP route, model extraction,
+automatic canonical-history scan, prompt injection, cross-channel retrieval,
+embedding, FTS index, vector database, or full-message cache.
+
+`propose_memory_candidate` and `confirm_memory` remain disabled Phase 2
+interfaces. No Phase 1 operation calls a provider.
+
+## Kinds and scopes
+
+Kinds are closed to:
+
+- `user_preference`
+- `user_profile`
+- `relationship`
+- `shared_episode`
+- `project`
+- `decision`
+- `task_or_progress`
+- `assistant_experience`
+
+Scope types are `global_user`, `channel`, `session`, and `project`.
+`global_user` always uses an empty `scope_ref`; channel scope accepts only the
+server's known channel names. Session and project references are internal,
+validated opaque identifiers. They are not accepted from an external client in
+Phase 1 and must not be logged.
+
+## Provenance and evidence
+
+Every explicit user fact requires at least one canonical user message with one
+of these evidence types:
+
+- `user_explicit_remember`
+- `user_explicit_statement`
+- `user_confirmed_decision`
+
+The store rereads the canonical row and derives its role, channel, and source.
+The supplied provenance must match exactly. Missing rows, malformed metadata,
+role mismatch, channel/source spoofing, roleplay, fiction, third-party claims,
+connection tests, error logs, and raw request bodies fail closed.
+
+`assistant_experience` follows a separate contract: all evidence must be a
+canonical assistant message explicitly labeled `assistant_experience`.
+Assistant-only evidence can never create a user fact.
+
+Provenance queries return only channel, source, evidence role/type, and creation
+time. They never return canonical text, canonical IDs, session IDs, Telegram or
+device identifiers.
+
+## Normalization, idempotency, and HMAC
+
+Normalization version 1 uses Unicode NFC, normalizes CRLF/CR, trims surrounding
+whitespace, and collapses consecutive whitespace. It does not lowercase,
+remove punctuation, rewrite facts, or merge synonyms.
+
+The idempotency fingerprint is HMAC-SHA-256 over a versioned,
+domain-separated canonical payload containing scope, kind, normalization
+version, and normalized content. It uses a dedicated secret and is compared
+with constant-time digest comparison. A plain content SHA is never used.
+
+The HMAC key is not stored in SQLite and neither the key nor a fingerprint is
+returned, logged, included in exceptions, or exposed by object `repr`.
+Concurrent identical creates are serialized by SQLite and protected by a
+partial unique index covering active/candidate items.
+
+## Create, correct, and forget
+
+Create writes an active item and all validated sources in one transaction.
+An identical live fingerprint returns the existing public `memory_key` and may
+add new valid provenance. Similar text is not automatically merged.
+
+Correct requires an active public `memory_key`. Identical normalized content is
+an idempotent no-op. Different content creates a new item, changes the old item
+to `superseded`, links it to the new row, and creates a
+`corrected_obsolete` suppression in one transaction. The old revision remains
+available for audit but is never returned by active retrieval. Correction may
+raise sensitivity but cannot silently downgrade an existing sensitivity level.
+
+Forget changes an active item to `forgotten`, clears both derived content and
+the item fingerprint, retains its non-content audit metadata and provenance,
+and creates a `user_forget` suppression atomically. Repeated forget is
+idempotent. Phase 1 has no restore or unsuppress operation.
+
+Canonical source messages remain unchanged. Memory forget is therefore not
+canonical transcript deletion. SQLite files, WALs, and backups can retain
+historical canonical content; a future transcript-erasure workflow requires a
+separate storage and backup lifecycle.
+
+The suppression row contains only a keyed HMAC, scope/kind, version, category,
+and timestamp. It never stores forgotten text or a reversible copy.
+
+## Privacy policy
+
+The deterministic policy rejects credentials, Authorization/Bearer values,
+cookies/session credentials, private keys, common secret formats, financial
+credentials, precise coordinate pairs, technical identity values, test/E2E
+markers, connection tests, and error-log bodies. Error categories never echo
+matched content.
+
+Sensitive and restricted storage is disabled by default. Sensitive content
+cannot be silently downgraded to normal. Phase 1 retrieval always excludes
+sensitive/restricted items; its internal opt-in retrieval path remains disabled.
+Prompt-injection-looking text is treated only as inert data and cannot change
+control flow or select a tool, provider, extractor, scope policy, or SQL.
+
+## Configuration
+
+```dotenv
+MEMORY_CORE_ENABLED=false
+MEMORY_EXPLICIT_WRITES_ENABLED=false
+MEMORY_SENSITIVE_STORAGE_ENABLED=false
+MEMORY_MAX_ITEM_CHARS=1000
+MEMORY_FORGET_RETENTION_POLICY=tombstone_without_content
+MEMORY_FINGERPRINT_HMAC_SECRET=
+```
+
+When Memory Core is disabled, no HMAC key is required and `/readyz` reports
+`memory_core=false` without making the service unready. Enabled read-only mode
+validates the v7 schema without requiring a key. Enabling explicit writes
+requires a dedicated 32-512 character printable-ASCII key distinct from all
+relay, channel, model, audit, and API-loop credentials. Invalid enabled-write
+configuration reports only a safe readiness category and rejects writes.
+
+## Migration and rollback
+
+Migration v7 only adds `memory_items`, `memory_sources`,
+`memory_suppressions`, and their indexes. It does not rebuild or modify v1-v6
+tables or data. The validator checks exact columns, CHECK constraints, index
+attributes/columns/partial predicates, foreign keys, and normalized DDL.
+
+Old v6 application code ignores the additive tables and can continue to read
+its existing tables. Application rollback is therefore compatible while all
+Memory features are disabled, but it does not remove the v7 schema marker or
+tables. Restore a consistent pre-v7 backup if a physical schema downgrade is
+required; never delete only a migration marker or hand-edit the tables.
+
+## Deferred phases
+
+Phase 2 may add model-assisted candidate extraction with an independently
+audited provider call and fail-closed activation policy. Phase 3 may add
+bounded, policy-controlled retrieval and prompt context. Neither capability is
+implemented or enabled by this change.

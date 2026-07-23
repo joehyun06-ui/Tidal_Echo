@@ -56,7 +56,9 @@ class NoNetworkMixin:
 
 
 def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False,
-             auto_idempotency: bool = False, operit_share: bool = False):
+             auto_idempotency: bool = False, operit_share: bool = False,
+             memory: bool = False, memory_writes: bool = False,
+             memory_sensitive: bool = False, memory_secret: str = ""):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -90,6 +92,12 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "OPERIT_SHARE_MODEL_ALIAS": "ouou-home",
         "HEARTBEAT_ENABLED": "false",
         "HEARTBEAT_SCHEDULE_REVISION": "test-default",
+        "MEMORY_CORE_ENABLED": "true" if memory else "false",
+        "MEMORY_EXPLICIT_WRITES_ENABLED": "true" if memory_writes else "false",
+        "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
+        "MEMORY_MAX_ITEM_CHARS": "1000",
+        "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",
+        "MEMORY_FINGERPRINT_HMAC_SECRET": memory_secret,
         "LLM_MODEL": "test-provider-model",
         "LLM_TEMPERATURE": "0.7",
         "LLM_MAX_TOKENS": "2000",
@@ -97,7 +105,8 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
     }
     os.environ.update(values)
     for name in ("backend.app", "backend.telegram_integration", "backend.channel_store",
-                 "backend.kelivo_service", "backend.heartbeat_service"):
+                 "backend.kelivo_service", "backend.heartbeat_service",
+                 "backend.memory_policy", "backend.memory_store", "backend.memory_service"):
         sys.modules.pop(name, None)
     module = importlib.import_module("backend.app")
     module.telegram_integration = importlib.import_module("backend.telegram_integration")

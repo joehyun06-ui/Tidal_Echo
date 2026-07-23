@@ -413,6 +413,122 @@ def _migration_006(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+MEMORY_TABLE_DDL: dict[str, str] = {
+    "memory_items": """CREATE TABLE memory_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_key TEXT NOT NULL UNIQUE
+                CHECK(length(memory_key) BETWEEN 32 AND 96
+                      AND memory_key NOT GLOB '*[^A-Za-z0-9_-]*'),
+            kind TEXT NOT NULL CHECK(kind IN
+                ('user_preference','user_profile','relationship','shared_episode',
+                 'project','decision','task_or_progress','assistant_experience')),
+            scope_type TEXT NOT NULL CHECK(scope_type IN
+                ('global_user','channel','session','project')),
+            scope_ref TEXT NOT NULL,
+            normalized_content TEXT,
+            normalized_fingerprint BLOB,
+            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version > 0),
+            status TEXT NOT NULL CHECK(status IN
+                ('candidate','active','superseded','forgotten','rejected')),
+            explicitness TEXT NOT NULL CHECK(explicitness IN ('explicit','inferred')),
+            confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            sensitivity TEXT NOT NULL CHECK(sensitivity IN ('normal','sensitive','restricted')),
+            first_observed_at TEXT NOT NULL,
+            last_confirmed_at TEXT NOT NULL,
+            superseded_by_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK(
+                (scope_type='global_user' AND scope_ref='')
+                OR
+                (scope_type!='global_user' AND length(scope_ref) BETWEEN 1 AND 128
+                 AND scope_ref NOT GLOB '*[^A-Za-z0-9._:-]*')
+            ),
+            CHECK(
+                (status IN ('candidate','active','rejected')
+                 AND normalized_content IS NOT NULL AND length(normalized_content)>0
+                 AND normalized_fingerprint IS NOT NULL
+                 AND typeof(normalized_fingerprint)='blob' AND length(normalized_fingerprint)=32
+                 AND superseded_by_id IS NULL)
+                OR
+                (status='superseded'
+                 AND normalized_content IS NOT NULL AND length(normalized_content)>0
+                 AND normalized_fingerprint IS NOT NULL
+                 AND typeof(normalized_fingerprint)='blob' AND length(normalized_fingerprint)=32
+                 AND superseded_by_id IS NOT NULL)
+                OR
+                (status='forgotten' AND normalized_content IS NULL
+                 AND normalized_fingerprint IS NULL AND superseded_by_id IS NULL)
+            ),
+            CHECK(superseded_by_id IS NULL OR superseded_by_id != id),
+            FOREIGN KEY(superseded_by_id) REFERENCES memory_items(id) ON DELETE RESTRICT)""",
+    "memory_sources": """CREATE TABLE memory_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            canonical_message_id INTEGER NOT NULL,
+            channel TEXT NOT NULL
+                CHECK(length(channel) BETWEEN 1 AND 64
+                      AND channel NOT GLOB '*[^A-Za-z0-9._:-]*'),
+            source TEXT NOT NULL DEFAULT ''
+                CHECK(length(source)<=64
+                      AND source NOT GLOB '*[^A-Za-z0-9._:-]*'),
+            evidence_role TEXT NOT NULL CHECK(evidence_role IN ('user','assistant')),
+            evidence_type TEXT NOT NULL CHECK(evidence_type IN
+                ('user_explicit_remember','user_explicit_statement','user_confirmed_decision',
+                 'assistant_experience','roleplay','fiction','third_party',
+                 'connection_test','error_log','raw_request')),
+            created_at TEXT NOT NULL,
+            UNIQUE(memory_id,canonical_message_id,evidence_type),
+            FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE RESTRICT,
+            FOREIGN KEY(canonical_message_id) REFERENCES messages(id) ON DELETE RESTRICT)""",
+    "memory_suppressions": """CREATE TABLE memory_suppressions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_type TEXT NOT NULL CHECK(scope_type IN
+                ('global_user','channel','session','project')),
+            scope_ref TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN
+                ('user_preference','user_profile','relationship','shared_episode',
+                 'project','decision','task_or_progress','assistant_experience')),
+            normalized_fingerprint BLOB NOT NULL
+                CHECK(typeof(normalized_fingerprint)='blob'
+                      AND length(normalized_fingerprint)=32),
+            fingerprint_version INTEGER NOT NULL CHECK(fingerprint_version > 0),
+            reason_category TEXT NOT NULL CHECK(reason_category IN
+                ('user_forget','user_reject','privacy_policy','corrected_obsolete')),
+            created_at TEXT NOT NULL,
+            CHECK(
+                (scope_type='global_user' AND scope_ref='')
+                OR
+                (scope_type!='global_user' AND length(scope_ref) BETWEEN 1 AND 128
+                 AND scope_ref NOT GLOB '*[^A-Za-z0-9._:-]*')
+            ),
+            UNIQUE(scope_type,scope_ref,kind,fingerprint_version,normalized_fingerprint))""",
+}
+
+MEMORY_INDEX_DDL: dict[str, str] = {
+    "idx_memory_items_active_lookup":
+        "CREATE INDEX idx_memory_items_active_lookup "
+        "ON memory_items(status,scope_type,scope_ref,kind,sensitivity,last_confirmed_at,id)",
+    "idx_memory_items_superseded_by":
+        "CREATE INDEX idx_memory_items_superseded_by ON memory_items(superseded_by_id)",
+    "idx_memory_items_live_fingerprint":
+        "CREATE UNIQUE INDEX idx_memory_items_live_fingerprint "
+        "ON memory_items(scope_type,scope_ref,kind,fingerprint_version,normalized_fingerprint) "
+        "WHERE status IN ('active','candidate')",
+    "idx_memory_sources_memory":
+        "CREATE INDEX idx_memory_sources_memory ON memory_sources(memory_id,id)",
+    "idx_memory_sources_canonical":
+        "CREATE INDEX idx_memory_sources_canonical ON memory_sources(canonical_message_id,id)",
+}
+
+
+def _migration_007(conn: sqlite3.Connection) -> None:
+    """Add the disabled-by-default, explicit derived Memory Core foundation."""
+    validate_heartbeat_hardening_schema(conn)
+    for statement in (*MEMORY_TABLE_DDL.values(), *MEMORY_INDEX_DDL.values()):
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -815,6 +931,144 @@ def validate_heartbeat_hardening_schema(conn: sqlite3.Connection) -> None:
             raise sqlite3.DatabaseError(f"invalid heartbeat hardening index fingerprint: {name}")
 
 
+def validate_memory_schema(conn: sqlite3.Connection) -> None:
+    """Reject a v7 marker unless the complete Memory Core structure is exact."""
+    expected_columns = {
+        "memory_items": {
+            "id": ("INTEGER", 0, None, 1),
+            "memory_key": ("TEXT", 1, None, 0),
+            "kind": ("TEXT", 1, None, 0),
+            "scope_type": ("TEXT", 1, None, 0),
+            "scope_ref": ("TEXT", 1, None, 0),
+            "normalized_content": ("TEXT", 0, None, 0),
+            "normalized_fingerprint": ("BLOB", 0, None, 0),
+            "fingerprint_version": ("INTEGER", 1, None, 0),
+            "status": ("TEXT", 1, None, 0),
+            "explicitness": ("TEXT", 1, None, 0),
+            "confidence": ("REAL", 1, None, 0),
+            "sensitivity": ("TEXT", 1, None, 0),
+            "first_observed_at": ("TEXT", 1, None, 0),
+            "last_confirmed_at": ("TEXT", 1, None, 0),
+            "superseded_by_id": ("INTEGER", 0, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+            "updated_at": ("TEXT", 1, None, 0),
+        },
+        "memory_sources": {
+            "id": ("INTEGER", 0, None, 1),
+            "memory_id": ("INTEGER", 1, None, 0),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "channel": ("TEXT", 1, None, 0),
+            "source": ("TEXT", 1, "''", 0),
+            "evidence_role": ("TEXT", 1, None, 0),
+            "evidence_type": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+        "memory_suppressions": {
+            "id": ("INTEGER", 0, None, 1),
+            "scope_type": ("TEXT", 1, None, 0),
+            "scope_ref": ("TEXT", 1, None, 0),
+            "kind": ("TEXT", 1, None, 0),
+            "normalized_fingerprint": ("BLOB", 1, None, 0),
+            "fingerprint_version": ("INTEGER", 1, None, 0),
+            "reason_category": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+    }
+    for table, expected in expected_columns.items():
+        rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if any(int(row["hidden"]) != 0 for row in rows):
+            raise sqlite3.DatabaseError(f"invalid hidden memory column: {table}")
+        actual = {
+            row["name"]: (
+                str(row["type"]).upper(), int(row["notnull"]), row["dflt_value"], int(row["pk"]),
+            )
+            for row in rows
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid memory schema: {table} columns")
+
+    expected_indexes = {
+        "memory_items": {
+            "sqlite_autoindex_memory_items_1": (
+                True, "u", False, ("memory_key",),
+            ),
+            "idx_memory_items_active_lookup": (
+                False, "c", False,
+                ("status", "scope_type", "scope_ref", "kind", "sensitivity",
+                 "last_confirmed_at", "id"),
+            ),
+            "idx_memory_items_superseded_by": (
+                False, "c", False, ("superseded_by_id",),
+            ),
+            "idx_memory_items_live_fingerprint": (
+                True, "c", True,
+                ("scope_type", "scope_ref", "kind", "fingerprint_version",
+                 "normalized_fingerprint"),
+            ),
+        },
+        "memory_sources": {
+            "sqlite_autoindex_memory_sources_1": (
+                True, "u", False, ("memory_id", "canonical_message_id", "evidence_type"),
+            ),
+            "idx_memory_sources_memory": (
+                False, "c", False, ("memory_id", "id"),
+            ),
+            "idx_memory_sources_canonical": (
+                False, "c", False, ("canonical_message_id", "id"),
+            ),
+        },
+        "memory_suppressions": {
+            "sqlite_autoindex_memory_suppressions_1": (
+                True, "u", False,
+                ("scope_type", "scope_ref", "kind", "fingerprint_version",
+                 "normalized_fingerprint"),
+            ),
+        },
+    }
+    for table, expected in expected_indexes.items():
+        actual_rows = {row["name"]: row for row in conn.execute(f"PRAGMA index_list({table})")}
+        if set(actual_rows) != set(expected):
+            raise sqlite3.DatabaseError(f"invalid memory index set: {table}")
+        for name, (unique, origin, partial, columns) in expected.items():
+            row = actual_rows[name]
+            if (bool(row["unique"]), row["origin"], bool(row["partial"])) != (
+                unique, origin, partial,
+            ):
+                raise sqlite3.DatabaseError(f"invalid memory index attributes: {name}")
+            _validate_index_xinfo(conn, name, columns)
+
+    expected_fks = {
+        "memory_items": {
+            ("superseded_by_id", "memory_items", "id", "NO ACTION", "RESTRICT", "NONE"),
+        },
+        "memory_sources": {
+            ("memory_id", "memory_items", "id", "NO ACTION", "RESTRICT", "NONE"),
+            ("canonical_message_id", "messages", "id", "NO ACTION", "RESTRICT", "NONE"),
+        },
+        "memory_suppressions": set(),
+    }
+    for table, expected in expected_fks.items():
+        actual = {
+            (row["from"], row["table"], row["to"], row["on_update"], row["on_delete"], row["match"])
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(f"invalid memory foreign key: {table}")
+
+    for table, expected_sql in MEMORY_TABLE_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid memory table fingerprint: {table}")
+    for name, expected_sql in MEMORY_INDEX_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,),
+        ).fetchone()
+        if row is None or _sql_fingerprint(str(row["sql"])) != _sql_fingerprint(expected_sql):
+            raise sqlite3.DatabaseError(f"invalid memory index fingerprint: {name}")
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "telegram_private_text_mvp", _migration_001),
     (2, "telegram_reliability", _migration_002),
@@ -822,6 +1076,7 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
     (4, "kelivo_automatic_idempotency", _migration_004),
     (5, "dylan_heartbeat_foundation", _migration_005),
     (6, "dylan_heartbeat_hardening", _migration_006),
+    (7, "explicit_memory_core_foundation", _migration_007),
 )
 
 
@@ -854,6 +1109,8 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 validate_heartbeat_schema(conn)
             if latest is not None and int(latest) >= 6:
                 validate_heartbeat_hardening_schema(conn)
+            if latest is not None and int(latest) >= 7:
+                validate_memory_schema(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

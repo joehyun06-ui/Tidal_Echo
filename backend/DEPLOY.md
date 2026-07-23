@@ -244,6 +244,24 @@ Run exactly one production relay/Telegram worker instance with SQLite. The test 
 Operit 的专用分享入口与 Kelivo 通用聊天入口是两套隔离的认证面；完整的 MVP
 契约、Android 手工配置与安全边界见 [`OPERIT_SHARE.md`](OPERIT_SHARE.md)。
 
+### Memory Core Phase 1（默认关闭）
+
+Migration v7 仅增加派生记忆表和严格索引，不修改 v1–v6 表或既有消息。
+Phase 1 不调用模型、不自动扫描历史、不向 prompt 注入记忆，也不开放 Memory
+HTTP API。完整的数据边界、显式 create/correct/forget、provenance、suppression
+与隐私契约见 [`MEMORY_CORE.md`](MEMORY_CORE.md)。
+
+保持 `MEMORY_CORE_ENABLED=false` 和
+`MEMORY_EXPLICIT_WRITES_ENABLED=false` 时，不需要配置 HMAC Secret，readiness
+会报告 `memory_core=false` 但不因此失败。只有在后续独立阶段启用显式写入时，
+才创建一把与 relay、Telegram、Kelivo、Operit、模型、审计和 API-loop
+凭据均不同的专用 `MEMORY_FINGERPRINT_HMAC_SECRET`。
+
+部署包含 v7 的代码前应创建一致的 SQLite 备份。v7 是纯加法，关闭 Memory
+功能后旧 v6 应用代码可继续使用既有表；这属于应用回滚，不会移除 v7 表。
+如需物理 schema downgrade，应恢复上线前整库备份，不得只删除 migration
+marker 或手工拆表。
+
 ### Kelivo OpenAI-compatible 非流式 API（可选）
 
 Kelivo 默认关闭。只有设置 `KELIVO_ENABLED=true`、一把全新的

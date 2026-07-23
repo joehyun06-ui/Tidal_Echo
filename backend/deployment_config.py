@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import hmac
 import math
 import os
 import tempfile
 import urllib.parse
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
 from typing import Mapping
@@ -158,6 +159,18 @@ class HeartbeatConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool
+    explicit_writes_enabled: bool
+    sensitive_storage_enabled: bool
+    max_item_chars: int
+    forget_retention_policy: str
+    fingerprint_hmac_secret: str = field(repr=False)
+    configuration_valid: bool = True
+    error_category: str = ""
+
+
+@dataclass(frozen=True)
 class DeploymentConfig:
     render_telegram_mvp: bool
     persistent_root: Path
@@ -172,6 +185,7 @@ class DeploymentConfig:
     kelivo: KelivoConfig
     operit_share: OperitShareConfig
     heartbeat: HeartbeatConfig
+    memory: MemoryConfig
 
 
 def _parse_heartbeat_time(value: object, category: str) -> time:
@@ -350,6 +364,28 @@ def load_deployment_config(
     operit_share_enabled = parse_strict_bool(
         env.get("OPERIT_SHARE_ENABLED", "false"), "invalid_operit_share_enabled"
     )
+    memory_enabled = parse_strict_bool(
+        env.get("MEMORY_CORE_ENABLED", "false"), "invalid_memory_core_enabled"
+    )
+    memory_explicit_writes = parse_strict_bool(
+        env.get("MEMORY_EXPLICIT_WRITES_ENABLED", "false"),
+        "invalid_memory_explicit_writes_enabled",
+    )
+    memory_sensitive_storage = parse_strict_bool(
+        env.get("MEMORY_SENSITIVE_STORAGE_ENABLED", "false"),
+        "invalid_memory_sensitive_storage_enabled",
+    )
+    memory_max_item_chars = parse_bounded_int(
+        env.get("MEMORY_MAX_ITEM_CHARS", "1000"), 64, 4096,
+        "invalid_memory_max_item_chars",
+    )
+    memory_forget_policy = str(
+        env.get("MEMORY_FORGET_RETENTION_POLICY", "tombstone_without_content")
+    )
+    if memory_forget_policy != "tombstone_without_content":
+        raise DeploymentConfigError("invalid_memory_forget_retention_policy")
+    if not memory_enabled and (memory_explicit_writes or memory_sensitive_storage):
+        raise DeploymentConfigError("invalid_memory_feature_relationship")
     if telegram_enabled != bool(telegram_config.requested):
         raise DeploymentConfigError("telegram_config_invalid")
 
@@ -384,6 +420,8 @@ def load_deployment_config(
         env.get("OPERIT_SHARE_CLIENT_ID", "primary-operit-share")
     ).strip()
     operit_share_model_alias = str(env.get("OPERIT_SHARE_MODEL_ALIAS", "ouou-home")).strip()
+    raw_memory_hmac_secret = str(env.get("MEMORY_FINGERPRINT_HMAC_SECRET", ""))
+    memory_hmac_secret = raw_memory_hmac_secret.strip()
     kelivo_allow_remap = parse_strict_bool(
         env.get("KELIVO_ALLOW_SESSION_REMAP", "false"), "invalid_kelivo_allow_session_remap"
     )
@@ -488,6 +526,46 @@ def load_deployment_config(
         if operit_share_client_id == kelivo_client_id:
             raise DeploymentConfigError("operit_share_identity_invalid")
 
+    memory_configuration_valid = True
+    memory_error_category = ""
+    if memory_enabled and memory_explicit_writes:
+        if not memory_hmac_secret:
+            memory_configuration_valid = False
+            memory_error_category = "memory_fingerprint_hmac_secret_missing"
+        elif (
+            raw_memory_hmac_secret != memory_hmac_secret
+            or len(memory_hmac_secret) < 32
+            or len(memory_hmac_secret) > 512
+            or not memory_hmac_secret.isascii()
+            or any(ord(char) < 33 or ord(char) > 126 for char in memory_hmac_secret)
+        ):
+            memory_configuration_valid = False
+            memory_error_category = "memory_fingerprint_hmac_secret_invalid"
+        else:
+            protected_memory_secrets = {
+                str(env.get("RELAY_SECRET", "")).strip(),
+                str(env.get("KELIVO_API_KEY", "")).strip(),
+                str(env.get("OPERIT_SHARE_API_KEY", "")).strip(),
+                str(env.get("TELEGRAM_BOT_TOKEN", "")).strip(),
+                str(env.get("TELEGRAM_WEBHOOK_SECRET", "")).strip(),
+                str(env.get("CHANNEL_AUDIT_HMAC_SECRET", "")).strip(),
+                str(env.get("LLM_API_KEY", "")).strip(),
+                str(env.get("LLM_API_KEY_2", "")).strip(),
+                str(env.get("LLM_API_KEY_3", "")).strip(),
+                str(env.get("LLM_API_KEY_4", "")).strip(),
+                str(env.get("MINIMAX_API_KEY", "")).strip(),
+                str(env.get("API_LOOP_INTERNAL_TOKEN", "")).strip(),
+                str(env.get("API_LOOP_EXPECTED_NONCE", "")).strip(),
+                str(env.get("API_LOOP_INSTANCE_NONCE", "")).strip(),
+            }
+            protected_memory_secrets.discard("")
+            if any(
+                hmac.compare_digest(memory_hmac_secret, candidate)
+                for candidate in protected_memory_secrets
+            ):
+                memory_configuration_valid = False
+                memory_error_category = "memory_fingerprint_hmac_secret_must_be_distinct"
+
     try:
         timeouts = LoopTimeouts(
             model_total=parse_positive_finite_float(env.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"),
@@ -588,6 +666,16 @@ def load_deployment_config(
             model_alias=operit_share_model_alias,
         ),
         heartbeat=heartbeat_config,
+        memory=MemoryConfig(
+            enabled=memory_enabled,
+            explicit_writes_enabled=memory_explicit_writes,
+            sensitive_storage_enabled=memory_sensitive_storage,
+            max_item_chars=memory_max_item_chars,
+            forget_retention_policy=memory_forget_policy,
+            fingerprint_hmac_secret=memory_hmac_secret,
+            configuration_valid=memory_configuration_valid,
+            error_category=memory_error_category,
+        ),
     )
 
 

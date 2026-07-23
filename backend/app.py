@@ -41,10 +41,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 try:
-    from . import channel_store, deployment_config, kelivo_service
+    from . import channel_store, deployment_config, kelivo_service, memory_service
     from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 except ImportError:  # support `python backend/app.py`
-    import channel_store, deployment_config, kelivo_service
+    import channel_store, deployment_config, kelivo_service, memory_service
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 
 try:
@@ -128,6 +128,7 @@ LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = DEPLOYMENT.timeouts.safety_margin
 LOOP_DISPATCH_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.dispatch
 validate_loop_timeouts = deployment_config.validate_loop_timeouts
 KELIVO_PERSONA, KELIVO_PERSONA_SOURCE = deployment_config.load_server_persona()
+MEMORY_SERVICE = memory_service.MemoryService(DB_PATH, DEPLOYMENT.memory)
 
 if not SECRET:
     raise SystemExit("RELAY_SECRET is required (set it in the systemd EnvironmentFile)")
@@ -1000,6 +1001,7 @@ def _database_ready() -> bool:
                 "channel_accounts", "channel_conversations", "inbound_events",
                 "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
                 "heartbeat_schedule_revisions", "heartbeat_run_inputs",
+                "memory_items", "memory_sources", "memory_suppressions",
             }
             if DEPLOYMENT.kelivo.enabled or DEPLOYMENT.operit_share.enabled:
                 required_tables.update({
@@ -1023,6 +1025,7 @@ def _database_ready() -> bool:
                 channel_store.validate_kelivo_schema(conn)
             channel_store.validate_heartbeat_schema(conn)
             channel_store.validate_heartbeat_hardening_schema(conn)
+            channel_store.validate_memory_schema(conn)
             return True
     except (OSError, sqlite3.Error, ValueError):
         return False
@@ -1074,6 +1077,8 @@ async def readyz():
         "telegram_worker": worker_task is not None and not worker_task.done(),
         "api_loop": await _api_loop_ready(),
     }
+    memory_ready, memory_error = await asyncio.to_thread(MEMORY_SERVICE.readiness)
+    checks["memory_core"] = memory_ready
     if DEPLOYMENT.kelivo.enabled:
         checks["kelivo"] = await asyncio.to_thread(
             kelivo_service.client_mapping_ready,
@@ -1088,8 +1093,14 @@ async def readyz():
             DEPLOYMENT.operit_share.client_id,
             DEPLOYMENT.operit_share.api_session,
         )
-    ready = all(checks.values())
+    gating_checks = {
+        name: value for name, value in checks.items()
+        if name != "memory_core" or DEPLOYMENT.memory.enabled
+    }
+    ready = all(gating_checks.values())
     payload = {"ready": ready, "checks": checks, "status": "ready" if ready else "not_ready"}
+    if DEPLOYMENT.memory.enabled and memory_error:
+        payload["errors"] = {"memory_core": memory_error}
     return JSONResponse(payload, status_code=200 if ready else 503)
 
 
