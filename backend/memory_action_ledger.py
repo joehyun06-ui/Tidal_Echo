@@ -605,7 +605,6 @@ class _MemoryActionUnitOfWork:
             or self._terminal is not None
             or self._store_completed
             or self._store_failed
-            or type(action) is not memory_runtime.MemoryActionBinding
         ):
             raise MemoryActionLedgerError("invalid_state")
         if binding.action_kind == "remember":
@@ -621,16 +620,20 @@ class _MemoryActionUnitOfWork:
         else:
             expected_action_type = memory_runtime.ACTION_FORGET_USER
             expected_memory_key = binding.target_memory_key
-        if (
-            action.action_type != expected_action_type
-            or action.canonical_message_id != self._canonical_message_id
-            or action.kind != binding.kind
-            or action.scope_type != binding.scope_type
-            or action.scope_ref != binding.scope_ref
-            or action.normalized_content != binding.normalized_content
-            or action.sensitivity != binding.sensitivity
-            or action.memory_key != expected_memory_key
-        ):
+        try:
+            conflicts = (
+                action.action_type != expected_action_type
+                or action.canonical_message_id != self._canonical_message_id
+                or action.kind != binding.kind
+                or action.scope_type != binding.scope_type
+                or action.scope_ref != binding.scope_ref
+                or action.normalized_content != binding.normalized_content
+                or action.sensitivity != binding.sensitivity
+                or action.memory_key != expected_memory_key
+            )
+        except (AttributeError, TypeError):
+            raise MemoryActionLedgerError("invalid_state") from None
+        if conflicts:
             raise MemoryActionLedgerError("request_binding_conflict")
 
     def _defer_action(self, action_id: str) -> None:

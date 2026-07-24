@@ -14,8 +14,6 @@ from unittest import mock
 from backend import (
     channel_store,
     memory_action_ledger,
-    memory_runtime,
-    memory_store,
 )
 from backend.tests.test_memory_service import (
     TEST_HMAC_SECRET,
@@ -1027,14 +1025,15 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
 
     def test_uow_binds_the_store_action_to_the_claimed_request(self):
         binding = self.binding()
+        runtime_module = importlib.import_module(type(self.authority).__module__)
         with self.store._action_unit_of_work() as uow:
             self.assertIsNone(uow.claim_request(binding))
             canonical_id = uow._insert_canonical_action(
                 text=binding.normalized_content,
                 metadata={"channel": "web", "source": "relay"},
             )
-            action = memory_runtime.MemoryActionBinding(
-                action_type=memory_runtime.ACTION_REMEMBER_USER,
+            action = runtime_module.MemoryActionBinding(
+                action_type=runtime_module.ACTION_REMEMBER_USER,
                 canonical_message_id=canonical_id,
                 kind=binding.kind,
                 scope_type=binding.scope_type,
@@ -1044,7 +1043,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             )
             uow._validate_store_action(self.store, action)
             mismatches = (
-                replace(action, action_type=memory_runtime.ACTION_CORRECT_USER),
+                replace(action, action_type=runtime_module.ACTION_CORRECT_USER),
                 replace(action, canonical_message_id=canonical_id + 1),
                 replace(action, kind="decision"),
                 replace(action, scope_type="project", scope_ref="synthetic"),
@@ -1064,8 +1063,10 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
     def test_store_rejects_a_capability_for_a_different_claimed_request(self):
         binding = self.binding()
         different_content = "Different synthetic binding"
+        runtime_module = importlib.import_module(type(self.authority).__module__)
+        store_module = importlib.import_module(type(self.store).__module__)
         with self.assertRaisesRegex(
-            memory_store.MemoryStoreError,
+            store_module.MemoryStoreError,
             "request_binding_conflict",
         ):
             with self.store._action_unit_of_work() as uow:
@@ -1074,10 +1075,10 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     text=binding.normalized_content,
                     metadata={"channel": "web", "source": "relay"},
                 )
-                envelope = memory_runtime.issue_action_envelope(
+                envelope = runtime_module.issue_action_envelope(
                     self.authority,
-                    memory_runtime.MemoryActionBinding(
-                        action_type=memory_runtime.ACTION_REMEMBER_USER,
+                    runtime_module.MemoryActionBinding(
+                        action_type=runtime_module.ACTION_REMEMBER_USER,
                         canonical_message_id=canonical_id,
                         kind=binding.kind,
                         scope_type=binding.scope_type,
