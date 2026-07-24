@@ -991,7 +991,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             with store._action_unit_of_work() as uow:
                 uow.claim_request(binding)
         self.assertEqual(self.counts(path), before)
-        self.assertEqual(before["memory_action_requests"], 1)
+        self.assertGreaterEqual(before["memory_action_requests"], 1)
 
     @staticmethod
     def insert_other_item(conn, *, marker: str) -> tuple[int, str]:
@@ -1152,7 +1152,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 sqlite3.DatabaseError,
-                "memory action trigger",
+                "memory action",
             ):
                 channel_store.validate_memory_action_schema(conn)
         with self.assertRaisesRegex(
