@@ -12,9 +12,15 @@ from enum import Enum
 from typing import Iterable, Sequence
 
 try:
-    from . import channel_store, memory_policy, memory_runtime
+    from . import (
+        channel_store,
+        memory_action_ledger,
+        memory_policy,
+        memory_runtime,
+    )
 except ImportError:  # support direct module execution in local tooling
     import channel_store
+    import memory_action_ledger
     import memory_policy
     import memory_runtime
 
@@ -246,10 +252,54 @@ class MemoryStore:
     def validate_schema(self) -> bool:
         try:
             with channel_store.connect(self.path) as conn:
-                channel_store.validate_memory_schema(conn)
+                channel_store.validate_memory_action_schema(conn)
             return True
         except (OSError, sqlite3.Error, ValueError):
             return False
+
+    def _action_unit_of_work(self):
+        """Create the internal root transaction for a reviewed composition path."""
+        self._require_write_runtime()
+        try:
+            runtime_policy = memory_runtime.require_runtime_authority(
+                self._authority
+            )
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+        if runtime_policy is not self._runtime_policy:
+            raise MemoryStoreError("runtime_authority_invalid")
+        return memory_action_ledger._new_unit_of_work(
+            store=self,
+            secret=self._runtime_policy.fingerprint_hmac_secret,
+        )
+
+    def _write_connection(self, transaction: object | None):
+        if transaction is None:
+            return channel_store.connect(self.path)
+        if not isinstance(
+            transaction,
+            memory_action_ledger._MemoryActionUnitOfWork,
+        ):
+            raise MemoryStoreError("transaction_context_invalid")
+        try:
+            return transaction._store_connection(self)
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
+
+    def _defer_action_to_transaction(
+        self,
+        transaction: object | None,
+        action_id: str | None,
+        *,
+        consumed: bool,
+    ) -> str | None:
+        if transaction is None or action_id is None or not consumed:
+            return action_id
+        try:
+            transaction._defer_action(action_id)
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
+        return None
 
     def _require_write_runtime(self) -> None:
         try:
@@ -688,13 +738,14 @@ class MemoryStore:
         sources: Iterable[memory_policy.ProvenanceInput],
         grant_kind: _GrantKind,
         authorization: object | None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
         try:
-            with channel_store.connect(self.path) as conn:
+            with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
@@ -848,11 +899,18 @@ class MemoryStore:
             return result
         except MemoryStoreError:
             raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
         finally:
+            action_id = self._defer_action_to_transaction(
+                _transaction,
+                action_id,
+                consumed=consumed,
+            )
             self._finish_action(action_id, consumed=consumed)
 
     def create_explicit_memory_from_user_action(
@@ -865,6 +923,7 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         if kind in {"assistant_experience", "decision"}:
             raise MemoryStoreError("unsupported_evidence")
@@ -877,6 +936,7 @@ class MemoryStore:
             sources=sources,
             grant_kind=_GrantKind.EXPLICIT_USER_MEMORY,
             authorization=authorization,
+            _transaction=_transaction,
         )
 
     def create_confirmed_project_decision_from_action(
@@ -889,6 +949,7 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         if kind != "decision":
             raise MemoryStoreError("unsupported_evidence")
@@ -901,6 +962,7 @@ class MemoryStore:
             sources=sources,
             grant_kind=_GrantKind.CONFIRMED_PROJECT_DECISION,
             authorization=authorization,
+            _transaction=_transaction,
         )
 
     def create_assistant_experience_from_action(
@@ -913,6 +975,7 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         if kind != "assistant_experience":
             raise MemoryStoreError("unsupported_evidence")
@@ -925,6 +988,7 @@ class MemoryStore:
             sources=sources,
             grant_kind=_GrantKind.ASSISTANT_EXPERIENCE,
             authorization=authorization,
+            _transaction=_transaction,
         )
 
     def correct_memory_from_user_action(
@@ -935,13 +999,14 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
         try:
-            with channel_store.connect(self.path) as conn:
+            with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
@@ -1128,11 +1193,18 @@ class MemoryStore:
             return result
         except MemoryStoreError:
             raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
         finally:
+            action_id = self._defer_action_to_transaction(
+                _transaction,
+                action_id,
+                consumed=consumed,
+            )
             self._finish_action(action_id, consumed=consumed)
 
     def forget_memory_atomic(
@@ -1141,13 +1213,14 @@ class MemoryStore:
         memory_key: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
         try:
-            with channel_store.connect(self.path) as conn:
+            with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
@@ -1240,11 +1313,18 @@ class MemoryStore:
             return result
         except MemoryStoreError:
             raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
         finally:
+            action_id = self._defer_action_to_transaction(
+                _transaction,
+                action_id,
+                consumed=consumed,
+            )
             self._finish_action(action_id, consumed=consumed)
 
     def get_item_by_key(self, memory_key: str) -> dict | None:

@@ -448,3 +448,29 @@ dispatching 行。Kelivo 关闭时不检查 Kelivo 专属跨字段关系，`/v1/
 
 发布 v3 前必须备份完整 `relay.db`。若曾运行未提交的旧 v3 测试 schema，应删除测试数据库，
 或从 v2/上线前整库备份恢复；不能只修改 migration marker，也不要让启动逻辑猜测修复可疑结构。
+
+### Memory Phase 1.5 PR A：v8 request ledger（仅基础设施）
+
+Migration v8 仅新增 `memory_action_requests` 与一个显式索引，不修改或重建
+v1–v7。Memory Core 启用为 read-only 时会原子应用并严格验证 v7–v8；这不需要
+fingerprint Key ID/HMAC Secret，也不会启用写入。
+
+v8 ledger 只保存受限 request ID、闭集 action/origin、32-byte
+domain-separated HMAC binding、公开 target/result Memory key、terminal
+status/category 与 UTC timestamp。它不保存 Memory/canonical 正文副本、
+fingerprint、外部用户/设备/session identity、完整 metadata、capability/signature、
+Runtime Authority、Secret/Key ID、SQL 或异常正文；没有持久化 `processing` 状态。
+terminal HMAC 同时绑定 canonical reference 与结果；重放会交叉检查对应
+canonical/evidence/Memory 状态，满足 SQL CHECK 但被篡改的数据仍会 fail closed。
+
+本阶段只增加可信 composition root 将来可使用的内部 Unit of Work。它让 ledger、
+新 canonical action、capability 验证和 Memory Store 写入能够共享一个
+`BEGIN IMMEDIATE`，但没有实现 Explicit Memory Entry Service，也没有 CLI、MCP、
+HTTP、Telegram 或 Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会
+执行 Memory write。该 Unit of Work 是组合与事务原子性机制，不是同进程 Python
+sandbox。
+
+本 PR 不批准部署或生产启用。`MEMORY_EXPLICIT_WRITES_ENABLED` 继续默认
+`false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8
+表；应用回滚不得手工删除 v8 marker/table。若必须物理降级 schema，只能在停写后
+恢复一致的 pre-v8 整库备份。

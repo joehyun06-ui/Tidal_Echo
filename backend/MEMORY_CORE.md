@@ -296,14 +296,16 @@ MEMORY_FINGERPRINT_HMAC_SECRET=
 
 When Memory Core is disabled, no HMAC key is required and `/readyz` reports
 `memory_core=false` without making the service unready. Disabled startup applies
-and strictly validates core v1–v6; it neither requires nor repairs optional v7.
+and strictly validates core v1–v6; it neither requires nor repairs optional
+v7–v8.
 The shared core validator checks every v1–v6 migration marker, table/column,
 primary key, default, CHECK, foreign key, unique/partial index, explicit index,
 and trigger set. A recorded migration with a missing or changed core object
 returns only `core_schema_invalid` and is never silently repaired by
-`CREATE TABLE IF NOT EXISTS`. Optional v7 damage remains isolated only while
+`CREATE TABLE IF NOT EXISTS`. Optional v7–v8 damage remains isolated only while
 Memory is disabled.
-Enabled read-only mode atomically applies/validates v7 without requiring a key.
+Enabled read-only mode atomically applies/validates v7–v8 without requiring a
+key.
 Enabling explicit writes also requires a stable bounded Key ID and a dedicated,
 high-entropy 32–512 character printable-ASCII key distinct from all relay,
 channel, model, audit, and API-loop credentials. Invalid configuration or
@@ -332,6 +334,69 @@ remove the v7 schema marker or tables. Restore a consistent pre-v7 backup if a
 physical schema downgrade is required; never delete only a migration marker or
 hand-edit the tables.
 
+### Phase 1.5 action request ledger foundation
+
+Migration v8 is additive and adds only `memory_action_requests` plus its
+explicit lookup index. It does not rebuild or modify v1-v7 tables or their
+data. The ledger is a terminal request record for a later reviewed explicit
+action entry service; this change does not implement that service or connect a
+CLI, MCP tool, HTTP route, Telegram command, Operit command, or other
+transport.
+
+Each row binds a bounded server-issued request ID to a closed action kind and
+server-owned origin using a 32-byte HMAC-SHA-256 digest. The digest codec
+covers request ID, action kind, origin, target public Memory key, scope, Memory
+kind, sensitivity, normalized-content representation and version, and the
+canonical-action contract version. It reuses the dedicated Memory fingerprint
+HMAC secret only after write configuration is valid, under the independent
+domain `memory-entry/request-binding/v1`. Domain separation prevents a ledger
+digest from being substituted for a Memory fingerprint or profile check while
+avoiding another long-lived production secret. A plain content hash is never
+used.
+
+Before a terminal row commits, the same request fields are authenticated again
+under `memory-entry/request-terminal/v1` together with status, fixed result
+category, public result Memory key, and canonical message reference. Replay
+recomputes that terminal HMAC and checks the referenced canonical, evidence,
+and Memory rows. A database edit that preserves SQL constraints but changes a
+result/reference, or removes required state, therefore fails closed.
+
+The ledger stores no Memory or canonical text copy, fingerprint, external
+user/device/session identity, complete metadata, capability, signature,
+Runtime Authority, Secret, Key ID, SQL, or exception body. It has no persisted
+`processing` state: a new request is claimed while an internal
+`BEGIN IMMEDIATE` owns the SQLite write lock, and only a fixed terminal
+`completed` or `failed` row can commit. The exact action/target/result/status
+combinations, digest shape, timestamps, foreign key, primary/unique keys,
+index, migration marker, and normalized DDL are validated fail closed.
+PR A intentionally exposes no helper that persists deterministic input
+validation failures: those return a fixed data-free category before canonical,
+ledger, profile, evidence, item, source, or suppression state is created.
+
+`MemoryStore` now also has a private transaction-aware foundation for a future
+composition-root service. The Store creates the Unit of Work from its fixed DB
+path and existing Runtime Authority; no caller supplies a connection, SQL,
+path, capability, or policy flag. The Unit of Work owns one root
+`BEGIN IMMEDIATE`. Existing Store operations reuse that connection through a
+private savepoint, retain all policy/capability/provenance checks, and defer
+one-use capability completion until the root commit. A known rollback releases
+the capability reservation; an uncertain commit burns the capability and
+requires later request-ID lookup rather than blind replay.
+
+This Unit of Work is an application-composition and database-atomicity
+mechanism inside the trusted Python process. Its private names, constructor
+token, connection ownership, and object checks are not a sandbox against
+arbitrary same-process Python execution.
+
+Phase 1.5 PR A deliberately leaves suppression terminal coordination and
+same-content correction response mapping to the future Entry Service change.
+It adds no production Memory write entrypoint. Core read-only mode can apply
+and validate v8 without a fingerprint secret; explicit writes remain disabled
+by default. Old v7 application code ignores the additive v8 marker/table.
+Application rollback therefore leaves v8 in place; a physical schema downgrade
+still requires restoration of a consistent pre-v8 backup, never manual marker
+or table deletion.
+
 ## Deferred phases
 
 Phase 2 may add model-assisted candidate extraction with an independently
@@ -341,6 +406,6 @@ implemented or enabled by this change.
 
 ## Review status
 
-The third targeted fixes are implemented, but final independent review has not
-yet completed. This branch remains Draft and is not ready to merge or deploy;
-this document does not claim that every finding is closed.
+Phase 1.5 PR A is infrastructure only. It does not approve deployment,
+production Secret configuration, explicit-write activation, or a transport.
+It must remain Draft until independent security review completes.
