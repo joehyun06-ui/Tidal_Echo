@@ -378,10 +378,12 @@ composition-root service. The Store creates the Unit of Work from its fixed DB
 path and existing Runtime Authority; no caller supplies a connection, SQL,
 path, capability, or policy flag. The Unit of Work owns one root
 `BEGIN IMMEDIATE`. Existing Store operations reuse that connection through a
-private savepoint, retain all policy/capability/provenance checks, and defer
-one-use capability completion until the root commit. A known rollback releases
-the capability reservation; an uncertain commit burns the capability and
-requires later request-ID lookup rather than blind replay.
+private savepoint, retain all policy/capability/provenance checks, and verify
+that the actual Store capability binding exactly matches the claimed request
+action, canonical reference, target, scope, kind, content, and sensitivity.
+One-use capability completion is deferred until the root commit. A known
+rollback releases the capability reservation; an uncertain commit burns the
+capability and requires later request-ID lookup rather than blind replay.
 
 This Unit of Work is an application-composition and database-atomicity
 mechanism inside the trusted Python process. Its private names, constructor

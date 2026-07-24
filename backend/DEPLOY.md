@@ -465,10 +465,11 @@ canonical/evidence/Memory 状态，满足 SQL CHECK 但被篡改的数据仍会 
 
 本阶段只增加可信 composition root 将来可使用的内部 Unit of Work。它让 ledger、
 新 canonical action、capability 验证和 Memory Store 写入能够共享一个
-`BEGIN IMMEDIATE`，但没有实现 Explicit Memory Entry Service，也没有 CLI、MCP、
-HTTP、Telegram 或 Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会
-执行 Memory write。该 Unit of Work 是组合与事务原子性机制，不是同进程 Python
-sandbox。
+`BEGIN IMMEDIATE`，并在 capability 消费前核对实际 Store action 与已 claim request
+的 action、canonical reference、target、scope、kind、正文和 sensitivity 完全一致；
+但没有实现 Explicit Memory Entry Service，也没有 CLI、MCP、HTTP、Telegram 或
+Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会执行 Memory
+write。该 Unit of Work 是组合与事务原子性机制，不是同进程 Python sandbox。
 
 本 PR 不批准部署或生产启用。`MEMORY_EXPLICIT_WRITES_ENABLED` 继续默认
 `false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8

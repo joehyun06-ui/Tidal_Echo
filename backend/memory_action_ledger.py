@@ -12,10 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from . import channel_store, memory_policy
+    from . import channel_store, memory_policy, memory_runtime
 except ImportError:  # support direct module execution in local tooling
     import channel_store
     import memory_policy
+    import memory_runtime
 
 
 REQUEST_BINDING_DOMAIN = "memory-entry/request-binding/v1"
@@ -588,6 +589,49 @@ class _MemoryActionUnitOfWork:
         ):
             raise MemoryActionLedgerError("invalid_state")
         return _CoordinatedStoreConnection(self)
+
+    def _validate_store_action(
+        self,
+        store: object,
+        action: object,
+    ) -> None:
+        self._require_active()
+        binding = self._binding
+        if (
+            store is not self._store
+            or binding is None
+            or self._replay is not None
+            or self._canonical_message_id is None
+            or self._terminal is not None
+            or self._store_completed
+            or self._store_failed
+            or type(action) is not memory_runtime.MemoryActionBinding
+        ):
+            raise MemoryActionLedgerError("invalid_state")
+        if binding.action_kind == "remember":
+            expected_action_type = (
+                memory_runtime.ACTION_CONFIRM_DECISION
+                if binding.kind == "decision"
+                else memory_runtime.ACTION_REMEMBER_USER
+            )
+            expected_memory_key = ""
+        elif binding.action_kind == "correct":
+            expected_action_type = memory_runtime.ACTION_CORRECT_USER
+            expected_memory_key = binding.target_memory_key
+        else:
+            expected_action_type = memory_runtime.ACTION_FORGET_USER
+            expected_memory_key = binding.target_memory_key
+        if (
+            action.action_type != expected_action_type
+            or action.canonical_message_id != self._canonical_message_id
+            or action.kind != binding.kind
+            or action.scope_type != binding.scope_type
+            or action.scope_ref != binding.scope_ref
+            or action.normalized_content != binding.normalized_content
+            or action.sensitivity != binding.sensitivity
+            or action.memory_key != expected_memory_key
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
 
     def _defer_action(self, action_id: str) -> None:
         self._require_active()

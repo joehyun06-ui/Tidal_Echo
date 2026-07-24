@@ -7,12 +7,15 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from backend import (
     channel_store,
     memory_action_ledger,
+    memory_runtime,
+    memory_store,
 )
 from backend.tests.test_memory_service import (
     TEST_HMAC_SECRET,
@@ -1021,6 +1024,83 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             connection.execute("BEGIN IMMEDIATE")
             with self.assertRaises(sqlite3.OperationalError):
                 connection.execute("BEGIN IMMEDIATE")
+
+    def test_uow_binds_the_store_action_to_the_claimed_request(self):
+        binding = self.binding()
+        with self.store._action_unit_of_work() as uow:
+            self.assertIsNone(uow.claim_request(binding))
+            canonical_id = uow._insert_canonical_action(
+                text=binding.normalized_content,
+                metadata={"channel": "web", "source": "relay"},
+            )
+            action = memory_runtime.MemoryActionBinding(
+                action_type=memory_runtime.ACTION_REMEMBER_USER,
+                canonical_message_id=canonical_id,
+                kind=binding.kind,
+                scope_type=binding.scope_type,
+                scope_ref=binding.scope_ref,
+                normalized_content=binding.normalized_content,
+                sensitivity=binding.sensitivity,
+            )
+            uow._validate_store_action(self.store, action)
+            mismatches = (
+                replace(action, action_type=memory_runtime.ACTION_CORRECT_USER),
+                replace(action, canonical_message_id=canonical_id + 1),
+                replace(action, kind="decision"),
+                replace(action, scope_type="project", scope_ref="synthetic"),
+                replace(action, scope_ref="synthetic"),
+                replace(action, normalized_content="Different synthetic binding"),
+                replace(action, sensitivity="sensitive"),
+                replace(action, memory_key="M" * 32),
+            )
+            for mismatch in mismatches:
+                with self.subTest(field=mismatch), self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "request_binding_conflict",
+                ):
+                    uow._validate_store_action(self.store, mismatch)
+        self.assertTrue(all(value == 0 for value in self.counts().values()))
+
+    def test_store_rejects_a_capability_for_a_different_claimed_request(self):
+        binding = self.binding()
+        different_content = "Different synthetic binding"
+        with self.assertRaisesRegex(
+            memory_store.MemoryStoreError,
+            "request_binding_conflict",
+        ):
+            with self.store._action_unit_of_work() as uow:
+                self.assertIsNone(uow.claim_request(binding))
+                canonical_id = uow._insert_canonical_action(
+                    text=binding.normalized_content,
+                    metadata={"channel": "web", "source": "relay"},
+                )
+                envelope = memory_runtime.issue_action_envelope(
+                    self.authority,
+                    memory_runtime.MemoryActionBinding(
+                        action_type=memory_runtime.ACTION_REMEMBER_USER,
+                        canonical_message_id=canonical_id,
+                        kind=binding.kind,
+                        scope_type=binding.scope_type,
+                        scope_ref=binding.scope_ref,
+                        normalized_content=different_content,
+                        sensitivity=binding.sensitivity,
+                    ),
+                )
+                self.store.create_explicit_memory_from_user_action(
+                    kind=binding.kind,
+                    scope_type=binding.scope_type,
+                    scope_ref=binding.scope_ref,
+                    content=different_content,
+                    sensitivity=binding.sensitivity,
+                    sources=[
+                        memory_action_ledger.memory_policy.ProvenanceInput(
+                            canonical_message_id=canonical_id
+                        )
+                    ],
+                    authorization=envelope,
+                    _transaction=uow,
+                )
+        self.assertTrue(all(value == 0 for value in self.counts().values()))
 
 
 if __name__ == "__main__":

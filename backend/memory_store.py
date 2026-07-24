@@ -705,7 +705,13 @@ class MemoryStore:
         self,
         authorization: object | None,
         binding: memory_runtime.MemoryActionBinding,
+        transaction: object | None = None,
     ) -> str:
+        if transaction is not None:
+            try:
+                transaction._validate_store_action(self, binding)
+            except memory_action_ledger.MemoryActionLedgerError as error:
+                raise MemoryStoreError(error.category) from None
         try:
             return memory_runtime.begin_action_consumption(
                 self._authority,
@@ -765,7 +771,11 @@ class MemoryStore:
                         normalized_content=normalized_binding_content,
                         sensitivity=sensitivity,
                     )
-                    action_id = self._begin_action(authorization, binding)
+                    action_id = self._begin_action(
+                        authorization,
+                        binding,
+                        transaction=_transaction,
+                    )
                     normalized_content, validated_inputs = (
                         policy.validate_explicit_create(
                             kind=kind,
@@ -1037,7 +1047,11 @@ class MemoryStore:
                         sensitivity=sensitivity,
                         memory_key=memory_key,
                     )
-                    action_id = self._begin_action(authorization, binding)
+                    action_id = self._begin_action(
+                        authorization,
+                        binding,
+                        transaction=_transaction,
+                    )
                     policy.validate_kind(old["kind"])
                     policy.validate_scope(old["scope_type"], old["scope_ref"])
                     normalized_content = policy.validate_content(
@@ -1245,7 +1259,11 @@ class MemoryStore:
                         sensitivity=row["sensitivity"],
                         memory_key=memory_key,
                     )
-                    action_id = self._begin_action(authorization, binding)
+                    action_id = self._begin_action(
+                        authorization,
+                        binding,
+                        transaction=_transaction,
+                    )
                     policy.validate_kind(row["kind"])
                     policy.validate_scope(row["scope_type"], row["scope_ref"])
                     validated_inputs = policy.validate_provenance_inputs(
