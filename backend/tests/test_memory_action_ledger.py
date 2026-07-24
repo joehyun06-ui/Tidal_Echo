@@ -1094,7 +1094,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     content=different_content,
                     sensitivity=binding.sensitivity,
                     sources=[
-                        memory_action_ledger.memory_policy.ProvenanceInput(
+                        store_module.memory_policy.ProvenanceInput(
                             canonical_message_id=canonical_id
                         )
                     ],
