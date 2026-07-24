@@ -336,12 +336,15 @@ hand-edit the tables.
 
 ### Phase 1.5 action request ledger foundation
 
-Migration v8 is additive and adds only `memory_action_requests` plus its
-explicit lookup index. It does not rebuild or modify v1-v7 tables or their
-data. The ledger is a terminal request record for a later reviewed explicit
-action entry service; this change does not implement that service or connect a
-CLI, MCP tool, HTTP route, Telegram command, Operit command, or other
-transport.
+Migration v8 is additive and adds only `memory_action_requests`, its explicit
+lookup index, and unconditional `BEFORE UPDATE` / `BEFORE DELETE` immutability
+triggers. It does not rebuild or modify v1-v7 tables or their data. The
+validator requires the exact two-trigger set and normalized SQL fingerprints;
+missing, modified, or additional ledger triggers fail closed. Terminal rows
+are inserted once and have no update path. The ledger remains a terminal
+request record for a later reviewed explicit action entry service; this change
+does not implement that service or connect a CLI, MCP tool, HTTP route,
+Telegram command, Operit command, or other transport.
 
 Each row binds a bounded server-issued request ID to a closed action kind and
 server-owned origin using a 32-byte HMAC-SHA-256 digest. The digest codec
@@ -356,10 +359,24 @@ used.
 
 Before a terminal row commits, the same request fields are authenticated again
 under `memory-entry/request-terminal/v1` together with status, fixed result
-category, public result Memory key, and canonical message reference. Replay
-recomputes that terminal HMAC and checks the referenced canonical, evidence,
-and Memory rows. A database edit that preserves SQL constraints but changes a
-result/reference, or removes required state, therefore fails closed.
+category, public result Memory key, canonical message reference, and a
+versioned `TerminalSemanticSnapshotV1`. The typed snapshot is built from the
+actual rows inside the same outer `BEGIN IMMEDIATE`: normalized canonical
+text and server-owned channel/source projection; action evidence ownership and
+binding fields; every related Memory source; target/result item state, scope,
+kind, sensitivity, content-presence and supersession; and any request-related
+suppression. The snapshot value is neither persisted, logged, returned, nor
+placed in an exception; only its terminal HMAC digest is stored.
+
+Initial completion verifies those actual semantics against the claimed request
+and the already-matched Store capability before inserting the terminal row.
+Any mismatch raises the fixed data-free `terminal_semantics_invalid` category
+and rolls back canonical, evidence, item, source, suppression, profile, and
+ledger state. Replay rebuilds the same typed snapshot from current rows,
+recomputes the terminal HMAC, compares it in constant time, and validates the
+same ownership and relationship invariants. Canonical, evidence, source, item,
+suppression, result-reference, deletion, or addition tampering therefore
+fails closed without executing a new request.
 
 The ledger stores no Memory or canonical text copy, fingerprint, external
 user/device/session identity, complete metadata, capability, signature,
@@ -390,14 +407,19 @@ mechanism inside the trusted Python process. Its private names, constructor
 token, connection ownership, and object checks are not a sandbox against
 arbitrary same-process Python execution.
 
-Phase 1.5 PR A deliberately leaves suppression terminal coordination and
-same-content correction response mapping to the future Entry Service change.
-It adds no production Memory write entrypoint. Core read-only mode can apply
-and validate v8 without a fingerprint secret; explicit writes remain disabled
-by default. Old v7 application code ignores the additive v8 marker/table.
-Application rollback therefore leaves v8 in place; a physical schema downgrade
-still requires restoration of a consistent pre-v8 backup, never manual marker
-or table deletion.
+The first independent review's High 1 / Medium 1 findings were the mutable
+terminal ledger and incomplete authentication of referenced terminal
+semantics. The earlier request/Store field equality check remains as additive
+hardening; it was not treated as closing those findings. This revision adds
+the immutable terminal triggers and complete referenced-semantic
+authentication, but the PR remains Draft pending another independent review.
+
+Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
+can apply and validate v8 without a fingerprint secret; explicit writes remain
+disabled by default. Old v7 application code ignores the additive v8
+marker/table. Application rollback therefore leaves v8 in place; a physical
+schema downgrade still requires restoration of a consistent pre-v8 backup,
+never manual marker or table deletion.
 
 ## Deferred phases
 

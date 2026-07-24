@@ -8,7 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 try:
@@ -22,11 +22,19 @@ except ImportError:  # support direct module execution in local tooling
 REQUEST_BINDING_DOMAIN = "memory-entry/request-binding/v1"
 REQUEST_TERMINAL_DOMAIN = "memory-entry/request-terminal/v1"
 CANONICAL_ACTION_CONTRACT_VERSION = 1
+TERMINAL_SEMANTIC_SNAPSHOT_VERSION = 1
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,96}\Z")
 MEMORY_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,96}\Z")
 SCOPE_REF_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+ACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{24,96}\Z")
 ACTION_KINDS = frozenset({"remember", "correct", "forget"})
 ORIGINS = frozenset({"operator_cli", "mcp", "telegram", "operit"})
+ORIGIN_CANONICAL_PROJECTION = {
+    "operator_cli": ("web", "relay"),
+    "mcp": ("relay", "mcp"),
+    "telegram": ("telegram", "telegram"),
+    "operit": ("operit_share", "operit"),
+}
 COMPLETED_CATEGORIES = {
     "remember": frozenset({"created", "idempotent_existing", "suppressed"}),
     "correct": frozenset({"corrected", "unchanged", "suppressed"}),
@@ -55,6 +63,7 @@ FAILED_CATEGORIES = frozenset({
     "sensitive_storage_disabled",
     "sensitivity_downgrade",
     "storage_unavailable",
+    "terminal_semantics_invalid",
     "unsupported_evidence",
 })
 
@@ -94,6 +103,91 @@ class MemoryActionLedgerResult:
     status: str
     result_category: str
     result_memory_key: str | None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalCanonicalSemanticV1:
+    canonical_message_id: int
+    direction: str
+    kind: str
+    channel: str
+    source: str
+    normalized_text: str
+    metadata_projection: tuple[tuple[str, str], ...]
+    canonical_action_contract_version: int
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalEvidenceSemanticV1:
+    evidence_event_id: int
+    canonical_message_id: int
+    action_id: str
+    action_type: str
+    action_binding_version: int
+    evidence_type: str
+    reality_scope: str
+    subject_scope: str
+    created_by_component: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalMemorySourceSemanticV1:
+    source_id: int
+    memory_id: int
+    memory_key: str
+    canonical_message_id: int
+    evidence_event_id: int
+    channel: str
+    source: str
+    evidence_role: str
+    evidence_type: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalMemoryItemSemanticV1:
+    relation: str
+    memory_id: int
+    memory_key: str
+    status: str
+    kind: str
+    scope_type: str
+    scope_ref: str
+    sensitivity: str
+    content_present: bool
+    normalized_content: str | None
+    fingerprint_version: int
+    normalized_fingerprint: str | None
+    superseded_by_memory_key: str | None
+    explicitness: str
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalSuppressionSemanticV1:
+    suppression_id: int
+    relation: str
+    scope_type: str
+    scope_ref: str
+    kind: str
+    fingerprint_version: int
+    normalized_fingerprint: str
+    reason_category: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalSemanticSnapshotV1:
+    version: int
+    canonical: TerminalCanonicalSemanticV1
+    evidence: tuple[TerminalEvidenceSemanticV1, ...]
+    sources: tuple[TerminalMemorySourceSemanticV1, ...]
+    items: tuple[TerminalMemoryItemSemanticV1, ...]
+    suppressions: tuple[TerminalSuppressionSemanticV1, ...]
+
+    def __repr__(self) -> str:
+        return "<TerminalSemanticSnapshotV1>"
 
 
 def issue_request_id() -> str:
@@ -245,6 +339,7 @@ def _terminal_binding_digest(
     status: str,
     result_category: str,
     result_memory_key: str | None,
+    semantic_snapshot: TerminalSemanticSnapshotV1 | None,
 ) -> bytes:
     if not _valid_secret(secret):
         raise MemoryActionLedgerError("memory_configuration_invalid")
@@ -257,6 +352,12 @@ def _terminal_binding_digest(
             or result_category not in COMPLETED_CATEGORIES[
                 validated.action_kind
             ]
+            or not isinstance(
+                semantic_snapshot,
+                TerminalSemanticSnapshotV1,
+            )
+            or semantic_snapshot.version
+            != TERMINAL_SEMANTIC_SNAPSHOT_VERSION
         )
     ):
         raise MemoryActionLedgerError("invalid_request")
@@ -266,6 +367,7 @@ def _terminal_binding_digest(
             canonical_message_id is not None
             or result_memory_key is not None
             or result_category not in FAILED_CATEGORIES
+            or semantic_snapshot is not None
         )
     ):
         raise MemoryActionLedgerError("invalid_request")
@@ -279,6 +381,11 @@ def _terminal_binding_digest(
                 "canonical_message_id": canonical_message_id,
                 "result_category": result_category,
                 "result_memory_key": result_memory_key,
+                "semantic_snapshot": (
+                    asdict(semantic_snapshot)
+                    if semantic_snapshot is not None
+                    else None
+                ),
                 "status": status,
             },
         )
@@ -477,6 +584,860 @@ class _MemoryActionUnitOfWork:
         except (OSError, sqlite3.Error, ValueError):
             raise MemoryActionLedgerError("storage_unavailable") from None
 
+    @staticmethod
+    def _semantic_error() -> MemoryActionLedgerError:
+        return MemoryActionLedgerError("terminal_semantics_invalid")
+
+    def _canonical_semantic(
+        self,
+        canonical_message_id: int,
+    ) -> TerminalCanonicalSemanticV1:
+        row = self._execute(
+            """SELECT id,direction,kind,text,meta FROM messages WHERE id=?""",
+            (canonical_message_id,),
+        ).fetchone()
+        if row is None:
+            raise self._semantic_error()
+        try:
+            raw_text = row["text"]
+            raw_meta = row["meta"]
+            if (
+                type(row["id"]) is not int
+                or int(row["id"]) != canonical_message_id
+                or not isinstance(row["direction"], str)
+                or not isinstance(row["kind"], str)
+                or not isinstance(raw_text, str)
+                or not raw_text
+                or len(raw_text) > 4096
+                or not isinstance(raw_meta, str)
+                or len(raw_meta.encode("utf-8")) > 16 * 1024
+            ):
+                raise self._semantic_error()
+            normalized_text = memory_policy.normalize_content(
+                raw_text,
+                max_chars=4096,
+            )
+            if normalized_text != raw_text:
+                raise self._semantic_error()
+            metadata = json.loads(raw_meta)
+            if (
+                not isinstance(metadata, dict)
+                or set(metadata) != {"channel", "source"}
+                or not isinstance(metadata["channel"], str)
+                or not isinstance(metadata["source"], str)
+            ):
+                raise self._semantic_error()
+            channel = metadata["channel"]
+            source = metadata["source"]
+            if (
+                channel not in memory_policy.KNOWN_CHANNELS
+                or SCOPE_REF_PATTERN.fullmatch(channel) is None
+                or (
+                    source
+                    and SCOPE_REF_PATTERN.fullmatch(source) is None
+                )
+            ):
+                raise self._semantic_error()
+        except MemoryActionLedgerError:
+            raise
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeError,
+            memory_policy.MemoryPolicyError,
+        ):
+            raise self._semantic_error() from None
+        return TerminalCanonicalSemanticV1(
+            canonical_message_id=canonical_message_id,
+            direction=row["direction"],
+            kind=row["kind"],
+            channel=channel,
+            source=source,
+            normalized_text=normalized_text,
+            metadata_projection=(
+                ("channel", channel),
+                ("source", source),
+            ),
+            canonical_action_contract_version=(
+                CANONICAL_ACTION_CONTRACT_VERSION
+            ),
+        )
+
+    def _item_semantic(
+        self,
+        memory_key: str,
+        *,
+        relation: str,
+    ) -> TerminalMemoryItemSemanticV1:
+        row = self._execute(
+            """SELECT i.*,s.memory_key AS superseded_by_memory_key
+               FROM memory_items i
+               LEFT JOIN memory_items s ON s.id=i.superseded_by_id
+               WHERE i.memory_key=?""",
+            (memory_key,),
+        ).fetchone()
+        if row is None:
+            raise self._semantic_error()
+        try:
+            fingerprint = row["normalized_fingerprint"]
+            content = row["normalized_content"]
+            confidence = row["confidence"]
+            superseded_key = row["superseded_by_memory_key"]
+            if (
+                type(row["id"]) is not int
+                or int(row["id"]) <= 0
+                or not isinstance(row["memory_key"], str)
+                or MEMORY_KEY_PATTERN.fullmatch(row["memory_key"]) is None
+                or row["memory_key"] != memory_key
+                or row["status"] not in {
+                    "candidate",
+                    "active",
+                    "superseded",
+                    "forgotten",
+                    "rejected",
+                }
+                or row["kind"] not in memory_policy.KINDS
+                or row["scope_type"] not in memory_policy.SCOPE_TYPES
+                or not isinstance(row["scope_ref"], str)
+                or row["sensitivity"] not in memory_policy.SENSITIVITIES
+                or type(row["fingerprint_version"]) is not int
+                or int(row["fingerprint_version"]) <= 0
+                or row["explicitness"] not in {"explicit", "inferred"}
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0.0 <= float(confidence) <= 1.0
+                or (
+                    superseded_key is not None
+                    and (
+                        not isinstance(superseded_key, str)
+                        or MEMORY_KEY_PATTERN.fullmatch(superseded_key)
+                        is None
+                    )
+                )
+            ):
+                raise self._semantic_error()
+            if row["scope_type"] == "global_user":
+                if row["scope_ref"] != "":
+                    raise self._semantic_error()
+            elif (
+                SCOPE_REF_PATTERN.fullmatch(row["scope_ref"]) is None
+                or (
+                    row["scope_type"] == "channel"
+                    and row["scope_ref"] not in memory_policy.KNOWN_CHANNELS
+                )
+            ):
+                raise self._semantic_error()
+            content_present = content is not None
+            if content_present:
+                if (
+                    not isinstance(content, str)
+                    or not content
+                    or len(content) > 4096
+                    or memory_policy.normalize_content(
+                        content,
+                        max_chars=4096,
+                    )
+                    != content
+                    or not isinstance(fingerprint, bytes)
+                    or len(fingerprint) != 32
+                ):
+                    raise self._semantic_error()
+            elif fingerprint is not None:
+                raise self._semantic_error()
+        except MemoryActionLedgerError:
+            raise
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            memory_policy.MemoryPolicyError,
+        ):
+            raise self._semantic_error() from None
+        return TerminalMemoryItemSemanticV1(
+            relation=relation,
+            memory_id=int(row["id"]),
+            memory_key=memory_key,
+            status=row["status"],
+            kind=row["kind"],
+            scope_type=row["scope_type"],
+            scope_ref=row["scope_ref"],
+            sensitivity=row["sensitivity"],
+            content_present=content_present,
+            normalized_content=content if content_present else None,
+            fingerprint_version=int(row["fingerprint_version"]),
+            normalized_fingerprint=(
+                fingerprint.hex()
+                if isinstance(fingerprint, bytes)
+                else None
+            ),
+            superseded_by_memory_key=superseded_key,
+            explicitness=row["explicitness"],
+            confidence=float(confidence),
+        )
+
+    def _source_semantics(
+        self,
+        *,
+        canonical_message_id: int,
+        item_ids: tuple[int, ...],
+    ) -> tuple[TerminalMemorySourceSemanticV1, ...]:
+        clauses = ["ms.canonical_message_id=?"]
+        parameters: list[object] = [canonical_message_id]
+        if item_ids:
+            placeholders = ",".join("?" for _ in item_ids)
+            clauses.append(f"ms.memory_id IN ({placeholders})")
+            parameters.extend(item_ids)
+        rows = self._execute(
+            f"""SELECT ms.*,mi.memory_key
+                FROM memory_sources ms
+                JOIN memory_items mi ON mi.id=ms.memory_id
+                WHERE {' OR '.join(clauses)}
+                ORDER BY ms.id""",
+            tuple(parameters),
+        ).fetchall()
+        result: list[TerminalMemorySourceSemanticV1] = []
+        for row in rows:
+            try:
+                if (
+                    type(row["id"]) is not int
+                    or int(row["id"]) <= 0
+                    or type(row["memory_id"]) is not int
+                    or int(row["memory_id"]) <= 0
+                    or not isinstance(row["memory_key"], str)
+                    or MEMORY_KEY_PATTERN.fullmatch(row["memory_key"]) is None
+                    or type(row["canonical_message_id"]) is not int
+                    or int(row["canonical_message_id"]) <= 0
+                    or type(row["evidence_event_id"]) is not int
+                    or int(row["evidence_event_id"]) <= 0
+                    or not isinstance(row["channel"], str)
+                    or row["channel"] not in memory_policy.KNOWN_CHANNELS
+                    or not isinstance(row["source"], str)
+                    or (
+                        row["source"]
+                        and SCOPE_REF_PATTERN.fullmatch(row["source"]) is None
+                    )
+                    or row["evidence_role"] not in {"user", "assistant"}
+                    or row["evidence_type"]
+                    not in memory_policy.ALL_EVIDENCE_TYPES
+                    or not isinstance(row["created_at"], str)
+                ):
+                    raise self._semantic_error()
+            except MemoryActionLedgerError:
+                raise
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise self._semantic_error() from None
+            result.append(TerminalMemorySourceSemanticV1(
+                source_id=int(row["id"]),
+                memory_id=int(row["memory_id"]),
+                memory_key=row["memory_key"],
+                canonical_message_id=int(row["canonical_message_id"]),
+                evidence_event_id=int(row["evidence_event_id"]),
+                channel=row["channel"],
+                source=row["source"],
+                evidence_role=row["evidence_role"],
+                evidence_type=row["evidence_type"],
+                created_at=row["created_at"],
+            ))
+        return tuple(result)
+
+    def _evidence_semantics(
+        self,
+        *,
+        canonical_message_id: int,
+        evidence_ids: tuple[int, ...],
+    ) -> tuple[TerminalEvidenceSemanticV1, ...]:
+        clauses = ["canonical_message_id=?"]
+        parameters: list[object] = [canonical_message_id]
+        if evidence_ids:
+            placeholders = ",".join("?" for _ in evidence_ids)
+            clauses.append(f"id IN ({placeholders})")
+            parameters.extend(evidence_ids)
+        rows = self._execute(
+            f"""SELECT * FROM memory_evidence_events
+                WHERE {' OR '.join(clauses)}
+                ORDER BY id""",
+            tuple(parameters),
+        ).fetchall()
+        result: list[TerminalEvidenceSemanticV1] = []
+        for row in rows:
+            try:
+                if (
+                    type(row["id"]) is not int
+                    or int(row["id"]) <= 0
+                    or type(row["canonical_message_id"]) is not int
+                    or int(row["canonical_message_id"]) <= 0
+                    or not isinstance(row["action_id"], str)
+                    or ACTION_ID_PATTERN.fullmatch(row["action_id"]) is None
+                    or row["action_type"] not in memory_runtime.ACTION_TYPES
+                    or type(row["action_binding_version"]) is not int
+                    or int(row["action_binding_version"])
+                    != memory_runtime.ACTION_BINDING_VERSION
+                    or row["evidence_type"]
+                    not in memory_policy.ALL_EVIDENCE_TYPES
+                    or row["reality_scope"]
+                    not in memory_policy.REALITY_SCOPES
+                    or row["subject_scope"]
+                    not in memory_policy.SUBJECT_SCOPES
+                    or row["created_by_component"]
+                    not in memory_policy.EVIDENCE_COMPONENTS
+                    or not isinstance(row["created_at"], str)
+                ):
+                    raise self._semantic_error()
+            except MemoryActionLedgerError:
+                raise
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise self._semantic_error() from None
+            result.append(TerminalEvidenceSemanticV1(
+                evidence_event_id=int(row["id"]),
+                canonical_message_id=int(row["canonical_message_id"]),
+                action_id=row["action_id"],
+                action_type=row["action_type"],
+                action_binding_version=int(row["action_binding_version"]),
+                evidence_type=row["evidence_type"],
+                reality_scope=row["reality_scope"],
+                subject_scope=row["subject_scope"],
+                created_by_component=row["created_by_component"],
+                created_at=row["created_at"],
+            ))
+        return tuple(result)
+
+    def _suppression_semantics(
+        self,
+        *,
+        binding: MemoryActionRequestBinding,
+        relation: str,
+        normalized_content: str | None,
+        fingerprint_version: int,
+        reason_category: str | None,
+    ) -> tuple[TerminalSuppressionSemanticV1, ...]:
+        if normalized_content is None:
+            return ()
+        try:
+            fingerprint = memory_policy.fingerprint_content(
+                self._secret,
+                scope_type=binding.scope_type,
+                scope_ref=binding.scope_ref,
+                kind=binding.kind,
+                normalized_content=normalized_content,
+            )
+        except memory_policy.MemoryPolicyError:
+            raise self._semantic_error() from None
+        sql = """SELECT * FROM memory_suppressions
+                 WHERE scope_type=? AND scope_ref=? AND kind=?
+                   AND fingerprint_version=?
+                   AND normalized_fingerprint=?"""
+        parameters: list[object] = [
+            binding.scope_type,
+            binding.scope_ref,
+            binding.kind,
+            fingerprint_version,
+            fingerprint,
+        ]
+        if reason_category is not None:
+            sql += " AND reason_category=?"
+            parameters.append(reason_category)
+        sql += " ORDER BY id"
+        rows = self._execute(sql, tuple(parameters)).fetchall()
+        result: list[TerminalSuppressionSemanticV1] = []
+        for row in rows:
+            stored = row["normalized_fingerprint"]
+            if (
+                type(row["id"]) is not int
+                or int(row["id"]) <= 0
+                or row["scope_type"] != binding.scope_type
+                or row["scope_ref"] != binding.scope_ref
+                or row["kind"] != binding.kind
+                or type(row["fingerprint_version"]) is not int
+                or int(row["fingerprint_version"]) != fingerprint_version
+                or not isinstance(stored, bytes)
+                or len(stored) != 32
+                or not hmac.compare_digest(stored, fingerprint)
+                or row["reason_category"]
+                not in {
+                    "user_forget",
+                    "user_reject",
+                    "privacy_policy",
+                    "corrected_obsolete",
+                }
+                or not isinstance(row["created_at"], str)
+            ):
+                raise self._semantic_error()
+            result.append(TerminalSuppressionSemanticV1(
+                suppression_id=int(row["id"]),
+                relation=relation,
+                scope_type=row["scope_type"],
+                scope_ref=row["scope_ref"],
+                kind=row["kind"],
+                fingerprint_version=int(row["fingerprint_version"]),
+                normalized_fingerprint=stored.hex(),
+                reason_category=row["reason_category"],
+                created_at=row["created_at"],
+            ))
+        return tuple(result)
+
+    def _build_terminal_semantic_snapshot(
+        self,
+        binding: MemoryActionRequestBinding,
+        *,
+        canonical_message_id: int,
+        result_category: str,
+        result_memory_key: str | None,
+    ) -> TerminalSemanticSnapshotV1:
+        canonical = self._canonical_semantic(canonical_message_id)
+        items: list[TerminalMemoryItemSemanticV1] = []
+        target_key = binding.target_memory_key
+        if target_key is not None:
+            relation = (
+                "target_result"
+                if target_key == result_memory_key
+                else "target"
+            )
+            items.append(self._item_semantic(target_key, relation=relation))
+        if (
+            result_memory_key is not None
+            and result_memory_key != target_key
+        ):
+            items.append(self._item_semantic(
+                result_memory_key,
+                relation="result",
+            ))
+        item_ids = tuple(item.memory_id for item in items)
+        sources = self._source_semantics(
+            canonical_message_id=canonical_message_id,
+            item_ids=item_ids,
+        )
+        evidence = self._evidence_semantics(
+            canonical_message_id=canonical_message_id,
+            evidence_ids=tuple(
+                source.evidence_event_id for source in sources
+            ),
+        )
+        suppressions: tuple[TerminalSuppressionSemanticV1, ...] = ()
+        fingerprint_version = memory_policy.FINGERPRINT_VERSION
+        if result_category == "suppressed":
+            suppressions = self._suppression_semantics(
+                binding=binding,
+                relation="request_content",
+                normalized_content=binding.normalized_content,
+                fingerprint_version=fingerprint_version,
+                reason_category=None,
+            )
+        elif (
+            binding.action_kind == "forget"
+            and result_category == "forgotten"
+        ):
+            suppressions = self._suppression_semantics(
+                binding=binding,
+                relation="forgotten_target",
+                normalized_content=binding.normalized_content,
+                fingerprint_version=fingerprint_version,
+                reason_category="user_forget",
+            )
+        elif (
+            binding.action_kind == "correct"
+            and result_category == "corrected"
+        ):
+            target = next(
+                (item for item in items if item.relation == "target"),
+                None,
+            )
+            if (
+                target is None
+                or not target.content_present
+                or target.normalized_content is None
+            ):
+                raise self._semantic_error()
+            suppressions = self._suppression_semantics(
+                binding=binding,
+                relation="superseded_target",
+                normalized_content=target.normalized_content,
+                fingerprint_version=target.fingerprint_version,
+                reason_category="corrected_obsolete",
+            )
+        return TerminalSemanticSnapshotV1(
+            version=TERMINAL_SEMANTIC_SNAPSHOT_VERSION,
+            canonical=canonical,
+            evidence=evidence,
+            sources=sources,
+            items=tuple(items),
+            suppressions=suppressions,
+        )
+
+    @staticmethod
+    def _expected_evidence_semantics(
+        binding: MemoryActionRequestBinding,
+    ) -> tuple[str, str, str, str, str]:
+        if binding.action_kind == "remember":
+            if binding.kind == "decision":
+                return (
+                    memory_runtime.ACTION_CONFIRM_DECISION,
+                    "confirmed_project_decision",
+                    "real",
+                    "project",
+                    "memory_admin",
+                )
+            return (
+                memory_runtime.ACTION_REMEMBER_USER,
+                "explicit_user_memory",
+                "real",
+                "user",
+                "memory_admin",
+            )
+        if binding.action_kind == "correct":
+            return (
+                memory_runtime.ACTION_CORRECT_USER,
+                "explicit_user_correction",
+                "real",
+                "user",
+                "memory_admin",
+            )
+        return (
+            memory_runtime.ACTION_FORGET_USER,
+            "user_forget",
+            "real",
+            "user",
+            "memory_admin",
+        )
+
+    def _validate_terminal_semantic_snapshot(
+        self,
+        binding: MemoryActionRequestBinding,
+        snapshot: TerminalSemanticSnapshotV1,
+        *,
+        canonical_message_id: int,
+        result_category: str,
+        result_memory_key: str | None,
+        expected_action_id: str | None,
+    ) -> None:
+        if (
+            not isinstance(snapshot, TerminalSemanticSnapshotV1)
+            or snapshot.version != TERMINAL_SEMANTIC_SNAPSHOT_VERSION
+            or snapshot.canonical.canonical_message_id
+            != canonical_message_id
+            or snapshot.canonical.direction != "in"
+            or snapshot.canonical.kind != "user"
+            or snapshot.canonical.canonical_action_contract_version
+            != binding.canonical_action_contract_version
+        ):
+            raise self._semantic_error()
+        expected_channel, expected_source = ORIGIN_CANONICAL_PROJECTION[
+            binding.origin
+        ]
+        if (
+            snapshot.canonical.channel != expected_channel
+            or snapshot.canonical.source != expected_source
+            or snapshot.canonical.metadata_projection
+            != (
+                ("channel", expected_channel),
+                ("source", expected_source),
+            )
+            or (
+                binding.normalized_content is not None
+                and snapshot.canonical.normalized_text
+                != binding.normalized_content
+            )
+        ):
+            raise self._semantic_error()
+
+        items_by_relation = {
+            item.relation: item for item in snapshot.items
+        }
+        if (
+            len(items_by_relation) != len(snapshot.items)
+            or len({item.memory_id for item in snapshot.items})
+            != len(snapshot.items)
+            or len({item.memory_key for item in snapshot.items})
+            != len(snapshot.items)
+        ):
+            raise self._semantic_error()
+        for item in snapshot.items:
+            if (
+                item.explicitness != "explicit"
+                or item.confidence != 1.0
+                or item.fingerprint_version
+                != memory_policy.FINGERPRINT_VERSION
+            ):
+                raise self._semantic_error()
+            if item.content_present:
+                try:
+                    expected_fingerprint = memory_policy.fingerprint_content(
+                        self._secret,
+                        scope_type=item.scope_type,
+                        scope_ref=item.scope_ref,
+                        kind=item.kind,
+                        normalized_content=item.normalized_content,
+                    ).hex()
+                except memory_policy.MemoryPolicyError:
+                    raise self._semantic_error() from None
+                if item.normalized_fingerprint != expected_fingerprint:
+                    raise self._semantic_error()
+            elif (
+                item.normalized_content is not None
+                or item.normalized_fingerprint is not None
+            ):
+                raise self._semantic_error()
+
+        sensitivity_rank = {
+            "normal": 0,
+            "sensitive": 1,
+            "restricted": 2,
+        }
+
+        def require_binding_fields(
+            item: TerminalMemoryItemSemanticV1,
+            *,
+            require_content: bool,
+            sensitivity_mode: str,
+        ) -> None:
+            item_rank = sensitivity_rank[item.sensitivity]
+            binding_rank = sensitivity_rank[binding.sensitivity]
+            if (
+                item.kind != binding.kind
+                or item.scope_type != binding.scope_type
+                or item.scope_ref != binding.scope_ref
+                or (
+                    require_content
+                    and (
+                        not item.content_present
+                        or item.normalized_content
+                        != binding.normalized_content
+                    )
+                )
+                or (
+                    sensitivity_mode == "exact"
+                    and item.sensitivity != binding.sensitivity
+                )
+                or (
+                    sensitivity_mode == "at_least"
+                    and item_rank < binding_rank
+                )
+                or (
+                    sensitivity_mode == "at_most"
+                    and item_rank > binding_rank
+                )
+            ):
+                raise self._semantic_error()
+
+        action_item: TerminalMemoryItemSemanticV1 | None = None
+        if binding.action_kind == "remember":
+            if result_category == "suppressed":
+                if snapshot.items or result_memory_key is not None:
+                    raise self._semantic_error()
+            else:
+                result_item = items_by_relation.get("result")
+                if (
+                    len(snapshot.items) != 1
+                    or result_item is None
+                    or result_item.memory_key != result_memory_key
+                    or result_item.status != "active"
+                    or result_item.superseded_by_memory_key is not None
+                ):
+                    raise self._semantic_error()
+                require_binding_fields(
+                    result_item,
+                    require_content=True,
+                    sensitivity_mode=(
+                        "exact"
+                        if result_category == "created"
+                        else "at_least"
+                    ),
+                )
+                action_item = result_item
+        elif binding.action_kind == "correct":
+            target_key = binding.target_memory_key
+            if result_category == "corrected":
+                target = items_by_relation.get("target")
+                result_item = items_by_relation.get("result")
+                if (
+                    len(snapshot.items) != 2
+                    or target is None
+                    or result_item is None
+                    or target.memory_key != target_key
+                    or result_item.memory_key != result_memory_key
+                    or target.memory_key == result_item.memory_key
+                    or target.status != "superseded"
+                    or target.superseded_by_memory_key
+                    != result_item.memory_key
+                    or result_item.status != "active"
+                    or result_item.superseded_by_memory_key is not None
+                ):
+                    raise self._semantic_error()
+                require_binding_fields(
+                    target,
+                    require_content=False,
+                    sensitivity_mode="at_most",
+                )
+                require_binding_fields(
+                    result_item,
+                    require_content=True,
+                    sensitivity_mode="exact",
+                )
+                if target.normalized_content == binding.normalized_content:
+                    raise self._semantic_error()
+                action_item = result_item
+            elif result_category == "unchanged":
+                target = items_by_relation.get("target_result")
+                if (
+                    len(snapshot.items) != 1
+                    or target is None
+                    or target.memory_key != target_key
+                    or result_memory_key != target_key
+                    or target.status != "active"
+                    or target.superseded_by_memory_key is not None
+                ):
+                    raise self._semantic_error()
+                require_binding_fields(
+                    target,
+                    require_content=True,
+                    sensitivity_mode="exact",
+                )
+                action_item = target
+            else:
+                target = items_by_relation.get("target")
+                if (
+                    result_category != "suppressed"
+                    or len(snapshot.items) != 1
+                    or target is None
+                    or target.memory_key != target_key
+                    or result_memory_key is not None
+                    or target.status != "active"
+                ):
+                    raise self._semantic_error()
+                require_binding_fields(
+                    target,
+                    require_content=False,
+                    sensitivity_mode="at_most",
+                )
+                if target.normalized_content == binding.normalized_content:
+                    raise self._semantic_error()
+        else:
+            target = items_by_relation.get("target_result")
+            if (
+                len(snapshot.items) != 1
+                or target is None
+                or target.memory_key != binding.target_memory_key
+                or result_memory_key != binding.target_memory_key
+                or target.status != "forgotten"
+                or target.content_present
+                or target.superseded_by_memory_key is not None
+            ):
+                raise self._semantic_error()
+            require_binding_fields(
+                target,
+                require_content=False,
+                sensitivity_mode="exact",
+            )
+            action_item = target
+
+        expected_action_type, expected_evidence_type, reality, subject, component = (
+            self._expected_evidence_semantics(binding)
+        )
+        evidence_by_id = {
+            evidence.evidence_event_id: evidence
+            for evidence in snapshot.evidence
+        }
+        if len(evidence_by_id) != len(snapshot.evidence):
+            raise self._semantic_error()
+        current_evidence = tuple(
+            evidence
+            for evidence in snapshot.evidence
+            if evidence.canonical_message_id == canonical_message_id
+        )
+        current_sources = tuple(
+            source
+            for source in snapshot.sources
+            if source.canonical_message_id == canonical_message_id
+        )
+        if result_category == "suppressed":
+            if current_evidence or current_sources:
+                raise self._semantic_error()
+        else:
+            if len(current_evidence) != 1 or len(current_sources) != 1:
+                raise self._semantic_error()
+            evidence = current_evidence[0]
+            source = current_sources[0]
+            if (
+                evidence.action_type != expected_action_type
+                or evidence.evidence_type != expected_evidence_type
+                or evidence.reality_scope != reality
+                or evidence.subject_scope != subject
+                or evidence.created_by_component != component
+                or evidence.action_binding_version
+                != memory_runtime.ACTION_BINDING_VERSION
+                or (
+                    expected_action_id is not None
+                    and evidence.action_id != expected_action_id
+                )
+                or source.evidence_event_id
+                != evidence.evidence_event_id
+                or source.evidence_type != expected_evidence_type
+                or source.evidence_role != "user"
+                or source.channel != snapshot.canonical.channel
+                or source.source != snapshot.canonical.source
+                or action_item is None
+                or source.memory_id != action_item.memory_id
+                or source.memory_key != action_item.memory_key
+            ):
+                raise self._semantic_error()
+
+        item_ids = {item.memory_id for item in snapshot.items}
+        source_ids = set()
+        for source in snapshot.sources:
+            evidence = evidence_by_id.get(source.evidence_event_id)
+            if (
+                source.source_id in source_ids
+                or source.memory_id not in item_ids
+                or evidence is None
+                or evidence.canonical_message_id
+                != source.canonical_message_id
+                or evidence.evidence_type != source.evidence_type
+            ):
+                raise self._semantic_error()
+            source_ids.add(source.source_id)
+        if {
+            evidence.evidence_event_id for evidence in snapshot.evidence
+        } != {source.evidence_event_id for source in snapshot.sources} | {
+            evidence.evidence_event_id for evidence in current_evidence
+        }:
+            raise self._semantic_error()
+
+        if (
+            binding.action_kind == "remember"
+            and result_category == "created"
+            and len(snapshot.sources) != 1
+        ) or (
+            binding.action_kind == "correct"
+            and result_category == "corrected"
+            and len(tuple(
+                source
+                for source in snapshot.sources
+                if source.memory_key == result_memory_key
+            ))
+            != 1
+        ):
+            raise self._semantic_error()
+
+        needs_suppression = (
+            result_category == "suppressed"
+            or (
+                binding.action_kind == "correct"
+                and result_category == "corrected"
+            )
+            or (
+                binding.action_kind == "forget"
+                and result_category == "forgotten"
+            )
+        )
+        if (
+            needs_suppression and len(snapshot.suppressions) != 1
+        ) or (
+            not needs_suppression and snapshot.suppressions
+        ):
+            raise self._semantic_error()
+
     def claim_request(
         self,
         binding: MemoryActionRequestBinding,
@@ -496,51 +1457,39 @@ class _MemoryActionUnitOfWork:
             return None
         stored_digest = row["request_binding_digest"]
         result = _safe_ledger_result(row)
-        try:
-            expected_digest = _terminal_binding_digest(
-                self._secret,
+        canonical_id = row["canonical_message_id"]
+        snapshot = None
+        if result.status == "completed":
+            snapshot = self._build_terminal_semantic_snapshot(
                 validated,
-                canonical_message_id=row["canonical_message_id"],
-                status=result.status,
+                canonical_message_id=canonical_id,
                 result_category=result.result_category,
                 result_memory_key=result.result_memory_key,
             )
-        except MemoryActionLedgerError:
-            raise MemoryActionLedgerError("memory_schema_invalid") from None
+        expected_digest = _terminal_binding_digest(
+            self._secret,
+            validated,
+            canonical_message_id=canonical_id,
+            status=result.status,
+            result_category=result.result_category,
+            result_memory_key=result.result_memory_key,
+            semantic_snapshot=snapshot,
+        )
         if (
             not isinstance(stored_digest, bytes)
             or len(stored_digest) != 32
             or not hmac.compare_digest(stored_digest, expected_digest)
         ):
             raise MemoryActionLedgerError("request_binding_conflict")
-        canonical_id = row["canonical_message_id"]
         if result.status == "completed":
-            if self._execute(
-                "SELECT 1 FROM messages WHERE id=?",
-                (canonical_id,),
-            ).fetchone() is None:
-                raise MemoryActionLedgerError("memory_schema_invalid")
-            evidence_count = int(self._execute(
-                """SELECT count(*) FROM memory_evidence_events
-                   WHERE canonical_message_id=?""",
-                (canonical_id,),
-            ).fetchone()[0])
-            if (
-                result.result_category == "suppressed"
-                and evidence_count != 0
-            ) or (
-                result.result_category != "suppressed"
-                and evidence_count != 1
-            ):
-                raise MemoryActionLedgerError("memory_schema_invalid")
-            if (
-                result.result_memory_key is not None
-                and self._execute(
-                    "SELECT 1 FROM memory_items WHERE memory_key=?",
-                    (result.result_memory_key,),
-                ).fetchone() is None
-            ):
-                raise MemoryActionLedgerError("memory_schema_invalid")
+            self._validate_terminal_semantic_snapshot(
+                validated,
+                snapshot,
+                canonical_message_id=canonical_id,
+                result_category=result.result_category,
+                result_memory_key=result.result_memory_key,
+                expected_action_id=None,
+            )
         self._replay = result
         return result
 
@@ -667,10 +1616,29 @@ class _MemoryActionUnitOfWork:
             or result_category not in COMPLETED_CATEGORIES[binding.action_kind]
             or (
                 result_memory_key is not None
-                and MEMORY_KEY_PATTERN.fullmatch(result_memory_key) is None
+                and (
+                    not isinstance(result_memory_key, str)
+                    or MEMORY_KEY_PATTERN.fullmatch(result_memory_key) is None
+                )
             )
         ):
             raise MemoryActionLedgerError("invalid_state")
+        if len(self._deferred_actions) != 1:
+            raise self._semantic_error()
+        snapshot = self._build_terminal_semantic_snapshot(
+            binding,
+            canonical_message_id=self._canonical_message_id,
+            result_category=result_category,
+            result_memory_key=result_memory_key,
+        )
+        self._validate_terminal_semantic_snapshot(
+            binding,
+            snapshot,
+            canonical_message_id=self._canonical_message_id,
+            result_category=result_category,
+            result_memory_key=result_memory_key,
+            expected_action_id=self._deferred_actions[0],
+        )
         stamp = channel_store.now_iso()
         terminal_digest = _terminal_binding_digest(
             self._secret,
@@ -679,6 +1647,7 @@ class _MemoryActionUnitOfWork:
             status="completed",
             result_category=result_category,
             result_memory_key=result_memory_key,
+            semantic_snapshot=snapshot,
         )
         self._execute(
             """INSERT INTO memory_action_requests

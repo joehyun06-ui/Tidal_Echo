@@ -707,7 +707,8 @@ MEMORY_ACTION_REQUEST_TABLE_DDL = """CREATE TABLE memory_action_requests (
                     'memory_configuration_invalid','memory_schema_invalid',
                     'not_found','request_binding_conflict',
                     'sensitive_storage_disabled','sensitivity_downgrade',
-                    'storage_unavailable','unsupported_evidence'
+                    'storage_unavailable','terminal_semantics_invalid',
+                    'unsupported_evidence'
                 )
             )
         ),
@@ -731,12 +732,30 @@ MEMORY_ACTION_REQUEST_INDEX_DDL = {
         "ON memory_action_requests(status,created_at,request_id)",
 }
 
+MEMORY_ACTION_REQUEST_TRIGGER_DDL = {
+    "memory_action_requests_immutable_update":
+        """CREATE TRIGGER memory_action_requests_immutable_update
+           BEFORE UPDATE ON memory_action_requests
+           BEGIN
+             SELECT RAISE(ABORT,'memory_action_request_immutable');
+           END""",
+    "memory_action_requests_immutable_delete":
+        """CREATE TRIGGER memory_action_requests_immutable_delete
+           BEFORE DELETE ON memory_action_requests
+           BEGIN
+             SELECT RAISE(ABORT,'memory_action_request_immutable');
+           END""",
+}
+
 
 def _migration_008(conn: sqlite3.Connection) -> None:
     """Add the terminal explicit-action request ledger without changing v1-v7."""
     validate_memory_schema(conn)
     conn.execute(MEMORY_ACTION_REQUEST_TABLE_DDL)
-    for statement in MEMORY_ACTION_REQUEST_INDEX_DDL.values():
+    for statement in (
+        *MEMORY_ACTION_REQUEST_INDEX_DDL.values(),
+        *MEMORY_ACTION_REQUEST_TRIGGER_DDL.values(),
+    ):
         conn.execute(statement)
 
 
@@ -1903,15 +1922,28 @@ def validate_memory_action_schema(conn: sqlite3.Connection) -> None:
     expected_objects = {
         ("table", "memory_action_requests"),
         ("index", "idx_memory_action_requests_status_created"),
+        ("trigger", "memory_action_requests_immutable_delete"),
+        ("trigger", "memory_action_requests_immutable_update"),
     }
     if unexpected != expected_objects:
         raise sqlite3.DatabaseError("invalid memory action object set")
-    triggers = conn.execute(
-        """SELECT name FROM sqlite_master
+    actual_triggers = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            """SELECT name,sql FROM sqlite_master
            WHERE type='trigger' AND tbl_name='memory_action_requests'"""
-    ).fetchall()
-    if triggers:
+        )
+    }
+    if set(actual_triggers) != set(MEMORY_ACTION_REQUEST_TRIGGER_DDL):
         raise sqlite3.DatabaseError("invalid memory action trigger set")
+    for name, expected_sql in MEMORY_ACTION_REQUEST_TRIGGER_DDL.items():
+        if (
+            _sql_fingerprint(str(actual_triggers[name]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError(
+                f"invalid memory action trigger fingerprint: {name}"
+            )
 
 
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (

@@ -241,6 +241,35 @@ class MemoryActionLedgerSchemaTests(unittest.TestCase):
                     digest=digest,
                 )
 
+    def test_terminal_rows_are_insert_once_and_immutable(self):
+        request_id = self.request_id("I")
+        self.insert_row(
+            request_id=request_id,
+            action_kind="remember",
+            target_memory_key=None,
+            canonical_message_id=self.canonical(),
+            result_memory_key=self.memory_key("I"),
+            status="completed",
+            result_category="created",
+        )
+        with channel_store.connect(self.path) as conn:
+            for statement in (
+                """UPDATE memory_action_requests SET result_category='suppressed'
+                   WHERE request_id=?""",
+                "DELETE FROM memory_action_requests WHERE request_id=?",
+            ):
+                with self.subTest(statement=statement), self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "memory_action_request_immutable",
+                ):
+                    conn.execute(statement, (request_id,))
+            row = conn.execute(
+                """SELECT status,result_category
+                   FROM memory_action_requests WHERE request_id=?""",
+                (request_id,),
+            ).fetchone()
+        self.assertEqual(tuple(row), ("completed", "created"))
+
     def test_schema_has_no_content_identity_secret_or_capability_fields(self):
         with channel_store.connect(self.path) as conn:
             names = {
@@ -290,6 +319,7 @@ class MemoryActionMigrationValidationTests(unittest.TestCase):
         *,
         table_sql: str | None = None,
         index_sql: str | None = None,
+        trigger_sql: tuple[str, ...] | None = None,
         marker_name: str = "explicit_memory_action_request_ledger",
         extra_sql: str | None = None,
     ) -> None:
@@ -301,6 +331,14 @@ class MemoryActionMigrationValidationTests(unittest.TestCase):
                     "idx_memory_action_requests_status_created"
                 ]
             )
+            for statement in (
+                trigger_sql
+                if trigger_sql is not None
+                else tuple(
+                    channel_store.MEMORY_ACTION_REQUEST_TRIGGER_DDL.values()
+                )
+            ):
+                conn.execute(statement)
             if extra_sql:
                 conn.execute(extra_sql)
             stamp = channel_store.now_iso()
@@ -500,6 +538,50 @@ class MemoryActionMigrationValidationTests(unittest.TestCase):
                     index_sql=index_sql,
                     marker_name=marker or "explicit_memory_action_request_ledger",
                     extra_sql=extra_sql,
+                )
+                with channel_store.connect(path) as conn, self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "memory action",
+                ):
+                    channel_store.validate_memory_action_schema(conn)
+
+    def test_validator_requires_exact_immutable_trigger_set(self):
+        update_sql = channel_store.MEMORY_ACTION_REQUEST_TRIGGER_DDL[
+            "memory_action_requests_immutable_update"
+        ]
+        delete_sql = channel_store.MEMORY_ACTION_REQUEST_TRIGGER_DDL[
+            "memory_action_requests_immutable_delete"
+        ]
+        cases = (
+            ("missing", (update_sql,), None),
+            (
+                "modified",
+                (
+                    update_sql,
+                    delete_sql.replace(
+                        "memory_action_request_immutable",
+                        "changed_error",
+                    ),
+                ),
+                None,
+            ),
+            (
+                "extra",
+                (update_sql, delete_sql),
+                """CREATE TRIGGER memory_action_requests_extra
+                   BEFORE INSERT ON memory_action_requests
+                   BEGIN
+                     SELECT RAISE(ABORT,'extra');
+                   END""",
+            ),
+        )
+        for name, triggers, extra in cases:
+            with self.subTest(name=name):
+                path = self.prepare_v7(f"trigger-{name}")
+                self.install_v8_objects(
+                    path,
+                    trigger_sql=triggers,
+                    extra_sql=extra,
                 )
                 with channel_store.connect(path) as conn, self.assertRaisesRegex(
                     sqlite3.DatabaseError,
@@ -768,6 +850,181 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             result_memory_key=result.item["memory_key"],
         )
 
+    def completed_remember_case(self, marker: str):
+        path = str(Path(self.temp.name) / f"tamper-{marker}.sqlite3")
+        self._prepare_path(path)
+        runtime = bootstrap_runtime(path, memory_config())
+        actions = runtime.privileged_actions
+        store = actions._store
+        authority = actions._authority
+        binding = self.binding(
+            request_id=marker[0].upper() * 32,
+            content=f"Synthetic {marker} memory",
+        )
+        with store._action_unit_of_work() as uow:
+            self.assertIsNone(uow.claim_request(binding))
+            terminal = self.stage_remember(
+                uow,
+                binding,
+                store=store,
+                authority=authority,
+            )
+            result = uow.commit()
+        self.assertEqual(result, terminal)
+        return path, store, authority, binding, result
+
+    @staticmethod
+    def execute_correct(
+        *,
+        store,
+        authority,
+        binding: memory_action_ledger.MemoryActionRequestBinding,
+    ):
+        runtime_module = importlib.import_module(type(authority).__module__)
+        store_module = importlib.import_module(type(store).__module__)
+        with store._action_unit_of_work() as uow:
+            replay = uow.claim_request(binding)
+            if replay is not None:
+                return uow.commit(), True
+            canonical_id = uow._insert_canonical_action(
+                text=binding.normalized_content,
+                metadata={"channel": "web", "source": "relay"},
+            )
+            envelope = runtime_module.issue_action_envelope(
+                authority,
+                runtime_module.MemoryActionBinding(
+                    action_type=runtime_module.ACTION_CORRECT_USER,
+                    canonical_message_id=canonical_id,
+                    kind=binding.kind,
+                    scope_type=binding.scope_type,
+                    scope_ref=binding.scope_ref,
+                    normalized_content=binding.normalized_content,
+                    sensitivity=binding.sensitivity,
+                    memory_key=binding.target_memory_key,
+                ),
+            )
+            result = store.correct_memory_from_user_action(
+                memory_key=binding.target_memory_key,
+                content=binding.normalized_content,
+                sensitivity=binding.sensitivity,
+                sources=[
+                    store_module.memory_policy.ProvenanceInput(
+                        canonical_message_id=canonical_id
+                    )
+                ],
+                authorization=envelope,
+                _transaction=uow,
+            )
+            category = (
+                "unchanged"
+                if result.outcome == "idempotent_noop"
+                else result.outcome
+            )
+            uow.complete_request(
+                result_category=category,
+                result_memory_key=(
+                    result.item["memory_key"]
+                    if result.item is not None
+                    else None
+                ),
+            )
+            return uow.commit(), False
+
+    @staticmethod
+    def execute_forget(
+        *,
+        store,
+        authority,
+        binding: memory_action_ledger.MemoryActionRequestBinding,
+    ):
+        runtime_module = importlib.import_module(type(authority).__module__)
+        store_module = importlib.import_module(type(store).__module__)
+        with store._action_unit_of_work() as uow:
+            replay = uow.claim_request(binding)
+            if replay is not None:
+                return uow.commit(), True
+            canonical_id = uow._insert_canonical_action(
+                text=binding.normalized_content,
+                metadata={"channel": "web", "source": "relay"},
+            )
+            envelope = runtime_module.issue_action_envelope(
+                authority,
+                runtime_module.MemoryActionBinding(
+                    action_type=runtime_module.ACTION_FORGET_USER,
+                    canonical_message_id=canonical_id,
+                    kind=binding.kind,
+                    scope_type=binding.scope_type,
+                    scope_ref=binding.scope_ref,
+                    normalized_content=binding.normalized_content,
+                    sensitivity=binding.sensitivity,
+                    memory_key=binding.target_memory_key,
+                ),
+            )
+            result = store.forget_memory_atomic(
+                memory_key=binding.target_memory_key,
+                sources=[
+                    store_module.memory_policy.ProvenanceInput(
+                        canonical_message_id=canonical_id
+                    )
+                ],
+                authorization=envelope,
+                _transaction=uow,
+            )
+            uow.complete_request(
+                result_category=result.outcome,
+                result_memory_key=result.item["memory_key"],
+            )
+            return uow.commit(), False
+
+    def assert_replay_rejected_without_growth(
+        self,
+        *,
+        path: str,
+        store,
+        binding: memory_action_ledger.MemoryActionRequestBinding,
+    ) -> None:
+        before = self.counts(path)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "request_binding_conflict|terminal_semantics_invalid",
+        ):
+            with store._action_unit_of_work() as uow:
+                uow.claim_request(binding)
+        self.assertEqual(self.counts(path), before)
+        self.assertEqual(before["memory_action_requests"], 1)
+
+    @staticmethod
+    def insert_other_item(conn, *, marker: str) -> tuple[int, str]:
+        content = f"Other {marker} memory"
+        memory_key = marker.upper() * 32
+        fingerprint = memory_action_ledger.memory_policy.fingerprint_content(
+            TEST_HMAC_SECRET,
+            scope_type="global_user",
+            scope_ref="",
+            kind="project",
+            normalized_content=content,
+        )
+        stamp = channel_store.now_iso()
+        cursor = conn.execute(
+            """INSERT INTO memory_items
+               (memory_key,kind,scope_type,scope_ref,normalized_content,
+                normalized_fingerprint,fingerprint_version,status,explicitness,
+                confidence,sensitivity,first_observed_at,last_confirmed_at,
+                superseded_by_id,created_at,updated_at)
+               VALUES(?,'project','global_user','',?,? ,1,'active','explicit',
+                      1.0,'normal',?,?,NULL,?,?)""",
+            (
+                memory_key,
+                content,
+                fingerprint,
+                stamp,
+                stamp,
+                stamp,
+                stamp,
+            ),
+        )
+        return int(cursor.lastrowid), memory_key
+
     def test_success_commits_ledger_canonical_and_memory_together(self):
         result, replay = self.execute_remember(self.binding())
         self.assertFalse(replay)
@@ -784,6 +1041,73 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 "memory_suppressions": 0,
             },
         )
+
+    def test_correct_and_forget_terminal_semantics_commit_and_replay(self):
+        (
+            _correct_path,
+            correct_store,
+            correct_authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("correct-flow")
+        correct_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Q" * 32,
+            action_kind="correct",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content="Corrected synthetic memory",
+        )
+        first, replay = self.execute_correct(
+            store=correct_store,
+            authority=correct_authority,
+            binding=correct_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(first.result_category, "corrected")
+        second, replay = self.execute_correct(
+            store=correct_store,
+            authority=correct_authority,
+            binding=correct_binding,
+        )
+        self.assertTrue(replay)
+        self.assertEqual(first, second)
+
+        (
+            _forget_path,
+            forget_store,
+            forget_authority,
+            forget_remember_binding,
+            forget_remember_result,
+        ) = self.completed_remember_case("forget-flow")
+        forget_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="G" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=forget_remember_result.result_memory_key,
+            scope_type=forget_remember_binding.scope_type,
+            scope_ref=forget_remember_binding.scope_ref,
+            kind=forget_remember_binding.kind,
+            sensitivity=forget_remember_binding.sensitivity,
+            normalized_content=forget_remember_binding.normalized_content,
+        )
+        first, replay = self.execute_forget(
+            store=forget_store,
+            authority=forget_authority,
+            binding=forget_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(first.result_category, "forgotten")
+        second, replay = self.execute_forget(
+            store=forget_store,
+            authority=forget_authority,
+            binding=forget_binding,
+        )
+        self.assertTrue(replay)
+        self.assertEqual(first, second)
 
     def test_replay_and_changed_payload_binding(self):
         binding = self.binding()
@@ -804,44 +1128,462 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 uow.claim_request(self.binding(content="Changed synthetic payload"))
         self.assertEqual(self.counts()["memory_action_requests"], 1)
         with channel_store.connect(self.path) as conn:
-            conn.execute(
+            for statement in (
                 """UPDATE memory_action_requests
                    SET result_category='idempotent_existing'
                    WHERE request_id=?""",
-                (binding.request_id,),
-            )
-        with self.store._action_unit_of_work() as uow:
-            with self.assertRaisesRegex(
-                memory_action_ledger.MemoryActionLedgerError,
-                "request_binding_conflict",
+                "DELETE FROM memory_action_requests WHERE request_id=?",
             ):
-                uow.claim_request(binding)
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "memory_action_request_immutable",
+                ):
+                    conn.execute(statement, (binding.request_id,))
+        third, replay = self.execute_remember(binding)
+        self.assertTrue(replay)
+        self.assertEqual(first, third)
+
+    def test_missing_terminal_trigger_blocks_validator_and_claim(self):
+        binding = self.binding()
+        self.execute_remember(binding)
         with channel_store.connect(self.path) as conn:
             conn.execute(
-                """UPDATE memory_action_requests SET result_category='created'
+                "DROP TRIGGER memory_action_requests_immutable_delete"
+            )
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "memory action trigger",
+            ):
+                channel_store.validate_memory_action_schema(conn)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "memory_schema_invalid",
+        ):
+            with self.store._action_unit_of_work():
+                self.fail("invalid v8 schema must fail before claim")
+        self.assertEqual(self.counts()["memory_action_requests"], 1)
+
+    def test_replay_authenticates_canonical_evidence_source_item_and_result(self):
+        canonical_cases = (
+            ("canonical-text", "UPDATE messages SET text='Tampered text'"),
+            (
+                "canonical-meta",
+                """UPDATE messages
+                   SET meta='{"channel":"web","source":"relay","extra":"x"}'""",
+            ),
+            (
+                "canonical-role",
+                "UPDATE messages SET direction='out',kind='reply'",
+            ),
+            (
+                "canonical-channel",
+                """UPDATE messages
+                   SET meta='{"channel":"telegram","source":"relay"}'""",
+            ),
+            (
+                "canonical-source",
+                """UPDATE messages
+                   SET meta='{"channel":"web","source":"mcp"}'""",
+            ),
+        )
+        for marker, statement in canonical_cases:
+            with self.subTest(marker=marker):
+                (
+                    path,
+                    store,
+                    _authority,
+                    binding,
+                    _result,
+                ) = self.completed_remember_case(marker)
+                with channel_store.connect(path) as conn:
+                    conn.execute(statement)
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=binding,
+                )
+
+        evidence_cases = (
+            ("evidence-action-id", "action_id", "E" * 32, False),
+            (
+                "evidence-action-type",
+                "action_type",
+                "correct_explicit_user",
+                False,
+            ),
+            (
+                "evidence-binding-version",
+                "action_binding_version",
+                2,
+                True,
+            ),
+            (
+                "evidence-type",
+                "evidence_type",
+                "explicit_user_correction",
+                False,
+            ),
+            ("evidence-reality", "reality_scope", "fiction", False),
+            ("evidence-subject", "subject_scope", "project", False),
+            (
+                "evidence-component",
+                "created_by_component",
+                "web_adapter",
+                False,
+            ),
+        )
+        update_trigger = channel_store.MEMORY_TRIGGER_DDL[
+            "memory_evidence_events_immutable_update"
+        ]
+        for marker, column, value, ignore_checks in evidence_cases:
+            with self.subTest(marker=marker):
+                (
+                    path,
+                    store,
+                    _authority,
+                    binding,
+                    _result,
+                ) = self.completed_remember_case(marker)
+                with channel_store.connect(path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute(
+                        "DROP TRIGGER memory_evidence_events_immutable_update"
+                    )
+                    if ignore_checks:
+                        conn.execute("PRAGMA ignore_check_constraints=ON")
+                    conn.execute(
+                        f"UPDATE memory_evidence_events SET {column}=?",
+                        (value,),
+                    )
+                    if ignore_checks:
+                        conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    conn.execute(update_trigger)
+                    conn.execute("PRAGMA foreign_keys=ON")
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=binding,
+                )
+
+        source_cases = (
+            ("source-channel", "channel", "telegram"),
+            ("source-source", "source", "mcp"),
+            ("source-role", "evidence_role", "assistant"),
+        )
+        for marker, column, value in source_cases:
+            with self.subTest(marker=marker):
+                (
+                    path,
+                    store,
+                    _authority,
+                    binding,
+                    _result,
+                ) = self.completed_remember_case(marker)
+                with channel_store.connect(path) as conn:
+                    conn.execute(
+                        f"UPDATE memory_sources SET {column}=?",
+                        (value,),
+                    )
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=binding,
+                )
+
+        item_cases = (
+            (
+                "item-content",
+                """UPDATE memory_items
+                   SET normalized_content='Tampered item content'""",
+            ),
+            ("item-kind", "UPDATE memory_items SET kind='task_or_progress'"),
+            (
+                "item-scope",
+                """UPDATE memory_items
+                   SET scope_type='project',scope_ref='tampered'""",
+            ),
+            (
+                "item-sensitivity",
+                "UPDATE memory_items SET sensitivity='sensitive'",
+            ),
+            ("item-state", "UPDATE memory_items SET status='rejected'"),
+        )
+        for marker, statement in item_cases:
+            with self.subTest(marker=marker):
+                (
+                    path,
+                    store,
+                    _authority,
+                    binding,
+                    _result,
+                ) = self.completed_remember_case(marker)
+                with channel_store.connect(path) as conn:
+                    conn.execute(statement)
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=binding,
+                )
+
+        path, store, _authority, binding, _result = self.completed_remember_case(
+            "result-key"
+        )
+        with channel_store.connect(path) as conn:
+            _other_id, other_key = self.insert_other_item(
+                conn,
+                marker="Z",
+            )
+            conn.execute(
+                "DROP TRIGGER memory_action_requests_immutable_update"
+            )
+            conn.execute(
+                """UPDATE memory_action_requests SET result_memory_key=?
                    WHERE request_id=?""",
-                (binding.request_id,),
+                (other_key, binding.request_id),
             )
             conn.execute(
-                "DELETE FROM memory_sources",
+                channel_store.MEMORY_ACTION_REQUEST_TRIGGER_DDL[
+                    "memory_action_requests_immutable_update"
+                ]
+            )
+        self.assert_replay_rejected_without_growth(
+            path=path,
+            store=store,
+            binding=binding,
+        )
+
+        path, store, _authority, binding, result = self.completed_remember_case(
+            "source-link"
+        )
+        with channel_store.connect(path) as conn:
+            other_id, _other_key = self.insert_other_item(
+                conn,
+                marker="Y",
             )
             conn.execute(
-                "DROP TRIGGER memory_evidence_events_immutable_delete",
+                """UPDATE memory_sources SET memory_id=?
+                   WHERE memory_id=(
+                     SELECT id FROM memory_items WHERE memory_key=?
+                   )""",
+                (other_id, result.result_memory_key),
             )
+        self.assert_replay_rejected_without_growth(
+            path=path,
+            store=store,
+            binding=binding,
+        )
+
+    def test_replay_rejects_deleted_or_added_evidence_and_sources(self):
+        path, store, _authority, binding, _result = self.completed_remember_case(
+            "delete-source"
+        )
+        with channel_store.connect(path) as conn:
+            conn.execute("DELETE FROM memory_sources")
+        self.assert_replay_rejected_without_growth(
+            path=path,
+            store=store,
+            binding=binding,
+        )
+
+        path, store, _authority, binding, _result = self.completed_remember_case(
+            "delete-evidence"
+        )
+        with channel_store.connect(path) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute(
-                "DELETE FROM memory_evidence_events",
+                "DROP TRIGGER memory_evidence_events_immutable_delete"
             )
+            conn.execute("DELETE FROM memory_evidence_events")
             conn.execute(
                 channel_store.MEMORY_TRIGGER_DDL[
                     "memory_evidence_events_immutable_delete"
-                ],
+                ]
             )
-        with self.store._action_unit_of_work() as uow:
-            with self.assertRaisesRegex(
-                memory_action_ledger.MemoryActionLedgerError,
-                "memory_schema_invalid",
-            ):
-                uow.claim_request(binding)
+            conn.execute("PRAGMA foreign_keys=ON")
+        self.assert_replay_rejected_without_growth(
+            path=path,
+            store=store,
+            binding=binding,
+        )
+
+        path, store, _authority, binding, result = self.completed_remember_case(
+            "add-provenance"
+        )
+        with channel_store.connect(path) as conn:
+            stamp = channel_store.now_iso()
+            canonical = conn.execute(
+                """INSERT INTO messages(ts,direction,kind,text,meta)
+                   VALUES(?,'in','user','Additional provenance',
+                          '{"channel":"web","source":"relay"}')""",
+                (stamp,),
+            )
+            evidence = conn.execute(
+                """INSERT INTO memory_evidence_events
+                   (canonical_message_id,action_id,action_type,
+                    action_binding_version,evidence_type,reality_scope,
+                    subject_scope,created_by_component,created_at)
+                   VALUES(? ,?,'remember_explicit_user',1,
+                          'explicit_user_memory','real','user',
+                          'memory_admin',?)""",
+                (int(canonical.lastrowid), "P" * 32, stamp),
+            )
+            memory_id = conn.execute(
+                "SELECT id FROM memory_items WHERE memory_key=?",
+                (result.result_memory_key,),
+            ).fetchone()[0]
+            conn.execute(
+                """INSERT INTO memory_sources
+                   (memory_id,evidence_event_id,canonical_message_id,channel,
+                    source,evidence_role,evidence_type,created_at)
+                   VALUES(?,?,?,'web','relay','user',
+                          'explicit_user_memory',?)""",
+                (
+                    memory_id,
+                    int(evidence.lastrowid),
+                    int(canonical.lastrowid),
+                    stamp,
+                ),
+            )
+        self.assert_replay_rejected_without_growth(
+            path=path,
+            store=store,
+            binding=binding,
+        )
+
+    def test_forget_replay_authenticates_suppression_semantics(self):
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-suppression")
+        forget_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="W" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=remember_binding.normalized_content,
+        )
+        result, replay = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=forget_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(result.result_category, "forgotten")
+        with channel_store.connect(path) as conn:
+            conn.execute(
+                """UPDATE memory_suppressions
+                   SET reason_category='privacy_policy'"""
+            )
+        self.assert_replay_rejected_without_growth(
+            path=path,
+            store=store,
+            binding=forget_binding,
+        )
+
+    def test_initial_terminal_semantic_miswiring_rolls_back_all_state(self):
+        cases = (
+            (
+                "canonical-content",
+                "Canonical content A",
+                {"channel": "web", "source": "relay"},
+                None,
+            ),
+            (
+                "origin-source",
+                "Memory content B",
+                {"channel": "web", "source": "mcp"},
+                None,
+            ),
+            (
+                "scope",
+                "Memory content B",
+                {"channel": "web", "source": "relay"},
+                """UPDATE memory_items
+                   SET scope_type='project',scope_ref='miswired'""",
+            ),
+            (
+                "sensitivity",
+                "Memory content B",
+                {"channel": "web", "source": "relay"},
+                "UPDATE memory_items SET sensitivity='sensitive'",
+            ),
+        )
+        for index, (name, canonical_text, metadata, mutation) in enumerate(cases):
+            with self.subTest(name=name):
+                path = str(
+                    Path(self.temp.name) / f"miswire-{name}.sqlite3"
+                )
+                self._prepare_path(path)
+                runtime = bootstrap_runtime(path, memory_config())
+                actions = runtime.privileged_actions
+                store = actions._store
+                authority = actions._authority
+                runtime_module = importlib.import_module(
+                    type(authority).__module__
+                )
+                store_module = importlib.import_module(type(store).__module__)
+                binding = self.binding(
+                    request_id=chr(65 + index) * 32,
+                    content="Memory content B",
+                )
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "terminal_semantics_invalid",
+                ):
+                    with store._action_unit_of_work() as uow:
+                        self.assertIsNone(uow.claim_request(binding))
+                        canonical_id = uow._insert_canonical_action(
+                            text=canonical_text,
+                            metadata=metadata,
+                        )
+                        envelope = runtime_module.issue_action_envelope(
+                            authority,
+                            runtime_module.MemoryActionBinding(
+                                action_type=(
+                                    runtime_module.ACTION_REMEMBER_USER
+                                ),
+                                canonical_message_id=canonical_id,
+                                kind=binding.kind,
+                                scope_type=binding.scope_type,
+                                scope_ref=binding.scope_ref,
+                                normalized_content=binding.normalized_content,
+                                sensitivity=binding.sensitivity,
+                            ),
+                        )
+                        store_result = (
+                            store.create_explicit_memory_from_user_action(
+                                kind=binding.kind,
+                                scope_type=binding.scope_type,
+                                scope_ref=binding.scope_ref,
+                                content=binding.normalized_content,
+                                sensitivity=binding.sensitivity,
+                                sources=[
+                                    store_module.memory_policy.ProvenanceInput(
+                                        canonical_message_id=canonical_id
+                                    )
+                                ],
+                                authorization=envelope,
+                                _transaction=uow,
+                            )
+                        )
+                        if mutation is not None:
+                            uow._execute(mutation)
+                        uow.complete_request(
+                            result_category=store_result.outcome,
+                            result_memory_key=(
+                                store_result.item["memory_key"]
+                            ),
+                        )
+                self.assertTrue(
+                    all(value == 0 for value in self.counts(path).values())
+                )
 
     def test_concurrent_same_request_has_one_writer_and_stable_replays(self):
         binding = self.binding()

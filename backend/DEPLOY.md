@@ -451,17 +451,26 @@ dispatching 行。Kelivo 关闭时不检查 Kelivo 专属跨字段关系，`/v1/
 
 ### Memory Phase 1.5 PR A：v8 request ledger（仅基础设施）
 
-Migration v8 仅新增 `memory_action_requests` 与一个显式索引，不修改或重建
-v1–v7。Memory Core 启用为 read-only 时会原子应用并严格验证 v7–v8；这不需要
-fingerprint Key ID/HMAC Secret，也不会启用写入。
+Migration v8 仅新增 `memory_action_requests`、一个显式索引，以及无条件拒绝
+UPDATE/DELETE 的两个 immutable triggers，不修改或重建 v1–v7。validator 精确要求
+两个 trigger 的集合与 SQL fingerprint；缺失、修改或多余 trigger 都 fail closed。
+terminal row 只允许 INSERT once，不存在 UPDATE 路径。Memory Core 启用为 read-only
+时会原子应用并严格验证 v7–v8；这不需要 fingerprint Key ID/HMAC Secret，也不会启用写入。
 
 v8 ledger 只保存受限 request ID、闭集 action/origin、32-byte
 domain-separated HMAC binding、公开 target/result Memory key、terminal
 status/category 与 UTC timestamp。它不保存 Memory/canonical 正文副本、
 fingerprint、外部用户/设备/session identity、完整 metadata、capability/signature、
 Runtime Authority、Secret/Key ID、SQL 或异常正文；没有持久化 `processing` 状态。
-terminal HMAC 同时绑定 canonical reference 与结果；重放会交叉检查对应
-canonical/evidence/Memory 状态，满足 SQL CHECK 但被篡改的数据仍会 fail closed。
+terminal HMAC 同时绑定 canonical reference、结果和版本化
+`TerminalSemanticSnapshotV1`。snapshot 在同一个外层 `BEGIN IMMEDIATE` 中从实际
+canonical、evidence、memory_sources、target/result item 和相关 suppression 行构建，
+验证正文/role/channel/source、evidence ownership/action、provenance link、
+kind/scope/sensitivity/state/supersession 与 request/Store capability 完全一致。
+snapshot 原文不落库、不记录、不返回；只保存 HMAC digest。首次完成不符返回固定且
+data-free 的 `terminal_semantics_invalid` 并整笔回滚；replay 使用相同 validator
+重建 snapshot、重算 HMAC 并 constant-time compare，任何 referenced-row 篡改、增删或
+result-key 重指向均 fail closed，且不会执行新 request。
 
 本阶段只增加可信 composition root 将来可使用的内部 Unit of Work。它让 ledger、
 新 canonical action、capability 验证和 Memory Store 写入能够共享一个
@@ -470,6 +479,11 @@ canonical/evidence/Memory 状态，满足 SQL CHECK 但被篡改的数据仍会 
 但没有实现 Explicit Memory Entry Service，也没有 CLI、MCP、HTTP、Telegram 或
 Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会执行 Memory
 write。该 Unit of Work 是组合与事务原子性机制，不是同进程 Python sandbox。
+
+第一轮独立复审的 High 1 / Medium 1 分别是 terminal ledger 可变与 referenced
+terminal semantics 认证不完整。此前 request/Store 逐字段匹配属于附加加固，并不代表
+原 findings 已关闭；本轮才加入 immutable terminal triggers 与完整 semantic snapshot
+认证。PR 必须继续保持 Draft，等待再次独立复审。
 
 本 PR 不批准部署或生产启用。`MEMORY_EXPLICIT_WRITES_ENABLED` 继续默认
 `false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8
