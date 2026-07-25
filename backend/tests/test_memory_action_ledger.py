@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import sqlite3
 import tempfile
@@ -797,6 +798,8 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
     def execute_remember(
         self,
         binding: memory_action_ledger.MemoryActionRequestBinding,
+        *,
+        spoof_outcome: str | None = None,
     ):
         with self.store._action_unit_of_work() as uow:
             replay = uow.claim_request(binding)
@@ -807,12 +810,20 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 binding,
                 store=self.store,
                 authority=self.authority,
+                spoof_outcome=spoof_outcome,
             )
             self.assertEqual(terminal.status, "completed")
             return uow.commit(), False
 
     @staticmethod
-    def stage_remember(uow, binding, *, store, authority):
+    def stage_remember(
+        uow,
+        binding,
+        *,
+        store,
+        authority,
+        spoof_outcome: str | None = None,
+    ):
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
         canonical_id = uow._insert_canonical_action(
@@ -845,10 +856,12 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             authorization=envelope,
             _transaction=uow,
         )
-        return uow.complete_request(
-            result_category=result.outcome,
-            result_memory_key=result.item["memory_key"],
-        )
+        if spoof_outcome is not None:
+            uow._store_outcome = replace(
+                uow._store_outcome,
+                store_outcome=spoof_outcome,
+            )
+        return uow.complete_request()
 
     def completed_remember_case(self, marker: str):
         path = str(Path(self.temp.name) / f"tamper-{marker}.sqlite3")
@@ -874,11 +887,33 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         return path, store, authority, binding, result
 
     @staticmethod
+    def execute_remember_for_store(
+        store,
+        authority,
+        binding: memory_action_ledger.MemoryActionRequestBinding,
+        *,
+        spoof_outcome: str | None = None,
+    ):
+        with store._action_unit_of_work() as uow:
+            replay = uow.claim_request(binding)
+            if replay is not None:
+                return uow.commit(), True
+            MemoryActionUnitOfWorkTests.stage_remember(
+                uow,
+                binding,
+                store=store,
+                authority=authority,
+                spoof_outcome=spoof_outcome,
+            )
+            return uow.commit(), False
+
+    @staticmethod
     def execute_correct(
         *,
         store,
         authority,
         binding: memory_action_ledger.MemoryActionRequestBinding,
+        spoof_outcome: str | None = None,
     ):
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
@@ -915,19 +950,12 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 authorization=envelope,
                 _transaction=uow,
             )
-            category = (
-                "unchanged"
-                if result.outcome == "idempotent_noop"
-                else result.outcome
-            )
-            uow.complete_request(
-                result_category=category,
-                result_memory_key=(
-                    result.item["memory_key"]
-                    if result.item is not None
-                    else None
-                ),
-            )
+            if spoof_outcome is not None:
+                uow._store_outcome = replace(
+                    uow._store_outcome,
+                    store_outcome=spoof_outcome,
+                )
+            uow.complete_request()
             return uow.commit(), False
 
     @staticmethod
@@ -936,6 +964,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         store,
         authority,
         binding: memory_action_ledger.MemoryActionRequestBinding,
+        spoof_outcome: str | None = None,
     ):
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
@@ -944,7 +973,10 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             if replay is not None:
                 return uow.commit(), True
             canonical_id = uow._insert_canonical_action(
-                text=binding.normalized_content,
+                text=(
+                    binding.normalized_content
+                    or "Forget previously forgotten memory"
+                ),
                 metadata={"channel": "web", "source": "relay"},
             )
             envelope = runtime_module.issue_action_envelope(
@@ -970,10 +1002,12 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 authorization=envelope,
                 _transaction=uow,
             )
-            uow.complete_request(
-                result_category=result.outcome,
-                result_memory_key=result.item["memory_key"],
-            )
+            if spoof_outcome is not None:
+                uow._store_outcome = replace(
+                    uow._store_outcome,
+                    store_outcome=spoof_outcome,
+                )
+            uow.complete_request()
             return uow.commit(), False
 
     def assert_replay_rejected_without_growth(
@@ -1041,6 +1075,274 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 "memory_suppressions": 0,
             },
         )
+
+    def test_complete_request_has_no_caller_selected_terminal_parameters(self):
+        signature = inspect.signature(
+            memory_action_ledger._MemoryActionUnitOfWork.complete_request
+        )
+        self.assertEqual(tuple(signature.parameters), ("self",))
+        with self.store._action_unit_of_work() as uow:
+            with self.assertRaises(TypeError):
+                uow.complete_request(
+                    result_category="created",
+                    result_memory_key="X" * 32,
+                )
+
+    def test_store_outcome_to_terminal_category_attack_matrix_fails_closed(self):
+        def fresh(marker: str):
+            path = str(Path(self.temp.name) / f"outcome-{marker}.sqlite3")
+            self._prepare_path(path)
+            runtime = bootstrap_runtime(path, memory_config())
+            actions = runtime.privileged_actions
+            return path, actions._store, actions._authority
+
+        def remember_binding(request_char: str, content: str):
+            return self.binding(
+                request_id=request_char * 32,
+                content=content,
+            )
+
+        def correction_binding(
+            request_char: str,
+            *,
+            target_key: str,
+            content: str,
+        ):
+            return memory_action_ledger.MemoryActionRequestBinding(
+                request_id=request_char * 32,
+                action_kind="correct",
+                origin="operator_cli",
+                target_memory_key=target_key,
+                scope_type="global_user",
+                scope_ref="",
+                kind="project",
+                sensitivity="normal",
+                normalized_content=content,
+            )
+
+        def forget_binding(
+            request_char: str,
+            *,
+            target_key: str,
+            content: str | None,
+        ):
+            return memory_action_ledger.MemoryActionRequestBinding(
+                request_id=request_char * 32,
+                action_kind="forget",
+                origin="operator_cli",
+                target_memory_key=target_key,
+                scope_type="global_user",
+                scope_ref="",
+                kind="project",
+                sensitivity="normal",
+                normalized_content=content,
+            )
+
+        for spoofed in ("idempotent_existing", "suppressed"):
+            with self.subTest(actual="created", spoofed=spoofed):
+                path, store, authority = fresh(f"created-{spoofed}")
+                binding = remember_binding("A", "Created matrix memory")
+                before = self.counts(path)
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "terminal_semantics_invalid",
+                ):
+                    with store._action_unit_of_work() as uow:
+                        uow.claim_request(binding)
+                        self.stage_remember(
+                            uow,
+                            binding,
+                            store=store,
+                            authority=authority,
+                            spoof_outcome=spoofed,
+                        )
+                self.assertEqual(self.counts(path), before)
+
+        for spoofed in ("created", "suppressed"):
+            with self.subTest(
+                actual="idempotent_existing",
+                spoofed=spoofed,
+            ):
+                path, store, authority = fresh(f"existing-{spoofed}")
+                content = "Existing matrix memory"
+                seed, _ = self.execute_remember_for_store(
+                    store,
+                    authority,
+                    remember_binding("B", content),
+                )
+                before = self.counts(path)
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "terminal_semantics_invalid",
+                ):
+                    self.execute_remember_for_store(
+                        store,
+                        authority,
+                        remember_binding("C", content),
+                        spoof_outcome=spoofed,
+                    )
+                self.assertEqual(self.counts(path), before)
+                self.assertIsNotNone(seed.result_memory_key)
+
+        for spoofed in ("created", "idempotent_existing"):
+            with self.subTest(actual="suppressed", spoofed=spoofed):
+                path, store, authority = fresh(f"suppressed-{spoofed}")
+                content = "Suppressed matrix memory"
+                seed, _ = self.execute_remember_for_store(
+                    store,
+                    authority,
+                    remember_binding("D", content),
+                )
+                self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=forget_binding(
+                        "E",
+                        target_key=seed.result_memory_key,
+                        content=content,
+                    ),
+                )
+                before = self.counts(path)
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "terminal_semantics_invalid",
+                ):
+                    self.execute_remember_for_store(
+                        store,
+                        authority,
+                        remember_binding("F", content),
+                        spoof_outcome=spoofed,
+                    )
+                self.assertEqual(self.counts(path), before)
+
+        for actual, content, spoofed_values in (
+            ("corrected", "Corrected matrix replacement", ("idempotent_noop", "suppressed")),
+            ("idempotent_noop", "Correct matrix seed", ("corrected", "suppressed")),
+        ):
+            for spoofed in spoofed_values:
+                with self.subTest(actual=actual, spoofed=spoofed):
+                    path, store, authority = fresh(f"{actual}-{spoofed}")
+                    seed_content = "Correct matrix seed"
+                    seed, _ = self.execute_remember_for_store(
+                        store,
+                        authority,
+                        remember_binding("G", seed_content),
+                    )
+                    before = self.counts(path)
+                    with self.assertRaisesRegex(
+                        memory_action_ledger.MemoryActionLedgerError,
+                        "terminal_semantics_invalid",
+                    ):
+                        self.execute_correct(
+                            store=store,
+                            authority=authority,
+                            binding=correction_binding(
+                                "H",
+                                target_key=seed.result_memory_key,
+                                content=content,
+                            ),
+                            spoof_outcome=spoofed,
+                        )
+                    self.assertEqual(self.counts(path), before)
+
+        for spoofed in ("corrected", "idempotent_noop"):
+            with self.subTest(actual="correct_suppressed", spoofed=spoofed):
+                path, store, authority = fresh(f"correct-suppressed-{spoofed}")
+                target, _ = self.execute_remember_for_store(
+                    store,
+                    authority,
+                    remember_binding("I", "Correction target"),
+                )
+                blocked_content = "Blocked correction replacement"
+                blocked, _ = self.execute_remember_for_store(
+                    store,
+                    authority,
+                    remember_binding("J", blocked_content),
+                )
+                self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=forget_binding(
+                        "K",
+                        target_key=blocked.result_memory_key,
+                        content=blocked_content,
+                    ),
+                )
+                before = self.counts(path)
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "terminal_semantics_invalid",
+                ):
+                    self.execute_correct(
+                        store=store,
+                        authority=authority,
+                        binding=correction_binding(
+                            "L",
+                            target_key=target.result_memory_key,
+                            content=blocked_content,
+                        ),
+                        spoof_outcome=spoofed,
+                    )
+                self.assertEqual(self.counts(path), before)
+
+        with self.subTest(actual="forgotten", spoofed="already_forgotten"):
+            path, store, authority = fresh("forgotten")
+            content = "Forget matrix memory"
+            seed, _ = self.execute_remember_for_store(
+                store,
+                authority,
+                remember_binding("M", content),
+            )
+            before = self.counts(path)
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "terminal_semantics_invalid",
+            ):
+                self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=forget_binding(
+                        "N",
+                        target_key=seed.result_memory_key,
+                        content=content,
+                    ),
+                    spoof_outcome="already_forgotten",
+                )
+            self.assertEqual(self.counts(path), before)
+
+        with self.subTest(actual="already_forgotten", spoofed="forgotten"):
+            path, store, authority = fresh("already-forgotten")
+            content = "Already forgotten matrix memory"
+            seed, _ = self.execute_remember_for_store(
+                store,
+                authority,
+                remember_binding("O", content),
+            )
+            self.execute_forget(
+                store=store,
+                authority=authority,
+                binding=forget_binding(
+                    "P",
+                    target_key=seed.result_memory_key,
+                    content=content,
+                ),
+            )
+            before = self.counts(path)
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "terminal_semantics_invalid",
+            ):
+                self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=forget_binding(
+                        "Q",
+                        target_key=seed.result_memory_key,
+                        content=None,
+                    ),
+                    spoof_outcome="forgotten",
+                )
+            self.assertEqual(self.counts(path), before)
 
     def test_correct_and_forget_terminal_semantics_commit_and_replay(self):
         (
@@ -1142,6 +1444,100 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         third, replay = self.execute_remember(binding)
         self.assertTrue(replay)
         self.assertEqual(first, third)
+
+    def test_replay_revalidates_actual_terminal_request_columns_and_digest(self):
+        cases = (
+            ("action-kind", "action_kind", "correct", True),
+            ("origin", "origin", "mcp", False),
+            ("target-key", "target_memory_key", "T" * 32, True),
+            ("status", "status", "failed", True),
+            (
+                "result-category",
+                "result_category",
+                "idempotent_existing",
+                False,
+            ),
+            ("canonical-id", "canonical_message_id", "other_canonical", False),
+            ("result-key", "result_memory_key", "other_item", False),
+            (
+                "created-at",
+                "created_at",
+                "2030-01-02T03:04:05+00:00",
+                True,
+            ),
+            (
+                "updated-at",
+                "updated_at",
+                "2030-01-02T03:04:05+00:00",
+                True,
+            ),
+        )
+        trigger = channel_store.MEMORY_ACTION_REQUEST_TRIGGER_DDL[
+            "memory_action_requests_immutable_update"
+        ]
+        for marker, column, raw_value, ignore_checks in cases:
+            with self.subTest(column=column):
+                path, store, _authority, binding, _result = (
+                    self.completed_remember_case(marker)
+                )
+                with channel_store.connect(path) as conn:
+                    value = raw_value
+                    if raw_value == "other_canonical":
+                        cursor = conn.execute(
+                            """INSERT INTO messages(ts,direction,kind,text,meta)
+                               VALUES(?,'in','user','Other canonical',
+                                      '{"channel":"web","source":"relay"}')""",
+                            (channel_store.now_iso(),),
+                        )
+                        value = int(cursor.lastrowid)
+                    elif raw_value == "other_item":
+                        _item_id, value = self.insert_other_item(
+                            conn,
+                            marker="Z",
+                        )
+                    conn.execute(
+                        "DROP TRIGGER memory_action_requests_immutable_update"
+                    )
+                    if ignore_checks:
+                        conn.execute("PRAGMA ignore_check_constraints=ON")
+                    conn.execute(
+                        f"""UPDATE memory_action_requests SET {column}=?
+                            WHERE request_id=?""",
+                        (value, binding.request_id),
+                    )
+                    if ignore_checks:
+                        conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    conn.execute(trigger)
+                    channel_store.validate_memory_action_schema(conn)
+                before = self.counts(path)
+                with self.assertRaises(
+                    memory_action_ledger.MemoryActionLedgerError
+                ) as raised:
+                    with store._action_unit_of_work() as uow:
+                        uow.claim_request(binding)
+                self.assertIn(
+                    raised.exception.category,
+                    {
+                        "memory_schema_invalid",
+                        "request_binding_conflict",
+                        "terminal_semantics_invalid",
+                    },
+                )
+                self.assertEqual(
+                    str(raised.exception),
+                    raised.exception.category,
+                )
+                self.assertEqual(self.counts(path), before)
+                with channel_store.connect(path) as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            f"""SELECT {column}
+                                FROM memory_action_requests
+                                WHERE request_id=?""",
+                            (binding.request_id,),
+                        ).fetchone()[0],
+                        value,
+                    )
 
     def test_missing_terminal_trigger_blocks_validator_and_claim(self):
         binding = self.binding()
@@ -1487,6 +1883,164 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             binding=forget_binding,
         )
 
+    def test_replay_rejects_missing_outcome_required_suppression_rows(self):
+        def remove_and_replay(path, store, binding, reason):
+            with channel_store.connect(path) as conn:
+                deleted = conn.execute(
+                    """DELETE FROM memory_suppressions
+                       WHERE reason_category=?""",
+                    (reason,),
+                )
+                self.assertGreaterEqual(deleted.rowcount, 1)
+            self.assert_replay_rejected_without_growth(
+                path=path,
+                store=store,
+                binding=binding,
+            )
+
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("missing-forgotten-suppression")
+        forgotten_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="A" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=remember_binding.normalized_content,
+        )
+        self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=forgotten_binding,
+        )
+        remove_and_replay(
+            path,
+            store,
+            forgotten_binding,
+            "user_forget",
+        )
+
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("missing-already-suppression")
+        initial_forget = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="B" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=remember_binding.normalized_content,
+        )
+        self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=initial_forget,
+        )
+        already_binding = replace(
+            initial_forget,
+            request_id="C" * 32,
+            normalized_content=None,
+        )
+        result, replay = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=already_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(result.result_category, "already_forgotten")
+        remove_and_replay(
+            path,
+            store,
+            already_binding,
+            "user_forget",
+        )
+
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("missing-corrected-suppression")
+        corrected_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="D" * 32,
+            action_kind="correct",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content="Corrected missing suppression memory",
+        )
+        self.execute_correct(
+            store=store,
+            authority=authority,
+            binding=corrected_binding,
+        )
+        remove_and_replay(
+            path,
+            store,
+            corrected_binding,
+            "corrected_obsolete",
+        )
+
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("missing-matched-suppression")
+        forget_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="E" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=remember_binding.normalized_content,
+        )
+        self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=forget_binding,
+        )
+        suppressed_binding = replace(
+            remember_binding,
+            request_id="F" * 32,
+        )
+        result, replay = self.execute_remember_for_store(
+            store,
+            authority,
+            suppressed_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(result.result_category, "suppressed")
+        remove_and_replay(
+            path,
+            store,
+            suppressed_binding,
+            "user_forget",
+        )
+
     def test_initial_terminal_semantic_miswiring_rolls_back_all_state(self):
         cases = (
             (
@@ -1575,12 +2129,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                         )
                         if mutation is not None:
                             uow._execute(mutation)
-                        uow.complete_request(
-                            result_category=store_result.outcome,
-                            result_memory_key=(
-                                store_result.item["memory_key"]
-                            ),
-                        )
+                        uow.complete_request()
                 self.assertTrue(
                     all(value == 0 for value in self.counts(path).values())
                 )
@@ -1693,10 +2242,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                             )
                         if stage == "after_store":
                             raise RuntimeError("synthetic_after_store")
-                        uow.complete_request(
-                            result_category=result.outcome,
-                            result_memory_key=result.item["memory_key"],
-                        )
+                        uow.complete_request()
                         raise RuntimeError("synthetic_after_terminal")
                 counts = self.counts(path)
                 self.assertTrue(all(value == 0 for value in counts.values()))

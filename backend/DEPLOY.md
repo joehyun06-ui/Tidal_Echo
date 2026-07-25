@@ -472,6 +472,28 @@ data-free 的 `terminal_semantics_invalid` 并整笔回滚；replay 使用相同
 重建 snapshot、重算 HMAC 并 constant-time compare，任何 referenced-row 篡改、增删或
 result-key 重指向均 fail closed，且不会执行新 request。
 
+terminal category 和 result key 不再由 caller 传入。Store 的私有 savepoint
+完成后，`MemoryStore` 会在同一 Unit of Work 中记录一个 sealed、
+`frozen`/`slots` 的 `TrustedStoreOutcomeV1`；它只携带 action/outcome、
+target/result item、当前 evidence/source、精确相关 suppression IDs 和 contract
+version。`complete_request()` 现在是零参数 API，只能消费这一份真实 Store outcome，
+并通过唯一闭集映射派生 terminal category/result key。future adapter 无法选择、
+覆盖或“建议”category。
+
+每种 outcome 都固定自己的 suppression snapshot：remember/correct 的 suppressed
+绑定实际命中的 request/replacement fingerprint；corrected 绑定
+`corrected_obsolete`；forgotten 与 already_forgotten 都绑定目标 Memory 的精确
+`user_forget` suppression。缺失、替换或增加影响这些关系的行会使首次完成或 replay
+fail closed。
+
+Replay 先把数据库实际 terminal row 解码为严格的 `StoredTerminalRowV1`，逐字段比较
+实际 `request_id/action_kind/origin/target_memory_key` 与 caller binding，再使用 row
+中实际的 canonical/status/result/category/created_at/updated_at 重建 terminal
+payload、重建当前 semantic snapshot、重算 HMAC 并 constant-time compare。不得用
+caller binding 的 request columns 代替数据库值。immutable triggers 保护正常写入；
+即使测试中离线移除 trigger、篡改 row、再恢复完全相同的正式 trigger，HMAC/snapshot
+仍会检测语义变化。
+
 本阶段只增加可信 composition root 将来可使用的内部 Unit of Work。它让 ledger、
 新 canonical action、capability 验证和 Memory Store 写入能够共享一个
 `BEGIN IMMEDIATE`，并在 capability 消费前核对实际 Store action 与已 claim request
@@ -481,9 +503,12 @@ Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会�
 write。该 Unit of Work 是组合与事务原子性机制，不是同进程 Python sandbox。
 
 第一轮独立复审的 High 1 / Medium 1 分别是 terminal ledger 可变与 referenced
-terminal semantics 认证不完整。此前 request/Store 逐字段匹配属于附加加固，并不代表
-原 findings 已关闭；本轮才加入 immutable terminal triggers 与完整 semantic snapshot
-认证。PR 必须继续保持 Draft，等待再次独立复审。
+terminal semantics 认证不完整；第二轮定向修复加入了 immutable terminal triggers
+与 referenced-semantic authentication。最新独立复审结论是 original Medium
+closed、original High partially closed、new Medium 1；新 Medium 指向 caller-selected
+terminal outcome 与 replay 替代数据库 request columns。本轮定向修复已完成真实 Store
+outcome 绑定和实际 stored columns 重验，但仍须等待下一次独立复审。PR 必须继续保持
+Open/Draft，不得转 Ready、merge 或部署。
 
 本 PR 不批准部署或生产启用。`MEMORY_EXPLICIT_WRITES_ENABLED` 继续默认
 `false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8

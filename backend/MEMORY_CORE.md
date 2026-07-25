@@ -359,14 +359,27 @@ used.
 
 Before a terminal row commits, the same request fields are authenticated again
 under `memory-entry/request-terminal/v1` together with status, fixed result
-category, public result Memory key, canonical message reference, and a
-versioned `TerminalSemanticSnapshotV1`. The typed snapshot is built from the
+category, public result Memory key, canonical message reference, both UTC
+timestamps, the outcome/snapshot contract versions, and a versioned
+`TerminalSemanticSnapshotV1`. The terminal category and result key are not
+caller inputs. After the Store savepoint finishes, `MemoryStore` records one
+sealed `TrustedStoreOutcomeV1` in the owning Unit of Work. It contains only the
+action/kind/outcome, target/result item references, current evidence/source
+references, exact outcome-relevant suppression IDs, and contract version.
+`complete_request()` accepts no category or result-key parameters and applies
+the sole closed mapping from the recorded Store outcome to the terminal row.
+Unknown, cross-action, duplicate, missing, or cross-Store outcomes fail closed.
+
+The typed snapshot is built from the
 actual rows inside the same outer `BEGIN IMMEDIATE`: normalized canonical
 text and server-owned channel/source projection; action evidence ownership and
 binding fields; every related Memory source; target/result item state, scope,
-kind, sensitivity, content-presence and supersession; and any request-related
-suppression. The snapshot value is neither persisted, logged, returned, nor
-placed in an exception; only its terminal HMAC digest is stored.
+kind, sensitivity, content-presence and supersession; and the exact
+outcome-required suppression rows. Remember/correct suppression binds the
+matching requested/replacement fingerprint, correction binds the
+`corrected_obsolete` row, and both `forgotten` and `already_forgotten` bind the
+target's `user_forget` row. The snapshot value is neither persisted, logged,
+returned, nor placed in an exception; only its terminal HMAC digest is stored.
 
 Initial completion verifies those actual semantics against the claimed request
 and the already-matched Store capability before inserting the terminal row.
@@ -376,7 +389,15 @@ ledger state. Replay rebuilds the same typed snapshot from current rows,
 recomputes the terminal HMAC, compares it in constant time, and validates the
 same ownership and relationship invariants. Canonical, evidence, source, item,
 suppression, result-reference, deletion, or addition tampering therefore
-fails closed without executing a new request.
+fails closed without executing a new request. Replay first reads a strict
+`StoredTerminalRowV1`, compares its actual `request_id`, `action_kind`,
+`origin`, and `target_memory_key` to the caller binding field by field, and
+then rebuilds the terminal payload from the database row's actual canonical,
+status, result, category, and timestamp columns. Caller request columns are
+never substituted for stored request columns during terminal HMAC
+recalculation. Immutable triggers protect normal writes; the HMAC and semantic
+snapshot still detect row changes after a synthetic offline
+drop/tamper/restore of those exact triggers.
 
 The ledger stores no Memory or canonical text copy, fingerprint, external
 user/device/session identity, complete metadata, capability, signature,
@@ -409,10 +430,14 @@ arbitrary same-process Python execution.
 
 The first independent review's High 1 / Medium 1 findings were the mutable
 terminal ledger and incomplete authentication of referenced terminal
-semantics. The earlier request/Store field equality check remains as additive
-hardening; it was not treated as closing those findings. This revision adds
-the immutable terminal triggers and complete referenced-semantic
-authentication, but the PR remains Draft pending another independent review.
+semantics. The second targeted revision added immutable terminal triggers and
+referenced-semantic authentication. The latest independent review closed the
+original Medium, left the original High partially closed, and reported one new
+Medium: caller-selected terminal outcomes and replay substitution of request
+columns. This targeted revision binds completion to the real Store outcome and
+revalidates the actual stored request columns. It records the targeted fix as
+complete, but the PR remains Draft and awaits another independent review; it
+is not ready for merge or deployment.
 
 Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
 can apply and validate v8 without a fingerprint secret; explicit writes remain

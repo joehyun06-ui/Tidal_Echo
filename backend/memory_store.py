@@ -292,10 +292,20 @@ class MemoryStore:
         action_id: str | None,
         *,
         consumed: bool,
+        result: StoreResult | None,
+        suppression_ids: tuple[int, ...],
     ) -> str | None:
         if transaction is None or action_id is None or not consumed:
             return action_id
+        if result is None:
+            raise MemoryStoreError("invalid_state")
         try:
+            transaction._record_store_outcome(
+                store=self,
+                action_id=action_id,
+                store_result=result,
+                suppression_ids=suppression_ids,
+            )
             transaction._defer_action(action_id)
         except memory_action_ledger.MemoryActionLedgerError as error:
             raise MemoryStoreError(error.category) from None
@@ -614,7 +624,7 @@ class MemoryStore:
         return matched
 
     @staticmethod
-    def _is_suppressed_conn(
+    def _matching_suppression_ids(
         conn: sqlite3.Connection,
         *,
         scope_type: str,
@@ -622,22 +632,23 @@ class MemoryStore:
         kind: str,
         fingerprint_version: int,
         fingerprint: bytes,
-    ) -> bool:
+    ) -> tuple[int, ...]:
         rows = conn.execute(
-            """SELECT normalized_fingerprint FROM memory_suppressions
+            """SELECT id,normalized_fingerprint FROM memory_suppressions
                WHERE scope_type=? AND scope_ref=? AND kind=? AND fingerprint_version=?
                ORDER BY id""",
             (scope_type, scope_ref, kind, fingerprint_version),
         ).fetchall()
-        matched = False
+        matched: list[int] = []
         for row in rows:
             stored = row["normalized_fingerprint"]
             current = (
                 isinstance(stored, bytes)
                 and memory_policy.secure_digest_equal(stored, fingerprint)
             )
-            matched = current or matched
-        return matched
+            if current:
+                matched.append(int(row["id"]))
+        return tuple(matched)
 
     @staticmethod
     def _insert_sources(
@@ -676,7 +687,7 @@ class MemoryStore:
         fingerprint_version: int,
         reason_category: str,
         stamp: str,
-    ) -> None:
+    ) -> int:
         conn.execute(
             """INSERT INTO memory_suppressions
                (scope_type,scope_ref,kind,normalized_fingerprint,fingerprint_version,
@@ -694,6 +705,47 @@ class MemoryStore:
                 stamp,
             ),
         )
+        rows = conn.execute(
+            """SELECT id,normalized_fingerprint FROM memory_suppressions
+               WHERE scope_type=? AND scope_ref=? AND kind=?
+                 AND fingerprint_version=? ORDER BY id""",
+            (scope_type, scope_ref, kind, fingerprint_version),
+        ).fetchall()
+        matched_ids = tuple(
+            int(row["id"])
+            for row in rows
+            if (
+                isinstance(row["normalized_fingerprint"], bytes)
+                and memory_policy.secure_digest_equal(
+                    row["normalized_fingerprint"],
+                    fingerprint,
+                )
+            )
+        )
+        if len(matched_ids) != 1:
+            raise MemoryStoreError("conflict")
+        return matched_ids[0]
+
+    @staticmethod
+    def _forgotten_target_suppression_ids(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> tuple[int, ...]:
+        rows = conn.execute(
+            """SELECT id FROM memory_suppressions
+               WHERE scope_type=? AND scope_ref=? AND kind=?
+                 AND fingerprint_version=?
+                 AND reason_category='user_forget'
+                 AND created_at=? ORDER BY id""",
+            (
+                row["scope_type"],
+                row["scope_ref"],
+                row["kind"],
+                int(row["fingerprint_version"]),
+                row["updated_at"],
+            ),
+        ).fetchall()
+        return tuple(int(value["id"]) for value in rows)
 
     @staticmethod
     def _translate_sqlite_error(error: Exception) -> MemoryStoreError:
@@ -750,6 +802,8 @@ class MemoryStore:
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
+        result: StoreResult | None = None
+        suppression_ids: tuple[int, ...] = ()
         try:
             with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -805,14 +859,15 @@ class MemoryStore:
                         kind=kind,
                         normalized_content=normalized_content,
                     )
-                    if self._is_suppressed_conn(
+                    suppression_ids = self._matching_suppression_ids(
                         conn,
                         scope_type=scope_type,
                         scope_ref=scope_ref,
                         kind=kind,
                         fingerprint=fingerprint,
                         fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                    ):
+                    )
+                    if suppression_ids:
                         conn.execute("ROLLBACK")
                         consumed = True
                         result = StoreResult("suppressed")
@@ -920,6 +975,8 @@ class MemoryStore:
                 _transaction,
                 action_id,
                 consumed=consumed,
+                result=result,
+                suppression_ids=suppression_ids,
             )
             self._finish_action(action_id, consumed=consumed)
 
@@ -1015,6 +1072,8 @@ class MemoryStore:
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
+        result: StoreResult | None = None
+        suppression_ids: tuple[int, ...] = ()
         try:
             with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1123,14 +1182,15 @@ class MemoryStore:
                             and not self._runtime_policy.sensitive_storage_enabled
                         ):
                             raise MemoryStoreError("sensitive_storage_disabled")
-                        if self._is_suppressed_conn(
+                        suppression_ids = self._matching_suppression_ids(
                             conn,
                             scope_type=old["scope_type"],
                             scope_ref=old["scope_ref"],
                             kind=old["kind"],
                             fingerprint=fingerprint,
                             fingerprint_version=self._runtime_policy.fingerprint_version,
-                        ):
+                        )
+                        if suppression_ids:
                             conn.execute("ROLLBACK")
                             consumed = True
                             result = StoreResult("suppressed")
@@ -1184,7 +1244,7 @@ class MemoryStore:
                             )
                             if updated.rowcount != 1:
                                 raise MemoryStoreError("conflict")
-                            self._insert_suppression(
+                            suppression_ids = (self._insert_suppression(
                                 conn,
                                 scope_type=old["scope_type"],
                                 scope_ref=old["scope_ref"],
@@ -1193,7 +1253,7 @@ class MemoryStore:
                                 fingerprint_version=int(old["fingerprint_version"]),
                                 reason_category="corrected_obsolete",
                                 stamp=stamp,
-                            )
+                            ),)
                             row = conn.execute(
                                 "SELECT * FROM memory_items WHERE id=?", (new_id,),
                             ).fetchone()
@@ -1218,6 +1278,8 @@ class MemoryStore:
                 _transaction,
                 action_id,
                 consumed=consumed,
+                result=result,
+                suppression_ids=suppression_ids,
             )
             self._finish_action(action_id, consumed=consumed)
 
@@ -1233,6 +1295,8 @@ class MemoryStore:
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
+        result: StoreResult | None = None
+        suppression_ids: tuple[int, ...] = ()
         try:
             with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1288,6 +1352,9 @@ class MemoryStore:
                         conn, int(row["id"]), sources_to_insert, stamp,
                     )
                     if row["status"] == "forgotten":
+                        suppression_ids = (
+                            self._forgotten_target_suppression_ids(conn, row)
+                        )
                         conn.execute("COMMIT")
                         consumed = True
                         result = StoreResult(
@@ -1297,7 +1364,7 @@ class MemoryStore:
                         fingerprint = row["normalized_fingerprint"]
                         if not isinstance(fingerprint, bytes):
                             raise MemoryStoreError("invalid_state")
-                        self._insert_suppression(
+                        suppression_ids = (self._insert_suppression(
                             conn,
                             scope_type=row["scope_type"],
                             scope_ref=row["scope_ref"],
@@ -1306,7 +1373,7 @@ class MemoryStore:
                             fingerprint_version=int(row["fingerprint_version"]),
                             reason_category="user_forget",
                             stamp=stamp,
-                        )
+                        ),)
                         updated = conn.execute(
                             """UPDATE memory_items
                                SET status='forgotten',normalized_content=NULL,
@@ -1342,6 +1409,8 @@ class MemoryStore:
                 _transaction,
                 action_id,
                 consumed=consumed,
+                result=result,
+                suppression_ids=suppression_ids,
             )
             self._finish_action(action_id, consumed=consumed)
 
