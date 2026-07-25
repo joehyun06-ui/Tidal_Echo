@@ -23,7 +23,7 @@ REQUEST_BINDING_DOMAIN = "memory-entry/request-binding/v1"
 REQUEST_TERMINAL_DOMAIN = "memory-entry/request-terminal/v1"
 CANONICAL_ACTION_CONTRACT_VERSION = 1
 TERMINAL_SEMANTIC_SNAPSHOT_VERSION = 1
-TRUSTED_STORE_OUTCOME_CONTRACT_VERSION = 1
+STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION = 1
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,96}\Z")
 MEMORY_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,96}\Z")
 SCOPE_REF_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -130,10 +130,8 @@ class MemoryActionLedgerResult:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class TrustedStoreOutcomeV1:
-    _seal: object = field(repr=False, compare=False)
+class StoreOutcomeSemanticsV1:
     version: int
-    action_id: str
     action_kind: str
     store_outcome: str
     result_memory_key: str | None
@@ -145,6 +143,20 @@ class TrustedStoreOutcomeV1:
     source_ids: tuple[int, ...]
     suppression_ids: tuple[int, ...]
     created_suppression_ids: tuple[int, ...]
+
+    def __repr__(self) -> str:
+        return "<StoreOutcomeSemanticsV1>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TrustedStoreOutcomeV1:
+    _seal: object = field(repr=False, compare=False)
+    _owner_uow_token: object = field(repr=False, compare=False)
+    _owner_store: object = field(repr=False, compare=False)
+    request_id: str = field(repr=False)
+    canonical_message_id: int = field(repr=False)
+    action_id: str = field(repr=False)
+    semantics: StoreOutcomeSemanticsV1 = field(repr=False)
 
     def __repr__(self) -> str:
         return "<TrustedStoreOutcomeV1>"
@@ -461,8 +473,8 @@ def _terminal_binding_digest(
                 "terminal_semantic_snapshot_version": (
                     TERMINAL_SEMANTIC_SNAPSHOT_VERSION
                 ),
-                "trusted_store_outcome_contract_version": (
-                    TRUSTED_STORE_OUTCOME_CONTRACT_VERSION
+                "store_outcome_semantics_contract_version": (
+                    STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION
                 ),
                 "updated_at": stored_row.updated_at,
             },
@@ -641,6 +653,8 @@ class _MemoryActionUnitOfWork:
         "_terminal",
         "_replay",
         "_store_outcome",
+        "_store_outcome_semantics",
+        "_store_outcome_owner_token",
         "_deferred_actions",
         "_store_completed",
         "_store_failed",
@@ -666,6 +680,8 @@ class _MemoryActionUnitOfWork:
         self._terminal: MemoryActionLedgerResult | None = None
         self._replay: MemoryActionLedgerResult | None = None
         self._store_outcome: TrustedStoreOutcomeV1 | None = None
+        self._store_outcome_semantics: StoreOutcomeSemanticsV1 | None = None
+        self._store_outcome_owner_token = object()
         self._deferred_actions: list[str] = []
         self._store_completed = False
         self._store_failed = False
@@ -1175,35 +1191,34 @@ class _MemoryActionUnitOfWork:
         binding: MemoryActionRequestBinding,
         *,
         canonical_message_id: int,
-        store_outcome: TrustedStoreOutcomeV1,
+        semantics: StoreOutcomeSemanticsV1,
     ) -> TerminalSemanticSnapshotV1:
         if (
-            not isinstance(store_outcome, TrustedStoreOutcomeV1)
-            or store_outcome._seal is not _TRUSTED_STORE_OUTCOME_TOKEN
-            or store_outcome.version
-            != TRUSTED_STORE_OUTCOME_CONTRACT_VERSION
-            or store_outcome.action_kind != binding.action_kind
-            or store_outcome.target_memory_key != binding.target_memory_key
-            or store_outcome.store_outcome
+            type(semantics) is not StoreOutcomeSemanticsV1
+            or semantics.version
+            != STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION
+            or semantics.action_kind != binding.action_kind
+            or semantics.target_memory_key != binding.target_memory_key
+            or semantics.store_outcome
             not in STORE_OUTCOME_TO_TERMINAL_CATEGORY[binding.action_kind]
-            or store_outcome.created_item_ids
+            or semantics.created_item_ids
             != (
-                (store_outcome.result_item_id,)
-                if store_outcome.store_outcome in {"created", "corrected"}
+                (semantics.result_item_id,)
+                if semantics.store_outcome in {"created", "corrected"}
                 else ()
             )
-            or store_outcome.created_suppression_ids
+            or semantics.created_suppression_ids
             != (
-                store_outcome.suppression_ids
-                if store_outcome.store_outcome in {"corrected", "forgotten"}
+                semantics.suppression_ids
+                if semantics.store_outcome in {"corrected", "forgotten"}
                 else ()
             )
         ):
             raise self._semantic_error()
         result_category = STORE_OUTCOME_TO_TERMINAL_CATEGORY[
             binding.action_kind
-        ][store_outcome.store_outcome]
-        result_memory_key = store_outcome.result_memory_key
+        ][semantics.store_outcome]
+        result_memory_key = semantics.result_memory_key
         canonical = self._canonical_semantic(canonical_message_id)
         items: list[TerminalMemoryItemSemanticV1] = []
         target_key = binding.target_memory_key
@@ -1238,7 +1253,7 @@ class _MemoryActionUnitOfWork:
             suppressions = self._suppression_semantics_by_ids(
                 binding=binding,
                 relation="request_content",
-                suppression_ids=store_outcome.suppression_ids,
+                suppression_ids=semantics.suppression_ids,
             )
         elif (
             binding.action_kind == "forget"
@@ -1247,7 +1262,7 @@ class _MemoryActionUnitOfWork:
             suppressions = self._suppression_semantics_by_ids(
                 binding=binding,
                 relation="forgotten_target",
-                suppression_ids=store_outcome.suppression_ids,
+                suppression_ids=semantics.suppression_ids,
             )
         elif (
             binding.action_kind == "correct"
@@ -1256,7 +1271,7 @@ class _MemoryActionUnitOfWork:
             suppressions = self._suppression_semantics_by_ids(
                 binding=binding,
                 relation="superseded_target",
-                suppression_ids=store_outcome.suppression_ids,
+                suppression_ids=semantics.suppression_ids,
             )
         return TerminalSemanticSnapshotV1(
             version=TERMINAL_SEMANTIC_SNAPSHOT_VERSION,
@@ -1689,7 +1704,7 @@ class _MemoryActionUnitOfWork:
         self,
         binding: MemoryActionRequestBinding,
         stored: StoredTerminalRowV1,
-    ) -> TrustedStoreOutcomeV1:
+    ) -> StoreOutcomeSemanticsV1:
         try:
             store_outcome = TERMINAL_CATEGORY_TO_STORE_OUTCOME[
                 stored.action_kind
@@ -1714,13 +1729,12 @@ class _MemoryActionUnitOfWork:
                 target_item_id = int(row["id"])
 
         evidence_rows = self._execute(
-            """SELECT id,action_id FROM memory_evidence_events
+            """SELECT id FROM memory_evidence_events
                WHERE canonical_message_id=? ORDER BY id""",
             (stored.canonical_message_id,),
         ).fetchall()
         evidence_event_ids = tuple(int(row["id"]) for row in evidence_rows)
         if evidence_event_ids:
-            action_id = evidence_rows[-1]["action_id"]
             placeholders = ",".join("?" for _ in evidence_event_ids)
             source_rows = self._execute(
                 f"""SELECT id FROM memory_sources
@@ -1728,7 +1742,6 @@ class _MemoryActionUnitOfWork:
                 evidence_event_ids,
             ).fetchall()
         else:
-            action_id = "replay_suppressed_outcome"
             source_rows = ()
         source_ids = tuple(int(row["id"]) for row in source_rows)
 
@@ -1793,10 +1806,8 @@ class _MemoryActionUnitOfWork:
                 ),
             ).fetchall()
             suppression_ids = tuple(int(row["id"]) for row in rows)
-        return TrustedStoreOutcomeV1(
-            _seal=_TRUSTED_STORE_OUTCOME_TOKEN,
-            version=TRUSTED_STORE_OUTCOME_CONTRACT_VERSION,
-            action_id=action_id,
+        return StoreOutcomeSemanticsV1(
+            version=STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION,
             action_kind=stored.action_kind,
             store_outcome=store_outcome,
             result_memory_key=stored.result_memory_key,
@@ -1846,13 +1857,12 @@ class _MemoryActionUnitOfWork:
             raise MemoryActionLedgerError("request_binding_conflict")
         result = _safe_ledger_result(stored)
         snapshot = None
-        store_outcome = None
         if result.status == "completed":
-            store_outcome = self._replay_store_outcome(validated, stored)
+            semantics = self._replay_store_outcome(validated, stored)
             snapshot = self._build_terminal_semantic_snapshot(
                 validated,
                 canonical_message_id=stored.canonical_message_id,
-                store_outcome=store_outcome,
+                semantics=semantics,
             )
         expected_digest = _terminal_binding_digest(
             self._secret,
@@ -1987,6 +1997,7 @@ class _MemoryActionUnitOfWork:
             or not self._store_completed
             or self._store_failed
             or self._store_outcome is not None
+            or self._store_outcome_semantics is not None
             or not isinstance(action_id, str)
             or ACTION_ID_PATTERN.fullmatch(action_id) is None
             or not isinstance(suppression_ids, tuple)
@@ -2083,10 +2094,8 @@ class _MemoryActionUnitOfWork:
             or (not requires_suppression and suppression_ids)
         ):
             raise self._semantic_error()
-        self._store_outcome = TrustedStoreOutcomeV1(
-            _seal=_TRUSTED_STORE_OUTCOME_TOKEN,
-            version=TRUSTED_STORE_OUTCOME_CONTRACT_VERSION,
-            action_id=action_id,
+        semantics = StoreOutcomeSemanticsV1(
+            version=STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION,
             action_kind=binding.action_kind,
             store_outcome=store_outcome,
             result_memory_key=result_memory_key,
@@ -2108,18 +2117,51 @@ class _MemoryActionUnitOfWork:
                 else ()
             ),
         )
+        self._store_outcome = TrustedStoreOutcomeV1(
+            _seal=_TRUSTED_STORE_OUTCOME_TOKEN,
+            _owner_uow_token=self._store_outcome_owner_token,
+            _owner_store=self._store,
+            request_id=binding.request_id,
+            canonical_message_id=self._canonical_message_id,
+            action_id=action_id,
+            semantics=semantics,
+        )
+        self._store_outcome_semantics = semantics
 
     def _defer_action(self, action_id: str) -> None:
         self._require_active()
+        binding = self._binding
+        outcome = self._store_outcome
+        semantics = (
+            outcome.semantics
+            if type(outcome) is TrustedStoreOutcomeV1
+            else None
+        )
         if (
             not self._store_completed
             or self._store_failed
-            or not isinstance(self._store_outcome, TrustedStoreOutcomeV1)
-            or self._store_outcome._seal is not _TRUSTED_STORE_OUTCOME_TOKEN
-            or self._store_outcome.action_id != action_id
+            or binding is None
+            or self._canonical_message_id is None
+            or self._replay is not None
+            or self._terminal is not None
+            or type(outcome) is not TrustedStoreOutcomeV1
+            or outcome._seal is not _TRUSTED_STORE_OUTCOME_TOKEN
+            or outcome._owner_uow_token is not self._store_outcome_owner_token
+            or outcome._owner_store is not self._store
+            or outcome.request_id != binding.request_id
+            or outcome.canonical_message_id != self._canonical_message_id
+            or outcome.action_id != action_id
+            or type(semantics) is not StoreOutcomeSemanticsV1
+            or semantics is not self._store_outcome_semantics
+            or semantics.version
+            != STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION
+            or semantics.action_kind != binding.action_kind
+            or semantics.target_memory_key != binding.target_memory_key
+            or semantics.store_outcome
+            not in STORE_OUTCOME_TO_TERMINAL_CATEGORY[binding.action_kind]
             or not isinstance(action_id, str)
-            or not action_id
-            or action_id in self._deferred_actions
+            or ACTION_ID_PATTERN.fullmatch(action_id) is None
+            or self._deferred_actions
         ):
             raise MemoryActionLedgerError("invalid_state")
         self._deferred_actions.append(action_id)
@@ -2127,7 +2169,15 @@ class _MemoryActionUnitOfWork:
     def complete_request(self) -> MemoryActionLedgerResult:
         self._require_active()
         binding = self._binding
-        store_outcome = self._store_outcome
+        outcome = self._store_outcome
+        if len(self._deferred_actions) != 1:
+            raise self._semantic_error()
+        deferred_action_id = self._deferred_actions[0]
+        semantics = (
+            outcome.semantics
+            if type(outcome) is TrustedStoreOutcomeV1
+            else None
+        )
         if (
             binding is None
             or self._binding_digest is None
@@ -2136,24 +2186,31 @@ class _MemoryActionUnitOfWork:
             or self._canonical_message_id is None
             or not self._store_completed
             or self._store_failed
-            or not isinstance(store_outcome, TrustedStoreOutcomeV1)
-            or store_outcome._seal is not _TRUSTED_STORE_OUTCOME_TOKEN
-            or store_outcome.action_kind != binding.action_kind
-            or store_outcome.target_memory_key != binding.target_memory_key
-            or store_outcome.store_outcome
+            or type(outcome) is not TrustedStoreOutcomeV1
+            or outcome._seal is not _TRUSTED_STORE_OUTCOME_TOKEN
+            or outcome._owner_uow_token is not self._store_outcome_owner_token
+            or outcome._owner_store is not self._store
+            or outcome.request_id != binding.request_id
+            or outcome.canonical_message_id != self._canonical_message_id
+            or outcome.action_id != deferred_action_id
+            or type(semantics) is not StoreOutcomeSemanticsV1
+            or semantics is not self._store_outcome_semantics
+            or semantics.version
+            != STORE_OUTCOME_SEMANTICS_CONTRACT_VERSION
+            or semantics.action_kind != binding.action_kind
+            or semantics.target_memory_key != binding.target_memory_key
+            or semantics.store_outcome
             not in STORE_OUTCOME_TO_TERMINAL_CATEGORY[binding.action_kind]
         ):
             raise MemoryActionLedgerError("invalid_state")
-        if len(self._deferred_actions) != 1:
-            raise self._semantic_error()
         result_category = STORE_OUTCOME_TO_TERMINAL_CATEGORY[
             binding.action_kind
-        ][store_outcome.store_outcome]
-        result_memory_key = store_outcome.result_memory_key
+        ][semantics.store_outcome]
+        result_memory_key = semantics.result_memory_key
         snapshot = self._build_terminal_semantic_snapshot(
             binding,
             canonical_message_id=self._canonical_message_id,
-            store_outcome=store_outcome,
+            semantics=semantics,
         )
         items_by_key = {
             item.memory_key: item.memory_id for item in snapshot.items
@@ -2170,22 +2227,22 @@ class _MemoryActionUnitOfWork:
             if source.evidence_event_id in current_evidence_id_set
         )
         if (
-            current_evidence_ids != store_outcome.evidence_event_ids
-            or current_source_ids != store_outcome.source_ids
+            current_evidence_ids != semantics.evidence_event_ids
+            or current_source_ids != semantics.source_ids
             or tuple(
                 suppression.suppression_id
                 for suppression in snapshot.suppressions
             )
-            != store_outcome.suppression_ids
+            != semantics.suppression_ids
             or (
-                store_outcome.result_memory_key is not None
-                and items_by_key.get(store_outcome.result_memory_key)
-                != store_outcome.result_item_id
+                semantics.result_memory_key is not None
+                and items_by_key.get(semantics.result_memory_key)
+                != semantics.result_item_id
             )
             or (
-                store_outcome.target_memory_key is not None
-                and items_by_key.get(store_outcome.target_memory_key)
-                != store_outcome.target_item_id
+                semantics.target_memory_key is not None
+                and items_by_key.get(semantics.target_memory_key)
+                != semantics.target_item_id
             )
         ):
             raise self._semantic_error()
@@ -2195,7 +2252,7 @@ class _MemoryActionUnitOfWork:
             canonical_message_id=self._canonical_message_id,
             result_category=result_category,
             result_memory_key=result_memory_key,
-            expected_action_id=self._deferred_actions[0],
+            expected_action_id=deferred_action_id,
         )
         stamp = channel_store.now_iso()
         stored = StoredTerminalRowV1(

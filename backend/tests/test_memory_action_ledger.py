@@ -8,8 +8,9 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from backend import (
@@ -824,6 +825,32 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         authority,
         spoof_outcome: str | None = None,
     ):
+        MemoryActionUnitOfWorkTests.stage_remember_store_action(
+            uow,
+            binding,
+            store=store,
+            authority=authority,
+        )
+        if spoof_outcome is not None:
+            spoofed_semantics = replace(
+                uow._store_outcome.semantics,
+                store_outcome=spoof_outcome,
+            )
+            uow._store_outcome_semantics = spoofed_semantics
+            uow._store_outcome = replace(
+                uow._store_outcome,
+                semantics=spoofed_semantics,
+            )
+        return uow.complete_request()
+
+    @staticmethod
+    def stage_remember_store_action(
+        uow,
+        binding,
+        *,
+        store,
+        authority,
+    ):
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
         canonical_id = uow._insert_canonical_action(
@@ -856,12 +883,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             authorization=envelope,
             _transaction=uow,
         )
-        if spoof_outcome is not None:
-            uow._store_outcome = replace(
-                uow._store_outcome,
-                store_outcome=spoof_outcome,
-            )
-        return uow.complete_request()
+        return result, envelope
 
     def completed_remember_case(self, marker: str):
         path = str(Path(self.temp.name) / f"tamper-{marker}.sqlite3")
@@ -951,9 +973,14 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 _transaction=uow,
             )
             if spoof_outcome is not None:
+                spoofed_semantics = replace(
+                    uow._store_outcome.semantics,
+                    store_outcome=spoof_outcome,
+                )
+                uow._store_outcome_semantics = spoofed_semantics
                 uow._store_outcome = replace(
                     uow._store_outcome,
-                    store_outcome=spoof_outcome,
+                    semantics=spoofed_semantics,
                 )
             uow.complete_request()
             return uow.commit(), False
@@ -1003,9 +1030,14 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 _transaction=uow,
             )
             if spoof_outcome is not None:
+                spoofed_semantics = replace(
+                    uow._store_outcome.semantics,
+                    store_outcome=spoof_outcome,
+                )
+                uow._store_outcome_semantics = spoofed_semantics
                 uow._store_outcome = replace(
                     uow._store_outcome,
-                    store_outcome=spoof_outcome,
+                    semantics=spoofed_semantics,
                 )
             uow.complete_request()
             return uow.commit(), False
@@ -1059,6 +1091,71 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         )
         return int(cursor.lastrowid), memory_key
 
+    def prepare_suppressed_store(
+        self,
+        *,
+        path: str,
+        content: str,
+    ):
+        self._prepare_path(path)
+        runtime = bootstrap_runtime(path, memory_config())
+        actions = runtime.privileged_actions
+        store = actions._store
+        authority = actions._authority
+        remember_binding = self.binding(
+            request_id="A" * 32,
+            content=content,
+        )
+        created, replay = self.execute_remember_for_store(
+            store,
+            authority,
+            remember_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(created.result_category, "created")
+        forget_binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="B" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=created.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=remember_binding.normalized_content,
+        )
+        forgotten, replay = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=forget_binding,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(forgotten.result_category, "forgotten")
+        return store, authority
+
+    @staticmethod
+    def committed_suppressed_outcome(
+        *,
+        store,
+        authority,
+        binding,
+    ):
+        with store._action_unit_of_work() as uow:
+            if uow.claim_request(binding) is not None:
+                raise AssertionError("suppressed owner test unexpectedly replayed")
+            MemoryActionUnitOfWorkTests.stage_remember_store_action(
+                uow,
+                binding,
+                store=store,
+                authority=authority,
+            )
+            outcome = uow._store_outcome
+            terminal = uow.complete_request()
+            committed = uow.commit()
+        if terminal != committed or terminal.result_category != "suppressed":
+            raise AssertionError("suppressed owner fixture did not commit")
+        return outcome
+
     def test_success_commits_ledger_canonical_and_memory_together(self):
         result, replay = self.execute_remember(self.binding())
         self.assertFalse(replay)
@@ -1081,6 +1178,58 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             memory_action_ledger._MemoryActionUnitOfWork.complete_request
         )
         self.assertEqual(tuple(signature.parameters), ("self",))
+        record_signature = inspect.signature(
+            memory_action_ledger._MemoryActionUnitOfWork._record_store_outcome
+        )
+        self.assertEqual(
+            tuple(record_signature.parameters),
+            (
+                "self",
+                "store",
+                "action_id",
+                "store_result",
+                "suppression_ids",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                item.name
+                for item in fields(
+                    memory_action_ledger.StoreOutcomeSemanticsV1
+                )
+            ),
+            (
+                "version",
+                "action_kind",
+                "store_outcome",
+                "result_memory_key",
+                "target_memory_key",
+                "result_item_id",
+                "target_item_id",
+                "created_item_ids",
+                "evidence_event_ids",
+                "source_ids",
+                "suppression_ids",
+                "created_suppression_ids",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                item.name
+                for item in fields(
+                    memory_action_ledger.TrustedStoreOutcomeV1
+                )
+            ),
+            (
+                "_seal",
+                "_owner_uow_token",
+                "_owner_store",
+                "request_id",
+                "canonical_message_id",
+                "action_id",
+                "semantics",
+            ),
+        )
         with self.store._action_unit_of_work() as uow:
             with self.assertRaises(TypeError):
                 uow.complete_request(
@@ -1343,6 +1492,450 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     spoof_outcome="forgotten",
                 )
             self.assertEqual(self.counts(path), before)
+
+    def test_suppressed_outcome_rejects_cross_uow_before_and_after_defer(self):
+        path = str(Path(self.temp.name) / "owner-cross-uow.sqlite3")
+        content = "Owner-bound suppressed memory"
+        store, authority = self.prepare_suppressed_store(
+            path=path,
+            content=content,
+        )
+        foreign_binding = self.binding(
+            request_id="C" * 32,
+            content=content,
+        )
+        foreign = self.committed_suppressed_outcome(
+            store=store,
+            authority=authority,
+            binding=foreign_binding,
+        )
+
+        after_defer_binding = self.binding(
+            request_id="D" * 32,
+            content=content,
+        )
+        before = self.counts(path)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            with store._action_unit_of_work() as uow:
+                self.assertIsNone(uow.claim_request(after_defer_binding))
+                self.stage_remember_store_action(
+                    uow,
+                    after_defer_binding,
+                    store=store,
+                    authority=authority,
+                )
+                self.assertEqual(
+                    repr(uow._store_outcome),
+                    "<TrustedStoreOutcomeV1>",
+                )
+                self.assertEqual(
+                    repr(uow._store_outcome.semantics),
+                    "<StoreOutcomeSemanticsV1>",
+                )
+                self.assertNotIn(
+                    after_defer_binding.request_id,
+                    repr(uow._store_outcome),
+                )
+                self.assertFalse(hasattr(uow._store_outcome, "__dict__"))
+                self.assertFalse(
+                    hasattr(uow._store_outcome.semantics, "__dict__")
+                )
+                with self.assertRaises(FrozenInstanceError):
+                    uow._store_outcome.action_id = "Z" * 32
+                with self.assertRaises(FrozenInstanceError):
+                    uow._store_outcome.semantics.store_outcome = "created"
+                current_action_id = uow._store_outcome.action_id
+                uow._store_outcome = foreign
+                uow.complete_request()
+        self.assertEqual(self.counts(path), before)
+        self.assertNotIn(current_action_id, authority._inflight_actions)
+        self.assertNotIn(current_action_id, authority._consumed_actions)
+
+        before_defer_binding = self.binding(
+            request_id="E" * 32,
+            content=content,
+        )
+        before = self.counts(path)
+        captured_action_ids: list[str] = []
+        with self.assertRaisesRegex(RuntimeError, "invalid_state"):
+            with store._action_unit_of_work() as uow:
+                self.assertIsNone(uow.claim_request(before_defer_binding))
+                original_defer = type(uow)._defer_action
+
+                def transplant_then_defer(inner, action_id):
+                    captured_action_ids.append(action_id)
+                    inner._store_outcome = foreign
+                    return original_defer(inner, action_id)
+
+                with mock.patch.object(
+                    type(uow),
+                    "_defer_action",
+                    new=transplant_then_defer,
+                ):
+                    self.stage_remember_store_action(
+                        uow,
+                        before_defer_binding,
+                        store=store,
+                        authority=authority,
+                    )
+        self.assertEqual(self.counts(path), before)
+        self.assertEqual(len(captured_action_ids), 1)
+        self.assertNotIn(captured_action_ids[0], authority._inflight_actions)
+        self.assertNotIn(captured_action_ids[0], authority._consumed_actions)
+
+        replay, was_replay = self.execute_remember_for_store(
+            store,
+            authority,
+            foreign_binding,
+        )
+        self.assertTrue(was_replay)
+        self.assertEqual(replay.result_category, "suppressed")
+
+    def test_suppressed_outcome_rejects_cross_store_transplant(self):
+        fixed_stamp = "2030-01-02T03:04:05+00:00"
+        content = "Cross-store owner-bound suppression"
+        path_a = str(Path(self.temp.name) / "owner-store-a.sqlite3")
+        path_b = str(Path(self.temp.name) / "owner-store-b.sqlite3")
+        live_store_module = importlib.import_module("backend.memory_store")
+        with mock.patch.object(
+            live_store_module.channel_store,
+            "now_iso",
+            return_value=fixed_stamp,
+        ):
+            store_a, authority_a = self.prepare_suppressed_store(
+                path=path_a,
+                content=content,
+            )
+            foreign = self.committed_suppressed_outcome(
+                store=store_a,
+                authority=authority_a,
+                binding=self.binding(
+                    request_id="C" * 32,
+                    content=content,
+                ),
+            )
+            store_b, authority_b = self.prepare_suppressed_store(
+                path=path_b,
+                content=content,
+            )
+
+            with channel_store.connect(path_a) as conn_a:
+                suppression_a = tuple(conn_a.execute(
+                    """SELECT id,scope_type,scope_ref,kind,
+                              hex(normalized_fingerprint),fingerprint_version,
+                              reason_category,created_at
+                       FROM memory_suppressions"""
+                ).fetchone())
+            with channel_store.connect(path_b) as conn_b:
+                suppression_b = tuple(conn_b.execute(
+                    """SELECT id,scope_type,scope_ref,kind,
+                              hex(normalized_fingerprint),fingerprint_version,
+                              reason_category,created_at
+                       FROM memory_suppressions"""
+                ).fetchone())
+            self.assertEqual(suppression_a, suppression_b)
+
+            binding_b = self.binding(
+                request_id="D" * 32,
+                content=content,
+            )
+            before = self.counts(path_b)
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "invalid_state",
+            ):
+                with store_b._action_unit_of_work() as uow:
+                    self.assertIsNone(uow.claim_request(binding_b))
+                    self.stage_remember_store_action(
+                        uow,
+                        binding_b,
+                        store=store_b,
+                        authority=authority_b,
+                    )
+                    native = uow._store_outcome
+                    self.assertEqual(foreign.semantics, native.semantics)
+                    cross_store = replace(
+                        foreign,
+                        _owner_uow_token=uow._store_outcome_owner_token,
+                        request_id=binding_b.request_id,
+                        canonical_message_id=uow._canonical_message_id,
+                        action_id=native.action_id,
+                        semantics=native.semantics,
+                    )
+                    uow._store_outcome = cross_store
+                    uow.complete_request()
+            self.assertEqual(self.counts(path_b), before)
+
+    def test_live_outcome_revalidates_every_owner_and_identity_field(self):
+        mutations = (
+            (
+                "owner-token",
+                lambda native, uow: replace(
+                    native,
+                    _owner_uow_token=object(),
+                ),
+            ),
+            (
+                "owner-store",
+                lambda native, _uow: replace(
+                    native,
+                    _owner_store=object(),
+                ),
+            ),
+            (
+                "request",
+                lambda native, _uow: replace(
+                    native,
+                    request_id="Z" * 32,
+                ),
+            ),
+            (
+                "canonical",
+                lambda native, _uow: replace(
+                    native,
+                    canonical_message_id=native.canonical_message_id + 100,
+                ),
+            ),
+            (
+                "action",
+                lambda native, _uow: replace(
+                    native,
+                    action_id="Z" * 32,
+                ),
+            ),
+            (
+                "semantics-object",
+                lambda native, _uow: replace(
+                    native,
+                    semantics=replace(native.semantics),
+                ),
+            ),
+            (
+                "seal",
+                lambda native, _uow: replace(
+                    native,
+                    _seal=object(),
+                ),
+            ),
+        )
+        for index, (marker, mutate) in enumerate(mutations):
+            with self.subTest(marker=marker):
+                path = str(
+                    Path(self.temp.name) / f"owner-field-{index}.sqlite3"
+                )
+                content = f"Owner field {index} suppressed memory"
+                store, authority = self.prepare_suppressed_store(
+                    path=path,
+                    content=content,
+                )
+                binding = self.binding(
+                    request_id="C" * 32,
+                    content=content,
+                )
+                before = self.counts(path)
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "invalid_state",
+                ):
+                    with store._action_unit_of_work() as uow:
+                        self.assertIsNone(uow.claim_request(binding))
+                        self.stage_remember_store_action(
+                            uow,
+                            binding,
+                            store=store,
+                            authority=authority,
+                        )
+                        native = uow._store_outcome
+                        uow._store_outcome = mutate(native, uow)
+                        uow.complete_request()
+                self.assertEqual(self.counts(path), before)
+
+    def test_live_outcome_rejects_fake_dict_namespace_and_subclass(self):
+        @dataclass(frozen=True)
+        class FakeOutcome:
+            semantics: object
+
+        def subclass_outcome(native, _uow):
+            class OutcomeSubclass(
+                memory_action_ledger.TrustedStoreOutcomeV1
+            ):
+                pass
+
+            return OutcomeSubclass(
+                _seal=native._seal,
+                _owner_uow_token=native._owner_uow_token,
+                _owner_store=native._owner_store,
+                request_id=native.request_id,
+                canonical_message_id=native.canonical_message_id,
+                action_id=native.action_id,
+                semantics=native.semantics,
+            )
+
+        candidates = (
+            ("dict", lambda native, _uow: {"semantics": native.semantics}),
+            (
+                "namespace",
+                lambda native, _uow: SimpleNamespace(
+                    semantics=native.semantics
+                ),
+            ),
+            (
+                "fake-dataclass",
+                lambda native, _uow: FakeOutcome(native.semantics),
+            ),
+            ("subclass", subclass_outcome),
+        )
+        for index, (marker, candidate) in enumerate(candidates):
+            with self.subTest(marker=marker):
+                path = str(
+                    Path(self.temp.name) / f"owner-type-{index}.sqlite3"
+                )
+                content = f"Owner type {index} suppressed memory"
+                store, authority = self.prepare_suppressed_store(
+                    path=path,
+                    content=content,
+                )
+                binding = self.binding(
+                    request_id="C" * 32,
+                    content=content,
+                )
+                before = self.counts(path)
+                with self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "invalid_state",
+                ):
+                    with store._action_unit_of_work() as uow:
+                        self.assertIsNone(uow.claim_request(binding))
+                        self.stage_remember_store_action(
+                            uow,
+                            binding,
+                            store=store,
+                            authority=authority,
+                        )
+                        native = uow._store_outcome
+                        uow._store_outcome = candidate(native, uow)
+                        uow.complete_request()
+                self.assertEqual(self.counts(path), before)
+
+    def test_live_outcome_missing_and_duplicate_recording_are_rejected(self):
+        missing_path = str(
+            Path(self.temp.name) / "owner-missing-outcome.sqlite3"
+        )
+        missing_content = "Missing owner-bound suppressed outcome"
+        missing_store, missing_authority = self.prepare_suppressed_store(
+            path=missing_path,
+            content=missing_content,
+        )
+        missing_binding = self.binding(
+            request_id="C" * 32,
+            content=missing_content,
+        )
+        before = self.counts(missing_path)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            with missing_store._action_unit_of_work() as uow:
+                self.assertIsNone(uow.claim_request(missing_binding))
+                self.stage_remember_store_action(
+                    uow,
+                    missing_binding,
+                    store=missing_store,
+                    authority=missing_authority,
+                )
+                uow._store_outcome = None
+                uow.complete_request()
+        self.assertEqual(self.counts(missing_path), before)
+
+        duplicate_path = str(
+            Path(self.temp.name) / "owner-duplicate-outcome.sqlite3"
+        )
+        duplicate_content = "Duplicate owner-bound suppressed outcome"
+        duplicate_store, duplicate_authority = self.prepare_suppressed_store(
+            path=duplicate_path,
+            content=duplicate_content,
+        )
+        duplicate_binding = self.binding(
+            request_id="C" * 32,
+            content=duplicate_content,
+        )
+        with duplicate_store._action_unit_of_work() as uow:
+            self.assertIsNone(uow.claim_request(duplicate_binding))
+            self.stage_remember_store_action(
+                uow,
+                duplicate_binding,
+                store=duplicate_store,
+                authority=duplicate_authority,
+            )
+            native = uow._store_outcome
+            deferred = tuple(uow._deferred_actions)
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "invalid_state",
+            ):
+                uow._record_store_outcome(
+                    store=duplicate_store,
+                    action_id=native.action_id,
+                    store_result=object(),
+                    suppression_ids=(),
+                )
+            self.assertIs(uow._store_outcome, native)
+            self.assertEqual(tuple(uow._deferred_actions), deferred)
+            terminal = uow.complete_request()
+            self.assertEqual(uow.commit(), terminal)
+
+    def test_live_outcome_cannot_complete_twice_or_cross_restart(self):
+        path = str(Path(self.temp.name) / "owner-reload.sqlite3")
+        content = "Reload-bound suppressed memory"
+        store, authority = self.prepare_suppressed_store(
+            path=path,
+            content=content,
+        )
+        first_binding = self.binding(
+            request_id="C" * 32,
+            content=content,
+        )
+        with store._action_unit_of_work() as uow:
+            self.assertIsNone(uow.claim_request(first_binding))
+            self.stage_remember_store_action(
+                uow,
+                first_binding,
+                store=store,
+                authority=authority,
+            )
+            old_outcome = uow._store_outcome
+            first = uow.complete_request()
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "invalid_state",
+            ):
+                uow.complete_request()
+            self.assertEqual(uow.commit(), first)
+
+        importlib.reload(memory_action_ledger)
+        second_binding = self.binding(
+            request_id="D" * 32,
+            content=content,
+        )
+        before = self.counts(path)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            with store._action_unit_of_work() as uow:
+                self.assertIsNone(uow.claim_request(second_binding))
+                self.stage_remember_store_action(
+                    uow,
+                    second_binding,
+                    store=store,
+                    authority=authority,
+                )
+                uow._store_outcome = old_outcome
+                uow.complete_request()
+        self.assertEqual(self.counts(path), before)
 
     def test_correct_and_forget_terminal_semantics_commit_and_replay(self):
         (

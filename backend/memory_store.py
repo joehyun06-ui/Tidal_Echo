@@ -308,6 +308,8 @@ class MemoryStore:
             )
             transaction._defer_action(action_id)
         except memory_action_ledger.MemoryActionLedgerError as error:
+            if action_id not in transaction._deferred_actions:
+                self._finish_action(action_id, consumed=False)
             raise MemoryStoreError(error.category) from None
         return None
 

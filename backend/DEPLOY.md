@@ -473,12 +473,16 @@ data-free 的 `terminal_semantics_invalid` 并整笔回滚；replay 使用相同
 result-key 重指向均 fail closed，且不会执行新 request。
 
 terminal category 和 result key 不再由 caller 传入。Store 的私有 savepoint
-完成后，`MemoryStore` 会在同一 Unit of Work 中记录一个 sealed、
-`frozen`/`slots` 的 `TrustedStoreOutcomeV1`；它只携带 action/outcome、
-target/result item、当前 evidence/source、精确相关 suppression IDs 和 contract
-version。`complete_request()` 现在是零参数 API，只能消费这一份真实 Store outcome，
-并通过唯一闭集映射派生 terminal category/result key。future adapter 无法选择、
-覆盖或“建议”category。
+完成后，`MemoryStore` 先记录一个可供 snapshot/replay 使用的 frozen、slots、
+repr-safe `StoreOutcomeSemanticsV1`。它只携带 action/outcome、target/result item、
+当前 evidence/source、精确相关 suppression IDs 和 contract version；随后由当前
+UoW 将它包进仅用于首次完成的 sealed `TrustedStoreOutcomeV1` live envelope。
+envelope 绑定每个 UoW 唯一的 owner token、Store object identity、request ID、
+canonical message ID 和真实 capability/action ID。`complete_request()` 保持零参数，
+并在 snapshot/HMAC/terminal INSERT 前再次核验所有 owner 字段以及
+`outcome.action_id == sole deferred action ID`，然后才从 semantics 的唯一闭集映射
+派生 terminal category/result key。cross-UoW、cross-Store、cross-request、
+cross-canonical 和 cross-action-ID 移植全部 fail closed。
 
 每种 outcome 都固定自己的 suppression snapshot：remember/correct 的 suppressed
 绑定实际命中的 request/replacement fingerprint；corrected 绑定
@@ -492,7 +496,9 @@ Replay 先把数据库实际 terminal row 解码为严格的 `StoredTerminalRowV
 payload、重建当前 semantic snapshot、重算 HMAC 并 constant-time compare。不得用
 caller binding 的 request columns 代替数据库值。immutable triggers 保护正常写入；
 即使测试中离线移除 trigger、篡改 row、再恢复完全相同的正式 trigger，HMAC/snapshot
-仍会检测语义变化。
+仍会检测语义变化。Replay 只重建 `StoreOutcomeSemanticsV1`，不会伪造 live
+`TrustedStoreOutcomeV1`；owner token/Store reference 不持久化、不进入 HMAC、
+不写日志或响应，也不需要在 restart 后重建。
 
 本阶段只增加可信 composition root 将来可使用的内部 Unit of Work。它让 ledger、
 新 canonical action、capability 验证和 Memory Store 写入能够共享一个
@@ -500,15 +506,15 @@ caller binding 的 request columns 代替数据库值。immutable triggers 保�
 的 action、canonical reference、target、scope、kind、正文和 sensitivity 完全一致；
 但没有实现 Explicit Memory Entry Service，也没有 CLI、MCP、HTTP、Telegram 或
 Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会执行 Memory
-write。该 Unit of Work 是组合与事务原子性机制，不是同进程 Python sandbox。
+write。该 Unit of Work 的 owner token 与 exact-type 检查用于防止受审 composition
+path 的误接线和跨 owner 移植，不是恶意同进程 Python sandbox。
 
-第一轮独立复审的 High 1 / Medium 1 分别是 terminal ledger 可变与 referenced
-terminal semantics 认证不完整；第二轮定向修复加入了 immutable terminal triggers
-与 referenced-semantic authentication。最新独立复审结论是 original Medium
-closed、original High partially closed、new Medium 1；新 Medium 指向 caller-selected
-terminal outcome 与 replay 替代数据库 request columns。本轮定向修复已完成真实 Store
-outcome 绑定和实际 stored columns 重验，但仍须等待下一次独立复审。PR 必须继续保持
-Open/Draft，不得转 Ready、merge 或部署。
+此前复审发现的 terminal immutability、referenced semantics、真实 Store outcome
+mapping 与实际 stored request columns 重验均已完成。随后最后一个定向 Medium 指出
+live outcome 未绑定 owning UoW/Store/request/canonical，且 completion 未再次比较
+outcome action ID。本轮已拆分 replayable semantics 与 owner-bound live envelope，
+并在 defer、complete 两处核验全部 owner/action identity。该 finding 的定向修复已完成，
+仍须等待最后一次聚焦独立复审。PR 必须继续保持 Open/Draft，不得转 Ready、merge 或部署。
 
 本 PR 不批准部署或生产启用。`MEMORY_EXPLICIT_WRITES_ENABLED` 继续默认
 `false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8

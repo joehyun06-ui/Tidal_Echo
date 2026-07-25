@@ -362,13 +362,18 @@ under `memory-entry/request-terminal/v1` together with status, fixed result
 category, public result Memory key, canonical message reference, both UTC
 timestamps, the outcome/snapshot contract versions, and a versioned
 `TerminalSemanticSnapshotV1`. The terminal category and result key are not
-caller inputs. After the Store savepoint finishes, `MemoryStore` records one
-sealed `TrustedStoreOutcomeV1` in the owning Unit of Work. It contains only the
-action/kind/outcome, target/result item references, current evidence/source
-references, exact outcome-relevant suppression IDs, and contract version.
-`complete_request()` accepts no category or result-key parameters and applies
-the sole closed mapping from the recorded Store outcome to the terminal row.
-Unknown, cross-action, duplicate, missing, or cross-Store outcomes fail closed.
+caller inputs. After the Store savepoint finishes, `MemoryStore` records a
+frozen `StoreOutcomeSemanticsV1` containing only the action kind/outcome,
+target/result item references, current evidence/source references, exact
+outcome-relevant suppression IDs, and contract version. That replayable value
+is wrapped in one sealed, live `TrustedStoreOutcomeV1` owned by the current
+Unit of Work. The envelope additionally binds the owning UoW token, Store
+object, request ID, canonical message ID, and capability/action ID.
+`complete_request()` accepts no category or result-key parameters, requires the
+envelope's action ID to equal the sole deferred action, and applies the closed
+mapping from its semantics to the terminal row. Unknown, cross-action,
+duplicate, missing, cross-UoW, cross-Store, cross-request, cross-canonical, or
+cross-action-ID outcomes fail closed.
 
 The typed snapshot is built from the
 actual rows inside the same outer `BEGIN IMMEDIATE`: normalized canonical
@@ -381,11 +386,16 @@ matching requested/replacement fingerprint, correction binds the
 target's `user_forget` row. The snapshot value is neither persisted, logged,
 returned, nor placed in an exception; only its terminal HMAC digest is stored.
 
-Initial completion verifies those actual semantics against the claimed request
-and the already-matched Store capability before inserting the terminal row.
-Any mismatch raises the fixed data-free `terminal_semantics_invalid` category
-and rolls back canonical, evidence, item, source, suppression, profile, and
-ledger state. Replay rebuilds the same typed snapshot from current rows,
+Initial completion first revalidates the live envelope's exact type, seal,
+owning UoW/Store identities, request/canonical identities, semantics object,
+and action ID against the sole deferred capability. It then verifies the actual
+Store semantics against the claimed request and already-matched Store
+capability before inserting the terminal row.
+Envelope ownership/state mismatches raise the fixed data-free `invalid_state`
+category; Store/snapshot semantic mismatches raise the fixed data-free
+`terminal_semantics_invalid` category. Both paths roll back canonical,
+evidence, item, source, suppression, profile, and ledger state. Replay rebuilds
+the same typed snapshot from current rows,
 recomputes the terminal HMAC, compares it in constant time, and validates the
 same ownership and relationship invariants. Canonical, evidence, source, item,
 suppression, result-reference, deletion, or addition tampering therefore
@@ -395,7 +405,9 @@ fails closed without executing a new request. Replay first reads a strict
 then rebuilds the terminal payload from the database row's actual canonical,
 status, result, category, and timestamp columns. Caller request columns are
 never substituted for stored request columns during terminal HMAC
-recalculation. Immutable triggers protect normal writes; the HMAC and semantic
+recalculation. Replay reconstructs only `StoreOutcomeSemanticsV1`; it never
+creates a live owner-bound envelope and needs no UoW/Store owner token.
+Immutable triggers protect normal writes; the HMAC and semantic
 snapshot still detect row changes after a synthetic offline
 drop/tamper/restore of those exact triggers.
 
@@ -424,20 +436,25 @@ rollback releases the capability reservation; an uncertain commit burns the
 capability and requires later request-ID lookup rather than blind replay.
 
 This Unit of Work is an application-composition and database-atomicity
-mechanism inside the trusted Python process. Its private names, constructor
-token, connection ownership, and object checks are not a sandbox against
-arbitrary same-process Python execution.
+mechanism inside the trusted Python process. Its private names, per-UoW owner
+token, connection ownership, and exact object checks prevent reviewed
+composition-path miswiring and cross-owner transplantation; they are not a
+sandbox against arbitrary malicious same-process Python execution.
 
 The first independent review's High 1 / Medium 1 findings were the mutable
 terminal ledger and incomplete authentication of referenced terminal
-semantics. The second targeted revision added immutable terminal triggers and
-referenced-semantic authentication. The latest independent review closed the
-original Medium, left the original High partially closed, and reported one new
-Medium: caller-selected terminal outcomes and replay substitution of request
-columns. This targeted revision binds completion to the real Store outcome and
-revalidates the actual stored request columns. It records the targeted fix as
-complete, but the PR remains Draft and awaits another independent review; it
-is not ready for merge or deployment.
+semantics. Later targeted revisions added immutable terminal triggers,
+referenced-semantic authentication, real Store-outcome mapping, and replay
+validation of actual request columns. The following review closed those
+findings but found one new Medium: the live Store outcome did not bind its
+owning UoW/Store/request/canonical identities or recheck its action ID at
+completion. This targeted revision separates replayable
+`StoreOutcomeSemanticsV1` from the owner-bound live envelope and revalidates all
+five identities before snapshot construction. The owner token and Store
+reference remain process-local: they are not persisted, hashed, logged,
+returned, or reconstructed on replay. The fix is complete but still awaits a
+final focused independent review; the PR remains Draft and is not ready for
+merge or deployment.
 
 Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
 can apply and validate v8 without a fingerprint secret; explicit writes remain
