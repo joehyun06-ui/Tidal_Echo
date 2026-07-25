@@ -12,9 +12,15 @@ from enum import Enum
 from typing import Iterable, Sequence
 
 try:
-    from . import channel_store, memory_policy, memory_runtime
+    from . import (
+        channel_store,
+        memory_action_ledger,
+        memory_policy,
+        memory_runtime,
+    )
 except ImportError:  # support direct module execution in local tooling
     import channel_store
+    import memory_action_ledger
     import memory_policy
     import memory_runtime
 
@@ -246,10 +252,66 @@ class MemoryStore:
     def validate_schema(self) -> bool:
         try:
             with channel_store.connect(self.path) as conn:
-                channel_store.validate_memory_schema(conn)
+                channel_store.validate_memory_action_schema(conn)
             return True
         except (OSError, sqlite3.Error, ValueError):
             return False
+
+    def _action_unit_of_work(self):
+        """Create the internal root transaction for a reviewed composition path."""
+        self._require_write_runtime()
+        try:
+            runtime_policy = memory_runtime.require_runtime_authority(
+                self._authority
+            )
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+        if runtime_policy is not self._runtime_policy:
+            raise MemoryStoreError("runtime_authority_invalid")
+        return memory_action_ledger._new_unit_of_work(
+            store=self,
+            secret=self._runtime_policy.fingerprint_hmac_secret,
+        )
+
+    def _write_connection(self, transaction: object | None):
+        if transaction is None:
+            return channel_store.connect(self.path)
+        if not isinstance(
+            transaction,
+            memory_action_ledger._MemoryActionUnitOfWork,
+        ):
+            raise MemoryStoreError("transaction_context_invalid")
+        try:
+            return transaction._store_connection(self)
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
+
+    def _defer_action_to_transaction(
+        self,
+        transaction: object | None,
+        action_id: str | None,
+        *,
+        consumed: bool,
+        result: StoreResult | None,
+        suppression_ids: tuple[int, ...],
+    ) -> str | None:
+        if transaction is None or action_id is None or not consumed:
+            return action_id
+        if result is None:
+            raise MemoryStoreError("invalid_state")
+        try:
+            transaction._record_store_outcome(
+                store=self,
+                action_id=action_id,
+                store_result=result,
+                suppression_ids=suppression_ids,
+            )
+            transaction._defer_action(action_id)
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            if action_id not in transaction._deferred_actions:
+                self._finish_action(action_id, consumed=False)
+            raise MemoryStoreError(error.category) from None
+        return None
 
     def _require_write_runtime(self) -> None:
         try:
@@ -564,7 +626,7 @@ class MemoryStore:
         return matched
 
     @staticmethod
-    def _is_suppressed_conn(
+    def _matching_suppression_ids(
         conn: sqlite3.Connection,
         *,
         scope_type: str,
@@ -572,22 +634,23 @@ class MemoryStore:
         kind: str,
         fingerprint_version: int,
         fingerprint: bytes,
-    ) -> bool:
+    ) -> tuple[int, ...]:
         rows = conn.execute(
-            """SELECT normalized_fingerprint FROM memory_suppressions
+            """SELECT id,normalized_fingerprint FROM memory_suppressions
                WHERE scope_type=? AND scope_ref=? AND kind=? AND fingerprint_version=?
                ORDER BY id""",
             (scope_type, scope_ref, kind, fingerprint_version),
         ).fetchall()
-        matched = False
+        matched: list[int] = []
         for row in rows:
             stored = row["normalized_fingerprint"]
             current = (
                 isinstance(stored, bytes)
                 and memory_policy.secure_digest_equal(stored, fingerprint)
             )
-            matched = current or matched
-        return matched
+            if current:
+                matched.append(int(row["id"]))
+        return tuple(matched)
 
     @staticmethod
     def _insert_sources(
@@ -626,7 +689,7 @@ class MemoryStore:
         fingerprint_version: int,
         reason_category: str,
         stamp: str,
-    ) -> None:
+    ) -> int:
         conn.execute(
             """INSERT INTO memory_suppressions
                (scope_type,scope_ref,kind,normalized_fingerprint,fingerprint_version,
@@ -644,6 +707,47 @@ class MemoryStore:
                 stamp,
             ),
         )
+        rows = conn.execute(
+            """SELECT id,normalized_fingerprint FROM memory_suppressions
+               WHERE scope_type=? AND scope_ref=? AND kind=?
+                 AND fingerprint_version=? ORDER BY id""",
+            (scope_type, scope_ref, kind, fingerprint_version),
+        ).fetchall()
+        matched_ids = tuple(
+            int(row["id"])
+            for row in rows
+            if (
+                isinstance(row["normalized_fingerprint"], bytes)
+                and memory_policy.secure_digest_equal(
+                    row["normalized_fingerprint"],
+                    fingerprint,
+                )
+            )
+        )
+        if len(matched_ids) != 1:
+            raise MemoryStoreError("conflict")
+        return matched_ids[0]
+
+    @staticmethod
+    def _forgotten_target_suppression_ids(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> tuple[int, ...]:
+        rows = conn.execute(
+            """SELECT id FROM memory_suppressions
+               WHERE scope_type=? AND scope_ref=? AND kind=?
+                 AND fingerprint_version=?
+                 AND reason_category='user_forget'
+                 AND created_at=? ORDER BY id""",
+            (
+                row["scope_type"],
+                row["scope_ref"],
+                row["kind"],
+                int(row["fingerprint_version"]),
+                row["updated_at"],
+            ),
+        ).fetchall()
+        return tuple(int(value["id"]) for value in rows)
 
     @staticmethod
     def _translate_sqlite_error(error: Exception) -> MemoryStoreError:
@@ -655,7 +759,13 @@ class MemoryStore:
         self,
         authorization: object | None,
         binding: memory_runtime.MemoryActionBinding,
+        transaction: object | None = None,
     ) -> str:
+        if transaction is not None:
+            try:
+                transaction._validate_store_action(self, binding)
+            except memory_action_ledger.MemoryActionLedgerError as error:
+                raise MemoryStoreError(error.category) from None
         try:
             return memory_runtime.begin_action_consumption(
                 self._authority,
@@ -688,13 +798,16 @@ class MemoryStore:
         sources: Iterable[memory_policy.ProvenanceInput],
         grant_kind: _GrantKind,
         authorization: object | None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
+        result: StoreResult | None = None
+        suppression_ids: tuple[int, ...] = ()
         try:
-            with channel_store.connect(self.path) as conn:
+            with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
@@ -714,7 +827,11 @@ class MemoryStore:
                         normalized_content=normalized_binding_content,
                         sensitivity=sensitivity,
                     )
-                    action_id = self._begin_action(authorization, binding)
+                    action_id = self._begin_action(
+                        authorization,
+                        binding,
+                        transaction=_transaction,
+                    )
                     normalized_content, validated_inputs = (
                         policy.validate_explicit_create(
                             kind=kind,
@@ -744,14 +861,15 @@ class MemoryStore:
                         kind=kind,
                         normalized_content=normalized_content,
                     )
-                    if self._is_suppressed_conn(
+                    suppression_ids = self._matching_suppression_ids(
                         conn,
                         scope_type=scope_type,
                         scope_ref=scope_ref,
                         kind=kind,
                         fingerprint=fingerprint,
                         fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                    ):
+                    )
+                    if suppression_ids:
                         conn.execute("ROLLBACK")
                         consumed = True
                         result = StoreResult("suppressed")
@@ -848,11 +966,20 @@ class MemoryStore:
             return result
         except MemoryStoreError:
             raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
         finally:
+            action_id = self._defer_action_to_transaction(
+                _transaction,
+                action_id,
+                consumed=consumed,
+                result=result,
+                suppression_ids=suppression_ids,
+            )
             self._finish_action(action_id, consumed=consumed)
 
     def create_explicit_memory_from_user_action(
@@ -865,6 +992,7 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         if kind in {"assistant_experience", "decision"}:
             raise MemoryStoreError("unsupported_evidence")
@@ -877,6 +1005,7 @@ class MemoryStore:
             sources=sources,
             grant_kind=_GrantKind.EXPLICIT_USER_MEMORY,
             authorization=authorization,
+            _transaction=_transaction,
         )
 
     def create_confirmed_project_decision_from_action(
@@ -889,6 +1018,7 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         if kind != "decision":
             raise MemoryStoreError("unsupported_evidence")
@@ -901,6 +1031,7 @@ class MemoryStore:
             sources=sources,
             grant_kind=_GrantKind.CONFIRMED_PROJECT_DECISION,
             authorization=authorization,
+            _transaction=_transaction,
         )
 
     def create_assistant_experience_from_action(
@@ -913,6 +1044,7 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         if kind != "assistant_experience":
             raise MemoryStoreError("unsupported_evidence")
@@ -925,6 +1057,7 @@ class MemoryStore:
             sources=sources,
             grant_kind=_GrantKind.ASSISTANT_EXPERIENCE,
             authorization=authorization,
+            _transaction=_transaction,
         )
 
     def correct_memory_from_user_action(
@@ -935,13 +1068,16 @@ class MemoryStore:
         sensitivity: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
+        result: StoreResult | None = None
+        suppression_ids: tuple[int, ...] = ()
         try:
-            with channel_store.connect(self.path) as conn:
+            with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
@@ -972,7 +1108,11 @@ class MemoryStore:
                         sensitivity=sensitivity,
                         memory_key=memory_key,
                     )
-                    action_id = self._begin_action(authorization, binding)
+                    action_id = self._begin_action(
+                        authorization,
+                        binding,
+                        transaction=_transaction,
+                    )
                     policy.validate_kind(old["kind"])
                     policy.validate_scope(old["scope_type"], old["scope_ref"])
                     normalized_content = policy.validate_content(
@@ -1044,14 +1184,15 @@ class MemoryStore:
                             and not self._runtime_policy.sensitive_storage_enabled
                         ):
                             raise MemoryStoreError("sensitive_storage_disabled")
-                        if self._is_suppressed_conn(
+                        suppression_ids = self._matching_suppression_ids(
                             conn,
                             scope_type=old["scope_type"],
                             scope_ref=old["scope_ref"],
                             kind=old["kind"],
                             fingerprint=fingerprint,
                             fingerprint_version=self._runtime_policy.fingerprint_version,
-                        ):
+                        )
+                        if suppression_ids:
                             conn.execute("ROLLBACK")
                             consumed = True
                             result = StoreResult("suppressed")
@@ -1105,7 +1246,7 @@ class MemoryStore:
                             )
                             if updated.rowcount != 1:
                                 raise MemoryStoreError("conflict")
-                            self._insert_suppression(
+                            suppression_ids = (self._insert_suppression(
                                 conn,
                                 scope_type=old["scope_type"],
                                 scope_ref=old["scope_ref"],
@@ -1114,7 +1255,7 @@ class MemoryStore:
                                 fingerprint_version=int(old["fingerprint_version"]),
                                 reason_category="corrected_obsolete",
                                 stamp=stamp,
-                            )
+                            ),)
                             row = conn.execute(
                                 "SELECT * FROM memory_items WHERE id=?", (new_id,),
                             ).fetchone()
@@ -1128,11 +1269,20 @@ class MemoryStore:
             return result
         except MemoryStoreError:
             raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
         finally:
+            action_id = self._defer_action_to_transaction(
+                _transaction,
+                action_id,
+                consumed=consumed,
+                result=result,
+                suppression_ids=suppression_ids,
+            )
             self._finish_action(action_id, consumed=consumed)
 
     def forget_memory_atomic(
@@ -1141,13 +1291,16 @@ class MemoryStore:
         memory_key: str,
         sources: Iterable[memory_policy.ProvenanceInput],
         authorization: object | None = None,
+        _transaction: object | None = None,
     ) -> StoreResult:
         self._require_write_runtime()
         policy = self._trusted_policy()
         action_id: str | None = None
         consumed = False
+        result: StoreResult | None = None
+        suppression_ids: tuple[int, ...] = ()
         try:
-            with channel_store.connect(self.path) as conn:
+            with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._require_write_runtime()
@@ -1172,7 +1325,11 @@ class MemoryStore:
                         sensitivity=row["sensitivity"],
                         memory_key=memory_key,
                     )
-                    action_id = self._begin_action(authorization, binding)
+                    action_id = self._begin_action(
+                        authorization,
+                        binding,
+                        transaction=_transaction,
+                    )
                     policy.validate_kind(row["kind"])
                     policy.validate_scope(row["scope_type"], row["scope_ref"])
                     validated_inputs = policy.validate_provenance_inputs(
@@ -1197,6 +1354,9 @@ class MemoryStore:
                         conn, int(row["id"]), sources_to_insert, stamp,
                     )
                     if row["status"] == "forgotten":
+                        suppression_ids = (
+                            self._forgotten_target_suppression_ids(conn, row)
+                        )
                         conn.execute("COMMIT")
                         consumed = True
                         result = StoreResult(
@@ -1206,7 +1366,7 @@ class MemoryStore:
                         fingerprint = row["normalized_fingerprint"]
                         if not isinstance(fingerprint, bytes):
                             raise MemoryStoreError("invalid_state")
-                        self._insert_suppression(
+                        suppression_ids = (self._insert_suppression(
                             conn,
                             scope_type=row["scope_type"],
                             scope_ref=row["scope_ref"],
@@ -1215,7 +1375,7 @@ class MemoryStore:
                             fingerprint_version=int(row["fingerprint_version"]),
                             reason_category="user_forget",
                             stamp=stamp,
-                        )
+                        ),)
                         updated = conn.execute(
                             """UPDATE memory_items
                                SET status='forgotten',normalized_content=NULL,
@@ -1240,11 +1400,20 @@ class MemoryStore:
             return result
         except MemoryStoreError:
             raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         except memory_policy.MemoryPolicyError as error:
             raise MemoryStoreError(error.category) from None
         except (OSError, sqlite3.Error, ValueError) as error:
             raise self._translate_sqlite_error(error) from None
         finally:
+            action_id = self._defer_action_to_transaction(
+                _transaction,
+                action_id,
+                consumed=consumed,
+                result=result,
+                suppression_ids=suppression_ids,
+            )
             self._finish_action(action_id, consumed=consumed)
 
     def get_item_by_key(self, memory_key: str) -> dict | None:

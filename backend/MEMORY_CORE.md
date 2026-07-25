@@ -296,14 +296,16 @@ MEMORY_FINGERPRINT_HMAC_SECRET=
 
 When Memory Core is disabled, no HMAC key is required and `/readyz` reports
 `memory_core=false` without making the service unready. Disabled startup applies
-and strictly validates core v1–v6; it neither requires nor repairs optional v7.
+and strictly validates core v1–v6; it neither requires nor repairs optional
+v7–v8.
 The shared core validator checks every v1–v6 migration marker, table/column,
 primary key, default, CHECK, foreign key, unique/partial index, explicit index,
 and trigger set. A recorded migration with a missing or changed core object
 returns only `core_schema_invalid` and is never silently repaired by
-`CREATE TABLE IF NOT EXISTS`. Optional v7 damage remains isolated only while
+`CREATE TABLE IF NOT EXISTS`. Optional v7–v8 damage remains isolated only while
 Memory is disabled.
-Enabled read-only mode atomically applies/validates v7 without requiring a key.
+Enabled read-only mode atomically applies/validates v7–v8 without requiring a
+key.
 Enabling explicit writes also requires a stable bounded Key ID and a dedicated,
 high-entropy 32–512 character printable-ASCII key distinct from all relay,
 channel, model, audit, and API-loop credentials. Invalid configuration or
@@ -332,6 +334,135 @@ remove the v7 schema marker or tables. Restore a consistent pre-v7 backup if a
 physical schema downgrade is required; never delete only a migration marker or
 hand-edit the tables.
 
+### Phase 1.5 action request ledger foundation
+
+Migration v8 is additive and adds only `memory_action_requests`, its explicit
+lookup index, and unconditional `BEFORE UPDATE` / `BEFORE DELETE` immutability
+triggers. It does not rebuild or modify v1-v7 tables or their data. The
+validator requires the exact two-trigger set and normalized SQL fingerprints;
+missing, modified, or additional ledger triggers fail closed. Terminal rows
+are inserted once and have no update path. The ledger remains a terminal
+request record for a later reviewed explicit action entry service; this change
+does not implement that service or connect a CLI, MCP tool, HTTP route,
+Telegram command, Operit command, or other transport.
+
+Each row binds a bounded server-issued request ID to a closed action kind and
+server-owned origin using a 32-byte HMAC-SHA-256 digest. The digest codec
+covers request ID, action kind, origin, target public Memory key, scope, Memory
+kind, sensitivity, normalized-content representation and version, and the
+canonical-action contract version. It reuses the dedicated Memory fingerprint
+HMAC secret only after write configuration is valid, under the independent
+domain `memory-entry/request-binding/v1`. Domain separation prevents a ledger
+digest from being substituted for a Memory fingerprint or profile check while
+avoiding another long-lived production secret. A plain content hash is never
+used.
+
+Before a terminal row commits, the same request fields are authenticated again
+under `memory-entry/request-terminal/v1` together with status, fixed result
+category, public result Memory key, canonical message reference, both UTC
+timestamps, the outcome/snapshot contract versions, and a versioned
+`TerminalSemanticSnapshotV1`. The terminal category and result key are not
+caller inputs. After the Store savepoint finishes, `MemoryStore` records a
+frozen `StoreOutcomeSemanticsV1` containing only the action kind/outcome,
+target/result item references, current evidence/source references, exact
+outcome-relevant suppression IDs, and contract version. That replayable value
+is wrapped in one sealed, live `TrustedStoreOutcomeV1` owned by the current
+Unit of Work. The envelope additionally binds the owning UoW token, Store
+object, request ID, canonical message ID, and capability/action ID.
+`complete_request()` accepts no category or result-key parameters, requires the
+envelope's action ID to equal the sole deferred action, and applies the closed
+mapping from its semantics to the terminal row. Unknown, cross-action,
+duplicate, missing, cross-UoW, cross-Store, cross-request, cross-canonical, or
+cross-action-ID outcomes fail closed.
+
+The typed snapshot is built from the
+actual rows inside the same outer `BEGIN IMMEDIATE`: normalized canonical
+text and server-owned channel/source projection; action evidence ownership and
+binding fields; every related Memory source; target/result item state, scope,
+kind, sensitivity, content-presence and supersession; and the exact
+outcome-required suppression rows. Remember/correct suppression binds the
+matching requested/replacement fingerprint, correction binds the
+`corrected_obsolete` row, and both `forgotten` and `already_forgotten` bind the
+target's `user_forget` row. The snapshot value is neither persisted, logged,
+returned, nor placed in an exception; only its terminal HMAC digest is stored.
+
+Initial completion first revalidates the live envelope's exact type, seal,
+owning UoW/Store identities, request/canonical identities, semantics object,
+and action ID against the sole deferred capability. It then verifies the actual
+Store semantics against the claimed request and already-matched Store
+capability before inserting the terminal row.
+Envelope ownership/state mismatches raise the fixed data-free `invalid_state`
+category; Store/snapshot semantic mismatches raise the fixed data-free
+`terminal_semantics_invalid` category. Both paths roll back canonical,
+evidence, item, source, suppression, profile, and ledger state. Replay rebuilds
+the same typed snapshot from current rows,
+recomputes the terminal HMAC, compares it in constant time, and validates the
+same ownership and relationship invariants. Canonical, evidence, source, item,
+suppression, result-reference, deletion, or addition tampering therefore
+fails closed without executing a new request. Replay first reads a strict
+`StoredTerminalRowV1`, compares its actual `request_id`, `action_kind`,
+`origin`, and `target_memory_key` to the caller binding field by field, and
+then rebuilds the terminal payload from the database row's actual canonical,
+status, result, category, and timestamp columns. Caller request columns are
+never substituted for stored request columns during terminal HMAC
+recalculation. Replay reconstructs only `StoreOutcomeSemanticsV1`; it never
+creates a live owner-bound envelope and needs no UoW/Store owner token.
+Immutable triggers protect normal writes; the HMAC and semantic
+snapshot still detect row changes after a synthetic offline
+drop/tamper/restore of those exact triggers.
+
+The ledger stores no Memory or canonical text copy, fingerprint, external
+user/device/session identity, complete metadata, capability, signature,
+Runtime Authority, Secret, Key ID, SQL, or exception body. It has no persisted
+`processing` state: a new request is claimed while an internal
+`BEGIN IMMEDIATE` owns the SQLite write lock, and only a fixed terminal
+`completed` or `failed` row can commit. The exact action/target/result/status
+combinations, digest shape, timestamps, foreign key, primary/unique keys,
+index, migration marker, and normalized DDL are validated fail closed.
+PR A intentionally exposes no helper that persists deterministic input
+validation failures: those return a fixed data-free category before canonical,
+ledger, profile, evidence, item, source, or suppression state is created.
+
+`MemoryStore` now also has a private transaction-aware foundation for a future
+composition-root service. The Store creates the Unit of Work from its fixed DB
+path and existing Runtime Authority; no caller supplies a connection, SQL,
+path, capability, or policy flag. The Unit of Work owns one root
+`BEGIN IMMEDIATE`. Existing Store operations reuse that connection through a
+private savepoint, retain all policy/capability/provenance checks, and verify
+that the actual Store capability binding exactly matches the claimed request
+action, canonical reference, target, scope, kind, content, and sensitivity.
+One-use capability completion is deferred until the root commit. A known
+rollback releases the capability reservation; an uncertain commit burns the
+capability and requires later request-ID lookup rather than blind replay.
+
+This Unit of Work is an application-composition and database-atomicity
+mechanism inside the trusted Python process. Its private names, per-UoW owner
+token, connection ownership, and exact object checks prevent reviewed
+composition-path miswiring and cross-owner transplantation; they are not a
+sandbox against arbitrary malicious same-process Python execution.
+
+The first independent review's High 1 / Medium 1 findings were the mutable
+terminal ledger and incomplete authentication of referenced terminal
+semantics. Later targeted revisions added immutable terminal triggers,
+referenced-semantic authentication, real Store-outcome mapping, and replay
+validation of actual request columns. The following review closed those
+findings but found one new Medium: the live Store outcome did not bind its
+owning UoW/Store/request/canonical identities or recheck its action ID at
+completion. This targeted revision separates replayable
+`StoreOutcomeSemanticsV1` from the owner-bound live envelope and revalidates all
+five identities before snapshot construction. The owner token and Store
+reference remain process-local: they are not persisted, hashed, logged,
+returned, or reconstructed on replay. The fix is complete but still awaits a
+final focused independent review; the PR remains Draft and is not ready for
+merge or deployment.
+
+Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
+can apply and validate v8 without a fingerprint secret; explicit writes remain
+disabled by default. Old v7 application code ignores the additive v8
+marker/table. Application rollback therefore leaves v8 in place; a physical
+schema downgrade still requires restoration of a consistent pre-v8 backup,
+never manual marker or table deletion.
+
 ## Deferred phases
 
 Phase 2 may add model-assisted candidate extraction with an independently
@@ -341,6 +472,6 @@ implemented or enabled by this change.
 
 ## Review status
 
-The third targeted fixes are implemented, but final independent review has not
-yet completed. This branch remains Draft and is not ready to merge or deploy;
-this document does not claim that every finding is closed.
+Phase 1.5 PR A is infrastructure only. It does not approve deployment,
+production Secret configuration, explicit-write activation, or a transport.
+It must remain Draft until independent security review completes.

@@ -448,3 +448,75 @@ dispatching 行。Kelivo 关闭时不检查 Kelivo 专属跨字段关系，`/v1/
 
 发布 v3 前必须备份完整 `relay.db`。若曾运行未提交的旧 v3 测试 schema，应删除测试数据库，
 或从 v2/上线前整库备份恢复；不能只修改 migration marker，也不要让启动逻辑猜测修复可疑结构。
+
+### Memory Phase 1.5 PR A：v8 request ledger（仅基础设施）
+
+Migration v8 仅新增 `memory_action_requests`、一个显式索引，以及无条件拒绝
+UPDATE/DELETE 的两个 immutable triggers，不修改或重建 v1–v7。validator 精确要求
+两个 trigger 的集合与 SQL fingerprint；缺失、修改或多余 trigger 都 fail closed。
+terminal row 只允许 INSERT once，不存在 UPDATE 路径。Memory Core 启用为 read-only
+时会原子应用并严格验证 v7–v8；这不需要 fingerprint Key ID/HMAC Secret，也不会启用写入。
+
+v8 ledger 只保存受限 request ID、闭集 action/origin、32-byte
+domain-separated HMAC binding、公开 target/result Memory key、terminal
+status/category 与 UTC timestamp。它不保存 Memory/canonical 正文副本、
+fingerprint、外部用户/设备/session identity、完整 metadata、capability/signature、
+Runtime Authority、Secret/Key ID、SQL 或异常正文；没有持久化 `processing` 状态。
+terminal HMAC 同时绑定 canonical reference、结果和版本化
+`TerminalSemanticSnapshotV1`。snapshot 在同一个外层 `BEGIN IMMEDIATE` 中从实际
+canonical、evidence、memory_sources、target/result item 和相关 suppression 行构建，
+验证正文/role/channel/source、evidence ownership/action、provenance link、
+kind/scope/sensitivity/state/supersession 与 request/Store capability 完全一致。
+snapshot 原文不落库、不记录、不返回；只保存 HMAC digest。首次完成不符返回固定且
+data-free 的 `terminal_semantics_invalid` 并整笔回滚；replay 使用相同 validator
+重建 snapshot、重算 HMAC 并 constant-time compare，任何 referenced-row 篡改、增删或
+result-key 重指向均 fail closed，且不会执行新 request。
+
+terminal category 和 result key 不再由 caller 传入。Store 的私有 savepoint
+完成后，`MemoryStore` 先记录一个可供 snapshot/replay 使用的 frozen、slots、
+repr-safe `StoreOutcomeSemanticsV1`。它只携带 action/outcome、target/result item、
+当前 evidence/source、精确相关 suppression IDs 和 contract version；随后由当前
+UoW 将它包进仅用于首次完成的 sealed `TrustedStoreOutcomeV1` live envelope。
+envelope 绑定每个 UoW 唯一的 owner token、Store object identity、request ID、
+canonical message ID 和真实 capability/action ID。`complete_request()` 保持零参数，
+并在 snapshot/HMAC/terminal INSERT 前再次核验所有 owner 字段以及
+`outcome.action_id == sole deferred action ID`，然后才从 semantics 的唯一闭集映射
+派生 terminal category/result key。cross-UoW、cross-Store、cross-request、
+cross-canonical 和 cross-action-ID 移植全部 fail closed。
+
+每种 outcome 都固定自己的 suppression snapshot：remember/correct 的 suppressed
+绑定实际命中的 request/replacement fingerprint；corrected 绑定
+`corrected_obsolete`；forgotten 与 already_forgotten 都绑定目标 Memory 的精确
+`user_forget` suppression。缺失、替换或增加影响这些关系的行会使首次完成或 replay
+fail closed。
+
+Replay 先把数据库实际 terminal row 解码为严格的 `StoredTerminalRowV1`，逐字段比较
+实际 `request_id/action_kind/origin/target_memory_key` 与 caller binding，再使用 row
+中实际的 canonical/status/result/category/created_at/updated_at 重建 terminal
+payload、重建当前 semantic snapshot、重算 HMAC 并 constant-time compare。不得用
+caller binding 的 request columns 代替数据库值。immutable triggers 保护正常写入；
+即使测试中离线移除 trigger、篡改 row、再恢复完全相同的正式 trigger，HMAC/snapshot
+仍会检测语义变化。Replay 只重建 `StoreOutcomeSemanticsV1`，不会伪造 live
+`TrustedStoreOutcomeV1`；owner token/Store reference 不持久化、不进入 HMAC、
+不写日志或响应，也不需要在 restart 后重建。
+
+本阶段只增加可信 composition root 将来可使用的内部 Unit of Work。它让 ledger、
+新 canonical action、capability 验证和 Memory Store 写入能够共享一个
+`BEGIN IMMEDIATE`，并在 capability 消费前核对实际 Store action 与已 claim request
+的 action、canonical reference、target、scope、kind、正文和 sensitivity 完全一致；
+但没有实现 Explicit Memory Entry Service，也没有 CLI、MCP、HTTP、Telegram 或
+Operit 入口。正式 App 仍只保留 read service；现有聊天路径不会执行 Memory
+write。该 Unit of Work 的 owner token 与 exact-type 检查用于防止受审 composition
+path 的误接线和跨 owner 移植，不是恶意同进程 Python sandbox。
+
+此前复审发现的 terminal immutability、referenced semantics、真实 Store outcome
+mapping 与实际 stored request columns 重验均已完成。随后最后一个定向 Medium 指出
+live outcome 未绑定 owning UoW/Store/request/canonical，且 completion 未再次比较
+outcome action ID。本轮已拆分 replayable semantics 与 owner-bound live envelope，
+并在 defer、complete 两处核验全部 owner/action identity。该 finding 的定向修复已完成，
+仍须等待最后一次聚焦独立复审。PR 必须继续保持 Open/Draft，不得转 Ready、merge 或部署。
+
+本 PR 不批准部署或生产启用。`MEMORY_EXPLICIT_WRITES_ENABLED` 继续默认
+`false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8
+表；应用回滚不得手工删除 v8 marker/table。若必须物理降级 schema，只能在停写后
+恢复一致的 pre-v8 整库备份。

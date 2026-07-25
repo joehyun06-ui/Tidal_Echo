@@ -629,6 +629,136 @@ def _migration_007(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+MEMORY_ACTION_REQUEST_TABLE_DDL = """CREATE TABLE memory_action_requests (
+        request_id TEXT PRIMARY KEY NOT NULL
+            CHECK(length(request_id) BETWEEN 32 AND 96
+                  AND request_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        action_kind TEXT NOT NULL
+            CHECK(action_kind IN ('remember','correct','forget')),
+        origin TEXT NOT NULL
+            CHECK(origin IN ('operator_cli','mcp','telegram','operit')),
+        request_binding_digest BLOB NOT NULL
+            CHECK(typeof(request_binding_digest)='blob'
+                  AND length(request_binding_digest)=32),
+        target_memory_key TEXT
+            CHECK(target_memory_key IS NULL
+                  OR (length(target_memory_key) BETWEEN 32 AND 96
+                      AND target_memory_key NOT GLOB '*[^A-Za-z0-9_-]*')),
+        canonical_message_id INTEGER UNIQUE,
+        result_memory_key TEXT
+            CHECK(result_memory_key IS NULL
+                  OR (length(result_memory_key) BETWEEN 32 AND 96
+                      AND result_memory_key NOT GLOB '*[^A-Za-z0-9_-]*')),
+        status TEXT NOT NULL CHECK(status IN ('completed','failed')),
+        result_category TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(
+            (action_kind='remember' AND target_memory_key IS NULL)
+            OR
+            (action_kind IN ('correct','forget') AND target_memory_key IS NOT NULL)
+        ),
+        CHECK(
+            (
+                status='completed'
+                AND canonical_message_id IS NOT NULL
+                AND (
+                    (
+                        action_kind='remember'
+                        AND (
+                            (result_category IN ('created','idempotent_existing')
+                             AND result_memory_key IS NOT NULL)
+                            OR
+                            (result_category='suppressed'
+                             AND result_memory_key IS NULL)
+                        )
+                    )
+                    OR
+                    (
+                        action_kind='correct'
+                        AND (
+                            (result_category IN ('corrected','unchanged')
+                             AND result_memory_key IS NOT NULL)
+                            OR
+                            (result_category='suppressed'
+                             AND result_memory_key IS NULL)
+                        )
+                    )
+                    OR
+                    (
+                        action_kind='forget'
+                        AND result_category IN ('forgotten','already_forgotten')
+                        AND result_memory_key=target_memory_key
+                    )
+                )
+            )
+            OR
+            (
+                status='failed'
+                AND canonical_message_id IS NULL
+                AND result_memory_key IS NULL
+                AND result_category IN (
+                    'authorization_expired','authorization_invalid',
+                    'authorization_not_yet_valid','authorization_replayed',
+                    'conflict','explicit_writes_disabled','feature_disabled',
+                    'invalid_content','invalid_kind','invalid_memory_key',
+                    'invalid_provenance','invalid_request','invalid_scope',
+                    'invalid_sensitivity','invalid_state',
+                    'memory_configuration_invalid','memory_schema_invalid',
+                    'not_found','request_binding_conflict',
+                    'sensitive_storage_disabled','sensitivity_downgrade',
+                    'storage_unavailable','terminal_semantics_invalid',
+                    'unsupported_evidence'
+                )
+            )
+        ),
+        CHECK(
+            length(created_at) BETWEEN 25 AND 40
+            AND created_at NOT GLOB '*[^0-9T:+.-]*'
+            AND substr(created_at,5,1)='-'
+            AND substr(created_at,8,1)='-'
+            AND substr(created_at,11,1)='T'
+            AND substr(created_at,14,1)=':'
+            AND substr(created_at,17,1)=':'
+            AND substr(created_at,-6)='+00:00'
+            AND updated_at=created_at
+        ),
+        FOREIGN KEY(canonical_message_id)
+            REFERENCES messages(id) ON DELETE RESTRICT)"""
+
+MEMORY_ACTION_REQUEST_INDEX_DDL = {
+    "idx_memory_action_requests_status_created":
+        "CREATE INDEX idx_memory_action_requests_status_created "
+        "ON memory_action_requests(status,created_at,request_id)",
+}
+
+MEMORY_ACTION_REQUEST_TRIGGER_DDL = {
+    "memory_action_requests_immutable_update":
+        """CREATE TRIGGER memory_action_requests_immutable_update
+           BEFORE UPDATE ON memory_action_requests
+           BEGIN
+             SELECT RAISE(ABORT,'memory_action_request_immutable');
+           END""",
+    "memory_action_requests_immutable_delete":
+        """CREATE TRIGGER memory_action_requests_immutable_delete
+           BEFORE DELETE ON memory_action_requests
+           BEGIN
+             SELECT RAISE(ABORT,'memory_action_request_immutable');
+           END""",
+}
+
+
+def _migration_008(conn: sqlite3.Connection) -> None:
+    """Add the terminal explicit-action request ledger without changing v1-v7."""
+    validate_memory_schema(conn)
+    conn.execute(MEMORY_ACTION_REQUEST_TABLE_DDL)
+    for statement in (
+        *MEMORY_ACTION_REQUEST_INDEX_DDL.values(),
+        *MEMORY_ACTION_REQUEST_TRIGGER_DDL.values(),
+    ):
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -1659,6 +1789,163 @@ def validate_memory_schema(conn: sqlite3.Connection) -> None:
             raise sqlite3.DatabaseError(f"invalid memory trigger fingerprint: {name}")
 
 
+def validate_memory_action_schema(conn: sqlite3.Connection) -> None:
+    """Reject a v8 marker unless the additive action ledger is exact."""
+    validate_memory_schema(conn)
+    marker = conn.execute(
+        """SELECT name,status FROM schema_migrations
+           WHERE version=8"""
+    ).fetchone()
+    if (
+        marker is None
+        or marker["name"] != "explicit_memory_action_request_ledger"
+        or marker["status"] != "applied"
+    ):
+        raise sqlite3.DatabaseError("invalid memory action migration marker")
+
+    rows = conn.execute("PRAGMA table_xinfo(memory_action_requests)").fetchall()
+    if any(int(row["hidden"]) != 0 for row in rows):
+        raise sqlite3.DatabaseError("invalid hidden memory action column")
+    actual_columns = {
+        row["name"]: (
+            str(row["type"]).upper(),
+            int(row["notnull"]),
+            row["dflt_value"],
+            int(row["pk"]),
+        )
+        for row in rows
+    }
+    expected_columns = {
+        "request_id": ("TEXT", 1, None, 1),
+        "action_kind": ("TEXT", 1, None, 0),
+        "origin": ("TEXT", 1, None, 0),
+        "request_binding_digest": ("BLOB", 1, None, 0),
+        "target_memory_key": ("TEXT", 0, None, 0),
+        "canonical_message_id": ("INTEGER", 0, None, 0),
+        "result_memory_key": ("TEXT", 0, None, 0),
+        "status": ("TEXT", 1, None, 0),
+        "result_category": ("TEXT", 1, None, 0),
+        "created_at": ("TEXT", 1, None, 0),
+        "updated_at": ("TEXT", 1, None, 0),
+    }
+    if actual_columns != expected_columns:
+        raise sqlite3.DatabaseError("invalid memory action schema columns")
+
+    actual_indexes = {
+        row["name"]: row
+        for row in conn.execute("PRAGMA index_list(memory_action_requests)")
+    }
+    expected_indexes = {
+        "sqlite_autoindex_memory_action_requests_1": (
+            True, "pk", False, ("request_id",),
+        ),
+        "sqlite_autoindex_memory_action_requests_2": (
+            True, "u", False, ("canonical_message_id",),
+        ),
+        "idx_memory_action_requests_status_created": (
+            False, "c", False, ("status", "created_at", "request_id"),
+        ),
+    }
+    if set(actual_indexes) != set(expected_indexes):
+        raise sqlite3.DatabaseError("invalid memory action index set")
+    for name, (unique, origin, partial, columns) in expected_indexes.items():
+        row = actual_indexes[name]
+        if (
+            bool(row["unique"]),
+            row["origin"],
+            bool(row["partial"]),
+        ) != (unique, origin, partial):
+            raise sqlite3.DatabaseError("invalid memory action index attributes")
+        try:
+            _validate_index_xinfo(conn, name, columns)
+        except sqlite3.DatabaseError:
+            raise sqlite3.DatabaseError(
+                "invalid memory action index columns"
+            ) from None
+
+    actual_fks = {
+        (
+            row["from"],
+            row["table"],
+            row["to"],
+            row["on_update"],
+            row["on_delete"],
+            row["match"],
+        )
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(memory_action_requests)"
+        )
+    }
+    if actual_fks != {
+        (
+            "canonical_message_id",
+            "messages",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        ),
+    }:
+        raise sqlite3.DatabaseError("invalid memory action foreign key")
+
+    table = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type='table' AND name='memory_action_requests'"""
+    ).fetchone()
+    if (
+        table is None
+        or _sql_fingerprint(str(table["sql"]))
+        != _sql_fingerprint(MEMORY_ACTION_REQUEST_TABLE_DDL)
+    ):
+        raise sqlite3.DatabaseError("invalid memory action table fingerprint")
+    for name, expected_sql in MEMORY_ACTION_REQUEST_INDEX_DDL.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if (
+            row is None
+            or _sql_fingerprint(str(row["sql"]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError("invalid memory action index fingerprint")
+
+    unexpected = {
+        (row["type"], row["name"])
+        for row in conn.execute(
+            """SELECT type,name FROM sqlite_master
+               WHERE (name LIKE 'memory_action_%'
+                      OR name LIKE 'idx_memory_action_%')
+                 AND name NOT LIKE 'sqlite_autoindex_%'"""
+        )
+    }
+    expected_objects = {
+        ("table", "memory_action_requests"),
+        ("index", "idx_memory_action_requests_status_created"),
+        ("trigger", "memory_action_requests_immutable_delete"),
+        ("trigger", "memory_action_requests_immutable_update"),
+    }
+    if unexpected != expected_objects:
+        raise sqlite3.DatabaseError("invalid memory action object set")
+    actual_triggers = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            """SELECT name,sql FROM sqlite_master
+           WHERE type='trigger' AND tbl_name='memory_action_requests'"""
+        )
+    }
+    if set(actual_triggers) != set(MEMORY_ACTION_REQUEST_TRIGGER_DDL):
+        raise sqlite3.DatabaseError("invalid memory action trigger set")
+    for name, expected_sql in MEMORY_ACTION_REQUEST_TRIGGER_DDL.items():
+        if (
+            _sql_fingerprint(str(actual_triggers[name]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError(
+                f"invalid memory action trigger fingerprint: {name}"
+            )
+
+
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "telegram_private_text_mvp", _migration_001),
     (2, "telegram_reliability", _migration_002),
@@ -1667,6 +1954,7 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
     (5, "dylan_heartbeat_foundation", _migration_005),
     (6, "dylan_heartbeat_hardening", _migration_006),
     (7, "explicit_memory_core_foundation", _migration_007),
+    (8, "explicit_memory_action_request_ledger", _migration_008),
 )
 CORE_MIGRATIONS = MIGRATIONS[:6]
 
@@ -1701,6 +1989,8 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 validate_core_schema_v1_v6(conn)
             if requested_latest >= 7:
                 validate_memory_schema(conn)
+            if requested_latest >= 8:
+                validate_memory_action_schema(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:
