@@ -198,8 +198,14 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         self._restart()
 
     def _restart(self):
-        global memory_explicit_actions
+        global memory_action_ledger, memory_explicit_actions
         runtime = bootstrap_runtime(self.path, memory_config())
+        memory_action_ledger = importlib.import_module(
+            "backend.memory_action_ledger"
+        )
+        memory_explicit_actions = importlib.import_module(
+            "backend.memory_explicit_actions"
+        )
         memory_explicit_actions = importlib.reload(memory_explicit_actions)
         backend = memory_explicit_actions.create_entry_backend(
             runtime.privileged_actions

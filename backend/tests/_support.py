@@ -22,6 +22,7 @@ def clear_backend_app_modules():
         "backend.kelivo_service", "backend.heartbeat_service",
         "backend.memory_policy", "backend.memory_runtime",
         "backend.memory_store", "backend.memory_service",
+        "backend.memory_action_ledger", "backend.memory_explicit_actions",
     )
     for name in module_names:
         sys.modules.pop(name, None)
@@ -76,7 +77,8 @@ class NoNetworkMixin:
 def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: bool = False,
              auto_idempotency: bool = False, operit_share: bool = False,
              memory: bool = False, memory_writes: bool = False,
-             memory_sensitive: bool = False, memory_secret: str = ""):
+             memory_sensitive: bool = False, memory_secret: str = "",
+             memory_entry: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -112,6 +114,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "HEARTBEAT_SCHEDULE_REVISION": "test-default",
         "MEMORY_CORE_ENABLED": "true" if memory else "false",
         "MEMORY_EXPLICIT_WRITES_ENABLED": "true" if memory_writes else "false",
+        "MEMORY_EXPLICIT_ENTRY_ENABLED": "true" if memory_entry else "false",
         "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
         "MEMORY_MAX_ITEM_CHARS": "1000",
         "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",

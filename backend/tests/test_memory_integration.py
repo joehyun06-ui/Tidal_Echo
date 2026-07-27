@@ -25,6 +25,15 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         ):
             return await request(module, "GET", "/readyz")
 
+    def _assert_no_entry_writer(self, module):
+        self.assertIsNone(module.MEMORY_EXPLICIT_ENTRY_SERVICES)
+        self.assertIsNone(module.memory_runtime._PROCESS_AUTHORITY)
+        self.assertFalse(hasattr(module.app.state, "memory_runtime"))
+        self.assertFalse(hasattr(module.app.state, "privileged_memory_actions"))
+        self.assertFalse(any(
+            "memory" in route.path.lower() for route in module.app.routes
+        ))
+
     async def test_default_disabled_reports_false_without_blocking_readiness(self):
         with tempfile.TemporaryDirectory() as root:
             module = load_app(root)
@@ -81,6 +90,160 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             response = await self._ready(module)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["checks"]["memory_core"])
+
+    async def test_entry_false_retains_read_only_object_graph(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                memory=True,
+                memory_writes=True,
+                memory_secret=TEST_HMAC_SECRET,
+                memory_entry=False,
+            )
+            response = await self._ready(module)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("memory_explicit_entry", response.json()["checks"])
+        self._assert_no_entry_writer(module)
+
+    async def test_entry_requires_core_and_writes_without_harming_core_check(self):
+        cases = (
+            (
+                "core_disabled",
+                False,
+                False,
+                False,
+                "memory_explicit_entry_requires_core",
+            ),
+            (
+                "writes_disabled",
+                True,
+                False,
+                True,
+                "memory_explicit_entry_requires_writes",
+            ),
+        )
+        for name, core, writes, core_ready, category in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                module = load_app(
+                    root,
+                    memory=core,
+                    memory_writes=writes,
+                    memory_entry=True,
+                )
+                response = await self._ready(module)
+                payload = response.json()
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    payload["checks"]["memory_core"],
+                    core_ready,
+                )
+                self.assertFalse(
+                    payload["checks"]["memory_explicit_entry"]
+                )
+                self.assertEqual(
+                    payload["errors"]["memory_explicit_entry"],
+                    category,
+                )
+                if core_ready:
+                    self.assertNotIn("memory_core", payload["errors"])
+                self._assert_no_entry_writer(module)
+
+    async def test_entry_missing_secret_has_no_writer(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                memory=True,
+                memory_writes=True,
+                memory_secret="",
+                memory_entry=True,
+            )
+            response = await self._ready(module)
+        payload = response.json()
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(payload["checks"]["memory_explicit_entry"])
+        self.assertEqual(
+            payload["errors"]["memory_explicit_entry"],
+            "memory_fingerprint_hmac_secret_missing",
+        )
+        self._assert_no_entry_writer(module)
+
+    async def test_entry_invalid_schema_and_profile_have_no_writer(self):
+        cases = (
+            (
+                "schema",
+                "DROP INDEX idx_memory_items_live_fingerprint",
+                "memory_schema_invalid",
+            ),
+            (
+                "profile",
+                """INSERT INTO memory_fingerprint_profile(
+                       singleton,key_id,key_check,normalization_version,
+                       fingerprint_version,created_at,updated_at
+                   ) VALUES(1,'wrong-key',zeroblob(32),1,1,'now','now')""",
+                "memory_fingerprint_profile_mismatch",
+            ),
+        )
+        for name, sql, category in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                initial = load_app(
+                    root,
+                    memory=True,
+                    memory_writes=True,
+                    memory_secret=TEST_HMAC_SECRET,
+                    memory_entry=False,
+                )
+                with closing(sqlite3.connect(initial.DB_PATH)) as connection:
+                    connection.execute(sql)
+                    connection.commit()
+                module = load_app(
+                    root,
+                    memory=True,
+                    memory_writes=True,
+                    memory_secret=TEST_HMAC_SECRET,
+                    memory_entry=True,
+                )
+                response = await self._ready(module)
+                payload = response.json()
+                self.assertEqual(response.status_code, 503)
+                self.assertFalse(
+                    payload["checks"]["memory_explicit_entry"]
+                )
+                self.assertEqual(
+                    payload["errors"]["memory_explicit_entry"],
+                    category,
+                )
+                self._assert_no_entry_writer(module)
+
+    async def test_fully_valid_entry_constructs_only_internal_bound_services(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                memory=True,
+                memory_writes=True,
+                memory_secret=TEST_HMAC_SECRET,
+                memory_entry=True,
+            )
+            response = await self._ready(module)
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["checks"]["memory_core"])
+        self.assertTrue(payload["checks"]["memory_explicit_entry"])
+        services = module.MEMORY_EXPLICIT_ENTRY_SERVICES
+        self.assertIsInstance(services, tuple)
+        self.assertEqual(
+            tuple(service._origin for service in services),
+            ("operator_cli", "mcp", "telegram", "operit"),
+        )
+        self.assertTrue(all(
+            type(service)
+            is module.memory_explicit_actions.ExplicitMemoryActionService
+            for service in services
+        ))
+        self.assertFalse(hasattr(module.app.state, "memory_runtime"))
+        self.assertFalse(hasattr(module.app.state, "privileged_memory_actions"))
+        self.assertFalse(any(
+            "memory" in route.path.lower() for route in module.app.routes
+        ))
 
     async def test_enabled_writes_missing_hmac_fail_closed_in_readiness(self):
         with tempfile.TemporaryDirectory() as root:
