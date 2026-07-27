@@ -1342,6 +1342,11 @@ class _MemoryActionUnitOfWork:
         expected_channel, expected_source = ORIGIN_CANONICAL_PROJECTION[
             binding.origin
         ]
+        expected_text = (
+            f"Forget explicit memory: {binding.target_memory_key}"
+            if binding.action_kind == "forget"
+            else binding.normalized_content
+        )
         if (
             snapshot.canonical.channel != expected_channel
             or snapshot.canonical.source != expected_source
@@ -1350,11 +1355,7 @@ class _MemoryActionUnitOfWork:
                 ("channel", expected_channel),
                 ("source", expected_source),
             )
-            or (
-                binding.normalized_content is not None
-                and snapshot.canonical.normalized_text
-                != binding.normalized_content
-            )
+            or snapshot.canonical.normalized_text != expected_text
         ):
             raise self._semantic_error()
 
@@ -1774,18 +1775,7 @@ class _MemoryActionUnitOfWork:
             suppression_ids = tuple(
                 suppression.suppression_id for suppression in semantics
             )
-        elif store_outcome == "forgotten":
-            semantics = self._suppression_semantics(
-                binding=binding,
-                relation="forgotten_target",
-                normalized_content=binding.normalized_content,
-                fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                reason_category="user_forget",
-            )
-            suppression_ids = tuple(
-                suppression.suppression_id for suppression in semantics
-            )
-        elif store_outcome == "already_forgotten":
+        elif store_outcome in {"forgotten", "already_forgotten"}:
             if binding.target_memory_key is None:
                 raise self._semantic_error()
             target = self._item_semantic(

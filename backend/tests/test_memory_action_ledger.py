@@ -993,6 +993,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         binding: memory_action_ledger.MemoryActionRequestBinding,
         spoof_outcome: str | None = None,
     ):
+        binding = replace(binding, normalized_content=None)
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
         with store._action_unit_of_work() as uow:
@@ -1000,10 +1001,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             if replay is not None:
                 return uow.commit(), True
             canonical_id = uow._insert_canonical_action(
-                text=(
-                    binding.normalized_content
-                    or "Forget previously forgotten memory"
-                ),
+                text=f"Forget explicit memory: {binding.target_memory_key}",
                 metadata={"channel": "web", "source": "relay"},
             )
             envelope = runtime_module.issue_action_envelope(
@@ -1014,7 +1012,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     kind=binding.kind,
                     scope_type=binding.scope_type,
                     scope_ref=binding.scope_ref,
-                    normalized_content=binding.normalized_content,
+                    normalized_content=None,
                     sensitivity=binding.sensitivity,
                     memory_key=binding.target_memory_key,
                 ),

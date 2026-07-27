@@ -93,8 +93,265 @@ def issue_request_id() -> str:
     return memory_action_ledger.issue_request_id()
 
 
+_ENTRY_BACKEND_CONSTRUCTOR_TOKEN = object()
+
+
+class MemoryActionEntryBackend:
+    """Reviewed internal owner of the PR A private transaction composition."""
+
+    __slots__ = ("_actions", "_store", "_policy")
+
+    def __init__(self, token: object, privileged_actions: object):
+        if (
+            token is not _ENTRY_BACKEND_CONSTRUCTOR_TOKEN
+            or type(privileged_actions) is not memory_service.PrivilegedMemoryActions
+        ):
+            raise ExplicitMemoryActionError("entry_composition_invalid")
+        self._actions = privileged_actions
+        self._store = privileged_actions._store
+        self._policy = privileged_actions._policy
+
+    def __repr__(self) -> str:
+        return "<MemoryActionEntryBackend>"
+
+    @staticmethod
+    def _validate_projection(*, origin: str, channel: str, source: str) -> None:
+        if _ORIGIN_PROJECTIONS.get(origin) != (channel, source):
+            raise ExplicitMemoryActionError("entry_composition_invalid")
+
+    @staticmethod
+    def _validate_memory_key(memory_key: object) -> str:
+        if (
+            not isinstance(memory_key, str)
+            or _MEMORY_KEY.fullmatch(memory_key) is None
+        ):
+            raise ExplicitMemoryActionError("invalid_memory_key")
+        return memory_key
+
+    @staticmethod
+    def _target(uow, memory_key: str, *, allow_forgotten: bool) -> dict:
+        row = uow._execute(
+            """SELECT memory_key,kind,scope_type,scope_ref,status,sensitivity
+               FROM memory_items WHERE memory_key=?""",
+            (memory_key,),
+        ).fetchone()
+        if row is None:
+            raise ExplicitMemoryActionError("not_found")
+        allowed = {"active", "forgotten"} if allow_forgotten else {"active"}
+        if row["status"] not in allowed:
+            raise ExplicitMemoryActionError("invalid_state")
+        return {
+            "memory_key": row["memory_key"],
+            "kind": row["kind"],
+            "scope_type": row["scope_type"],
+            "scope_ref": row["scope_ref"],
+            "status": row["status"],
+            "sensitivity": row["sensitivity"],
+        }
+
+    @staticmethod
+    def _safe_result(
+        terminal: memory_action_ledger.MemoryActionLedgerResult,
+        binding: memory_action_ledger.MemoryActionRequestBinding,
+        *,
+        replayed: bool,
+    ) -> ExplicitMemoryActionResult:
+        return ExplicitMemoryActionResult(
+            request_id=terminal.request_id,
+            action_kind=terminal.action_kind,
+            status=terminal.status,
+            category=terminal.result_category,
+            memory_key=terminal.result_memory_key,
+            kind=binding.kind,
+            scope_type=binding.scope_type,
+            sensitivity=binding.sensitivity,
+            replayed=replayed,
+        )
+
+    def _resolve_uncertain(
+        self,
+        binding: memory_action_ledger.MemoryActionRequestBinding,
+    ) -> ExplicitMemoryActionResult:
+        with self._store._action_unit_of_work() as lookup:
+            replay = lookup.claim_request(binding)
+            if replay is None:
+                raise ExplicitMemoryActionError("transaction_outcome_uncertain")
+            committed = lookup.commit()
+        return self._safe_result(committed, binding, replayed=True)
+
+    def _run(
+        self,
+        *,
+        prepare_binding,
+        canonical_text,
+        channel: str,
+        source: str,
+        action,
+    ) -> ExplicitMemoryActionResult:
+        binding = None
+        try:
+            with self._store._action_unit_of_work() as uow:
+                binding = prepare_binding(uow)
+                replay = uow.claim_request(binding)
+                if replay is not None:
+                    committed = uow.commit()
+                    return self._safe_result(committed, binding, replayed=True)
+                canonical_id = uow._insert_canonical_action(
+                    text=canonical_text(binding),
+                    metadata={"channel": channel, "source": source},
+                )
+                action(uow, canonical_id, binding)
+                uow.complete_request()
+                committed = uow.commit()
+                return self._safe_result(committed, binding, replayed=False)
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            if (
+                error.category == "transaction_outcome_uncertain"
+                and binding is not None
+            ):
+                return self._resolve_uncertain(binding)
+            raise
+
+    def remember(self, request, *, origin: str, channel: str, source: str):
+        self._validate_projection(origin=origin, channel=channel, source=source)
+        if type(request) is not RememberExplicitMemoryRequest:
+            raise ExplicitMemoryActionError("invalid_request")
+        if request.kind == "assistant_experience":
+            raise ExplicitMemoryActionError("unsupported_evidence")
+        self._policy.validate_kind(request.kind)
+        self._policy.validate_scope(request.scope_type, request.scope_ref)
+        normalized = self._policy.validate_content(
+            request.content,
+            request.sensitivity,
+            allow_existing_reclassification=True,
+        )
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id=request.request_id,
+            action_kind="remember",
+            origin=origin,
+            scope_type=request.scope_type,
+            scope_ref=request.scope_ref,
+            kind=request.kind,
+            sensitivity=request.sensitivity,
+            normalized_content=normalized,
+        )
+
+        def execute(uow, canonical_id, _binding):
+            arguments = {
+                "scope_type": request.scope_type,
+                "scope_ref": request.scope_ref,
+                "content": normalized,
+                "sensitivity": request.sensitivity,
+                "canonical_message_id": canonical_id,
+                "_transaction": uow,
+            }
+            if request.kind == "decision":
+                self._actions.confirm_project_decision(**arguments)
+            else:
+                self._actions.remember_explicit_user_message(
+                    kind=request.kind,
+                    **arguments,
+                )
+
+        return self._run(
+            prepare_binding=lambda _uow: binding,
+            canonical_text=lambda _binding: normalized,
+            channel=channel,
+            source=source,
+            action=execute,
+        )
+
+    def correct(self, request, *, origin: str, channel: str, source: str):
+        self._validate_projection(origin=origin, channel=channel, source=source)
+        if type(request) is not CorrectExplicitMemoryRequest:
+            raise ExplicitMemoryActionError("invalid_request")
+        memory_key = self._validate_memory_key(request.memory_key)
+        normalized = self._policy.validate_content(
+            request.replacement_content,
+            request.sensitivity,
+            allow_existing_reclassification=True,
+        )
+
+        def prepare(uow):
+            target = self._target(uow, memory_key, allow_forgotten=False)
+            if target["kind"] == "assistant_experience":
+                raise ExplicitMemoryActionError("unsupported_evidence")
+            return memory_action_ledger.MemoryActionRequestBinding(
+                request_id=request.request_id,
+                action_kind="correct",
+                origin=origin,
+                target_memory_key=memory_key,
+                scope_type=target["scope_type"],
+                scope_ref=target["scope_ref"],
+                kind=target["kind"],
+                sensitivity=request.sensitivity,
+                normalized_content=normalized,
+            )
+
+        def execute(uow, canonical_id, _binding):
+            self._actions.correct_explicit_user_memory(
+                memory_key=memory_key,
+                content=normalized,
+                sensitivity=request.sensitivity,
+                canonical_message_id=canonical_id,
+                _transaction=uow,
+            )
+
+        return self._run(
+            prepare_binding=prepare,
+            canonical_text=lambda _binding: normalized,
+            channel=channel,
+            source=source,
+            action=execute,
+        )
+
+    def forget(self, request, *, origin: str, channel: str, source: str):
+        self._validate_projection(origin=origin, channel=channel, source=source)
+        if type(request) is not ForgetExplicitMemoryRequest:
+            raise ExplicitMemoryActionError("invalid_request")
+        memory_key = self._validate_memory_key(request.memory_key)
+
+        def prepare(uow):
+            target = self._target(uow, memory_key, allow_forgotten=True)
+            return memory_action_ledger.MemoryActionRequestBinding(
+                request_id=request.request_id,
+                action_kind="forget",
+                origin=origin,
+                target_memory_key=memory_key,
+                scope_type=target["scope_type"],
+                scope_ref=target["scope_ref"],
+                kind=target["kind"],
+                sensitivity=target["sensitivity"],
+                normalized_content=None,
+            )
+
+        def execute(uow, canonical_id, _binding):
+            self._actions.forget_explicit_user_memory(
+                memory_key=memory_key,
+                canonical_message_id=canonical_id,
+                _transaction=uow,
+            )
+
+        return self._run(
+            prepare_binding=prepare,
+            canonical_text=lambda _binding: (
+                f"Forget explicit memory: {memory_key}"
+            ),
+            channel=channel,
+            source=source,
+            action=execute,
+        )
+
+
+def create_entry_backend(privileged_actions: object) -> MemoryActionEntryBackend:
+    return MemoryActionEntryBackend(
+        _ENTRY_BACKEND_CONSTRUCTOR_TOKEN,
+        privileged_actions,
+    )
+
+
 class ExplicitMemoryActionService:
-    """A fixed-origin façade; construction is reserved for the composition root."""
+    """A fixed-origin facade; construction is reserved for the composition root."""
 
     __slots__ = ("_backend", "_origin", "_channel", "_source")
 

@@ -1321,7 +1321,7 @@ class MemoryStore:
                         kind=row["kind"],
                         scope_type=row["scope_type"],
                         scope_ref=row["scope_ref"],
-                        normalized_content=row["normalized_content"],
+                        normalized_content=None,
                         sensitivity=row["sensitivity"],
                         memory_key=memory_key,
                     )
