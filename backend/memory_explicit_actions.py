@@ -173,18 +173,7 @@ class MemoryActionEntryBackend:
         binding: memory_action_ledger.MemoryActionRequestBinding,
     ) -> ExplicitMemoryActionResult:
         with self._store._action_unit_of_work() as lookup:
-            if binding.action_kind == "forget":
-                target = self._store._get_forget_target_metadata(
-                    binding.target_memory_key,
-                    _transaction=lookup,
-                )
-                if type(target) is not memory_store._ForgetTargetMetadataV1:
-                    raise ExplicitMemoryActionError("invalid_state")
-                lookup._require_prepared_forget_target(
-                    store=self._store,
-                    metadata=target,
-                )
-            replay = lookup.claim_request(binding)
+            replay = lookup._lookup_existing_terminal(binding)
             if replay is None:
                 raise ExplicitMemoryActionError("transaction_outcome_uncertain")
             committed = lookup.commit()
@@ -198,10 +187,25 @@ class MemoryActionEntryBackend:
         channel: str,
         source: str,
         action,
+        lookup_replay=None,
     ) -> ExplicitMemoryActionResult:
         binding = None
         try:
             with self._store._action_unit_of_work() as uow:
+                if lookup_replay is not None:
+                    terminal = lookup_replay(uow)
+                    if terminal is not None:
+                        if (
+                            type(terminal)
+                            is not memory_action_ledger._ForgetTerminalReplayV1
+                        ):
+                            raise ExplicitMemoryActionError("invalid_state")
+                        committed = uow.commit()
+                        return self._safe_result(
+                            committed,
+                            terminal.binding,
+                            replayed=True,
+                        )
                 binding = prepare_binding(uow)
                 replay = uow.claim_request(binding)
                 if replay is not None:
@@ -362,6 +366,11 @@ class MemoryActionEntryBackend:
             channel=channel,
             source=source,
             action=execute,
+            lookup_replay=lambda uow: uow.lookup_forget_terminal(
+                request_id=request.request_id,
+                origin=origin,
+                target_memory_key=memory_key,
+            ),
         )
 
 

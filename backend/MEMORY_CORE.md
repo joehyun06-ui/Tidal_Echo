@@ -467,7 +467,10 @@ compares all 11 fields again against its current write-side row. Replacement,
 mutation, stale, unregistered, cross-Store, cross-UoW, cross-request, and
 cross-origin objects fail closed. Registration is cleared on commit, rollback,
 and uncertain close; it is never persisted, hashed into terminal state,
-returned, represented with target data, logged, or reconstructed on replay.
+returned, represented with target data, or logged. It is created only after a
+same-transaction terminal probe proves that the request ID is absent and the
+request will enter the new-write path. Completed Forget replay and uncertain
+terminal lookup never create, seal, consume, or depend on a registration.
 The PR remains Draft and is not ready for merge or deployment.
 
 Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
@@ -495,16 +498,25 @@ origin, channel, source, canonical ID, result category, result key, Store
 outcome, or suppression semantics. This is trusted same-process miswiring
 control, not a Python sandbox.
 
-For each new request, the reviewed internal entry backend owns one outer
-`BEGIN IMMEDIATE`: it resolves correction/forget targets in that transaction,
-constructs the full request binding, claims the request, inserts exactly one
-new server-owned canonical action, invokes one fixed privileged action through
-the Store savepoint, validates the owner-bound Store outcome and semantic
-snapshot, inserts the terminal row, and commits. Terminal replay skips
-canonical insertion, capability issuance, and Store execution. A definite
-rollback releases the capability; an uncertain commit burns it, closes the
-current UoW, and performs only a fresh same-binding terminal lookup. A present
-terminal returns replay; an absent terminal returns
+The reviewed internal entry backend owns one outer `BEGIN IMMEDIATE`. Forget
+first probes `memory_action_requests` by request ID, fixed origin, and public
+target key. A present completed Forget terminal is authenticated from its
+actual stored request columns, current content-free tombstone,
+canonical/evidence/source/suppression semantics, and terminal HMAC. The
+tombstone supplies the persisted scope, kind, and sensitivity used to
+reconstruct and exactly validate the full binding. Replay then commits without
+target preparation, registration, canonical insertion, capability issuance,
+or Store execution. If the probe is absent, the same UoW performs the single A
+target projection, registers its exact object, constructs the binding, rechecks
+the ledger row in `claim_request()`, seals ownership only after that row is
+still absent, and proceeds through canonical insertion, Store savepoint,
+terminal validation/insertion, and outer commit. `BEGIN IMMEDIATE` keeps the
+probe-to-claim sequence single-winner.
+
+A definite rollback releases the capability; an uncertain commit burns it,
+closes the current UoW, and performs only a fresh same-binding
+existing-terminal lookup. That lookup never enters the new-request claim path.
+A present terminal returns replay; an absent terminal returns
 `transaction_outcome_uncertain` and is never blindly re-executed.
 
 Remember canonical text is normalized explicit user content. `decision` is
@@ -522,16 +534,25 @@ forgotten plaintext. Store state, tombstone, suppression, and the authenticated
 terminal snapshot are sufficient for restart replay.
 
 Every Forget-path `memory_items` read is one of three exact projections. A is
-the 11-field prepare/registration projection and runs once for each new request
-(and once to rebuild a replay binding). B is the Store projection: active
-Forget reads it once before and once after the update, while
+the 11-field prepare/registration projection and runs exactly once only for a
+new request after the terminal probe is absent. B is the Store projection:
+active Forget reads it once before and once after the update, while
 `already_forgotten` reads it once. C is the content-free tombstone projection
-with only metadata and `IS NULL` absence flags; completion and each replay read
-it once. Forget completion trusts the internal Store-produced item ID already
-bound to the registration and B row, while replay uses C's validated item ID,
-so neither path performs a separate `SELECT id`. The tombstone query has no
-self-join, and source semantics query only `memory_sources`, projecting
-`memory_id -> memory_key` from already validated terminal items.
+with only metadata and `IS NULL` absence flags; completion and every completed
+replay read it once. The resulting `memory_items` sequences are
+`A -> B(key) -> B(id) -> C` for new active Forget,
+`A -> B(key) -> C` for a new already-forgotten request, and only `C` for
+same-process replay, fresh-runtime replay, real process-restart replay, and
+uncertain terminal lookup. Forget completion trusts the internal
+Store-produced item ID already bound to the registration and B row, while
+replay uses C's validated item ID, so neither path performs a separate
+`SELECT id`. The tombstone query has no self-join, and source semantics query
+only `memory_sources`, projecting `memory_id -> memory_key` from already
+validated terminal items. A SQLite authorizer-backed test gate binds every
+`memory_items` read to an exact A/B/C statement fingerprint and rejects quoted,
+comment-adjacent, schema-qualified, CTE, alias, join, and subquery bypasses.
+Restart coverage uses two independent `sys.executable` subprocesses over one
+temporary SQLite database, not an in-process runtime bootstrap.
 
 `MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
 entry backend, service, facade, authority, or writer. True additionally

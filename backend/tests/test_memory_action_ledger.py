@@ -1296,6 +1296,51 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         ):
             uncertain_uow[0]._require_registered_forget_target(store=store)
 
+    def test_completed_forget_claim_replays_without_prepared_registration(self):
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-claim-no-registration")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="X" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        first, replayed = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=binding,
+        )
+        self.assertFalse(replayed)
+        self.assertEqual(first.result_category, "forgotten")
+        before = self.counts(path)
+        with (
+            mock.patch.object(
+                memory_action_ledger._MemoryActionUnitOfWork,
+                "_seal_registered_forget_target",
+                side_effect=AssertionError("replay must not seal registration"),
+            ),
+            store._action_unit_of_work() as uow,
+        ):
+            self.assertIsNone(uow._forget_target_metadata_identity)
+            self.assertIsNone(uow._forget_target_registration)
+            replay = uow.claim_request(binding)
+            self.assertEqual(replay, first)
+            self.assertIsNone(uow._forget_target_metadata_identity)
+            self.assertIsNone(uow._forget_target_registration)
+            committed = uow.commit()
+        self.assertEqual(committed, first)
+        self.assertEqual(self.counts(path), before)
+
     def assert_replay_rejected_without_growth(
         self,
         *,

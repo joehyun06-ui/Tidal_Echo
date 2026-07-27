@@ -553,17 +553,34 @@ Store/UoW identity、11 个 metadata 字段、request ID、origin、target key �
 request-binding digest。Privileged action 不接受 caller metadata，也不重复查询
 target，只能取得当前 UoW 已注册的 exact object；Store 写侧 B 查询会再次逐一比较
 11 个字段。伪造、替换、篡改、旧类实例、未注册或跨 Store/UoW/request/origin 的
-对象均 fail closed。Registration 仅存于进程内，并在 commit、rollback 或 uncertain
-close 时清除；不进入数据库、terminal、result、repr 或日志，restart replay 也不依赖它。
+对象均 fail closed。该 registration 只属于新写入路径：同一 `BEGIN IMMEDIATE`
+先按 request ID、固定 origin 与公开 target key probe terminal；只有 row 不存在时
+才执行 A、创建 registration，并在 `claim_request()` 再次确认 row 不存在后 seal。
+Registration 在 commit、rollback 或 uncertain close 时清除；不进入数据库、
+terminal、result、repr 或日志。
+
+已完成 Forget terminal replay 会从实际持久化 request columns 与当前 C tombstone
+重建完整 binding，验证 canonical/evidence/source/suppression semantic 与 terminal
+HMAC，然后直接 commit lookup UoW。Replay 不执行 A/B，不创建、seal 或消费
+registration，不签发 capability，也不调用 Store。Uncertain commit 关闭原 UoW 后
+只执行同 binding existing-terminal lookup；terminal 不存在时固定返回
+`transaction_outcome_uncertain`，绝不进入 new-request claim 或盲目重试。
 
 Forget 对 `memory_items` 的读取只有精确 A/B/C 三类：A 为 11 字段
-prepare/registration projection（每个新 request 一次；replay 重建 binding 时一次）；
+prepare/registration projection（仅每个新 request 一次）；
 B 为 Store projection（active 在 UPDATE 前后各一次，already-forgotten 一次）；
 C 为只含 tombstone metadata 与三个 `IS NULL` absence flag 的 terminal projection
-（completion 与每次 replay 各一次）。Completion 使用真实 Store outcome 携带并与
+（completion 与每次 completed replay 各一次）。实际 `memory_items` 序列为：
+new active `A -> B(key) -> B(id) -> C`，new already-forgotten
+`A -> B(key) -> C`，same-process/fresh-runtime/真实两进程 restart replay 与
+uncertain lookup 均只有 `C`。Completion 使用真实 Store outcome 携带并与
 registration/B row 核对的内部 item ID；replay 使用 C 的已验证 item ID，因此 Forget
 不再执行独立 `SELECT id`。Tombstone semantic 无 self-join；source semantic 只查询
 `memory_sources`，并从已验证 terminal item 建立 `memory_id -> memory_key` 映射。
+测试 gate 同时使用 statement exact fingerprint 与 SQLite authorizer，quoted
+identifier、comment adjacency、schema qualification、CTE、alias、join 与 subquery
+均不能绕过。真实 restart 测试由两个独立 `sys.executable` subprocess 共享一个临时
+SQLite 文件完成，不再把 in-process fresh runtime bootstrap 称为 process restart。
 
 环境变量保持：
 

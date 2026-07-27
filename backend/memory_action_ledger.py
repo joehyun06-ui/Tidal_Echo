@@ -181,6 +181,15 @@ class _RegisteredForgetTargetV1:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class _ForgetTerminalReplayV1:
+    binding: MemoryActionRequestBinding = field(repr=False)
+    result: MemoryActionLedgerResult = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "<ForgetTerminalReplayV1>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class StoredTerminalRowV1:
     request_id: str
     action_kind: str
@@ -2029,10 +2038,17 @@ class _MemoryActionUnitOfWork:
         self,
         binding: MemoryActionRequestBinding,
         stored: StoredTerminalRowV1,
+        *,
+        preloaded_forget_target: TerminalMemoryItemSemanticV1 | None = None,
     ) -> tuple[
         StoreOutcomeSemanticsV1,
         tuple[TerminalMemoryItemSemanticV1, ...],
     ]:
+        if (
+            stored.action_kind != "forget"
+            and preloaded_forget_target is not None
+        ):
+            raise self._semantic_error()
         try:
             store_outcome = TERMINAL_CATEGORY_TO_STORE_OUTCOME[
                 stored.action_kind
@@ -2112,10 +2128,18 @@ class _MemoryActionUnitOfWork:
         elif store_outcome in {"forgotten", "already_forgotten"}:
             if binding.target_memory_key is None:
                 raise self._semantic_error()
-            target = self._forgotten_item_semantic(
-                binding.target_memory_key,
-                relation="target_result",
-            )
+            target = preloaded_forget_target
+            if target is None:
+                target = self._forgotten_item_semantic(
+                    binding.target_memory_key,
+                    relation="target_result",
+                )
+            elif (
+                type(target) is not TerminalMemoryItemSemanticV1
+                or target.relation != "target_result"
+                or target.memory_key != binding.target_memory_key
+            ):
+                raise self._semantic_error()
             result_item_id = target.memory_id
             target_item_id = target.memory_id
             preloaded_items = (target,)
@@ -2157,27 +2181,20 @@ class _MemoryActionUnitOfWork:
             ),
         ), preloaded_items
 
-    def claim_request(
+    def _validate_existing_terminal(
         self,
-        binding: MemoryActionRequestBinding,
-    ) -> MemoryActionLedgerResult | None:
-        self._require_active()
-        if self._binding is not None:
-            raise MemoryActionLedgerError("invalid_state")
-        validated = _validate_binding(binding)
-        digest = request_binding_digest(self._secret, validated)
-        self._seal_registered_forget_target(validated, digest)
-        row = self._execute(
-            "SELECT * FROM memory_action_requests WHERE request_id=?",
-            (validated.request_id,),
-        ).fetchone()
-        self._binding = validated
-        self._binding_digest = digest
-        if row is None:
-            return None
-        stored = _stored_terminal_row(row)
+        validated: MemoryActionRequestBinding,
+        digest: bytes,
+        stored: StoredTerminalRowV1,
+        *,
+        preloaded_forget_target: TerminalMemoryItemSemanticV1 | None = None,
+    ) -> MemoryActionLedgerResult:
         if (
-            stored.request_id != validated.request_id
+            type(validated) is not MemoryActionRequestBinding
+            or not isinstance(digest, bytes)
+            or len(digest) != 32
+            or type(stored) is not StoredTerminalRowV1
+            or stored.request_id != validated.request_id
             or stored.action_kind != validated.action_kind
             or stored.origin != validated.origin
             or stored.target_memory_key != validated.target_memory_key
@@ -2189,6 +2206,7 @@ class _MemoryActionUnitOfWork:
             semantics, preloaded_items = self._replay_store_outcome(
                 validated,
                 stored,
+                preloaded_forget_target=preloaded_forget_target,
             )
             snapshot = self._build_terminal_semantic_snapshot(
                 validated,
@@ -2202,9 +2220,7 @@ class _MemoryActionUnitOfWork:
             stored_row=stored,
             semantic_snapshot=snapshot,
         )
-        if (
-            not hmac.compare_digest(stored.terminal_digest, expected_digest)
-        ):
+        if not hmac.compare_digest(stored.terminal_digest, expected_digest):
             raise MemoryActionLedgerError("request_binding_conflict")
         if result.status == "completed":
             self._validate_terminal_semantic_snapshot(
@@ -2215,8 +2231,124 @@ class _MemoryActionUnitOfWork:
                 result_memory_key=result.result_memory_key,
                 expected_action_id=None,
             )
+        self._binding = validated
+        self._binding_digest = bytes(digest)
         self._replay = result
         return result
+
+    def _lookup_existing_terminal(
+        self,
+        binding: MemoryActionRequestBinding,
+    ) -> MemoryActionLedgerResult | None:
+        self._require_active()
+        if (
+            self._binding is not None
+            or self._replay is not None
+            or self._terminal is not None
+            or self._forget_target_metadata_identity is not None
+            or self._forget_target_registration is not None
+        ):
+            raise MemoryActionLedgerError("invalid_state")
+        validated = _validate_binding(binding)
+        digest = request_binding_digest(self._secret, validated)
+        row = self._execute(
+            "SELECT * FROM memory_action_requests WHERE request_id=?",
+            (validated.request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._validate_existing_terminal(
+            validated,
+            digest,
+            _stored_terminal_row(row),
+        )
+
+    def lookup_forget_terminal(
+        self,
+        *,
+        request_id: str,
+        origin: str,
+        target_memory_key: str,
+    ) -> _ForgetTerminalReplayV1 | None:
+        self._require_active()
+        if (
+            self._binding is not None
+            or self._replay is not None
+            or self._terminal is not None
+            or self._forget_target_metadata_identity is not None
+            or self._forget_target_registration is not None
+            or not isinstance(request_id, str)
+            or REQUEST_ID_PATTERN.fullmatch(request_id) is None
+            or origin not in ORIGINS
+            or not isinstance(target_memory_key, str)
+            or MEMORY_KEY_PATTERN.fullmatch(target_memory_key) is None
+        ):
+            raise MemoryActionLedgerError("invalid_request")
+        row = self._execute(
+            "SELECT * FROM memory_action_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        stored = _stored_terminal_row(row)
+        if (
+            stored.request_id != request_id
+            or stored.action_kind != "forget"
+            or stored.origin != origin
+            or stored.target_memory_key != target_memory_key
+            or stored.status != "completed"
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
+        target = self._forgotten_item_semantic(
+            target_memory_key,
+            relation="target_result",
+        )
+        validated = _validate_binding(MemoryActionRequestBinding(
+            request_id=stored.request_id,
+            action_kind="forget",
+            origin=stored.origin,
+            target_memory_key=stored.target_memory_key,
+            scope_type=target.scope_type,
+            scope_ref=target.scope_ref,
+            kind=target.kind,
+            sensitivity=target.sensitivity,
+            normalized_content=None,
+        ))
+        digest = request_binding_digest(self._secret, validated)
+        result = self._validate_existing_terminal(
+            validated,
+            digest,
+            stored,
+            preloaded_forget_target=target,
+        )
+        return _ForgetTerminalReplayV1(
+            binding=validated,
+            result=result,
+        )
+
+    def claim_request(
+        self,
+        binding: MemoryActionRequestBinding,
+    ) -> MemoryActionLedgerResult | None:
+        self._require_active()
+        if self._binding is not None:
+            raise MemoryActionLedgerError("invalid_state")
+        validated = _validate_binding(binding)
+        digest = request_binding_digest(self._secret, validated)
+        row = self._execute(
+            "SELECT * FROM memory_action_requests WHERE request_id=?",
+            (validated.request_id,),
+        ).fetchone()
+        if row is not None:
+            return self._validate_existing_terminal(
+                validated,
+                digest,
+                _stored_terminal_row(row),
+            )
+        self._seal_registered_forget_target(validated, digest)
+        self._binding = validated
+        self._binding_digest = digest
+        return None
 
     def _insert_canonical_action(self, *, text: str, metadata: dict) -> int:
         self._require_active()
