@@ -22,7 +22,7 @@ def clear_backend_app_modules():
         "backend.kelivo_service", "backend.heartbeat_service",
         "backend.memory_policy", "backend.memory_runtime",
         "backend.memory_store", "backend.memory_service",
-        "backend.memory_action_ledger", "backend.memory_explicit_actions",
+        "backend.memory_explicit_actions",
     )
     for name in module_names:
         sys.modules.pop(name, None)

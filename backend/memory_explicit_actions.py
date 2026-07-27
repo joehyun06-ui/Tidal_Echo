@@ -223,7 +223,6 @@ class MemoryActionEntryBackend:
         normalized = self._policy.validate_content(
             request.content,
             request.sensitivity,
-            allow_existing_reclassification=True,
         )
         binding = memory_action_ledger.MemoryActionRequestBinding(
             request_id=request.request_id,
@@ -269,7 +268,6 @@ class MemoryActionEntryBackend:
         normalized = self._policy.validate_content(
             request.replacement_content,
             request.sensitivity,
-            allow_existing_reclassification=True,
         )
 
         def prepare(uow):

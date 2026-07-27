@@ -520,3 +520,42 @@ outcome action ID。本轮已拆分 replayable semantics 与 owner-bound live en
 `false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8
 表；应用回滚不得手工删除 v8 marker/table。若必须物理降级 schema，只能在停写后
 恢复一致的 pre-v8 整库备份。
+
+### Memory Phase 1.5 PR B: explicit action entry（默认关闭）
+
+PR B 增加内部 `ExplicitMemoryActionService`、固定 origin 的 facade 和受审查的
+事务组合 backend。它不增加 CLI、MCP、HTTP route、Telegram/Operit/Kelivo/
+Galatea adapter、provider/model、outbox 或外部消息。四个 facade 只在 composition
+root 内创建，分别固定为 `operator_cli -> web/relay`、`mcp -> relay/mcp`、
+`telegram -> telegram/telegram` 和 `operit -> operit_share/operit`；调用方不能
+覆盖 provenance、canonical ID、Store outcome、category 或 result key。
+
+每个新 request 在同一个 outer `BEGIN IMMEDIATE` 中完成 target resolution、
+完整 binding、claim、全新 server-owned canonical action、固定 privileged action、
+Store savepoint、owner-bound outcome/semantic validation、terminal INSERT 与 COMMIT。
+同 ID/同 binding 只做 terminal replay；同 ID/不同 binding/action 返回
+`request_binding_conflict`。不确定 COMMIT 只用新查询 UoW 查 terminal：存在则
+replay，不存在则固定返回 `transaction_outcome_uncertain`，绝不盲目重执行。
+
+Forget canonical 固定为
+`Forget explicit memory: <public memory_key>`，binding/capability 的
+`normalized_content=None`。旧正文不会被读取或复制到 canonical、result、error、
+repr、readiness 或日志；restart replay 依赖 target/tombstone/suppression 与已认证
+terminal snapshot。Category 与 result key 始终来自真实 Store outcome。
+
+环境变量保持：
+
+```dotenv
+MEMORY_CORE_ENABLED=false
+MEMORY_EXPLICIT_WRITES_ENABLED=false
+MEMORY_EXPLICIT_ENTRY_ENABLED=false
+```
+
+只有三者都为 true，且 fingerprint Key ID/HMAC Secret、profile、v7/v8 schema
+全部有效时，App 才构造内部 entry backend 与四个 facade。否则没有 authority/
+writer、没有 route writer，并由独立的 `memory_explicit_entry` readiness 状态
+fail closed；entry-only 错误不破坏 `memory_core` 的只读 readiness。
+
+PR B 不修改 DDL、migration tuple 或 schema version：
+`migration_v9_needed=false`。本 PR 不批准部署、生产 Secret、Core/writes/entry
+启用或生产 Memory action；生产继续保持 read-only，并等待独立安全复审。

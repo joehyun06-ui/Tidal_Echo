@@ -95,12 +95,13 @@ privacy boundary described below.
 
 ## Runtime authority and service boundary
 
-Application startup calls
-`bootstrap_memory_runtime_from_environment(...)` exactly once. That composition
-root invokes the formal deployment configuration loader itself and freezes a
-`MemoryRuntimePolicy`; `MemoryStore` no longer accepts caller-provided Memory
-configuration. The composition root supplies the process-local authority to the
-Store, repeated bootstrap attempts are rejected without replacing the current
+Application startup first creates only a `MemoryReadService`, without a Runtime
+Authority, writable Store, or privileged action object. When the separately
+gated explicit entry is requested and all startup checks pass, the composition
+root calls `bootstrap_memory_runtime_from_environment(...)` exactly once. That
+bootstrap invokes the formal deployment configuration loader itself, freezes a
+`MemoryRuntimePolicy`, and supplies the process-local authority to the Store.
+Repeated bootstrap attempts are rejected without replacing the current
 authority, and later environment mutation cannot change the frozen policy.
 These are application wiring and misuse controls within the trusted process,
 not a sandbox for arbitrary same-process Python.
@@ -108,11 +109,13 @@ not a sandbox for arbitrary same-process Python.
 The bootstrap also creates an independent random action HMAC secret. It is
 generated anew for every process, is separate from the fingerprint secret, and
 is never placed in configuration, SQLite, logs, errors, readiness, or object
-representations. The application retains only `MemoryReadService`, backed by a
-separate read-only query object whose object graph contains neither the
-writable Store nor Runtime Authority. It discards `PrivilegedMemoryActions` and
-does not place the runtime authority or privileged object in a route,
-`app.state`, Telegram, Kelivo, Operit, Galatea, or another adapter.
+representations. With the explicit entry disabled or invalid, the application
+retains only `MemoryReadService`, backed by a separate read-only query object
+whose object graph contains neither the writable Store nor Runtime Authority.
+With the entry fully valid, only the reviewed internal backend and its four
+bound facades retain `PrivilegedMemoryActions`. The runtime authority and
+privileged object are never placed in a route, `app.state`, Telegram, Kelivo,
+Operit, Galatea, or another adapter.
 
 `MemoryReadService` has no create, correct, forget, or grant method. The
 privileged object has only these fixed-semantics actions:
@@ -287,6 +290,7 @@ non-empty whitespace-padded sources fail closed. Operit retains `source=operit`.
 ```dotenv
 MEMORY_CORE_ENABLED=false
 MEMORY_EXPLICIT_WRITES_ENABLED=false
+MEMORY_EXPLICIT_ENTRY_ENABLED=false
 MEMORY_SENSITIVE_STORAGE_ENABLED=false
 MEMORY_MAX_ITEM_CHARS=1000
 MEMORY_FORGET_RETENTION_POLICY=tombstone_without_content
@@ -463,6 +467,57 @@ marker/table. Application rollback therefore leaves v8 in place; a physical
 schema downgrade still requires restoration of a consistent pre-v8 backup,
 never manual marker or table deletion.
 
+### Phase 1.5 PR B explicit action entry
+
+PR B adds typed, frozen, slotted, representation-safe request/result contracts
+and an internal `ExplicitMemoryActionService`. Four composition-root factories
+bind provenance permanently:
+
+- `operator_cli` to `channel=web`, `source=relay`;
+- `mcp` to `channel=relay`, `source=mcp`;
+- `telegram` to `channel=telegram`, `source=telegram`;
+- `operit` to `channel=operit_share`, `source=operit`.
+
+The names describe future ownership only. PR B connects none of these facades
+to a CLI, MCP server, HTTP route, Telegram command, Operit command, provider,
+model, outbox, or external-message path. Callers cannot supply or override
+origin, channel, source, canonical ID, result category, result key, Store
+outcome, or suppression semantics. This is trusted same-process miswiring
+control, not a Python sandbox.
+
+For each new request, the reviewed internal entry backend owns one outer
+`BEGIN IMMEDIATE`: it resolves correction/forget targets in that transaction,
+constructs the full request binding, claims the request, inserts exactly one
+new server-owned canonical action, invokes one fixed privileged action through
+the Store savepoint, validates the owner-bound Store outcome and semantic
+snapshot, inserts the terminal row, and commits. Terminal replay skips
+canonical insertion, capability issuance, and Store execution. A definite
+rollback releases the capability; an uncertain commit burns it, closes the
+current UoW, and performs only a fresh same-binding terminal lookup. A present
+terminal returns replay; an absent terminal returns
+`transaction_outcome_uncertain` and is never blindly re-executed.
+
+Remember canonical text is normalized explicit user content. `decision` is
+always routed to confirmed project decision; `assistant_experience` is
+rejected. Correct canonical text is normalized replacement content and targets
+only a public Memory key. Forget uses only
+`Forget explicit memory: <public memory_key>`. Its request/capability binding
+has `normalized_content=None`; it never reads or copies forgotten text into
+canonical data, results, errors, representations, readiness, or logs. Store
+state, tombstone, suppression, and the authenticated terminal snapshot are
+sufficient for restart replay.
+
+`MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
+entry backend, service, facade, authority, or writer. True additionally
+requires Core, explicit writes, valid key ID/HMAC configuration, a valid
+fingerprint profile, and exact v7/v8 schema. Failure constructs no entry writer
+and reports the independent data-free `memory_explicit_entry` readiness check;
+entry-only configuration faults do not change `memory_core` readiness.
+
+PR B changes no DDL or migration tuple: `migration_v9_needed=false`. Production
+remains read-only, with Core/writes/entry activation and real Memory Secret
+configuration outside this PR's approval.
+
 ## Deferred phases
 
 Phase 2 may add model-assisted candidate extraction with an independently
@@ -472,6 +527,7 @@ implemented or enabled by this change.
 
 ## Review status
 
-Phase 1.5 PR A is infrastructure only. It does not approve deployment,
-production Secret configuration, explicit-write activation, or a transport.
-It must remain Draft until independent security review completes.
+Phase 1.5 PR B is an internal, default-disabled entry composition. It does not
+approve deployment, production Secret configuration, Core/write/entry
+activation, or a transport. It must remain Draft until independent security
+review completes.

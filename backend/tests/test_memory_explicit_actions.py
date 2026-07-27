@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -233,10 +234,24 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
     def test_remember_created_replay_decision_and_suppression(self):
         created = self._remember("A", "Synthetic explicit entry memory")
         self.assertEqual(created.category, "created")
+        canonical = self._canonical_rows()[0]
+        self.assertEqual(
+            (canonical["direction"], canonical["kind"]),
+            ("in", "user"),
+        )
+        self.assertEqual(
+            json.loads(canonical["meta"]),
+            {"channel": "web", "source": "relay"},
+        )
         replay = self._remember("A", "Synthetic explicit entry memory")
         self.assertTrue(replay.replayed)
         self.assertEqual(replay.memory_key, created.memory_key)
         self.assertEqual(len(self._canonical_rows()), 1)
+
+        existing = self._remember("Y", "Synthetic explicit entry memory")
+        self.assertEqual(existing.category, "idempotent_existing")
+        self.assertEqual(existing.memory_key, created.memory_key)
+        self.assertEqual(len(self._canonical_rows()), 2)
 
         decision = self._remember(
             "B",
@@ -247,7 +262,7 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         with channel_store.connect(self.path) as connection:
             evidence = connection.execute(
                 """SELECT action_type,evidence_type FROM memory_evidence_events
-                   WHERE canonical_message_id=2"""
+                   WHERE canonical_message_id=3"""
             ).fetchone()
         self.assertEqual(evidence["action_type"], "confirm_project_decision")
         self.assertEqual(evidence["evidence_type"], "confirmed_project_decision")
@@ -378,6 +393,118 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             self.service.correct_explicit_user_memory(request)
         self.assertEqual(self._canonical_rows(), [])
 
+    def test_correct_suppression_and_nonactive_targets_fail_closed(self):
+        target = self._remember("a", "Synthetic correction target")
+        blocked = self._remember("b", "Synthetic blocked replacement")
+        self.service.forget_explicit_user_memory(
+            memory_explicit_actions.ForgetExplicitMemoryRequest(
+                "c" * 32,
+                blocked.memory_key,
+            )
+        )
+        suppressed = self.service.correct_explicit_user_memory(
+            memory_explicit_actions.CorrectExplicitMemoryRequest(
+                "d" * 32,
+                target.memory_key,
+                "Synthetic blocked replacement",
+                "normal",
+            )
+        )
+        self.assertEqual(suppressed.category, "suppressed")
+        self.assertIsNone(suppressed.memory_key)
+
+        corrected = self.service.correct_explicit_user_memory(
+            memory_explicit_actions.CorrectExplicitMemoryRequest(
+                "e" * 32,
+                target.memory_key,
+                "Synthetic active replacement",
+                "normal",
+            )
+        )
+        for marker, memory_key in (
+            ("f", target.memory_key),
+            ("g", blocked.memory_key),
+        ):
+            with (
+                self.subTest(marker=marker),
+                self.assertRaisesRegex(
+                    memory_explicit_actions.ExplicitMemoryActionError,
+                    "invalid_state",
+                ),
+            ):
+                self.service.correct_explicit_user_memory(
+                    memory_explicit_actions.CorrectExplicitMemoryRequest(
+                        marker * 32,
+                        memory_key,
+                        "Synthetic rejected replacement",
+                        "normal",
+                    )
+                )
+        self.assertNotEqual(corrected.memory_key, target.memory_key)
+
+    def test_policy_rejects_sensitive_storage_and_encoded_credentials(self):
+        cases = (
+            (
+                "h",
+                "A synthetic private preference",
+                "sensitive",
+                "sensitive_storage_disabled",
+            ),
+            (
+                "i",
+                "I was diagnosed with a synthetic condition",
+                "normal",
+                "sensitivity_downgrade",
+            ),
+            (
+                "j",
+                "%3Ftoken%3Dsynthetic-secret-value-12345",
+                "normal",
+                "secret_detected",
+            ),
+            (
+                "k",
+                r'{"\u0061pi_key":"synthetic-secret-value-12345"}',
+                "normal",
+                "secret_detected",
+            ),
+        )
+        for marker, content, sensitivity, category in cases:
+            with self.subTest(category=category):
+                request = memory_explicit_actions.RememberExplicitMemoryRequest(
+                    marker * 32,
+                    "project",
+                    "global_user",
+                    "",
+                    content,
+                    sensitivity,
+                )
+                with self.assertRaises(
+                    memory_explicit_actions.ExplicitMemoryActionError
+                ) as raised:
+                    self.service.remember_explicit_user_memory(request)
+                self.assertEqual(raised.exception.category, category)
+                self.assertNotIn(content, str(raised.exception))
+                self.assertNotIn(content, repr(request))
+        self.assertEqual(self._canonical_rows(), [])
+
+    def test_ordinary_canonical_row_is_never_reused(self):
+        with channel_store.connect(self.path) as connection:
+            ordinary_id = connection.execute(
+                """INSERT INTO messages(ts,direction,kind,text,meta)
+                   VALUES('now','in','user','Synthetic ordinary history',
+                          '{"channel":"web","source":"relay"}')"""
+            ).lastrowid
+        created = self._remember("l", "Synthetic new explicit action")
+        with channel_store.connect(self.path) as connection:
+            evidence_id = connection.execute(
+                """SELECT canonical_message_id FROM memory_evidence_events
+                   WHERE action_type='remember_explicit_user'"""
+            ).fetchone()[0]
+        self.assertNotEqual(evidence_id, ordinary_id)
+        self.assertEqual(created.category, "created")
+        self.assertEqual(len(self._canonical_rows()), 2)
+
     def test_concurrent_same_request_has_one_canonical_for_2_4_8_callers(self):
         for workers in (2, 4, 8):
             with self.subTest(workers=workers):
@@ -416,6 +543,90 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 connection.execute("SELECT count(*) FROM messages").fetchone()[0],
                 3,
             )
+
+    def test_concurrent_different_requests_same_content_are_all_terminal(self):
+        requests = tuple(
+            memory_explicit_actions.RememberExplicitMemoryRequest(
+                chr(65 + index) * 32,
+                "project",
+                "global_user",
+                "",
+                "Synthetic shared concurrent content",
+                "normal",
+            )
+            for index in range(4)
+        )
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(
+                self.service.remember_explicit_user_memory,
+                requests,
+            ))
+        self.assertEqual(
+            sorted(result.category for result in results),
+            ["created", "idempotent_existing", "idempotent_existing",
+             "idempotent_existing"],
+        )
+        self.assertEqual(len({result.memory_key for result in results}), 1)
+        self.assertEqual(len(self._canonical_rows()), 4)
+
+    def test_concurrent_correct_correct_and_correct_forget_serialize(self):
+        for case in ("correct_correct", "correct_forget"):
+            with self.subTest(case=case):
+                target = self._remember(
+                    "m" if case == "correct_correct" else "n",
+                    f"Synthetic {case} target",
+                )
+                first = lambda: self.service.correct_explicit_user_memory(
+                    memory_explicit_actions.CorrectExplicitMemoryRequest(
+                        ("o" if case == "correct_correct" else "p") * 32,
+                        target.memory_key,
+                        f"Synthetic {case} replacement one",
+                        "normal",
+                    )
+                )
+                if case == "correct_correct":
+                    second = lambda: self.service.correct_explicit_user_memory(
+                        memory_explicit_actions.CorrectExplicitMemoryRequest(
+                            "q" * 32,
+                            target.memory_key,
+                            "Synthetic second correction",
+                            "normal",
+                        )
+                    )
+                else:
+                    second = lambda: self.service.forget_explicit_user_memory(
+                        memory_explicit_actions.ForgetExplicitMemoryRequest(
+                            "r" * 32,
+                            target.memory_key,
+                        )
+                    )
+                calls = (first, second)
+
+                def run(call):
+                    try:
+                        return call()
+                    except memory_explicit_actions.ExplicitMemoryActionError as error:
+                        return error
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    outcomes = list(pool.map(run, calls))
+                successes = [
+                    value for value in outcomes
+                    if isinstance(
+                        value,
+                        memory_explicit_actions.ExplicitMemoryActionResult,
+                    )
+                ]
+                failures = [
+                    value for value in outcomes
+                    if isinstance(
+                        value,
+                        memory_explicit_actions.ExplicitMemoryActionError,
+                    )
+                ]
+                self.assertEqual(len(successes), 1)
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0].category, "invalid_state")
 
     def test_uncertain_commit_queries_terminal_without_reexecuting(self):
         original = memory_action_ledger._MemoryActionUnitOfWork.commit
