@@ -539,9 +539,13 @@ replay，不存在则固定返回 `transaction_outcome_uncertain`，绝不盲目
 
 Forget canonical 固定为
 `Forget explicit memory: <public memory_key>`，binding/capability 的
-`normalized_content=None`。旧正文不会被读取或复制到 canonical、result、error、
-repr、readiness 或日志；restart replay 依赖 target/tombstone/suppression 与已认证
-terminal snapshot。Category 与 result key 始终来自真实 Store outcome。
+`normalized_content=None`。Target resolution 与 Store action 使用明确的
+metadata-only projection；active 旧正文不会被 SELECT、物化到 Python/SQLite result
+row 或 dict，也不会被复制。Terminal snapshot 只读取 tombstone metadata 与 SQL
+`IS NULL` 缺失标志，不把正文或 fingerprint 值返回 Python。Canonical、result、
+error、repr、readiness 和日志均不含旧正文；restart replay 依赖
+target/tombstone/suppression 与已认证 terminal snapshot。Category 与 result key
+始终来自真实 Store outcome。
 
 环境变量保持：
 

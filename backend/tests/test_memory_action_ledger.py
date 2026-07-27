@@ -2474,6 +2474,80 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             binding=forget_binding,
         )
 
+    def test_forget_replay_rejects_every_tombstone_semantic_tamper(self):
+        cases = (
+            ("status", "UPDATE memory_items SET status='active'"),
+            ("kind", "UPDATE memory_items SET kind='task_or_progress'"),
+            (
+                "scope",
+                """UPDATE memory_items
+                   SET scope_type='project',scope_ref='tampered'""",
+            ),
+            (
+                "sensitivity",
+                "UPDATE memory_items SET sensitivity='sensitive'",
+            ),
+            ("updated-at", "UPDATE memory_items SET updated_at='tampered'"),
+            (
+                "supersession",
+                "UPDATE memory_items SET superseded_by_id=id",
+            ),
+            (
+                "dangling-supersession",
+                "UPDATE memory_items SET superseded_by_id=id+999999",
+            ),
+            (
+                "content",
+                """UPDATE memory_items
+                   SET normalized_content='FORGET_TAMPERED_CONTENT'""",
+            ),
+            (
+                "fingerprint",
+                """UPDATE memory_items
+                   SET normalized_fingerprint=zeroblob(32)""",
+            ),
+        )
+        for index, (name, statement) in enumerate(cases):
+            with self.subTest(name=name):
+                (
+                    path,
+                    store,
+                    authority,
+                    remember_binding,
+                    remember_result,
+                ) = self.completed_remember_case(
+                    f"forget-tombstone-{index}"
+                )
+                binding = memory_action_ledger.MemoryActionRequestBinding(
+                    request_id=chr(75 + index) * 32,
+                    action_kind="forget",
+                    origin="operator_cli",
+                    target_memory_key=remember_result.result_memory_key,
+                    scope_type=remember_binding.scope_type,
+                    scope_ref=remember_binding.scope_ref,
+                    kind=remember_binding.kind,
+                    sensitivity=remember_binding.sensitivity,
+                    normalized_content=None,
+                )
+                result, replay = self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=binding,
+                )
+                self.assertFalse(replay)
+                self.assertEqual(result.result_category, "forgotten")
+                with channel_store.connect(path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("PRAGMA ignore_check_constraints=ON")
+                    conn.execute(statement)
+                    conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=binding,
+                )
+
     def test_replay_rejects_missing_outcome_required_suppression_rows(self):
         def remove_and_replay(path, store, binding, reason):
             with channel_store.connect(path) as conn:

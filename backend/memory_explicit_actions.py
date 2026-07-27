@@ -310,16 +310,25 @@ class MemoryActionEntryBackend:
         memory_key = self._validate_memory_key(request.memory_key)
 
         def prepare(uow):
-            target = self._target(uow, memory_key, allow_forgotten=True)
+            target = self._store._get_forget_target_metadata(
+                memory_key,
+                _transaction=uow,
+            )
+            if target is None:
+                raise ExplicitMemoryActionError("not_found")
+            if type(target) is not memory_store._ForgetTargetMetadataV1:
+                raise ExplicitMemoryActionError("invalid_state")
+            if target.kind == "assistant_experience":
+                raise ExplicitMemoryActionError("unsupported_evidence")
             return memory_action_ledger.MemoryActionRequestBinding(
                 request_id=request.request_id,
                 action_kind="forget",
                 origin=origin,
                 target_memory_key=memory_key,
-                scope_type=target["scope_type"],
-                scope_ref=target["scope_ref"],
-                kind=target["kind"],
-                sensitivity=target["sensitivity"],
+                scope_type=target.scope_type,
+                scope_ref=target.scope_ref,
+                kind=target.kind,
+                sensitivity=target.sensitivity,
                 normalized_content=None,
             )
 

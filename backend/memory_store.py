@@ -39,6 +39,21 @@ class StoreResult:
     item: dict | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _ForgetTargetMetadataV1:
+    memory_id: int
+    memory_key: str = field(repr=False)
+    kind: str
+    scope_type: str
+    scope_ref: str = field(repr=False)
+    status: str
+    sensitivity: str
+    fingerprint_version: int
+    normalized_fingerprint: bytes | None = field(repr=False)
+    superseded_by_id: int | None = field(repr=False)
+    updated_at: str
+
+
 @dataclass(frozen=True, repr=False)
 class _CanonicalAction:
     canonical_message_id: int
@@ -143,6 +158,15 @@ MAX_CANONICAL_META_DEPTH = 8
 MAX_CANONICAL_META_STRING_CHARS = 4096
 _SAFE_META_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _SENSITIVITY_RANK = {"normal": 0, "sensitive": 1, "restricted": 2}
+_FORGET_TARGET_COLUMNS = """
+    id,memory_key,kind,scope_type,scope_ref,status,sensitivity,
+    fingerprint_version,normalized_fingerprint,superseded_by_id,updated_at
+"""
+_FORGET_RESULT_COLUMNS = """
+    id,memory_key,kind,scope_type,scope_ref,status,sensitivity,
+    fingerprint_version,normalized_fingerprint,superseded_by_id,updated_at,
+    explicitness,confidence,first_observed_at,last_confirmed_at,created_at
+"""
 _PROFILE_STATE_TABLES = (
     "memory_items",
     "memory_sources",
@@ -224,6 +248,133 @@ def _safe_item(row: sqlite3.Row) -> dict:
     }
 
 
+def _forget_target_metadata(
+    row: sqlite3.Row,
+    *,
+    expected_memory_key: str,
+) -> _ForgetTargetMetadataV1:
+    try:
+        fingerprint = row["normalized_fingerprint"]
+        status = row["status"]
+        superseded_by_id = row["superseded_by_id"]
+        if (
+            type(row["id"]) is not int
+            or row["id"] <= 0
+            or not isinstance(row["memory_key"], str)
+            or memory_action_ledger.MEMORY_KEY_PATTERN.fullmatch(
+                row["memory_key"]
+            )
+            is None
+            or row["memory_key"] != expected_memory_key
+            or row["kind"] not in memory_policy.KINDS
+            or row["scope_type"] not in memory_policy.SCOPE_TYPES
+            or not isinstance(row["scope_ref"], str)
+            or status not in {"active", "forgotten"}
+            or row["sensitivity"] not in memory_policy.SENSITIVITIES
+            or type(row["fingerprint_version"]) is not int
+            or row["fingerprint_version"] != memory_policy.FINGERPRINT_VERSION
+            or superseded_by_id is not None
+            or not isinstance(row["updated_at"], str)
+            or not row["updated_at"]
+            or (
+                status == "active"
+                and (
+                    type(fingerprint) is not bytes
+                    or len(fingerprint) != memory_policy.HMAC_DIGEST_BYTES
+                )
+            )
+            or (status == "forgotten" and fingerprint is not None)
+        ):
+            raise MemoryStoreError("invalid_state")
+        if row["scope_type"] == "global_user":
+            if row["scope_ref"] != "":
+                raise MemoryStoreError("invalid_state")
+        elif (
+            memory_action_ledger.SCOPE_REF_PATTERN.fullmatch(
+                row["scope_ref"]
+            )
+            is None
+            or (
+                row["scope_type"] == "channel"
+                and row["scope_ref"] not in memory_policy.KNOWN_CHANNELS
+            )
+        ):
+            raise MemoryStoreError("invalid_state")
+    except MemoryStoreError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise MemoryStoreError("invalid_state") from None
+    return _ForgetTargetMetadataV1(
+        memory_id=int(row["id"]),
+        memory_key=row["memory_key"],
+        kind=row["kind"],
+        scope_type=row["scope_type"],
+        scope_ref=row["scope_ref"],
+        status=status,
+        sensitivity=row["sensitivity"],
+        fingerprint_version=int(row["fingerprint_version"]),
+        normalized_fingerprint=fingerprint,
+        superseded_by_id=superseded_by_id,
+        updated_at=row["updated_at"],
+    )
+
+
+def _safe_forgotten_item(
+    row: sqlite3.Row,
+    metadata: _ForgetTargetMetadataV1,
+) -> dict:
+    if type(metadata) is not _ForgetTargetMetadataV1:
+        raise MemoryStoreError("invalid_state")
+    try:
+        confidence = row["confidence"]
+        if (
+            row["id"] != metadata.memory_id
+            or row["memory_key"] != metadata.memory_key
+            or row["kind"] != metadata.kind
+            or row["scope_type"] != metadata.scope_type
+            or row["scope_ref"] != metadata.scope_ref
+            or row["status"] != "forgotten"
+            or row["sensitivity"] != metadata.sensitivity
+            or row["fingerprint_version"] != metadata.fingerprint_version
+            or row["normalized_fingerprint"] is not None
+            or row["superseded_by_id"] is not None
+            or row["updated_at"] != metadata.updated_at
+            or row["explicitness"] not in {"explicit", "inferred"}
+            or isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0.0 <= float(confidence) <= 1.0
+            or not all(
+                isinstance(row[name], str) and bool(row[name])
+                for name in (
+                    "first_observed_at",
+                    "last_confirmed_at",
+                    "created_at",
+                )
+            )
+        ):
+            raise MemoryStoreError("invalid_state")
+    except MemoryStoreError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise MemoryStoreError("invalid_state") from None
+    return {
+        "memory_key": metadata.memory_key,
+        "kind": metadata.kind,
+        "scope_type": metadata.scope_type,
+        "scope_ref": metadata.scope_ref,
+        "normalized_content": None,
+        "fingerprint_version": metadata.fingerprint_version,
+        "status": "forgotten",
+        "explicitness": row["explicitness"],
+        "confidence": float(confidence),
+        "sensitivity": metadata.sensitivity,
+        "first_observed_at": row["first_observed_at"],
+        "last_confirmed_at": row["last_confirmed_at"],
+        "created_at": row["created_at"],
+        "updated_at": metadata.updated_at,
+    }
+
+
 class MemoryStore:
     """Final enforcement point for all Memory Core production writes."""
 
@@ -285,6 +436,79 @@ class MemoryStore:
             return transaction._store_connection(self)
         except memory_action_ledger.MemoryActionLedgerError as error:
             raise MemoryStoreError(error.category) from None
+
+    def _get_forget_target_metadata(
+        self,
+        memory_key: str,
+        *,
+        _transaction: object | None = None,
+    ) -> _ForgetTargetMetadataV1 | None:
+        self._require_write_runtime()
+        if (
+            not isinstance(memory_key, str)
+            or memory_action_ledger.MEMORY_KEY_PATTERN.fullmatch(memory_key)
+            is None
+        ):
+            raise MemoryStoreError("invalid_memory_key")
+        try:
+            if _transaction is None:
+                with channel_store.connect(self.path) as conn:
+                    row = conn.execute(
+                        f"""SELECT {_FORGET_TARGET_COLUMNS}
+                            FROM memory_items WHERE memory_key=?""",
+                        (memory_key,),
+                    ).fetchone()
+            else:
+                if (
+                    type(_transaction)
+                    is not memory_action_ledger._MemoryActionUnitOfWork
+                    or _transaction._store is not self
+                ):
+                    raise MemoryStoreError("transaction_context_invalid")
+                row = _transaction._execute(
+                    f"""SELECT {_FORGET_TARGET_COLUMNS}
+                        FROM memory_items WHERE memory_key=?""",
+                    (memory_key,),
+                ).fetchone()
+            if row is None:
+                return None
+            return _forget_target_metadata(
+                row,
+                expected_memory_key=memory_key,
+            )
+        except MemoryStoreError:
+            raise
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
+        except (OSError, sqlite3.Error, ValueError):
+            raise MemoryStoreError("storage_unavailable") from None
+
+    def _validate_forget_target_binding(
+        self,
+        metadata: _ForgetTargetMetadataV1,
+        *,
+        _transaction: object,
+    ) -> None:
+        if (
+            type(metadata) is not _ForgetTargetMetadataV1
+            or type(_transaction)
+            is not memory_action_ledger._MemoryActionUnitOfWork
+            or _transaction._store is not self
+        ):
+            raise MemoryStoreError("transaction_context_invalid")
+        binding = _transaction._binding
+        if (
+            type(binding)
+            is not memory_action_ledger.MemoryActionRequestBinding
+            or binding.action_kind != "forget"
+            or binding.target_memory_key != metadata.memory_key
+            or binding.kind != metadata.kind
+            or binding.scope_type != metadata.scope_type
+            or binding.scope_ref != metadata.scope_ref
+            or binding.sensitivity != metadata.sensitivity
+            or binding.normalized_content is not None
+        ):
+            raise MemoryStoreError("request_binding_conflict")
 
     def _defer_action_to_transaction(
         self,
@@ -1307,22 +1531,25 @@ class MemoryStore:
                     if authorization is None:
                         raise MemoryStoreError("authorization_required")
                     row = conn.execute(
-                        "SELECT * FROM memory_items WHERE memory_key=?",
+                        f"""SELECT {_FORGET_RESULT_COLUMNS}
+                            FROM memory_items WHERE memory_key=?""",
                         (memory_key,),
                     ).fetchone()
                     if row is None:
                         raise MemoryStoreError("not_found")
-                    if row["status"] not in {"active", "forgotten"}:
-                        raise MemoryStoreError("invalid_state")
+                    target = _forget_target_metadata(
+                        row,
+                        expected_memory_key=memory_key,
+                    )
                     source, source_inputs = _binding_source(sources)
                     binding = memory_runtime.MemoryActionBinding(
                         action_type=memory_runtime.ACTION_FORGET_USER,
                         canonical_message_id=source.canonical_message_id,
-                        kind=row["kind"],
-                        scope_type=row["scope_type"],
-                        scope_ref=row["scope_ref"],
+                        kind=target.kind,
+                        scope_type=target.scope_type,
+                        scope_ref=target.scope_ref,
                         normalized_content=None,
-                        sensitivity=row["sensitivity"],
+                        sensitivity=target.sensitivity,
                         memory_key=memory_key,
                     )
                     action_id = self._begin_action(
@@ -1330,10 +1557,13 @@ class MemoryStore:
                         binding,
                         transaction=_transaction,
                     )
-                    policy.validate_kind(row["kind"])
-                    policy.validate_scope(row["scope_type"], row["scope_ref"])
+                    policy.validate_kind(target.kind)
+                    policy.validate_scope(
+                        target.scope_type,
+                        target.scope_ref,
+                    )
                     validated_inputs = policy.validate_provenance_inputs(
-                        row["kind"], source_inputs,
+                        target.kind, source_inputs,
                     )
                     self._validate_or_initialize_profile(conn, initialize=True)
                     stamp = channel_store.now_iso()
@@ -1347,32 +1577,33 @@ class MemoryStore:
                     sources_to_insert = self._bind_prepared_grants(
                         conn,
                         grants=prepared_grants,
-                        memory_id=int(row["id"]),
+                        memory_id=target.memory_id,
                         grant_kind=_GrantKind.EXPLICIT_USER_FORGET,
                     )
                     self._insert_sources(
-                        conn, int(row["id"]), sources_to_insert, stamp,
+                        conn, target.memory_id, sources_to_insert, stamp,
                     )
-                    if row["status"] == "forgotten":
+                    if target.status == "forgotten":
                         suppression_ids = (
                             self._forgotten_target_suppression_ids(conn, row)
                         )
                         conn.execute("COMMIT")
                         consumed = True
                         result = StoreResult(
-                            "already_forgotten", _safe_item(row),
+                            "already_forgotten",
+                            _safe_forgotten_item(row, target),
                         )
                     else:
-                        fingerprint = row["normalized_fingerprint"]
-                        if not isinstance(fingerprint, bytes):
+                        fingerprint = target.normalized_fingerprint
+                        if type(fingerprint) is not bytes:
                             raise MemoryStoreError("invalid_state")
                         suppression_ids = (self._insert_suppression(
                             conn,
-                            scope_type=row["scope_type"],
-                            scope_ref=row["scope_ref"],
-                            kind=row["kind"],
+                            scope_type=target.scope_type,
+                            scope_ref=target.scope_ref,
+                            kind=target.kind,
                             fingerprint=fingerprint,
-                            fingerprint_version=int(row["fingerprint_version"]),
+                            fingerprint_version=target.fingerprint_version,
                             reason_category="user_forget",
                             stamp=stamp,
                         ),)
@@ -1382,17 +1613,28 @@ class MemoryStore:
                                    normalized_fingerprint=NULL,
                                    superseded_by_id=NULL,updated_at=?
                                WHERE id=? AND status='active'""",
-                            (stamp, int(row["id"])),
+                            (stamp, target.memory_id),
                         )
                         if updated.rowcount != 1:
                             raise MemoryStoreError("conflict")
                         forgotten = conn.execute(
-                            "SELECT * FROM memory_items WHERE id=?",
-                            (int(row["id"]),),
+                            f"""SELECT {_FORGET_RESULT_COLUMNS}
+                                FROM memory_items WHERE id=?""",
+                            (target.memory_id,),
                         ).fetchone()
+                        forgotten_target = _forget_target_metadata(
+                            forgotten,
+                            expected_memory_key=memory_key,
+                        )
                         conn.execute("COMMIT")
                         consumed = True
-                        result = StoreResult("forgotten", _safe_item(forgotten))
+                        result = StoreResult(
+                            "forgotten",
+                            _safe_forgotten_item(
+                                forgotten,
+                                forgotten_target,
+                            ),
+                        )
                 except Exception:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")

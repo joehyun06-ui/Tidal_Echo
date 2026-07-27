@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import logging
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -360,6 +362,210 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             )
         )
         self.assertEqual(second.category, "already_forgotten")
+        canonical_count = len(self._canonical_rows())
+        self._restart()
+        second_replay = self.service.forget_explicit_user_memory(
+            memory_explicit_actions.ForgetExplicitMemoryRequest(
+                "K" * 32,
+                corrected.memory_key,
+            )
+        )
+        self.assertTrue(second_replay.replayed)
+        self.assertEqual(second_replay.category, "already_forgotten")
+        self.assertEqual(len(self._canonical_rows()), canonical_count)
+
+    def test_forget_never_materializes_old_plaintext_in_python_results(self):
+        sentinel = "FORGET_OLD_CONTENT_SENTINEL_7f3149e62a"
+        created = self._remember("s", sentinel)
+        request = memory_explicit_actions.ForgetExplicitMemoryRequest(
+            "t" * 32,
+            created.memory_key,
+        )
+        store_module = importlib.import_module(
+            type(self.service._backend._store).__module__
+        )
+        ledger_module = store_module.memory_action_ledger
+        store_channel_store = store_module.channel_store
+        original_connect = store_channel_store.connect
+        original_metadata = store_module.MemoryStore._get_forget_target_metadata
+        original_record = (
+            ledger_module._MemoryActionUnitOfWork._record_store_outcome
+        )
+        original_snapshot = (
+            ledger_module._MemoryActionUnitOfWork
+            ._build_terminal_semantic_snapshot
+        )
+        statements = []
+        metadata_values = []
+        store_items = []
+        snapshots = []
+        log_messages = []
+
+        def traced_connect(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        def capture_metadata(store, *args, **kwargs):
+            value = original_metadata(store, *args, **kwargs)
+            metadata_values.append(value)
+            return value
+
+        def capture_record(uow, **kwargs):
+            item = kwargs["store_result"].item
+            store_items.append(dict(item) if isinstance(item, dict) else item)
+            return original_record(uow, **kwargs)
+
+        def capture_snapshot(uow, *args, **kwargs):
+            value = original_snapshot(uow, *args, **kwargs)
+            snapshots.append(value)
+            return value
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                log_messages.append(record.getMessage())
+
+        handler = CaptureHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        self.addCleanup(root_logger.removeHandler, handler)
+        with (
+            mock.patch.object(
+                store_channel_store,
+                "connect",
+                new=traced_connect,
+            ),
+            mock.patch.object(
+                store_module.MemoryStore,
+                "get_item_by_key",
+                side_effect=AssertionError(
+                    "forget must not call get_item_by_key"
+                ),
+            ),
+            mock.patch.object(
+                store_module.MemoryStore,
+                "_get_forget_target_metadata",
+                new=capture_metadata,
+            ),
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_record_store_outcome",
+                new=capture_record,
+            ),
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_build_terminal_semantic_snapshot",
+                new=capture_snapshot,
+            ),
+        ):
+            result = self.service.forget_explicit_user_memory(request)
+
+        self.assertEqual(result.category, "forgotten")
+        self.assertTrue(metadata_values)
+        self.assertTrue(all(
+            type(value) is store_module._ForgetTargetMetadataV1
+            for value in metadata_values
+        ))
+        self.assertEqual(
+            tuple(
+                field.name
+                for field in dataclasses.fields(
+                    store_module._ForgetTargetMetadataV1
+                )
+            ),
+            (
+                "memory_id",
+                "memory_key",
+                "kind",
+                "scope_type",
+                "scope_ref",
+                "status",
+                "sensitivity",
+                "fingerprint_version",
+                "normalized_fingerprint",
+                "superseded_by_id",
+                "updated_at",
+            ),
+        )
+        self.assertTrue(store_items)
+        self.assertTrue(all(
+            item["normalized_content"] is None for item in store_items
+        ))
+        self.assertTrue(snapshots)
+
+        selects = tuple(
+            " ".join(statement.upper().split())
+            for statement in statements
+            if statement.lstrip().upper().startswith("SELECT")
+        )
+        memory_item_selects = tuple(
+            statement
+            for statement in selects
+            if "FROM MEMORY_ITEMS" in statement
+        )
+        self.assertTrue(memory_item_selects)
+        self.assertFalse(any(
+            "SELECT * FROM MEMORY_ITEMS" in statement
+            or "SELECT I.*" in statement
+            for statement in memory_item_selects
+        ))
+        for statement in memory_item_selects:
+            without_absence_flag = statement.replace(
+                "I.NORMALIZED_CONTENT IS NULL AS CONTENT_ABSENT",
+                "",
+            )
+            self.assertNotIn(
+                "NORMALIZED_CONTENT",
+                without_absence_flag,
+            )
+            if "CONTENT_ABSENT" in statement:
+                self.assertIn(
+                    "NORMALIZED_CONTENT IS NULL AS CONTENT_ABSENT",
+                    statement,
+                )
+                self.assertIn(
+                    "NORMALIZED_FINGERPRINT IS NULL AS FINGERPRINT_ABSENT",
+                    statement,
+                )
+                self.assertIn(
+                    "SUPERSEDED_BY_ID IS NULL AS SUPERSESSION_ABSENT",
+                    statement,
+                )
+
+        forget_canonical = self._canonical_rows()[-1]
+        with channel_store.connect(self.path) as connection:
+            terminal = dict(connection.execute(
+                """SELECT request_id,action_kind,origin,target_memory_key,
+                          result_memory_key,status,result_category
+                   FROM memory_action_requests WHERE request_id=?""",
+                (request.request_id,),
+            ).fetchone())
+            tombstone = dict(connection.execute(
+                """SELECT memory_key,status,normalized_content,
+                          normalized_fingerprint
+                   FROM memory_items WHERE memory_key=?""",
+                (created.memory_key,),
+            ).fetchone())
+        observed = (
+            statements,
+            metadata_values,
+            store_items,
+            tuple(dataclasses.asdict(value) for value in snapshots),
+            result,
+            repr(result),
+            repr(request),
+            repr(self.service),
+            repr(self.service._backend),
+            forget_canonical["text"],
+            forget_canonical["meta"],
+            terminal,
+            tombstone,
+            log_messages,
+        )
+        self.assertNotIn(sentinel, repr(observed))
+        self.assertEqual(tombstone["status"], "forgotten")
+        self.assertIsNone(tombstone["normalized_content"])
+        self.assertIsNone(tombstone["normalized_fingerprint"])
 
     def test_request_binding_conflicts_across_payload_and_action(self):
         created = self._remember("L", "Synthetic binding memory")
@@ -392,6 +598,234 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         ):
             self.service.correct_explicit_user_memory(request)
         self.assertEqual(self._canonical_rows(), [])
+
+    def test_forget_metadata_rejects_fake_subclass_and_invalid_fingerprints(self):
+        created = self._remember("u", "Synthetic forget metadata target")
+        store_module = importlib.import_module(
+            type(self.service._backend._store).__module__
+        )
+        with channel_store.connect(self.path) as connection:
+            row = connection.execute(
+                """SELECT id,memory_key,kind,scope_type,scope_ref,status,
+                          sensitivity,fingerprint_version,
+                          normalized_fingerprint,superseded_by_id,updated_at
+                   FROM memory_items WHERE memory_key=?""",
+                (created.memory_key,),
+            ).fetchone()
+        native = store_module._ForgetTargetMetadataV1(
+            memory_id=row["id"],
+            memory_key=row["memory_key"],
+            kind=row["kind"],
+            scope_type=row["scope_type"],
+            scope_ref=row["scope_ref"],
+            status=row["status"],
+            sensitivity=row["sensitivity"],
+            fingerprint_version=row["fingerprint_version"],
+            normalized_fingerprint=row["normalized_fingerprint"],
+            superseded_by_id=row["superseded_by_id"],
+            updated_at=row["updated_at"],
+        )
+        self.assertNotIn(native.memory_key, repr(native))
+        self.assertNotIn(native.normalized_fingerprint.hex(), repr(native))
+
+        class MetadataSubclass(store_module._ForgetTargetMetadataV1):
+            pass
+
+        fake_values = (
+            dataclasses.asdict(native),
+            MetadataSubclass(
+                native.memory_id,
+                native.memory_key,
+                native.kind,
+                native.scope_type,
+                native.scope_ref,
+                native.status,
+                native.sensitivity,
+                native.fingerprint_version,
+                native.normalized_fingerprint,
+                native.superseded_by_id,
+                native.updated_at,
+            ),
+        )
+        before = len(self._canonical_rows())
+        for index, fake in enumerate(fake_values):
+            with (
+                self.subTest(type=type(fake).__name__),
+                mock.patch.object(
+                    store_module.MemoryStore,
+                    "_get_forget_target_metadata",
+                    return_value=fake,
+                ),
+                self.assertRaisesRegex(
+                    memory_explicit_actions.ExplicitMemoryActionError,
+                    "invalid_state",
+                ),
+            ):
+                self.service.forget_explicit_user_memory(
+                    memory_explicit_actions.ForgetExplicitMemoryRequest(
+                        chr(118 + index) * 32,
+                        created.memory_key,
+                    )
+                )
+        self.assertEqual(len(self._canonical_rows()), before)
+
+        with channel_store.connect(self.path) as connection:
+            connection.execute("PRAGMA ignore_check_constraints=ON")
+            connection.execute(
+                """UPDATE memory_items SET normalized_fingerprint=x'01'
+                   WHERE memory_key=?""",
+                (created.memory_key,),
+            )
+            connection.execute("PRAGMA ignore_check_constraints=OFF")
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "invalid_state",
+        ):
+            self.service.forget_explicit_user_memory(
+                memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    "x" * 32,
+                    created.memory_key,
+                )
+            )
+        self.assertEqual(len(self._canonical_rows()), before)
+        with channel_store.connect(self.path) as connection:
+            connection.execute(
+                """UPDATE memory_items SET normalized_fingerprint=?
+                   WHERE memory_key=?""",
+                (native.normalized_fingerprint, created.memory_key),
+            )
+
+        forgotten_target = self._remember(
+            "y",
+            "Synthetic forgotten fingerprint target",
+        )
+        self.service.forget_explicit_user_memory(
+            memory_explicit_actions.ForgetExplicitMemoryRequest(
+                "z" * 32,
+                forgotten_target.memory_key,
+            )
+        )
+        after_forget = len(self._canonical_rows())
+        with channel_store.connect(self.path) as connection:
+            connection.execute("PRAGMA ignore_check_constraints=ON")
+            connection.execute(
+                """UPDATE memory_items SET normalized_fingerprint=zeroblob(32)
+                   WHERE memory_key=?""",
+                (forgotten_target.memory_key,),
+            )
+            connection.execute("PRAGMA ignore_check_constraints=OFF")
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "invalid_state",
+        ):
+            self.service.forget_explicit_user_memory(
+                memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    "0" * 32,
+                    forgotten_target.memory_key,
+                )
+            )
+        self.assertEqual(len(self._canonical_rows()), after_forget)
+
+    def test_forget_metadata_faults_and_midflow_change_roll_back_all_growth(self):
+        target = self._remember("1", "Synthetic metadata fault target")
+        store_module = importlib.import_module(
+            type(self.service._backend._store).__module__
+        )
+        ledger_module = importlib.import_module(
+            "backend.memory_action_ledger"
+        )
+
+        def counts():
+            with channel_store.connect(self.path) as connection:
+                return {
+                    table: connection.execute(
+                        f"SELECT count(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in (
+                        "messages",
+                        "memory_action_requests",
+                        "memory_evidence_events",
+                        "memory_items",
+                        "memory_sources",
+                        "memory_suppressions",
+                    )
+                }
+
+        missing_before = counts()
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "not_found",
+        ):
+            self.service.forget_explicit_user_memory(
+                memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    "4" * 32,
+                    "Z" * 32,
+                )
+            )
+        self.assertEqual(counts(), missing_before)
+
+        before = counts()
+        original_execute = ledger_module._MemoryActionUnitOfWork._execute
+
+        def fail_metadata_query(uow, sql, parameters=()):
+            normalized = " ".join(str(sql).upper().split())
+            if (
+                "FROM MEMORY_ITEMS WHERE MEMORY_KEY=?" in normalized
+                and "NORMALIZED_FINGERPRINT" in normalized
+                and "NORMALIZED_CONTENT" not in normalized
+            ):
+                raise sqlite3.OperationalError("synthetic metadata failure")
+            return original_execute(uow, sql, parameters)
+
+        with (
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_execute",
+                new=fail_metadata_query,
+            ),
+            self.assertRaisesRegex(
+                memory_explicit_actions.ExplicitMemoryActionError,
+                "storage_unavailable",
+            ),
+        ):
+            self.service.forget_explicit_user_memory(
+                memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    "2" * 32,
+                    target.memory_key,
+                )
+            )
+        self.assertEqual(counts(), before)
+
+        original_metadata = store_module.MemoryStore._get_forget_target_metadata
+        calls = 0
+
+        def changed_metadata(store, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            value = original_metadata(store, *args, **kwargs)
+            if calls == 2:
+                return dataclasses.replace(value, kind="decision")
+            return value
+
+        with (
+            mock.patch.object(
+                store_module.MemoryStore,
+                "_get_forget_target_metadata",
+                new=changed_metadata,
+            ),
+            self.assertRaisesRegex(
+                memory_explicit_actions.ExplicitMemoryActionError,
+                "request_binding_conflict",
+            ),
+        ):
+            self.service.forget_explicit_user_memory(
+                memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    "3" * 32,
+                    target.memory_key,
+                )
+            )
+        self.assertEqual(calls, 2)
+        self.assertEqual(counts(), before)
 
     def test_correct_suppression_and_nonactive_targets_fail_closed(self):
         target = self._remember("a", "Synthetic correction target")

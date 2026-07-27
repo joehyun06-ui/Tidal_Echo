@@ -502,10 +502,14 @@ always routed to confirmed project decision; `assistant_experience` is
 rejected. Correct canonical text is normalized replacement content and targets
 only a public Memory key. Forget uses only
 `Forget explicit memory: <public memory_key>`. Its request/capability binding
-has `normalized_content=None`; it never reads or copies forgotten text into
-canonical data, results, errors, representations, readiness, or logs. Store
-state, tombstone, suppression, and the authenticated terminal snapshot are
-sufficient for restart replay.
+has `normalized_content=None`. Target resolution and the Store action use
+explicit metadata-only projections: active plaintext is never selected,
+materialized into a Python/SQLite result row or dict, or copied. The terminal
+snapshot reads only tombstone metadata plus SQL `IS NULL` absence flags; it
+never returns plaintext or fingerprint values to Python. Canonical data,
+results, errors, representations, readiness, and logs therefore contain no
+forgotten plaintext. Store state, tombstone, suppression, and the authenticated
+terminal snapshot are sufficient for restart replay.
 
 `MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
 entry backend, service, facade, authority, or writer. True additionally

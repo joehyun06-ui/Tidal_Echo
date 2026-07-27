@@ -932,6 +932,92 @@ class _MemoryActionUnitOfWork:
             updated_at=row["updated_at"],
         )
 
+    def _forgotten_item_semantic(
+        self,
+        memory_key: str,
+        *,
+        relation: str,
+    ) -> TerminalMemoryItemSemanticV1:
+        row = self._execute(
+            """SELECT i.id,i.memory_key,i.status,i.kind,i.scope_type,
+                      i.scope_ref,i.sensitivity,i.fingerprint_version,
+                      i.explicitness,i.confidence,i.updated_at,
+                      s.memory_key AS superseded_by_memory_key,
+                      i.superseded_by_id IS NULL AS supersession_absent,
+                      i.normalized_content IS NULL AS content_absent,
+                      i.normalized_fingerprint IS NULL AS fingerprint_absent
+               FROM memory_items i
+               LEFT JOIN memory_items s ON s.id=i.superseded_by_id
+               WHERE i.memory_key=?""",
+            (memory_key,),
+        ).fetchone()
+        if row is None:
+            raise self._semantic_error()
+        try:
+            confidence = row["confidence"]
+            if (
+                type(row["id"]) is not int
+                or row["id"] <= 0
+                or not isinstance(row["memory_key"], str)
+                or MEMORY_KEY_PATTERN.fullmatch(row["memory_key"]) is None
+                or row["memory_key"] != memory_key
+                or row["status"] != "forgotten"
+                or row["kind"] not in memory_policy.KINDS
+                or row["scope_type"] not in memory_policy.SCOPE_TYPES
+                or not isinstance(row["scope_ref"], str)
+                or row["sensitivity"] not in memory_policy.SENSITIVITIES
+                or type(row["fingerprint_version"]) is not int
+                or row["fingerprint_version"]
+                != memory_policy.FINGERPRINT_VERSION
+                or row["explicitness"] != "explicit"
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or float(confidence) != 1.0
+                or not isinstance(row["updated_at"], str)
+                or not row["updated_at"]
+                or row["superseded_by_memory_key"] is not None
+                or type(row["supersession_absent"]) is not int
+                or row["supersession_absent"] != 1
+                or type(row["content_absent"]) is not int
+                or row["content_absent"] != 1
+                or type(row["fingerprint_absent"]) is not int
+                or row["fingerprint_absent"] != 1
+            ):
+                raise self._semantic_error()
+            if row["scope_type"] == "global_user":
+                if row["scope_ref"] != "":
+                    raise self._semantic_error()
+            elif (
+                SCOPE_REF_PATTERN.fullmatch(row["scope_ref"]) is None
+                or (
+                    row["scope_type"] == "channel"
+                    and row["scope_ref"] not in memory_policy.KNOWN_CHANNELS
+                )
+            ):
+                raise self._semantic_error()
+        except MemoryActionLedgerError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise self._semantic_error() from None
+        return TerminalMemoryItemSemanticV1(
+            relation=relation,
+            memory_id=int(row["id"]),
+            memory_key=memory_key,
+            status="forgotten",
+            kind=row["kind"],
+            scope_type=row["scope_type"],
+            scope_ref=row["scope_ref"],
+            sensitivity=row["sensitivity"],
+            content_present=False,
+            normalized_content=None,
+            fingerprint_version=int(row["fingerprint_version"]),
+            normalized_fingerprint=None,
+            superseded_by_memory_key=None,
+            explicitness=row["explicitness"],
+            confidence=float(confidence),
+            updated_at=row["updated_at"],
+        )
+
     def _source_semantics(
         self,
         *,
@@ -1228,7 +1314,14 @@ class _MemoryActionUnitOfWork:
                 if target_key == result_memory_key
                 else "target"
             )
-            items.append(self._item_semantic(target_key, relation=relation))
+            items.append(
+                self._forgotten_item_semantic(
+                    target_key,
+                    relation=relation,
+                )
+                if binding.action_kind == "forget"
+                else self._item_semantic(target_key, relation=relation)
+            )
         if (
             result_memory_key is not None
             and result_memory_key != target_key
@@ -1778,7 +1871,7 @@ class _MemoryActionUnitOfWork:
         elif store_outcome in {"forgotten", "already_forgotten"}:
             if binding.target_memory_key is None:
                 raise self._semantic_error()
-            target = self._item_semantic(
+            target = self._forgotten_item_semantic(
                 binding.target_memory_key,
                 relation="target_result",
             )
