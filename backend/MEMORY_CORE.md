@@ -456,9 +456,19 @@ completion. This targeted revision separates replayable
 `StoreOutcomeSemanticsV1` from the owner-bound live envelope and revalidates all
 five identities before snapshot construction. The owner token and Store
 reference remain process-local: they are not persisted, hashed, logged,
-returned, or reconstructed on replay. The fix is complete but still awaits a
-final focused independent review; the PR remains Draft and is not ready for
-merge or deployment.
+returned, or reconstructed on replay. A later focused review found a separate
+Forget-target ownership gap. The entry backend now obtains the exact typed
+metadata object from the Store inside the outer UoW; the Store immediately
+registers that object with a process-local UoW registry. Claim seals the
+registration to the exact Store/UoW identities, all 11 target fields, target
+key, `forget` action kind, request ID, origin, and request-binding digest.
+The privileged action can retrieve only that registered object, and the Store
+compares all 11 fields again against its current write-side row. Replacement,
+mutation, stale, unregistered, cross-Store, cross-UoW, cross-request, and
+cross-origin objects fail closed. Registration is cleared on commit, rollback,
+and uncertain close; it is never persisted, hashed into terminal state,
+returned, represented with target data, logged, or reconstructed on replay.
+The PR remains Draft and is not ready for merge or deployment.
 
 Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
 can apply and validate v8 without a fingerprint secret; explicit writes remain
@@ -510,6 +520,18 @@ never returns plaintext or fingerprint values to Python. Canonical data,
 results, errors, representations, readiness, and logs therefore contain no
 forgotten plaintext. Store state, tombstone, suppression, and the authenticated
 terminal snapshot are sufficient for restart replay.
+
+Every Forget-path `memory_items` read is one of three exact projections. A is
+the 11-field prepare/registration projection and runs once for each new request
+(and once to rebuild a replay binding). B is the Store projection: active
+Forget reads it once before and once after the update, while
+`already_forgotten` reads it once. C is the content-free tombstone projection
+with only metadata and `IS NULL` absence flags; completion and each replay read
+it once. Forget completion trusts the internal Store-produced item ID already
+bound to the registration and B row, while replay uses C's validated item ID,
+so neither path performs a separate `SELECT id`. The tombstone query has no
+self-join, and source semantics query only `memory_sources`, projecting
+`memory_id -> memory_key` from already validated terminal items.
 
 `MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
 entry backend, service, facade, authority, or writer. True additionally

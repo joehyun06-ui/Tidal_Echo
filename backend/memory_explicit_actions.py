@@ -173,6 +173,17 @@ class MemoryActionEntryBackend:
         binding: memory_action_ledger.MemoryActionRequestBinding,
     ) -> ExplicitMemoryActionResult:
         with self._store._action_unit_of_work() as lookup:
+            if binding.action_kind == "forget":
+                target = self._store._get_forget_target_metadata(
+                    binding.target_memory_key,
+                    _transaction=lookup,
+                )
+                if type(target) is not memory_store._ForgetTargetMetadataV1:
+                    raise ExplicitMemoryActionError("invalid_state")
+                lookup._require_prepared_forget_target(
+                    store=self._store,
+                    metadata=target,
+                )
             replay = lookup.claim_request(binding)
             if replay is None:
                 raise ExplicitMemoryActionError("transaction_outcome_uncertain")
@@ -318,6 +329,10 @@ class MemoryActionEntryBackend:
                 raise ExplicitMemoryActionError("not_found")
             if type(target) is not memory_store._ForgetTargetMetadataV1:
                 raise ExplicitMemoryActionError("invalid_state")
+            uow._require_prepared_forget_target(
+                store=self._store,
+                metadata=target,
+            )
             if target.kind == "assistant_experience":
                 raise ExplicitMemoryActionError("unsupported_evidence")
             return memory_action_ledger.MemoryActionRequestBinding(

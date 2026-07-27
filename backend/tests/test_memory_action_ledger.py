@@ -16,6 +16,7 @@ from unittest import mock
 from backend import (
     channel_store,
     memory_action_ledger,
+    memory_store,
 )
 from backend.tests.test_memory_service import (
     TEST_HMAC_SECRET,
@@ -992,11 +993,18 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         authority,
         binding: memory_action_ledger.MemoryActionRequestBinding,
         spoof_outcome: str | None = None,
+        uow_sink: list[object] | None = None,
     ):
         binding = replace(binding, normalized_content=None)
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
         with store._action_unit_of_work() as uow:
+            if uow_sink is not None:
+                uow_sink.append(uow)
+            store._get_forget_target_metadata(
+                binding.target_memory_key,
+                _transaction=uow,
+            )
             replay = uow.claim_request(binding)
             if replay is not None:
                 return uow.commit(), True
@@ -1040,6 +1048,254 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             uow.complete_request()
             return uow.commit(), False
 
+    def test_forget_target_registration_is_owner_and_request_bound(self):
+        (
+            path,
+            store,
+            _authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-owner")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Z" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        other_store = object.__new__(type(store))
+        before = self.counts(path)
+
+        with store._action_unit_of_work() as owner:
+            target = store._get_forget_target_metadata(
+                binding.target_memory_key,
+                _transaction=owner,
+            )
+            registration = owner._forget_target_registration
+            self.assertIsNotNone(registration)
+            self.assertEqual(repr(registration), "<RegisteredForgetTargetV1>")
+            self.assertNotIn(binding.target_memory_key, repr(registration))
+            self.assertFalse(hasattr(registration, "__dict__"))
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "invalid_state",
+            ):
+                store._get_forget_target_metadata(
+                    binding.target_memory_key,
+                    _transaction=owner,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "request_binding_conflict",
+            ):
+                store.forget_memory_atomic(
+                    memory_key=binding.target_memory_key,
+                    sources=(),
+                    authorization=None,
+                    _transaction=owner,
+                )
+
+            self.assertIsNone(owner.claim_request(binding))
+            self.assertIs(
+                owner._require_registered_forget_target(store=store),
+                target,
+            )
+            sealed = owner._forget_target_registration
+            self.assertEqual(sealed.request_id, binding.request_id)
+            self.assertEqual(sealed.origin, binding.origin)
+            self.assertEqual(
+                sealed.binding_digest,
+                memory_action_ledger.request_binding_digest(
+                    TEST_HMAC_SECRET,
+                    binding,
+                ),
+            )
+            owner._forget_target_registration = replace(
+                sealed,
+                _metadata=replace(target),
+            )
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "request_binding_conflict",
+            ):
+                owner._require_registered_forget_target(store=store)
+            owner._forget_target_registration = sealed
+
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "request_binding_conflict",
+            ):
+                owner._require_registered_forget_target(store=other_store)
+
+            original_binding = owner._binding
+            for changed in (
+                replace(original_binding, request_id="Y" * 32),
+                replace(original_binding, origin="mcp"),
+            ):
+                with self.subTest(
+                    request=changed.request_id,
+                    origin=changed.origin,
+                ):
+                    owner._binding = changed
+                    with self.assertRaisesRegex(
+                        memory_action_ledger.MemoryActionLedgerError,
+                        "request_binding_conflict",
+                    ):
+                        owner._require_registered_forget_target(store=store)
+            owner._binding = original_binding
+
+        self.assertIsNone(owner._forget_target_registration)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            owner._require_registered_forget_target(store=store)
+        with store._action_unit_of_work() as foreign_uow:
+            foreign_uow._forget_target_registration = registration
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "request_binding_conflict",
+            ):
+                foreign_uow.claim_request(binding)
+        self.assertEqual(self.counts(path), before)
+
+    def test_forget_target_registration_rejects_unissued_metadata_shapes(self):
+        (
+            path,
+            store,
+            _authority,
+            _remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-fakes")
+        native = store._get_forget_target_metadata(
+            remember_result.result_memory_key,
+        )
+        native_type = type(native)
+
+        class MetadataSubclass(native_type):
+            pass
+
+        values = {
+            field.name: getattr(native, field.name)
+            for field in fields(native)
+        }
+        candidates = (
+            native,
+            dict(values),
+            SimpleNamespace(**values),
+            MetadataSubclass(**values),
+            replace(native),
+        )
+        before = self.counts(path)
+        for candidate in candidates:
+            with (
+                self.subTest(candidate=type(candidate).__name__),
+                store._action_unit_of_work() as uow,
+                self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "invalid_state",
+                ),
+            ):
+                uow._register_forget_target(
+                    store=store,
+                    metadata=candidate,
+                    issuance=object(),
+                )
+        self.assertEqual(self.counts(path), before)
+
+    def test_forget_target_registration_clears_on_commit_and_uncertain_close(self):
+        (
+            _path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-commit")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Z" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        committed_uow: list[object] = []
+        result, replay = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=binding,
+            uow_sink=committed_uow,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(result.result_category, "forgotten")
+        self.assertIsNone(committed_uow[0]._forget_target_registration)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            committed_uow[0]._require_registered_forget_target(store=store)
+
+        (
+            _path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-uncertain")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Y" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        uncertain_uow: list[object] = []
+        original_commit = memory_action_ledger._MemoryActionUnitOfWork.commit
+
+        def fail_after_commit(uow):
+            uow._connection = _CommitFailureConnection(
+                uow._connection,
+                after_commit=True,
+            )
+            return original_commit(uow)
+
+        with (
+            mock.patch.object(
+                memory_action_ledger._MemoryActionUnitOfWork,
+                "commit",
+                new=fail_after_commit,
+            ),
+            self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "transaction_outcome_uncertain",
+            ),
+        ):
+            self.execute_forget(
+                store=store,
+                authority=authority,
+                binding=binding,
+                uow_sink=uncertain_uow,
+            )
+        self.assertIsNone(uncertain_uow[0]._forget_target_registration)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            uncertain_uow[0]._require_registered_forget_target(store=store)
+
     def assert_replay_rejected_without_growth(
         self,
         *,
@@ -1049,10 +1305,15 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
     ) -> None:
         before = self.counts(path)
         with self.assertRaisesRegex(
-            memory_action_ledger.MemoryActionLedgerError,
-            "request_binding_conflict|terminal_semantics_invalid",
+            RuntimeError,
+            "invalid_state|request_binding_conflict|terminal_semantics_invalid",
         ):
             with store._action_unit_of_work() as uow:
+                if binding.action_kind == "forget":
+                    store._get_forget_target_metadata(
+                        binding.target_memory_key,
+                        _transaction=uow,
+                    )
                 uow.claim_request(binding)
         self.assertEqual(self.counts(path), before)
         self.assertGreaterEqual(before["memory_action_requests"], 1)

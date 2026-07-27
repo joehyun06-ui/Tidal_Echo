@@ -808,9 +808,18 @@ class MemoryAuthorityTests(NoNetworkMixin, unittest.TestCase):
             sensitivity="normal",
             canonical_message_id=self.message(),
         )
-        self.actions.forget_explicit_user_memory(
-            memory_key=created["memory"]["memory_key"],
-            canonical_message_id=self.message(),
+        explicit_actions = importlib.import_module(
+            "backend.memory_explicit_actions"
+        )
+        explicit_actions = importlib.reload(explicit_actions)
+        entry = explicit_actions.bind_operator_cli(
+            explicit_actions.create_entry_backend(self.actions)
+        )
+        entry.forget_explicit_user_memory(
+            explicit_actions.ForgetExplicitMemoryRequest(
+                explicit_actions.issue_request_id(),
+                created["memory"]["memory_key"],
+            )
         )
         before = self.counts()
         message_id = self.message()

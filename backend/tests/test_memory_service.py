@@ -78,6 +78,14 @@ class TestOnlyMemoryFacade:
         self.actions = runtime.privileged_actions
         self.store = self.actions._store
         self._message_factory = message_factory
+        explicit_actions = importlib.import_module(
+            "backend.memory_explicit_actions"
+        )
+        explicit_actions = importlib.reload(explicit_actions)
+        self._explicit_actions = explicit_actions
+        self._forget_entry = explicit_actions.bind_operator_cli(
+            explicit_actions.create_entry_backend(self.actions)
+        )
 
     def readiness(self):
         return self.read.readiness()
@@ -134,10 +142,24 @@ class TestOnlyMemoryFacade:
         )
 
     def forget_memory(self, *, memory_key):
-        return self.actions.forget_explicit_user_memory(
-            memory_key=memory_key,
-            canonical_message_id=self._message_factory(),
-        )
+        ready, error = self.read.readiness()
+        if not ready:
+            raise memory_service.MemoryServiceError(
+                error or "memory_schema_invalid"
+            )
+        try:
+            result = self._forget_entry.forget_explicit_user_memory(
+                self._explicit_actions.ForgetExplicitMemoryRequest(
+                    self._explicit_actions.issue_request_id(),
+                    memory_key,
+                )
+            )
+        except self._explicit_actions.ExplicitMemoryActionError as exc:
+            raise memory_service.MemoryServiceError(exc.category) from None
+        return {
+            "outcome": result.category,
+            "memory_key": result.memory_key,
+        }
 
     def get_active_memories(self, **kwargs):
         return self.read.get_active_memories(**kwargs)

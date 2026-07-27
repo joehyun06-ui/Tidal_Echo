@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Sequence
@@ -37,6 +38,7 @@ class MemoryStoreError(RuntimeError):
 class StoreResult:
     outcome: str
     item: dict | None = field(default=None, repr=False)
+    _memory_id: int | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -167,6 +169,19 @@ _FORGET_RESULT_COLUMNS = """
     fingerprint_version,normalized_fingerprint,superseded_by_id,updated_at,
     explicitness,confidence,first_observed_at,last_confirmed_at,created_at
 """
+_FORGET_TARGET_FIELD_NAMES = (
+    "memory_id",
+    "memory_key",
+    "kind",
+    "scope_type",
+    "scope_ref",
+    "status",
+    "sensitivity",
+    "fingerprint_version",
+    "normalized_fingerprint",
+    "superseded_by_id",
+    "updated_at",
+)
 _PROFILE_STATE_TABLES = (
     "memory_items",
     "memory_sources",
@@ -388,6 +403,7 @@ class MemoryStore:
         self.path = path
         self._authority = authority
         self._runtime_policy = runtime_policy
+        self._forget_target_issuance = threading.local()
 
     def _trusted_policy(self) -> memory_policy.MemoryPolicy:
         return memory_policy.MemoryPolicy(
@@ -472,10 +488,29 @@ class MemoryStore:
                 ).fetchone()
             if row is None:
                 return None
-            return _forget_target_metadata(
+            metadata = _forget_target_metadata(
                 row,
                 expected_memory_key=memory_key,
             )
+            if _transaction is not None:
+                issuance = object()
+                self._forget_target_issuance.current = (
+                    _transaction,
+                    metadata,
+                    issuance,
+                )
+                try:
+                    _transaction._register_forget_target(
+                        store=self,
+                        metadata=metadata,
+                        issuance=issuance,
+                    )
+                finally:
+                    try:
+                        del self._forget_target_issuance.current
+                    except AttributeError:
+                        pass
+            return metadata
         except MemoryStoreError:
             raise
         except memory_action_ledger.MemoryActionLedgerError as error:
@@ -483,32 +518,37 @@ class MemoryStore:
         except (OSError, sqlite3.Error, ValueError):
             raise MemoryStoreError("storage_unavailable") from None
 
-    def _validate_forget_target_binding(
-        self,
+    @staticmethod
+    def _forget_target_snapshot(
         metadata: _ForgetTargetMetadataV1,
+    ) -> tuple[object, ...]:
+        if type(metadata) is not _ForgetTargetMetadataV1:
+            raise MemoryStoreError("invalid_state")
+        try:
+            return tuple(
+                getattr(metadata, name)
+                for name in _FORGET_TARGET_FIELD_NAMES
+            )
+        except (AttributeError, TypeError):
+            raise MemoryStoreError("invalid_state") from None
+
+    def _consume_forget_target_issuance(
+        self,
         *,
-        _transaction: object,
-    ) -> None:
+        transaction: object,
+        metadata: _ForgetTargetMetadataV1,
+        issuance: object,
+    ) -> tuple[object, ...]:
+        current = getattr(self._forget_target_issuance, "current", None)
         if (
-            type(metadata) is not _ForgetTargetMetadataV1
-            or type(_transaction)
-            is not memory_action_ledger._MemoryActionUnitOfWork
-            or _transaction._store is not self
+            not isinstance(current, tuple)
+            or len(current) != 3
+            or current[0] is not transaction
+            or current[1] is not metadata
+            or current[2] is not issuance
         ):
-            raise MemoryStoreError("transaction_context_invalid")
-        binding = _transaction._binding
-        if (
-            type(binding)
-            is not memory_action_ledger.MemoryActionRequestBinding
-            or binding.action_kind != "forget"
-            or binding.target_memory_key != metadata.memory_key
-            or binding.kind != metadata.kind
-            or binding.scope_type != metadata.scope_type
-            or binding.scope_ref != metadata.scope_ref
-            or binding.sensitivity != metadata.sensitivity
-            or binding.normalized_content is not None
-        ):
-            raise MemoryStoreError("request_binding_conflict")
+            raise MemoryStoreError("invalid_state")
+        return self._forget_target_snapshot(metadata)
 
     def _defer_action_to_transaction(
         self,
@@ -1523,6 +1563,18 @@ class MemoryStore:
         consumed = False
         result: StoreResult | None = None
         suppression_ids: tuple[int, ...] = ()
+        if (
+            type(_transaction)
+            is not memory_action_ledger._MemoryActionUnitOfWork
+            or _transaction._store is not self
+        ):
+            raise MemoryStoreError("transaction_context_invalid")
+        try:
+            registered_target = _transaction._require_registered_forget_target(
+                store=self,
+            )
+        except memory_action_ledger.MemoryActionLedgerError as error:
+            raise MemoryStoreError(error.category) from None
         try:
             with self._write_connection(_transaction) as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1541,6 +1593,14 @@ class MemoryStore:
                         row,
                         expected_memory_key=memory_key,
                     )
+                    try:
+                        _transaction._validate_registered_forget_target(
+                            store=self,
+                            registered_metadata=registered_target,
+                            current_metadata=target,
+                        )
+                    except memory_action_ledger.MemoryActionLedgerError as error:
+                        raise MemoryStoreError(error.category) from None
                     source, source_inputs = _binding_source(sources)
                     binding = memory_runtime.MemoryActionBinding(
                         action_type=memory_runtime.ACTION_FORGET_USER,
@@ -1592,6 +1652,7 @@ class MemoryStore:
                         result = StoreResult(
                             "already_forgotten",
                             _safe_forgotten_item(row, target),
+                            target.memory_id,
                         )
                     else:
                         fingerprint = target.normalized_fingerprint
@@ -1634,6 +1695,7 @@ class MemoryStore:
                                 forgotten,
                                 forgotten_target,
                             ),
+                            forgotten_target.memory_id,
                         )
                 except Exception:
                     if conn.in_transaction:

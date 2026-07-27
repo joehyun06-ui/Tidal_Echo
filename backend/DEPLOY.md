@@ -547,6 +547,24 @@ error、repr、readiness 和日志均不含旧正文；restart replay 依赖
 target/tombstone/suppression 与已认证 terminal snapshot。Category 与 result key
 始终来自真实 Store outcome。
 
+Forget prepare 必须在当前 outer UoW 内调用 Store 的专用 metadata getter。Store
+立即把 exact metadata object 注册到该 UoW；claim 再把 registration seal 到 exact
+Store/UoW identity、11 个 metadata 字段、request ID、origin、target key 与
+request-binding digest。Privileged action 不接受 caller metadata，也不重复查询
+target，只能取得当前 UoW 已注册的 exact object；Store 写侧 B 查询会再次逐一比较
+11 个字段。伪造、替换、篡改、旧类实例、未注册或跨 Store/UoW/request/origin 的
+对象均 fail closed。Registration 仅存于进程内，并在 commit、rollback 或 uncertain
+close 时清除；不进入数据库、terminal、result、repr 或日志，restart replay 也不依赖它。
+
+Forget 对 `memory_items` 的读取只有精确 A/B/C 三类：A 为 11 字段
+prepare/registration projection（每个新 request 一次；replay 重建 binding 时一次）；
+B 为 Store projection（active 在 UPDATE 前后各一次，already-forgotten 一次）；
+C 为只含 tombstone metadata 与三个 `IS NULL` absence flag 的 terminal projection
+（completion 与每次 replay 各一次）。Completion 使用真实 Store outcome 携带并与
+registration/B row 核对的内部 item ID；replay 使用 C 的已验证 item ID，因此 Forget
+不再执行独立 `SELECT id`。Tombstone semantic 无 self-join；source semantic 只查询
+`memory_sources`，并从已验证 terminal item 建立 `memory_id -> memory_key` 映射。
+
 环境变量保持：
 
 ```dotenv

@@ -412,19 +412,17 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
         self._validate_memory_key(memory_key)
         sources = self._one_source(canonical_message_id)
         try:
-            current = self._store._get_forget_target_metadata(
-                memory_key,
-                _transaction=_transaction,
+            if (
+                type(_transaction)
+                is not memory_store.memory_action_ledger._MemoryActionUnitOfWork
+                or _transaction._store is not self._store
+            ):
+                raise MemoryServiceError("transaction_context_invalid")
+            current = _transaction._require_registered_forget_target(
+                store=self._store,
             )
-            if current is None:
-                raise MemoryServiceError("not_found")
             if type(current) is not memory_store._ForgetTargetMetadataV1:
                 raise MemoryServiceError("invalid_state")
-            if _transaction is not None:
-                self._store._validate_forget_target_binding(
-                    current,
-                    _transaction=_transaction,
-                )
             if current.kind == "assistant_experience":
                 raise MemoryServiceError("unsupported_evidence")
             validated = self._policy.validate_provenance_inputs(
