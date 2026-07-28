@@ -624,7 +624,11 @@ preflight against the same frozen deployment snapshot. Only after it succeeds
 does the function call `bootstrap_memory_runtime(deployment)`, create the
 reviewed entry backend, bind `operator_cli`, and return the exact
 `ExplicitMemoryActionService`. It never binds MCP, Telegram, or Operit and
-does not retain Runtime Authority or privileged actions in its return value.
+does not separately return Runtime Authority or privileged actions or expose
+them through the facade's public API, representation, or logs. The exact
+service necessarily retains its reviewed backend object graph under the
+existing trusted-same-process threat model; this is a composition and misuse
+boundary, not a Python sandbox.
 
 The existing `*_from_environment` runtime bootstraps remain available and now
 delegate to exact-type frozen-`DeploymentConfig` variants. This change adds no

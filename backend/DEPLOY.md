@@ -637,7 +637,9 @@ Runtime Authority，并只执行
 `create_entry_backend(runtime.privileged_actions)` 与
 `bind_operator_cli(backend)`。返回值是 repr-safe 的
 `ExplicitMemoryActionService`；不会绑定 MCP、Telegram、Operit，不会创建
-HTTP/provider/network/outbox 入口，也不会把 Authority 或 writer 暴露给调用方。
+HTTP/provider/network/outbox 入口，也不会单独返回 Authority/writer 或把它们放入
+公共 API、repr 或日志。Exact service 内部的 reviewed backend object graph 仍按
+既有 trusted-same-process threat model 持有写权限；该边界不是 Python sandbox。
 
 该 API 不改变上线流程或生产默认值。不要为本变更配置真实 Memory Secret，
 不要启用 `MEMORY_EXPLICIT_WRITES_ENABLED` 或
