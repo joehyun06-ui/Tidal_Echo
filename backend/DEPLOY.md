@@ -577,10 +577,21 @@ uncertain lookup 均只有 `C`。Completion 使用真实 Store outcome 携带并
 registration/B row 核对的内部 item ID；replay 使用 C 的已验证 item ID，因此 Forget
 不再执行独立 `SELECT id`。Tombstone semantic 无 self-join；source semantic 只查询
 `memory_sources`，并从已验证 terminal item 建立 `memory_id -> memory_key` 映射。
-测试 gate 同时使用 statement exact fingerprint 与 SQLite authorizer，quoted
-identifier、comment adjacency、schema qualification、CTE、alias、join 与 subquery
-均不能绕过。真实 restart 测试由两个独立 `sys.executable` subprocess 共享一个临时
-SQLite 文件完成，不再把 in-process fresh runtime bootstrap 称为 process restart。
+测试 gate 不再按 statement keyword 或是否出现 `SELECT` 放行。每个
+`memory_items` authorizer event 必须属于精确 A/B/C、精确 content-clearing Forget
+UPDATE，或 SQLite 外键校验只读取 `memory_items.id` 的精确 `memory_sources`
+INSERT。Gate 分别验证 read/update columns、cursor description、完成状态与 raw SQL
+fingerprint；quoted identifier、comment adjacency、schema qualification、CTE、
+alias、join、subquery、UPSERT、trigger 与 write `RETURNING` 均被拒绝。合法 Forget
+UPDATE 无 `RETURNING` 且不返回 row。
+
+真实 restart 测试由两个独立 `sys.executable -m` subprocess 共享一个临时 SQLite
+文件完成，不再把 in-process fresh runtime bootstrap 称为 process restart。
+Subprocess stdin 限制为 16 KiB exact phase schema，拒绝尾随、缺失、额外或错误类型
+字段；stdout/stderr/JSON/repr/argv/error 同时检查正文、synthetic Secret、
+fingerprint、registration/UoW 类型与对象地址泄漏。永久回归还包括 Forget 同
+request 2/4/8 SQLite caller single-winner，以及 fingerprint version、合法
+supersession 与 suppression 全字段/删除/结构合法替换 tamper。
 
 环境变量保持：
 

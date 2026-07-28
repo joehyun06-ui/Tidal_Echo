@@ -9,19 +9,42 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from backend import channel_store, memory_action_ledger, memory_explicit_actions
+from backend import (
+    channel_store,
+    memory_action_ledger,
+    memory_explicit_actions,
+    memory_policy,
+)
 from backend.tests._support import NoNetworkMixin
 from backend.tests.test_memory_service import (
     TEST_HMAC_SECRET,
     bootstrap_runtime,
     memory_config,
 )
+
+
+class _AuthorizerCursorProxy:
+    def __init__(self, cursor, gate):
+        self._cursor = cursor
+        self._gate = gate
+
+    def execute(self, sql, parameters=()):
+        self._gate.execute(self._cursor.execute, sql, parameters)
+        return self
+
+    def executemany(self, sql, parameters):
+        self._gate.execute(self._cursor.executemany, sql, parameters)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
 
 
 class _AuthorizerConnectionProxy:
@@ -43,11 +66,22 @@ class _AuthorizerConnectionProxy:
             parameters,
         )
 
+    def cursor(self, *args, **kwargs):
+        return _AuthorizerCursorProxy(
+            self._connection.cursor(*args, **kwargs),
+            self._gate,
+        )
+
+    def close(self):
+        self._connection.set_authorizer(None)
+        return self._connection.close()
+
     def __enter__(self):
         self._connection.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self._connection.set_authorizer(None)
         return self._connection.__exit__(exc_type, exc_value, traceback)
 
     def __getattr__(self, name):
@@ -55,15 +89,88 @@ class _AuthorizerConnectionProxy:
 
 
 class _ForgetSqlAuthorizerGate:
-    def __init__(self, fingerprints, fingerprint):
-        self._fingerprints = dict(fingerprints)
-        self._reverse = {
-            value: name for name, value in self._fingerprints.items()
+    _READ_DESCRIPTIONS = {
+        "A": (
+            "id", "memory_key", "kind", "scope_type", "scope_ref", "status",
+            "sensitivity", "fingerprint_version", "normalized_fingerprint",
+            "superseded_by_id", "updated_at",
+        ),
+        "B_KEY": (
+            "id", "memory_key", "kind", "scope_type", "scope_ref", "status",
+            "sensitivity", "fingerprint_version", "normalized_fingerprint",
+            "superseded_by_id", "updated_at", "explicitness", "confidence",
+            "first_observed_at", "last_confirmed_at", "created_at",
+        ),
+        "B_ID": (
+            "id", "memory_key", "kind", "scope_type", "scope_ref", "status",
+            "sensitivity", "fingerprint_version", "normalized_fingerprint",
+            "superseded_by_id", "updated_at", "explicitness", "confidence",
+            "first_observed_at", "last_confirmed_at", "created_at",
+        ),
+        "C": (
+            "id", "memory_key", "status", "kind", "scope_type", "scope_ref",
+            "sensitivity", "fingerprint_version", "explicitness",
+            "confidence", "updated_at", "content_absent",
+            "fingerprint_absent", "supersession_absent",
+        ),
+    }
+    _READ_COLUMNS = {
+        "A": frozenset({
+            "id", "memory_key", "kind", "scope_type", "scope_ref", "status",
+            "sensitivity", "fingerprint_version", "normalized_fingerprint",
+            "superseded_by_id", "updated_at",
+        }),
+        "B_KEY": frozenset({
+            "id", "memory_key", "kind", "scope_type", "scope_ref", "status",
+            "sensitivity", "fingerprint_version", "normalized_fingerprint",
+            "superseded_by_id", "updated_at", "explicitness", "confidence",
+            "first_observed_at", "last_confirmed_at", "created_at",
+        }),
+        "B_ID": frozenset({
+            "id", "memory_key", "kind", "scope_type", "scope_ref", "status",
+            "sensitivity", "fingerprint_version", "normalized_fingerprint",
+            "superseded_by_id", "updated_at", "explicitness", "confidence",
+            "first_observed_at", "last_confirmed_at", "created_at",
+        }),
+        "C": frozenset({
+            "id", "memory_key", "status", "kind", "scope_type", "scope_ref",
+            "sensitivity", "fingerprint_version", "explicitness",
+            "confidence", "updated_at", "normalized_content",
+            "normalized_fingerprint", "superseded_by_id",
+        }),
+    }
+    _WRITE_READ_COLUMNS = {
+        "FORGET_UPDATE": frozenset({"id", "status"}),
+        "SOURCE_INSERT_FK": frozenset({"id"}),
+    }
+    _WRITE_UPDATE_COLUMNS = {
+        "FORGET_UPDATE": (
+            "status",
+            "normalized_content",
+            "normalized_fingerprint",
+            "superseded_by_id",
+            "updated_at",
+        ),
+        "SOURCE_INSERT_FK": (),
+    }
+
+    def __init__(self, read_fingerprints, write_fingerprints, fingerprint):
+        self._read_fingerprints = dict(read_fingerprints)
+        self._write_fingerprints = dict(write_fingerprints)
+        self._read_reverse = {
+            value: name for name, value in self._read_fingerprints.items()
         }
+        self._write_reverse = {
+            value: name for name, value in self._write_fingerprints.items()
+        }
+        if set(self._read_reverse).intersection(self._write_reverse):
+            raise AssertionError("sql_gate_fingerprint_collision")
         self._fingerprint = fingerprint
         self._current_statement = None
-        self._current_recorded = False
+        self._current_record = None
         self.sequence = []
+        self.write_sequence = []
+        self.records = []
         self.violation = None
 
     def wrap(self, connection):
@@ -74,251 +181,150 @@ class _ForgetSqlAuthorizerGate:
         if self._current_statement is not None:
             raise AssertionError("nested_sql_gate_statement")
         self._current_statement = str(sql)
-        self._current_recorded = False
+        fingerprint = self._fingerprint(self._current_statement)
+        self._current_record = {
+            "raw_sql": self._current_statement,
+            "fingerprint": fingerprint,
+            "name": (
+                self._read_reverse.get(fingerprint)
+                or self._write_reverse.get(fingerprint)
+            ),
+            "read_events": [],
+            "write_events": [],
+            "read_recorded": False,
+            "write_recorded": False,
+            "description": None,
+            "completed": False,
+        }
         try:
-            return operation(sql, parameters)
+            cursor = operation(sql, parameters)
+            description = (
+                tuple(column[0] for column in cursor.description)
+                if cursor.description is not None
+                else None
+            )
+            self._current_record["description"] = description
+            self._validate_completed_statement()
+            self._current_record["completed"] = True
+            return cursor
         finally:
+            self.records.append(dict(self._current_record))
             self._current_statement = None
-            self._current_recorded = False
+            self._current_record = None
+
+    def _deny(self, action, table, column, database, trigger, reason):
+        if self.violation is None:
+            self.violation = {
+                "reason": reason,
+                "action": int(action),
+                "database": str(database or ""),
+                "table": str(table or ""),
+                "column": str(column or ""),
+                "trigger": str(trigger or ""),
+                "raw_sql": str(self._current_statement or ""),
+                "fingerprint": (
+                    str(self._current_record["fingerprint"])
+                    if self._current_record is not None
+                    else ""
+                ),
+            }
+        return sqlite3.SQLITE_DENY
 
     def _authorize(self, action, table, column, database, trigger):
-        if (
-            action == sqlite3.SQLITE_READ
-            and isinstance(table, str)
+        if not (
+            isinstance(table, str)
             and table.casefold() == "memory_items"
+            and action in {
+                sqlite3.SQLITE_READ,
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_INSERT,
+                sqlite3.SQLITE_DELETE,
+            }
         ):
-            statement = self._current_statement
-            leading = self._leading_keyword(statement)
-            if leading not in {"SELECT", "WITH"}:
-                if (
-                    leading in {"UPDATE", "INSERT", "DELETE", "REPLACE"}
-                    and isinstance(statement, str)
-                    and re.search(r"\bSELECT\b", statement, re.IGNORECASE) is None
-                ):
-                    return sqlite3.SQLITE_OK
-                self.violation = (
-                    str(database or ""),
-                    str(table),
-                    str(column or ""),
-                )
-                return sqlite3.SQLITE_DENY
-            fingerprint = (
-                self._fingerprint(statement)
-                if isinstance(statement, str)
-                else ""
+            return sqlite3.SQLITE_OK
+        if self._current_statement is None or self._current_record is None:
+            return self._deny(
+                action, table, column, database, trigger,
+                "memory_items_event_without_statement",
             )
-            name = self._reverse.get(fingerprint)
-            if name is None:
-                self.violation = (
-                    str(database or ""),
-                    str(table),
-                    str(column or ""),
-                )
-                return sqlite3.SQLITE_DENY
-            if not self._current_recorded:
-                self.sequence.append(name)
-                self._current_recorded = True
+        name = self._current_record["name"]
+        if action == sqlite3.SQLITE_READ:
+            event = {
+                "database": str(database or ""),
+                "table": str(table),
+                "column": str(column or ""),
+                "trigger": str(trigger or ""),
+            }
+            self._current_record["read_events"].append(event)
+            if name in self._READ_COLUMNS:
+                if column not in self._READ_COLUMNS[name]:
+                    return self._deny(
+                        action, table, column, database, trigger,
+                        "unexpected_read_column",
+                    )
+                if not self._current_record["read_recorded"]:
+                    self.sequence.append(name)
+                    self._current_record["read_recorded"] = True
+                return sqlite3.SQLITE_OK
+            if name in self._WRITE_READ_COLUMNS:
+                if column not in self._WRITE_READ_COLUMNS[name]:
+                    return self._deny(
+                        action, table, column, database, trigger,
+                        "write_statement_read_column",
+                    )
+                return sqlite3.SQLITE_OK
+            return self._deny(
+                action, table, column, database, trigger,
+                "unknown_read_fingerprint",
+            )
+
+        event = {
+            "action": int(action),
+            "database": str(database or ""),
+            "table": str(table),
+            "column": str(column or ""),
+            "trigger": str(trigger or ""),
+        }
+        self._current_record["write_events"].append(event)
+        if (
+            name not in self._WRITE_UPDATE_COLUMNS
+            or action != sqlite3.SQLITE_UPDATE
+            or column not in self._WRITE_UPDATE_COLUMNS[name]
+        ):
+            return self._deny(
+                action, table, column, database, trigger,
+                "unknown_write_fingerprint",
+            )
+        if not self._current_record["write_recorded"]:
+            self.write_sequence.append(name)
+            self._current_record["write_recorded"] = True
         return sqlite3.SQLITE_OK
 
-    @staticmethod
-    def _leading_keyword(statement):
-        if not isinstance(statement, str):
-            return ""
-        remaining = statement.lstrip()
-        while remaining:
-            if remaining.startswith("/*"):
-                end = remaining.find("*/", 2)
-                if end < 0:
-                    return ""
-                remaining = remaining[end + 2:].lstrip()
-                continue
-            if remaining.startswith("--"):
-                end = remaining.find("\n", 2)
-                if end < 0:
-                    return ""
-                remaining = remaining[end + 1:].lstrip()
-                continue
-            match = re.match(r"[A-Za-z]+", remaining)
-            return match.group(0).upper() if match else ""
-        return ""
-
-
-_FORGET_RESTART_SUBPROCESS = r"""
-import importlib
-import json
-import socket
-import sys
-from unittest import mock
-
-from backend import channel_store
-from backend.tests.test_memory_service import bootstrap_runtime, memory_config
-
-def network_blocked(*args, **kwargs):
-    raise AssertionError("restart_test_network_disabled")
-
-socket.socket.connect = network_blocked
-socket.socket.connect_ex = network_blocked
-socket.create_connection = network_blocked
-socket.getaddrinfo = network_blocked
-
-payload = json.loads(sys.stdin.read())
-path = payload["path"]
-phase = payload["phase"]
-secret = payload["secret"]
-tables = (
-    "messages",
-    "memory_action_requests",
-    "memory_evidence_events",
-    "memory_items",
-    "memory_sources",
-    "memory_suppressions",
-)
-
-def counts(connect):
-    with connect(path) as connection:
-        return {
-            table: int(connection.execute(
-                f"SELECT count(*) FROM {table}"
-            ).fetchone()[0])
-            for table in tables
-        }
-
-if phase == "complete":
-    with channel_store.connect(path) as connection:
-        connection.execute(channel_store.RELAY_TABLE_DDL["messages"])
-    channel_store.run_migrations(path)
-
-runtime = bootstrap_runtime(path, memory_config(secret=secret))
-explicit = importlib.import_module("backend.memory_explicit_actions")
-explicit = importlib.reload(explicit)
-backend = explicit.create_entry_backend(runtime.privileged_actions)
-service = explicit.bind_operator_cli(backend)
-
-if phase == "complete":
-    before = counts(channel_store.connect)
-    remembered = service.remember_explicit_user_memory(
-        explicit.RememberExplicitMemoryRequest(
-            payload["remember_request_id"],
-            "project",
-            "global_user",
-            "",
-            payload["content"],
-            "normal",
-        )
-    )
-    request = explicit.ForgetExplicitMemoryRequest(
-        payload["forget_request_id"],
-        remembered.memory_key,
-    )
-    result = service.forget_explicit_user_memory(request)
-    json.dump({
-        "request_id": payload["forget_request_id"],
-        "memory_key": remembered.memory_key,
-        "category": result.category,
-        "replayed": result.replayed,
-        "counts_before": before,
-        "counts_after": counts(channel_store.connect),
-    }, sys.stdout, sort_keys=True)
-elif phase == "replay":
-    from backend.tests.test_memory_explicit_actions import (
-        ExplicitMemoryActionBackendTests,
-        _ForgetSqlAuthorizerGate,
-    )
-
-    store = backend._store
-    actions = backend._actions
-    store_type = type(store)
-    action_type = type(actions)
-    store_module = importlib.import_module(store_type.__module__)
-    ledger_module = store_module.memory_action_ledger
-    runtime_module = importlib.import_module(type(actions._authority).__module__)
-    original_connect = store_module.channel_store.connect
-    original_lookup = (
-        ledger_module._MemoryActionUnitOfWork.lookup_forget_terminal
-    )
-    gate = _ForgetSqlAuthorizerGate(
-        ExplicitMemoryActionBackendTests._forget_sql_fingerprints(),
-        ExplicitMemoryActionBackendTests._sql_fingerprint,
-    )
-    registration_absent = {"before": False, "after": False}
-
-    def gated_connect(*args, **kwargs):
-        return gate.wrap(original_connect(*args, **kwargs))
-
-    def inspect_lookup(uow, **kwargs):
-        registration_absent["before"] = (
-            uow._forget_target_metadata_identity is None
-            and uow._forget_target_registration is None
-        )
-        value = original_lookup(uow, **kwargs)
-        registration_absent["after"] = (
-            uow._forget_target_metadata_identity is None
-            and uow._forget_target_registration is None
-        )
-        return value
-
-    before = counts(original_connect)
-    request = explicit.ForgetExplicitMemoryRequest(
-        payload["forget_request_id"],
-        payload["memory_key"],
-    )
-    with (
-        mock.patch.object(
-            store_module.channel_store,
-            "connect",
-            new=gated_connect,
-        ),
-        mock.patch.object(
-            ledger_module._MemoryActionUnitOfWork,
-            "lookup_forget_terminal",
-            new=inspect_lookup,
-        ),
-        mock.patch.object(
-            ledger_module._MemoryActionUnitOfWork,
-            "_register_forget_target",
-            side_effect=AssertionError("restart_replay_registered_target"),
-        ),
-        mock.patch.object(
-            ledger_module._MemoryActionUnitOfWork,
-            "_seal_registered_forget_target",
-            side_effect=AssertionError("restart_replay_sealed_target"),
-        ),
-        mock.patch.object(
-            store_type,
-            "_get_forget_target_metadata",
-            side_effect=AssertionError("restart_replay_executed_A"),
-        ),
-        mock.patch.object(
-            action_type,
-            "forget_explicit_user_memory",
-            side_effect=AssertionError("restart_replay_executed_store"),
-        ),
-        mock.patch.object(
-            runtime_module,
-            "issue_action_envelope",
-            side_effect=AssertionError("restart_replay_issued_capability"),
-        ),
-        mock.patch.object(
-            store_type,
-            "_finish_action",
-            side_effect=AssertionError("restart_replay_consumed_capability"),
-        ),
-    ):
-        result = service.forget_explicit_user_memory(request)
-    json.dump({
-        "category": result.category,
-        "replayed": result.replayed,
-        "sequence": gate.sequence,
-        "gate_violation": gate.violation,
-        "registration_absent": registration_absent,
-        "counts_before": before,
-        "counts_after": counts(original_connect),
-        "result_repr": repr(result),
-        "service_repr": repr(service),
-    }, sys.stdout, sort_keys=True)
-else:
-    raise RuntimeError("invalid_restart_test_phase")
-"""
+    def _validate_completed_statement(self):
+        record = self._current_record
+        name = record["name"]
+        if name in self._READ_DESCRIPTIONS:
+            if record["description"] != self._READ_DESCRIPTIONS[name]:
+                raise AssertionError("sql_gate_read_description_mismatch")
+            actual = frozenset(
+                event["column"] for event in record["read_events"]
+            )
+            if actual != self._READ_COLUMNS[name] or record["write_events"]:
+                raise AssertionError("sql_gate_read_events_mismatch")
+        elif name in self._WRITE_UPDATE_COLUMNS:
+            if record["description"] is not None:
+                raise AssertionError("sql_gate_write_returned_rows")
+            read_columns = frozenset(
+                event["column"] for event in record["read_events"]
+            )
+            update_columns = tuple(
+                event["column"] for event in record["write_events"]
+            )
+            if (
+                read_columns != self._WRITE_READ_COLUMNS[name]
+                or update_columns != self._WRITE_UPDATE_COLUMNS[name]
+            ):
+                raise AssertionError("sql_gate_write_events_mismatch")
 
 
 class _Backend:
@@ -588,6 +594,25 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             ),
         }
 
+    @classmethod
+    def _forget_sql_write_fingerprints(cls) -> dict[str, str]:
+        return {
+            "FORGET_UPDATE": cls._sql_fingerprint(
+                """UPDATE memory_items
+                   SET status='forgotten',normalized_content=NULL,
+                       normalized_fingerprint=NULL,superseded_by_id=NULL,
+                       updated_at=?
+                   WHERE id=? AND status='active'"""
+            ),
+            "SOURCE_INSERT_FK": cls._sql_fingerprint(
+                """INSERT INTO memory_sources
+                   (memory_id,evidence_event_id,canonical_message_id,
+                    channel,source,evidence_role,evidence_type,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(memory_id,evidence_event_id) DO NOTHING"""
+            ),
+        }
+
     def _capture_forget_sql(self, call, *, error_pattern=None):
         store = self.service._backend._store
         store_module = importlib.import_module(type(store).__module__)
@@ -598,8 +623,13 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         original_execute = ledger_module._MemoryActionUnitOfWork._execute
         statements = []
         row_keys = []
-        allowed = self._forget_sql_fingerprints()
-        gate = _ForgetSqlAuthorizerGate(allowed, self._sql_fingerprint)
+        allowed_reads = self._forget_sql_fingerprints()
+        allowed_writes = self._forget_sql_write_fingerprints()
+        gate = _ForgetSqlAuthorizerGate(
+            allowed_reads,
+            allowed_writes,
+            self._sql_fingerprint,
+        )
 
         def traced_connect(*args, **kwargs):
             connection = original_connect(*args, **kwargs)
@@ -666,7 +696,13 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 result = raised.exception
         self.assertIsNone(gate.violation)
         self.assertTrue(gate.sequence)
-        return result, tuple(gate.sequence), tuple(row_keys)
+        return (
+            result,
+            tuple(gate.sequence),
+            tuple(row_keys),
+            tuple(gate.write_sequence),
+            tuple(gate.records),
+        )
 
     def test_remember_created_replay_decision_and_suppression(self):
         created = self._remember("A", "Synthetic explicit entry memory")
@@ -815,11 +851,34 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             "6" * 32,
             target.memory_key,
         )
-        result, sequence, row_keys = self._capture_forget_sql(
+        result, sequence, row_keys, writes, records = self._capture_forget_sql(
             lambda: self.service.forget_explicit_user_memory(request)
         )
         self.assertEqual(result.category, "forgotten")
         self.assertEqual(sequence, ("A", "B_KEY", "B_ID", "C"))
+        self.assertEqual(writes, ("FORGET_UPDATE",))
+        update_records = tuple(
+            record for record in records
+            if record["name"] == "FORGET_UPDATE"
+        )
+        self.assertEqual(len(update_records), 1)
+        self.assertIsNone(update_records[0]["description"])
+        self.assertTrue(update_records[0]["completed"])
+        self.assertNotIn("RETURNING", update_records[0]["raw_sql"].upper())
+        source_fk_records = tuple(
+            record for record in records
+            if record["name"] == "SOURCE_INSERT_FK"
+        )
+        self.assertEqual(len(source_fk_records), 1)
+        self.assertEqual(
+            tuple(
+                event["column"]
+                for event in source_fk_records[0]["read_events"]
+            ),
+            ("id",),
+        )
+        self.assertIsNone(source_fk_records[0]["description"])
+        self.assertTrue(source_fk_records[0]["completed"])
 
         a_keys = (
             "id",
@@ -863,34 +922,39 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         ))
         self.assertEqual(row_keys[-1], c_keys)
 
-        replay, sequence, _row_keys = self._capture_forget_sql(
+        replay, sequence, _row_keys, writes, _records = self._capture_forget_sql(
             lambda: self.service.forget_explicit_user_memory(request)
         )
         self.assertTrue(replay.replayed)
         self.assertEqual(sequence, ("C",))
+        self.assertEqual(writes, ())
 
         self._fresh_runtime()
         request = memory_explicit_actions.ForgetExplicitMemoryRequest(
             "6" * 32,
             target.memory_key,
         )
-        restarted, sequence, _row_keys = self._capture_forget_sql(
+        restarted, sequence, _row_keys, writes, _records = (
+            self._capture_forget_sql(
             lambda: self.service.forget_explicit_user_memory(request)
+            )
         )
         self.assertTrue(restarted.replayed)
         self.assertEqual(sequence, ("C",))
+        self.assertEqual(writes, ())
 
         already_request = memory_explicit_actions.ForgetExplicitMemoryRequest(
             "7" * 32,
             target.memory_key,
         )
-        already, sequence, _row_keys = self._capture_forget_sql(
+        already, sequence, _row_keys, writes, _records = self._capture_forget_sql(
             lambda: self.service.forget_explicit_user_memory(
                 already_request
             )
         )
         self.assertEqual(already.category, "already_forgotten")
         self.assertEqual(sequence, ("A", "B_KEY", "C"))
+        self.assertEqual(writes, ())
 
         uncertain_target = self._remember(
             "8",
@@ -923,9 +987,11 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             "commit",
             new=committed_then_uncertain,
         ):
-            uncertain, sequence, _row_keys = self._capture_forget_sql(
+            uncertain, sequence, _row_keys, writes, _records = (
+                self._capture_forget_sql(
                 lambda: self.service.forget_explicit_user_memory(
                     uncertain_request
+                )
                 )
             )
         self.assertTrue(uncertain.replayed)
@@ -933,9 +999,21 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             sequence,
             ("A", "B_KEY", "B_ID", "C", "C"),
         )
+        self.assertEqual(writes, ("FORGET_UPDATE",))
 
     def test_forget_sql_authorizer_rejects_equivalent_unapproved_reads(self):
         target = self._remember("J", "Synthetic authorizer gate target")
+        insert_columns = """(
+            memory_key,kind,scope_type,scope_ref,normalized_content,
+            normalized_fingerprint,fingerprint_version,status,explicitness,
+            confidence,sensitivity,first_observed_at,last_confirmed_at,
+            superseded_by_id,created_at,updated_at
+        )"""
+        insert_values = (
+            "Z" * 32, "project", "global_user", "", "synthetic",
+            bytes(32), 1, "active", "explicit", 1.0, "normal",
+            "now", "now", None, "now", "now",
+        )
         statements = (
             (
                 """SELECT normalized_content FROM "memory_items"
@@ -1000,11 +1078,110 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                    ) WHERE memory_key=?""",
                 (target.memory_key, target.memory_key),
             ),
+            (
+                """UPDATE memory_items SET status=status
+                   WHERE memory_key=? RETURNING normalized_content""",
+                (target.memory_key,),
+            ),
+            (
+                """UPDATE memory_items SET status=normalized_content
+                   WHERE memory_key=?""",
+                (target.memory_key,),
+            ),
+            (
+                """UPDATE memory_items SET updated_at=updated_at
+                   WHERE normalized_content IS NOT NULL""",
+                (),
+            ),
+            (
+                """DELETE FROM memory_items
+                   WHERE memory_key=? RETURNING normalized_content""",
+                (target.memory_key,),
+            ),
+            (
+                """DELETE FROM memory_items
+                   WHERE normalized_content IS NOT NULL""",
+                (),
+            ),
+            (
+                f"""INSERT INTO memory_items {insert_columns}
+                    VALUES({','.join('?' for _ in insert_values)})
+                    RETURNING normalized_content""",
+                insert_values,
+            ),
+            (
+                f"""REPLACE INTO memory_items {insert_columns}
+                    VALUES({','.join('?' for _ in insert_values)})
+                    RETURNING normalized_content""",
+                insert_values,
+            ),
+            (
+                """WITH target AS (
+                       SELECT id FROM memory_items
+                   )
+                   UPDATE memory_items SET status='forgotten'
+                   RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """UPDATE main."memory_items"
+                   SET status=status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """UPDATE/**/memory_items
+                   SET status=status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """UPDATE "memory_items"
+                   SET status=status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """UPDATE [memory_items]
+                   SET status=status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """UPDATE `memory_items`
+                   SET status=status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """/* leading */ UPDATE memory_items
+                   SET status=status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                """UPDATE memory_items AS target
+                   SET status=target.status RETURNING normalized_content""",
+                (),
+            ),
+            (
+                f"""INSERT INTO memory_items {insert_columns}
+                    VALUES({','.join('?' for _ in insert_values)})
+                    ON CONFLICT(memory_key) DO UPDATE
+                    SET status=memory_items.normalized_content
+                    RETURNING normalized_content""",
+                insert_values,
+            ),
         )
+
+        def item_snapshot():
+            with channel_store.connect(self.path) as snapshot_connection:
+                return tuple(tuple(row) for row in snapshot_connection.execute(
+                    """SELECT id,memory_key,status,normalized_content,
+                              normalized_fingerprint,superseded_by_id,updated_at
+                       FROM memory_items ORDER BY id"""
+                ).fetchall())
+
         for statement, parameters in statements:
             with self.subTest(statement=statement):
+                before = item_snapshot()
                 gate = _ForgetSqlAuthorizerGate(
                     self._forget_sql_fingerprints(),
+                    self._forget_sql_write_fingerprints(),
                     self._sql_fingerprint,
                 )
                 connection = gate.wrap(channel_store.connect(self.path))
@@ -1015,6 +1192,46 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                     connection.close()
                 self.assertIsNotNone(gate.violation)
                 self.assertEqual(gate.sequence, [])
+                self.assertEqual(gate.write_sequence, [])
+                self.assertFalse(gate.records[-1]["completed"])
+                self.assertEqual(item_snapshot(), before)
+
+        with channel_store.connect(self.path) as setup:
+            setup.execute(
+                """CREATE TABLE forget_gate_driver(
+                       id INTEGER PRIMARY KEY, marker INTEGER NOT NULL
+                   )"""
+            )
+            setup.execute(
+                "INSERT INTO forget_gate_driver(id,marker) VALUES(1,0)"
+            )
+            setup.execute(
+                """CREATE TRIGGER forget_gate_read_trigger
+                   BEFORE UPDATE ON forget_gate_driver
+                   BEGIN
+                       SELECT normalized_content FROM memory_items;
+                   END"""
+            )
+        before = item_snapshot()
+        gate = _ForgetSqlAuthorizerGate(
+            self._forget_sql_fingerprints(),
+            self._forget_sql_write_fingerprints(),
+            self._sql_fingerprint,
+        )
+        connection = gate.wrap(channel_store.connect(self.path))
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    """UPDATE forget_gate_driver
+                       SET marker=marker+1 WHERE id=1"""
+                )
+        finally:
+            connection.close()
+        self.assertIsNotNone(gate.violation)
+        self.assertEqual(gate.violation["trigger"], "forget_gate_read_trigger")
+        self.assertEqual(gate.sequence, [])
+        self.assertEqual(gate.write_sequence, [])
+        self.assertEqual(item_snapshot(), before)
 
     def test_tampered_forget_replay_still_uses_only_c_before_fail_closed(self):
         target = self._remember("U", "Synthetic tampered SQL replay target")
@@ -1042,7 +1259,7 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                     "memory_suppressions",
                 )
             )
-        error, sequence, row_keys = self._capture_forget_sql(
+        error, sequence, row_keys, writes, _records = self._capture_forget_sql(
             lambda: self.service.forget_explicit_user_memory(request),
             error_pattern="terminal_semantics_invalid|request_binding_conflict",
         )
@@ -1051,6 +1268,7 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             {"terminal_semantics_invalid", "request_binding_conflict"},
         )
         self.assertEqual(sequence, ("C",))
+        self.assertEqual(writes, ())
         self.assertEqual(
             row_keys,
             ((
@@ -1191,14 +1409,17 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 (forgotten_request, "forgotten"),
                 (already_request, "already_forgotten"),
             ):
-                replay, sequence, row_keys = self._capture_forget_sql(
+                replay, sequence, row_keys, writes, _records = (
+                    self._capture_forget_sql(
                     lambda request=request: (
                         self.service.forget_explicit_user_memory(request)
+                    )
                     )
                 )
                 self.assertTrue(replay.replayed)
                 self.assertEqual(replay.category, category)
                 self.assertEqual(sequence, ("C",))
+                self.assertEqual(writes, ())
                 self.assertEqual(
                     row_keys,
                     ((
@@ -1224,29 +1445,74 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
     def test_forget_replay_survives_real_two_process_restart(self):
         path = str(Path(self.temp.name) / "restart-process.sqlite3")
         sentinel = "FORGET_PROCESS_RESTART_SENTINEL_98d53c2a"
+        synthetic_secret = (
+            "RESTART_HMAC_SENTINEL!Aa9#7f3149e62bC8d0Q2"
+        )
+        fingerprint = memory_policy.fingerprint_content(
+            synthetic_secret,
+            scope_type="global_user",
+            scope_ref="",
+            kind="project",
+            normalized_content=sentinel,
+        ).hex()
+        args = [
+            sys.executable,
+            "-B",
+            "-m",
+            "backend.tests._forget_restart_worker",
+        ]
+        forbidden = (
+            sentinel,
+            synthetic_secret,
+            fingerprint,
+            "_MemoryActionUnitOfWork",
+            "_ForgetTargetMetadataV1",
+            "_RegisteredForgetTargetV1",
+        )
 
         def run(payload):
             completed = subprocess.run(
-                [sys.executable, "-B", "-c", _FORGET_RESTART_SUBPROCESS],
+                args,
                 input=json.dumps(payload),
                 text=True,
                 capture_output=True,
                 timeout=45,
                 check=False,
             )
-            self.assertNotIn(sentinel, completed.stdout)
-            self.assertNotIn(sentinel, completed.stderr)
+            observed = (
+                completed.stdout,
+                completed.stderr,
+                repr(args),
+            )
+            for value in forbidden:
+                self.assertTrue(all(value not in text for text in observed))
+            self.assertTrue(all(
+                re.search(r"object at 0x[0-9a-f]+", text, re.IGNORECASE)
+                is None
+                for text in observed
+            ))
             if completed.returncode != 0:
                 self.fail("forget_restart_subprocess_failed")
             try:
-                return json.loads(completed.stdout)
+                parsed = json.loads(completed.stdout)
             except (TypeError, ValueError):
                 self.fail("forget_restart_subprocess_output_invalid")
+            self.assertIs(type(parsed), dict)
+            for value in forbidden:
+                self.assertNotIn(value, repr(parsed))
+            self.assertIsNone(
+                re.search(
+                    r"object at 0x[0-9a-f]+",
+                    repr(parsed),
+                    re.IGNORECASE,
+                )
+            )
+            return parsed
 
         first = run({
             "phase": "complete",
             "path": path,
-            "secret": TEST_HMAC_SECRET,
+            "secret": synthetic_secret,
             "content": sentinel,
             "remember_request_id": "Q" * 32,
             "forget_request_id": "R" * 32,
@@ -1258,13 +1524,14 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         second = run({
             "phase": "replay",
             "path": path,
-            "secret": TEST_HMAC_SECRET,
+            "secret": synthetic_secret,
             "forget_request_id": first["request_id"],
             "memory_key": first["memory_key"],
         })
         self.assertEqual(second["category"], first["category"])
         self.assertTrue(second["replayed"])
         self.assertEqual(second["sequence"], ["C"])
+        self.assertEqual(second["write_sequence"], [])
         self.assertIsNone(second["gate_violation"])
         self.assertEqual(
             second["registration_absent"],
@@ -1281,6 +1548,59 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             ).fetchone()
         self.assertIsNone(tombstone["normalized_content"])
         self.assertIsNone(tombstone["normalized_fingerprint"])
+
+    def test_forget_restart_worker_rejects_unbounded_or_nonexact_payloads(self):
+        path = str(Path(self.temp.name) / "invalid-restart.sqlite3")
+        valid = {
+            "phase": "complete",
+            "path": path,
+            "secret": TEST_HMAC_SECRET,
+            "content": "Synthetic restart schema content",
+            "remember_request_id": "Q" * 32,
+            "forget_request_id": "R" * 32,
+        }
+        invalid_payloads = (
+            "",
+            "null",
+            "[]",
+            '"string"',
+            "1",
+            json.dumps({**valid, "extra": "rejected"}),
+            json.dumps({
+                key: value for key, value in valid.items()
+                if key != "content"
+            }),
+            json.dumps({**valid, "secret": True}),
+            json.dumps({**valid, "phase": "unknown"}),
+            json.dumps({**valid, "forget_request_id": "short"}),
+            json.dumps({**valid, "path": "relative.sqlite3"}),
+            json.dumps(valid) + " trailing",
+            "x" * (16 * 1024 + 1),
+        )
+        args = [
+            sys.executable,
+            "-B",
+            "-m",
+            "backend.tests._forget_restart_worker",
+        ]
+        for raw in invalid_payloads:
+            with self.subTest(raw_length=len(raw)):
+                completed = subprocess.run(
+                    args,
+                    input=raw,
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(
+                    completed.stderr.strip(),
+                    "restart_payload_invalid",
+                )
+                self.assertNotIn(str(valid), completed.stderr)
+                self.assertNotIn(TEST_HMAC_SECRET, completed.stderr)
 
     def test_forget_uncertain_lookup_uses_terminal_without_registration(self):
         target = self._remember("S", "Synthetic uncertain registration target")
@@ -1406,8 +1726,10 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             ),
             mock.patch.object(store_type, "_finish_action", new=finish),
         ):
-            result, sequence, _row_keys = self._capture_forget_sql(
+            result, sequence, _row_keys, writes, _records = (
+                self._capture_forget_sql(
                 lambda: self.service.forget_explicit_user_memory(request)
+                )
             )
         self.assertTrue(result.replayed)
         self.assertEqual(result.category, "forgotten")
@@ -1415,6 +1737,7 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             sequence,
             ("A", "B_KEY", "B_ID", "C", "C"),
         )
+        self.assertEqual(writes, ("FORGET_UPDATE",))
         self.assertEqual(calls["commit"], 2)
         self.assertEqual(calls["lookup"], 1)
         for name in ("register", "seal", "get", "action", "issue"):
@@ -2214,6 +2537,262 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 connection.execute("SELECT count(*) FROM messages").fetchone()[0],
                 3,
             )
+
+    def test_concurrent_same_forget_request_is_single_writer_for_2_4_8(self):
+        tables = (
+            "messages",
+            "memory_action_requests",
+            "memory_evidence_events",
+            "memory_items",
+            "memory_sources",
+            "memory_suppressions",
+        )
+        for workers, marker in ((2, "U"), (4, "V"), (8, "W")):
+            with self.subTest(workers=workers):
+                path = str(
+                    Path(self.temp.name) / f"forget-concurrent-{workers}.sqlite3"
+                )
+                with channel_store.connect(path) as connection:
+                    connection.execute(
+                        channel_store.RELAY_TABLE_DDL["messages"]
+                    )
+                channel_store.run_migrations(path)
+                runtime = bootstrap_runtime(path, memory_config())
+                backend = memory_explicit_actions.create_entry_backend(
+                    runtime.privileged_actions
+                )
+                service = memory_explicit_actions.bind_operator_cli(backend)
+                content = f"FORGET_CONCURRENCY_SENTINEL_{workers}_7f31"
+                remembered = service.remember_explicit_user_memory(
+                    memory_explicit_actions.RememberExplicitMemoryRequest(
+                        marker * 32,
+                        "project",
+                        "global_user",
+                        "",
+                        content,
+                        "normal",
+                    )
+                )
+                request = memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    marker.lower() * 32,
+                    remembered.memory_key,
+                )
+                store = backend._store
+                actions = backend._actions
+                uow_type = memory_action_ledger._MemoryActionUnitOfWork
+                original_get = type(store)._get_forget_target_metadata
+                original_register = uow_type._register_forget_target
+                original_seal = uow_type._seal_registered_forget_target
+                original_action = type(actions).forget_explicit_user_memory
+                calls = {"A": 0, "register": 0, "seal": 0, "Store": 0}
+                lock = threading.Lock()
+
+                def count_call(name):
+                    with lock:
+                        calls[name] += 1
+
+                def get(current_store, *args, **kwargs):
+                    count_call("A")
+                    return original_get(current_store, *args, **kwargs)
+
+                def register(uow, **kwargs):
+                    count_call("register")
+                    return original_register(uow, **kwargs)
+
+                def seal(uow, binding, digest):
+                    count_call("seal")
+                    return original_seal(uow, binding, digest)
+
+                def action(current_actions, **kwargs):
+                    count_call("Store")
+                    return original_action(current_actions, **kwargs)
+
+                def counts():
+                    with channel_store.connect(path) as connection:
+                        return {
+                            table: int(connection.execute(
+                                f"SELECT count(*) FROM {table}"
+                            ).fetchone()[0])
+                            for table in tables
+                        }
+
+                before = counts()
+                with (
+                    mock.patch.object(
+                        type(store),
+                        "_get_forget_target_metadata",
+                        new=get,
+                    ),
+                    mock.patch.object(
+                        uow_type,
+                        "_register_forget_target",
+                        new=register,
+                    ),
+                    mock.patch.object(
+                        uow_type,
+                        "_seal_registered_forget_target",
+                        new=seal,
+                    ),
+                    mock.patch.object(
+                        type(actions),
+                        "forget_explicit_user_memory",
+                        new=action,
+                    ),
+                ):
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        results = list(pool.map(
+                            lambda _index: (
+                                service.forget_explicit_user_memory(request)
+                            ),
+                            range(workers),
+                        ))
+                after = counts()
+                delta = {
+                    table: after[table] - before[table] for table in tables
+                }
+                self.assertEqual(
+                    calls,
+                    {"A": 1, "register": 1, "seal": 1, "Store": 1},
+                )
+                self.assertEqual(
+                    sum(not result.replayed for result in results),
+                    1,
+                )
+                self.assertEqual(
+                    sum(result.replayed for result in results),
+                    workers - 1,
+                )
+                self.assertEqual(
+                    {result.category for result in results},
+                    {"forgotten"},
+                )
+                self.assertEqual(
+                    delta,
+                    {
+                        "messages": 1,
+                        "memory_action_requests": 1,
+                        "memory_evidence_events": 1,
+                        "memory_items": 0,
+                        "memory_sources": 1,
+                        "memory_suppressions": 1,
+                    },
+                )
+                with channel_store.connect(path) as connection:
+                    item = connection.execute(
+                        """SELECT status,normalized_content,
+                                  normalized_fingerprint
+                           FROM memory_items WHERE memory_key=?""",
+                        (remembered.memory_key,),
+                    ).fetchone()
+                self.assertEqual(item["status"], "forgotten")
+                self.assertIsNone(item["normalized_content"])
+                self.assertIsNone(item["normalized_fingerprint"])
+                observed = repr((results, calls, delta))
+                self.assertNotIn(content, observed)
+                self.assertNotIn(
+                    memory_policy.fingerprint_content(
+                        TEST_HMAC_SECRET,
+                        scope_type="global_user",
+                        scope_ref="",
+                        kind="project",
+                        normalized_content=content,
+                    ).hex(),
+                    observed,
+                )
+                self.assertNotRegex(observed, r"object at 0x[0-9a-f]+")
+
+    def test_forget_request_target_origin_and_concurrent_target_matrix(self):
+        tables = (
+            "messages",
+            "memory_action_requests",
+            "memory_evidence_events",
+            "memory_items",
+            "memory_sources",
+            "memory_suppressions",
+        )
+
+        def counts():
+            with channel_store.connect(self.path) as connection:
+                return {
+                    table: int(connection.execute(
+                        f"SELECT count(*) FROM {table}"
+                    ).fetchone()[0])
+                    for table in tables
+                }
+
+        first_target = self._remember("1", "Synthetic binding target one")
+        second_target = self._remember("2", "Synthetic binding target two")
+        request = memory_explicit_actions.ForgetExplicitMemoryRequest(
+            "3" * 32,
+            first_target.memory_key,
+        )
+        first = self.service.forget_explicit_user_memory(request)
+        self.assertEqual(first.category, "forgotten")
+
+        before = counts()
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "request_binding_conflict",
+        ):
+            self.service.forget_explicit_user_memory(
+                memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    request.request_id,
+                    second_target.memory_key,
+                )
+            )
+        self.assertEqual(counts(), before)
+
+        mcp_service = memory_explicit_actions.bind_mcp(self.service._backend)
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "request_binding_conflict",
+        ):
+            mcp_service.forget_explicit_user_memory(request)
+        self.assertEqual(counts(), before)
+
+        distinct = self.service.forget_explicit_user_memory(
+            memory_explicit_actions.ForgetExplicitMemoryRequest(
+                "4" * 32,
+                first_target.memory_key,
+            )
+        )
+        self.assertFalse(distinct.replayed)
+        self.assertEqual(distinct.category, "already_forgotten")
+
+        concurrent_target = self._remember(
+            "5",
+            "Synthetic concurrent forget forget target",
+        )
+        calls = tuple(
+            memory_explicit_actions.ForgetExplicitMemoryRequest(
+                marker * 32,
+                concurrent_target.memory_key,
+            )
+            for marker in ("6", "7")
+        )
+        before = counts()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                self.service.forget_explicit_user_memory,
+                calls,
+            ))
+        after = counts()
+        self.assertEqual(
+            sorted(result.category for result in results),
+            ["already_forgotten", "forgotten"],
+        )
+        self.assertTrue(all(not result.replayed for result in results))
+        self.assertEqual(
+            {table: after[table] - before[table] for table in tables},
+            {
+                "messages": 2,
+                "memory_action_requests": 2,
+                "memory_evidence_events": 2,
+                "memory_items": 0,
+                "memory_sources": 2,
+                "memory_suppressions": 1,
+            },
+        )
 
     def test_concurrent_different_requests_same_content_are_all_terminal(self):
         requests = tuple(

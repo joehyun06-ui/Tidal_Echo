@@ -548,11 +548,25 @@ Store-produced item ID already bound to the registration and B row, while
 replay uses C's validated item ID, so neither path performs a separate
 `SELECT id`. The tombstone query has no self-join, and source semantics query
 only `memory_sources`, projecting `memory_id -> memory_key` from already
-validated terminal items. A SQLite authorizer-backed test gate binds every
-`memory_items` read to an exact A/B/C statement fingerprint and rejects quoted,
-comment-adjacent, schema-qualified, CTE, alias, join, and subquery bypasses.
-Restart coverage uses two independent `sys.executable` subprocesses over one
-temporary SQLite database, not an in-process runtime bootstrap.
+validated terminal items. A SQLite authorizer-backed test gate uses no
+statement-keyword or `SELECT`-presence shortcut. Every `memory_items`
+authorizer event must belong to an exact A/B/C projection, the exact
+content-clearing Forget UPDATE, or the exact `memory_sources` insert whose
+SQLite foreign-key check reads only `memory_items.id`. The gate separately
+validates read/update columns, cursor description, completion state, and raw
+statement fingerprint. It rejects quoted, comment-adjacent, schema-qualified,
+CTE, alias, join, subquery, UPSERT, trigger, and write-`RETURNING` bypasses;
+the legitimate Forget UPDATE has no `RETURNING` and produces no row.
+Restart coverage uses two independent `sys.executable` module subprocesses
+over one temporary SQLite database, not an in-process runtime bootstrap.
+Their stdin JSON is bounded to 16 KiB and validated against an exact
+phase-specific schema before runtime construction. Tests reject stdout,
+stderr, JSON, repr, argv, and error leakage of plaintext, the synthetic HMAC
+secret, its fingerprint, internal registration/UoW type names, or object
+addresses. Permanent tests also cover same-request Forget with 2/4/8
+independent SQLite callers and the complete tombstone/suppression tamper
+matrix, including valid-target supersession and structurally valid
+suppression replacement.
 
 `MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
 entry backend, service, facade, authority, or writer. True additionally

@@ -1354,11 +1354,6 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             "invalid_state|request_binding_conflict|terminal_semantics_invalid",
         ):
             with store._action_unit_of_work() as uow:
-                if binding.action_kind == "forget":
-                    store._get_forget_target_metadata(
-                        binding.target_memory_key,
-                        _transaction=uow,
-                    )
                 uow.claim_request(binding)
         self.assertEqual(self.counts(path), before)
         self.assertGreaterEqual(before["memory_action_requests"], 1)
@@ -2744,41 +2739,142 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         )
 
     def test_forget_replay_authenticates_suppression_semantics(self):
-        (
-            path,
-            store,
-            authority,
-            remember_binding,
-            remember_result,
-        ) = self.completed_remember_case("forget-suppression")
-        forget_binding = memory_action_ledger.MemoryActionRequestBinding(
-            request_id="W" * 32,
-            action_kind="forget",
-            origin="operator_cli",
-            target_memory_key=remember_result.result_memory_key,
-            scope_type=remember_binding.scope_type,
-            scope_ref=remember_binding.scope_ref,
-            kind=remember_binding.kind,
-            sensitivity=remember_binding.sensitivity,
-            normalized_content=remember_binding.normalized_content,
-        )
-        result, replay = self.execute_forget(
-            store=store,
-            authority=authority,
-            binding=forget_binding,
-        )
-        self.assertFalse(replay)
-        self.assertEqual(result.result_category, "forgotten")
-        with channel_store.connect(path) as conn:
-            conn.execute(
+        cases = (
+            ("scope_type", "UPDATE memory_suppressions SET scope_type='project'"),
+            ("scope_ref", "UPDATE memory_suppressions SET scope_ref='tampered'"),
+            ("kind", "UPDATE memory_suppressions SET kind='task_or_progress'"),
+            (
+                "fingerprint_version",
                 """UPDATE memory_suppressions
-                   SET reason_category='privacy_policy'"""
-            )
-        self.assert_replay_rejected_without_growth(
-            path=path,
-            store=store,
-            binding=forget_binding,
+                   SET fingerprint_version=fingerprint_version+1""",
+            ),
+            (
+                "normalized_fingerprint",
+                """UPDATE memory_suppressions
+                   SET normalized_fingerprint=zeroblob(32)""",
+            ),
+            (
+                "reason_category",
+                """UPDATE memory_suppressions
+                   SET reason_category='privacy_policy'""",
+            ),
+            (
+                "created_at",
+                "UPDATE memory_suppressions SET created_at='tampered'",
+            ),
+            ("deleted", "DELETE FROM memory_suppressions"),
+            ("replaced", None),
         )
+        columns = (
+            "id",
+            "scope_type",
+            "scope_ref",
+            "kind",
+            "fingerprint_version",
+            "normalized_fingerprint",
+            "reason_category",
+            "created_at",
+        )
+        for index, (name, statement) in enumerate(cases):
+            with self.subTest(name=name):
+                (
+                    path,
+                    store,
+                    authority,
+                    remember_binding,
+                    remember_result,
+                ) = self.completed_remember_case(
+                    f"suppression-{index}"
+                )
+                forget_binding = memory_action_ledger.MemoryActionRequestBinding(
+                    request_id=str(index) * 32,
+                    action_kind="forget",
+                    origin="operator_cli",
+                    target_memory_key=remember_result.result_memory_key,
+                    scope_type=remember_binding.scope_type,
+                    scope_ref=remember_binding.scope_ref,
+                    kind=remember_binding.kind,
+                    sensitivity=remember_binding.sensitivity,
+                    normalized_content=None,
+                )
+                result, replay = self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=forget_binding,
+                )
+                self.assertFalse(replay)
+                self.assertEqual(result.result_category, "forgotten")
+                if name == "replaced":
+                    second_binding = self.binding(
+                        request_id="X" * 32,
+                        content="Synthetic replacement suppression memory",
+                    )
+                    second_result, second_replay = (
+                        self.execute_remember_for_store(
+                            store,
+                            authority,
+                            second_binding,
+                        )
+                    )
+                    self.assertFalse(second_replay)
+                    second_forget = memory_action_ledger.MemoryActionRequestBinding(
+                        request_id="Y" * 32,
+                        action_kind="forget",
+                        origin="operator_cli",
+                        target_memory_key=second_result.result_memory_key,
+                        scope_type=second_binding.scope_type,
+                        scope_ref=second_binding.scope_ref,
+                        kind=second_binding.kind,
+                        sensitivity=second_binding.sensitivity,
+                        normalized_content=None,
+                    )
+                    self.execute_forget(
+                        store=store,
+                        authority=authority,
+                        binding=second_forget,
+                    )
+                with channel_store.connect(path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("PRAGMA ignore_check_constraints=ON")
+                    if statement is not None:
+                        conn.execute(statement)
+                    else:
+                        rows = conn.execute(
+                            f"""SELECT {','.join(columns)}
+                                FROM memory_suppressions ORDER BY id"""
+                        ).fetchall()
+                        self.assertEqual(len(rows), 2)
+                        conn.execute("DELETE FROM memory_suppressions")
+                        placeholders = ",".join("?" for _ in columns)
+                        conn.execute(
+                            f"""INSERT INTO memory_suppressions
+                                ({','.join(columns)}) VALUES({placeholders})""",
+                            (
+                                rows[1]["id"],
+                                *(
+                                    rows[0][column]
+                                    for column in columns[1:]
+                                ),
+                            ),
+                        )
+                        conn.execute(
+                            f"""INSERT INTO memory_suppressions
+                                ({','.join(columns)}) VALUES({placeholders})""",
+                            (
+                                rows[0]["id"],
+                                *(
+                                    rows[1][column]
+                                    for column in columns[1:]
+                                ),
+                            ),
+                        )
+                    conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=forget_binding,
+                )
 
     def test_forget_replay_rejects_every_tombstone_semantic_tamper(self):
         cases = (
@@ -2793,6 +2889,11 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 "sensitivity",
                 "UPDATE memory_items SET sensitivity='sensitive'",
             ),
+            (
+                "fingerprint-version",
+                """UPDATE memory_items
+                   SET fingerprint_version=fingerprint_version+1""",
+            ),
             ("updated-at", "UPDATE memory_items SET updated_at='tampered'"),
             (
                 "supersession",
@@ -2802,6 +2903,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 "dangling-supersession",
                 "UPDATE memory_items SET superseded_by_id=id+999999",
             ),
+            ("valid-supersession", None),
             (
                 "content",
                 """UPDATE memory_items
@@ -2842,10 +2944,34 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 )
                 self.assertFalse(replay)
                 self.assertEqual(result.result_category, "forgotten")
+                parameters = ()
+                if name == "valid-supersession":
+                    second_binding = self.binding(
+                        request_id="Z" * 32,
+                        content="Synthetic valid supersession target",
+                    )
+                    second_result, second_replay = (
+                        self.execute_remember_for_store(
+                            store,
+                            authority,
+                            second_binding,
+                        )
+                    )
+                    self.assertFalse(second_replay)
+                    statement = """UPDATE memory_items
+                                   SET superseded_by_id=(
+                                       SELECT id FROM memory_items
+                                       WHERE memory_key=?
+                                   )
+                                   WHERE memory_key=?"""
+                    parameters = (
+                        second_result.result_memory_key,
+                        binding.target_memory_key,
+                    )
                 with channel_store.connect(path) as conn:
                     conn.execute("PRAGMA foreign_keys=OFF")
                     conn.execute("PRAGMA ignore_check_constraints=ON")
-                    conn.execute(statement)
+                    conn.execute(statement, parameters)
                     conn.execute("PRAGMA ignore_check_constraints=OFF")
                     conn.execute("PRAGMA foreign_keys=ON")
                 self.assert_replay_rejected_without_growth(

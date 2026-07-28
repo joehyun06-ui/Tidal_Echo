@@ -61,6 +61,9 @@ class RememberExplicitMemoryRequest:
     content: str = field(repr=False)
     sensitivity: str
 
+    def __repr__(self) -> str:
+        return "<RememberExplicitMemoryRequest>"
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class CorrectExplicitMemoryRequest:
@@ -69,11 +72,17 @@ class CorrectExplicitMemoryRequest:
     replacement_content: str = field(repr=False)
     sensitivity: str
 
+    def __repr__(self) -> str:
+        return "<CorrectExplicitMemoryRequest>"
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ForgetExplicitMemoryRequest:
     request_id: str = field(repr=False)
     memory_key: str = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "<ForgetExplicitMemoryRequest>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -87,6 +96,9 @@ class ExplicitMemoryActionResult:
     scope_type: str
     sensitivity: str
     replayed: bool
+
+    def __repr__(self) -> str:
+        return "<ExplicitMemoryActionResult>"
 
 
 def issue_request_id() -> str:
