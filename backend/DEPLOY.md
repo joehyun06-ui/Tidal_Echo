@@ -620,3 +620,26 @@ fail closed；entry-only 错误不破坏 `memory_core` 的只读 readiness。
 PR B 不修改 DDL、migration tuple 或 schema version：
 `migration_v9_needed=false`。本 PR 不批准部署、生产 Secret、Core/writes/entry
 启用或生产 Memory action；生产继续保持 read-only，并等待独立安全复审。
+
+### Memory operator preflight（仅供后续 CLI 组合根）
+
+`backend.memory_operator_composition` 是无 FastAPI 副作用的正式 API；本阶段
+不提供 CLI 命令，也不批准部署或启用生产 flags。调用方可先调用
+`preflight_operator_memory_from_environment(...)`。它只加载一次部署配置，
+使用 SQLite `mode=ro`、`PRAGMA query_only=ON`、`foreign_keys=ON` 和冻结的
+busy timeout，完整验证 core/relay v1-v6、Memory v7、ledger v8、精确 marker
+集合及 fingerprint profile。数据库不存在时不会创建文件；失败不会运行
+migration、recovery、路径准备、brain target 初始化或任何业务写入。
+
+只有 preflight 全部成功后，
+`compose_operator_memory_service_from_environment(...)` 才创建进程唯一
+Runtime Authority，并只执行
+`create_entry_backend(runtime.privileged_actions)` 与
+`bind_operator_cli(backend)`。返回值是 repr-safe 的
+`ExplicitMemoryActionService`；不会绑定 MCP、Telegram、Operit，不会创建
+HTTP/provider/network/outbox 入口，也不会把 Authority 或 writer 暴露给调用方。
+
+该 API 不改变上线流程或生产默认值。不要为本变更配置真实 Memory Secret，
+不要启用 `MEMORY_EXPLICIT_WRITES_ENABLED` 或
+`MEMORY_EXPLICIT_ENTRY_ENABLED`，不要对生产 SQLite 或备份运行 operator
+preflight。`migration_v9_needed=false`。

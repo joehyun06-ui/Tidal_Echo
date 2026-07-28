@@ -592,6 +592,44 @@ PR B changes no DDL or migration tuple: `migration_v9_needed=false`. Production
 remains read-only, with Core/writes/entry activation and real Memory Secret
 configuration outside this PR's approval.
 
+## Operator preflight and composition API
+
+`backend.memory_operator_composition` provides a non-FastAPI composition root
+for a future operator CLI. It does not implement a CLI command or create an
+HTTP, MCP, Telegram, Operit, provider, network, or outbox path.
+
+`preflight_operator_memory_from_environment(telegram_config, environ=None)`
+loads one frozen `DeploymentConfig` and then, without constructing a Runtime
+Authority, Store, writer, backend, or service:
+
+1. requires Memory Core, explicit writes, and explicit entry to be enabled and
+   valid in that frozen snapshot;
+2. requires the configured SQLite file to exist;
+3. opens it through a `mode=ro`, `query_only=ON`, foreign-key-enabled
+   connection using the frozen busy timeout;
+4. validates the exact v1-v8 marker set, complete core/relay/v7/v8 schema, and
+   the configured fingerprint profile; and
+5. closes the connection and returns a frozen, slotted, representation-safe
+   `MemoryOperatorPreflightV1`.
+
+The v1-v8 validator rejects missing, duplicate, renamed, non-applied, or
+unknown markers, including any v9+ marker. Profile validation shares the
+connection-aware rules used by `MemoryReader`: an absent profile is accepted
+only when all Memory and action-ledger business state is empty; every mismatch
+returns `memory_fingerprint_profile_mismatch` without exposing the Secret,
+key check, fingerprint, path, SQL, or stored data.
+
+`compose_operator_memory_service_from_environment(...)` runs that same
+preflight against the same frozen deployment snapshot. Only after it succeeds
+does the function call `bootstrap_memory_runtime(deployment)`, create the
+reviewed entry backend, bind `operator_cli`, and return the exact
+`ExplicitMemoryActionService`. It never binds MCP, Telegram, or Operit and
+does not retain Runtime Authority or privileged actions in its return value.
+
+The existing `*_from_environment` runtime bootstraps remain available and now
+delegate to exact-type frozen-`DeploymentConfig` variants. This change adds no
+DDL or migration: `migration_v9_needed=false`.
+
 ## Deferred phases
 
 Phase 2 may add model-assisted candidate extraction with an independently
