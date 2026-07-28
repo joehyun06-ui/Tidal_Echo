@@ -95,12 +95,13 @@ privacy boundary described below.
 
 ## Runtime authority and service boundary
 
-Application startup calls
-`bootstrap_memory_runtime_from_environment(...)` exactly once. That composition
-root invokes the formal deployment configuration loader itself and freezes a
-`MemoryRuntimePolicy`; `MemoryStore` no longer accepts caller-provided Memory
-configuration. The composition root supplies the process-local authority to the
-Store, repeated bootstrap attempts are rejected without replacing the current
+Application startup first creates only a `MemoryReadService`, without a Runtime
+Authority, writable Store, or privileged action object. When the separately
+gated explicit entry is requested and all startup checks pass, the composition
+root calls `bootstrap_memory_runtime_from_environment(...)` exactly once. That
+bootstrap invokes the formal deployment configuration loader itself, freezes a
+`MemoryRuntimePolicy`, and supplies the process-local authority to the Store.
+Repeated bootstrap attempts are rejected without replacing the current
 authority, and later environment mutation cannot change the frozen policy.
 These are application wiring and misuse controls within the trusted process,
 not a sandbox for arbitrary same-process Python.
@@ -108,11 +109,13 @@ not a sandbox for arbitrary same-process Python.
 The bootstrap also creates an independent random action HMAC secret. It is
 generated anew for every process, is separate from the fingerprint secret, and
 is never placed in configuration, SQLite, logs, errors, readiness, or object
-representations. The application retains only `MemoryReadService`, backed by a
-separate read-only query object whose object graph contains neither the
-writable Store nor Runtime Authority. It discards `PrivilegedMemoryActions` and
-does not place the runtime authority or privileged object in a route,
-`app.state`, Telegram, Kelivo, Operit, Galatea, or another adapter.
+representations. With the explicit entry disabled or invalid, the application
+retains only `MemoryReadService`, backed by a separate read-only query object
+whose object graph contains neither the writable Store nor Runtime Authority.
+With the entry fully valid, only the reviewed internal backend and its four
+bound facades retain `PrivilegedMemoryActions`. The runtime authority and
+privileged object are never placed in a route, `app.state`, Telegram, Kelivo,
+Operit, Galatea, or another adapter.
 
 `MemoryReadService` has no create, correct, forget, or grant method. The
 privileged object has only these fixed-semantics actions:
@@ -287,6 +290,7 @@ non-empty whitespace-padded sources fail closed. Operit retains `source=operit`.
 ```dotenv
 MEMORY_CORE_ENABLED=false
 MEMORY_EXPLICIT_WRITES_ENABLED=false
+MEMORY_EXPLICIT_ENTRY_ENABLED=false
 MEMORY_SENSITIVE_STORAGE_ENABLED=false
 MEMORY_MAX_ITEM_CHARS=1000
 MEMORY_FORGET_RETENTION_POLICY=tombstone_without_content
@@ -452,9 +456,22 @@ completion. This targeted revision separates replayable
 `StoreOutcomeSemanticsV1` from the owner-bound live envelope and revalidates all
 five identities before snapshot construction. The owner token and Store
 reference remain process-local: they are not persisted, hashed, logged,
-returned, or reconstructed on replay. The fix is complete but still awaits a
-final focused independent review; the PR remains Draft and is not ready for
-merge or deployment.
+returned, or reconstructed on replay. A later focused review found a separate
+Forget-target ownership gap. The entry backend now obtains the exact typed
+metadata object from the Store inside the outer UoW; the Store immediately
+registers that object with a process-local UoW registry. Claim seals the
+registration to the exact Store/UoW identities, all 11 target fields, target
+key, `forget` action kind, request ID, origin, and request-binding digest.
+The privileged action can retrieve only that registered object, and the Store
+compares all 11 fields again against its current write-side row. Replacement,
+mutation, stale, unregistered, cross-Store, cross-UoW, cross-request, and
+cross-origin objects fail closed. Registration is cleared on commit, rollback,
+and uncertain close; it is never persisted, hashed into terminal state,
+returned, represented with target data, or logged. It is created only after a
+same-transaction terminal probe proves that the request ID is absent and the
+request will enter the new-write path. Completed Forget replay and uncertain
+terminal lookup never create, seal, consume, or depend on a registration.
+The PR remains Draft and is not ready for merge or deployment.
 
 Phase 1.5 PR A adds no production Memory write entrypoint. Core read-only mode
 can apply and validate v8 without a fingerprint secret; explicit writes remain
@@ -462,6 +479,118 @@ disabled by default. Old v7 application code ignores the additive v8
 marker/table. Application rollback therefore leaves v8 in place; a physical
 schema downgrade still requires restoration of a consistent pre-v8 backup,
 never manual marker or table deletion.
+
+### Phase 1.5 PR B explicit action entry
+
+PR B adds typed, frozen, slotted, representation-safe request/result contracts
+and an internal `ExplicitMemoryActionService`. Four composition-root factories
+bind provenance permanently:
+
+- `operator_cli` to `channel=web`, `source=relay`;
+- `mcp` to `channel=relay`, `source=mcp`;
+- `telegram` to `channel=telegram`, `source=telegram`;
+- `operit` to `channel=operit_share`, `source=operit`.
+
+The names describe future ownership only. PR B connects none of these facades
+to a CLI, MCP server, HTTP route, Telegram command, Operit command, provider,
+model, outbox, or external-message path. Callers cannot supply or override
+origin, channel, source, canonical ID, result category, result key, Store
+outcome, or suppression semantics. This is trusted same-process miswiring
+control, not a Python sandbox.
+
+The reviewed internal entry backend owns one outer `BEGIN IMMEDIATE`. Forget
+first probes `memory_action_requests` by request ID, fixed origin, and public
+target key. A present completed Forget terminal is authenticated from its
+actual stored request columns, current content-free tombstone,
+canonical/evidence/source/suppression semantics, and terminal HMAC. The
+tombstone supplies the persisted scope, kind, and sensitivity used to
+reconstruct and exactly validate the full binding. Replay then commits without
+target preparation, registration, canonical insertion, capability issuance,
+or Store execution. If the probe is absent, the same UoW performs the single A
+target projection, registers its exact object, constructs the binding, rechecks
+the ledger row in `claim_request()`, seals ownership only after that row is
+still absent, and proceeds through canonical insertion, Store savepoint,
+terminal validation/insertion, and outer commit. `BEGIN IMMEDIATE` keeps the
+probe-to-claim sequence single-winner.
+
+A definite rollback releases the capability; an uncertain commit burns it,
+closes the current UoW, and performs only a fresh same-binding
+existing-terminal lookup. That lookup never enters the new-request claim path.
+A present terminal returns replay; an absent terminal returns
+`transaction_outcome_uncertain` and is never blindly re-executed.
+
+Remember canonical text is normalized explicit user content. `decision` is
+always routed to confirmed project decision; `assistant_experience` is
+rejected. Correct canonical text is normalized replacement content and targets
+only a public Memory key. Forget uses only
+`Forget explicit memory: <public memory_key>`. Its request/capability binding
+has `normalized_content=None`. Target resolution and the Store action use
+explicit metadata-only projections: active plaintext is never selected,
+materialized into a Python/SQLite result row or dict, or copied. The terminal
+snapshot reads only tombstone metadata plus SQL `IS NULL` absence flags; it
+never returns plaintext or fingerprint values to Python. Canonical data,
+results, errors, representations, readiness, and logs therefore contain no
+forgotten plaintext. Store state, tombstone, suppression, and the authenticated
+terminal snapshot are sufficient for restart replay.
+
+Every Forget-path `memory_items` read is one of three exact projections. A is
+the 11-field prepare/registration projection and runs exactly once only for a
+new request after the terminal probe is absent. B is the Store projection:
+active Forget reads it once before and once after the update, while
+`already_forgotten` reads it once. C is the content-free tombstone projection
+with only metadata and `IS NULL` absence flags; completion and every completed
+replay read it once. The resulting `memory_items` sequences are
+`A -> B(key) -> B(id) -> C` for new active Forget,
+`A -> B(key) -> C` for a new already-forgotten request, and only `C` for
+same-process replay, fresh-runtime replay, real process-restart replay, and
+uncertain terminal lookup. Forget completion trusts the internal
+Store-produced item ID already bound to the registration and B row, while
+replay uses C's validated item ID, so neither path performs a separate
+`SELECT id`. The tombstone query has no self-join, and source semantics query
+only `memory_sources`, projecting `memory_id -> memory_key` from already
+validated terminal items. A SQLite authorizer-backed test gate uses no
+statement-keyword or `SELECT`-presence shortcut. Every `memory_items`
+authorizer event must belong to an exact A/B/C projection, the exact
+content-clearing Forget UPDATE, or the exact `memory_sources` insert whose
+SQLite foreign-key check reads only `memory_items.id`. The gate separately
+validates read/update columns, cursor description, completion state, and a
+conservative raw-statement key. That key normalizes only line endings,
+token-external whitespace, and spacing around safe punctuation; it preserves
+every literal, parameter placeholder, quoted identifier, comment, clause, and
+expression. In particular, literal Memory keys and integer IDs are never
+folded into `?`. Unknown literal A/B lookalikes, quoted, comment-adjacent,
+schema-qualified, CTE, alias, join, subquery, UPSERT, trigger, and
+write-`RETURNING` bypasses are rejected. Persistent gate violations and
+records contain only fixed categories, registered names or `unknown`, safe
+schema column names, descriptions for registered statements, and booleans;
+they retain no SQL, statement key, database path, trigger text, parameter, or
+literal. The legitimate Forget UPDATE has no `RETURNING` and produces no row.
+Restart coverage uses two independent `sys.executable` module subprocesses
+over one temporary SQLite database, not an in-process runtime bootstrap.
+Their stdin JSON is bounded to 16 KiB and validated against an exact
+phase-specific schema before runtime construction. Tests reject stdout,
+stderr, JSON, repr, argv, and error leakage of plaintext, the synthetic HMAC
+secret, its fingerprint, internal registration/UoW type names, or object
+addresses. Permanent tests also cover same-request Forget with 2/4/8
+independent SQLite callers and the complete tombstone/suppression tamper
+matrix. Real completed-replay SQLite cases cover every tombstone semantic
+field (`id`, key, status, kind, scope, sensitivity, explicitness, confidence,
+fingerprint version, updated time, content/fingerprint absence, and
+supersession), self/dangling/valid-target supersession, and row deletion.
+Suppression cases cover every field, deletion, and structurally valid
+replacement. Every replay fails closed without A, registration, capability,
+Store execution, terminal mutation, or business-table growth.
+
+`MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
+entry backend, service, facade, authority, or writer. True additionally
+requires Core, explicit writes, valid key ID/HMAC configuration, a valid
+fingerprint profile, and exact v7/v8 schema. Failure constructs no entry writer
+and reports the independent data-free `memory_explicit_entry` readiness check;
+entry-only configuration faults do not change `memory_core` readiness.
+
+PR B changes no DDL or migration tuple: `migration_v9_needed=false`. Production
+remains read-only, with Core/writes/entry activation and real Memory Secret
+configuration outside this PR's approval.
 
 ## Deferred phases
 
@@ -472,6 +601,7 @@ implemented or enabled by this change.
 
 ## Review status
 
-Phase 1.5 PR A is infrastructure only. It does not approve deployment,
-production Secret configuration, explicit-write activation, or a transport.
-It must remain Draft until independent security review completes.
+Phase 1.5 PR B is an internal, default-disabled entry composition. It does not
+approve deployment, production Secret configuration, Core/write/entry
+activation, or a transport. It must remain Draft until independent security
+review completes.

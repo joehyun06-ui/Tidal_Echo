@@ -16,6 +16,7 @@ from unittest import mock
 from backend import (
     channel_store,
     memory_action_ledger,
+    memory_store,
 )
 from backend.tests.test_memory_service import (
     TEST_HMAC_SECRET,
@@ -992,18 +993,23 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         authority,
         binding: memory_action_ledger.MemoryActionRequestBinding,
         spoof_outcome: str | None = None,
+        uow_sink: list[object] | None = None,
     ):
+        binding = replace(binding, normalized_content=None)
         runtime_module = importlib.import_module(type(authority).__module__)
         store_module = importlib.import_module(type(store).__module__)
         with store._action_unit_of_work() as uow:
+            if uow_sink is not None:
+                uow_sink.append(uow)
+            store._get_forget_target_metadata(
+                binding.target_memory_key,
+                _transaction=uow,
+            )
             replay = uow.claim_request(binding)
             if replay is not None:
                 return uow.commit(), True
             canonical_id = uow._insert_canonical_action(
-                text=(
-                    binding.normalized_content
-                    or "Forget previously forgotten memory"
-                ),
+                text=f"Forget explicit memory: {binding.target_memory_key}",
                 metadata={"channel": "web", "source": "relay"},
             )
             envelope = runtime_module.issue_action_envelope(
@@ -1014,7 +1020,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     kind=binding.kind,
                     scope_type=binding.scope_type,
                     scope_ref=binding.scope_ref,
-                    normalized_content=binding.normalized_content,
+                    normalized_content=None,
                     sensitivity=binding.sensitivity,
                     memory_key=binding.target_memory_key,
                 ),
@@ -1042,6 +1048,299 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             uow.complete_request()
             return uow.commit(), False
 
+    def test_forget_target_registration_is_owner_and_request_bound(self):
+        (
+            path,
+            store,
+            _authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-owner")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Z" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        other_store = object.__new__(type(store))
+        before = self.counts(path)
+
+        with store._action_unit_of_work() as owner:
+            target = store._get_forget_target_metadata(
+                binding.target_memory_key,
+                _transaction=owner,
+            )
+            registration = owner._forget_target_registration
+            self.assertIsNotNone(registration)
+            self.assertEqual(repr(registration), "<RegisteredForgetTargetV1>")
+            self.assertNotIn(binding.target_memory_key, repr(registration))
+            self.assertFalse(hasattr(registration, "__dict__"))
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "invalid_state",
+            ):
+                store._get_forget_target_metadata(
+                    binding.target_memory_key,
+                    _transaction=owner,
+                )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "request_binding_conflict",
+            ):
+                store.forget_memory_atomic(
+                    memory_key=binding.target_memory_key,
+                    sources=(),
+                    authorization=None,
+                    _transaction=owner,
+                )
+
+            self.assertIsNone(owner.claim_request(binding))
+            self.assertIs(
+                owner._require_registered_forget_target(store=store),
+                target,
+            )
+            sealed = owner._forget_target_registration
+            self.assertEqual(sealed.request_id, binding.request_id)
+            self.assertEqual(sealed.origin, binding.origin)
+            self.assertEqual(
+                sealed.binding_digest,
+                memory_action_ledger.request_binding_digest(
+                    TEST_HMAC_SECRET,
+                    binding,
+                ),
+            )
+            owner._forget_target_registration = replace(
+                sealed,
+                _metadata=replace(target),
+            )
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "request_binding_conflict",
+            ):
+                owner._require_registered_forget_target(store=store)
+            owner._forget_target_registration = sealed
+
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "request_binding_conflict",
+            ):
+                owner._require_registered_forget_target(store=other_store)
+
+            original_binding = owner._binding
+            for changed in (
+                replace(original_binding, request_id="Y" * 32),
+                replace(original_binding, origin="mcp"),
+            ):
+                with self.subTest(
+                    request=changed.request_id,
+                    origin=changed.origin,
+                ):
+                    owner._binding = changed
+                    with self.assertRaisesRegex(
+                        memory_action_ledger.MemoryActionLedgerError,
+                        "request_binding_conflict",
+                    ):
+                        owner._require_registered_forget_target(store=store)
+            owner._binding = original_binding
+
+        self.assertIsNone(owner._forget_target_registration)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            owner._require_registered_forget_target(store=store)
+        with store._action_unit_of_work() as foreign_uow:
+            foreign_uow._forget_target_registration = registration
+            with self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "request_binding_conflict",
+            ):
+                foreign_uow.claim_request(binding)
+        self.assertEqual(self.counts(path), before)
+
+    def test_forget_target_registration_rejects_unissued_metadata_shapes(self):
+        (
+            path,
+            store,
+            _authority,
+            _remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-fakes")
+        native = store._get_forget_target_metadata(
+            remember_result.result_memory_key,
+        )
+        native_type = type(native)
+
+        class MetadataSubclass(native_type):
+            pass
+
+        values = {
+            field.name: getattr(native, field.name)
+            for field in fields(native)
+        }
+        candidates = (
+            native,
+            dict(values),
+            SimpleNamespace(**values),
+            MetadataSubclass(**values),
+            replace(native),
+        )
+        before = self.counts(path)
+        for candidate in candidates:
+            with (
+                self.subTest(candidate=type(candidate).__name__),
+                store._action_unit_of_work() as uow,
+                self.assertRaisesRegex(
+                    memory_action_ledger.MemoryActionLedgerError,
+                    "invalid_state",
+                ),
+            ):
+                uow._register_forget_target(
+                    store=store,
+                    metadata=candidate,
+                    issuance=object(),
+                )
+        self.assertEqual(self.counts(path), before)
+
+    def test_forget_target_registration_clears_on_commit_and_uncertain_close(self):
+        (
+            _path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-commit")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Z" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        committed_uow: list[object] = []
+        result, replay = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=binding,
+            uow_sink=committed_uow,
+        )
+        self.assertFalse(replay)
+        self.assertEqual(result.result_category, "forgotten")
+        self.assertIsNone(committed_uow[0]._forget_target_registration)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            committed_uow[0]._require_registered_forget_target(store=store)
+
+        (
+            _path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-registration-uncertain")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="Y" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        uncertain_uow: list[object] = []
+        original_commit = memory_action_ledger._MemoryActionUnitOfWork.commit
+
+        def fail_after_commit(uow):
+            uow._connection = _CommitFailureConnection(
+                uow._connection,
+                after_commit=True,
+            )
+            return original_commit(uow)
+
+        with (
+            mock.patch.object(
+                memory_action_ledger._MemoryActionUnitOfWork,
+                "commit",
+                new=fail_after_commit,
+            ),
+            self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "transaction_outcome_uncertain",
+            ),
+        ):
+            self.execute_forget(
+                store=store,
+                authority=authority,
+                binding=binding,
+                uow_sink=uncertain_uow,
+            )
+        self.assertIsNone(uncertain_uow[0]._forget_target_registration)
+        with self.assertRaisesRegex(
+            memory_action_ledger.MemoryActionLedgerError,
+            "invalid_state",
+        ):
+            uncertain_uow[0]._require_registered_forget_target(store=store)
+
+    def test_completed_forget_claim_replays_without_prepared_registration(self):
+        (
+            path,
+            store,
+            authority,
+            remember_binding,
+            remember_result,
+        ) = self.completed_remember_case("forget-claim-no-registration")
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id="X" * 32,
+            action_kind="forget",
+            origin="operator_cli",
+            target_memory_key=remember_result.result_memory_key,
+            scope_type=remember_binding.scope_type,
+            scope_ref=remember_binding.scope_ref,
+            kind=remember_binding.kind,
+            sensitivity=remember_binding.sensitivity,
+            normalized_content=None,
+        )
+        first, replayed = self.execute_forget(
+            store=store,
+            authority=authority,
+            binding=binding,
+        )
+        self.assertFalse(replayed)
+        self.assertEqual(first.result_category, "forgotten")
+        before = self.counts(path)
+        with (
+            mock.patch.object(
+                memory_action_ledger._MemoryActionUnitOfWork,
+                "_seal_registered_forget_target",
+                side_effect=AssertionError("replay must not seal registration"),
+            ),
+            store._action_unit_of_work() as uow,
+        ):
+            self.assertIsNone(uow._forget_target_metadata_identity)
+            self.assertIsNone(uow._forget_target_registration)
+            replay = uow.claim_request(binding)
+            self.assertEqual(replay, first)
+            self.assertIsNone(uow._forget_target_metadata_identity)
+            self.assertIsNone(uow._forget_target_registration)
+            committed = uow.commit()
+        self.assertEqual(committed, first)
+        self.assertEqual(self.counts(path), before)
+
     def assert_replay_rejected_without_growth(
         self,
         *,
@@ -1051,8 +1350,8 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
     ) -> None:
         before = self.counts(path)
         with self.assertRaisesRegex(
-            memory_action_ledger.MemoryActionLedgerError,
-            "request_binding_conflict|terminal_semantics_invalid",
+            RuntimeError,
+            "invalid_state|request_binding_conflict|terminal_semantics_invalid",
         ):
             with store._action_unit_of_work() as uow:
                 uow.claim_request(binding)
@@ -2440,41 +2739,258 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         )
 
     def test_forget_replay_authenticates_suppression_semantics(self):
-        (
-            path,
-            store,
-            authority,
-            remember_binding,
-            remember_result,
-        ) = self.completed_remember_case("forget-suppression")
-        forget_binding = memory_action_ledger.MemoryActionRequestBinding(
-            request_id="W" * 32,
-            action_kind="forget",
-            origin="operator_cli",
-            target_memory_key=remember_result.result_memory_key,
-            scope_type=remember_binding.scope_type,
-            scope_ref=remember_binding.scope_ref,
-            kind=remember_binding.kind,
-            sensitivity=remember_binding.sensitivity,
-            normalized_content=remember_binding.normalized_content,
-        )
-        result, replay = self.execute_forget(
-            store=store,
-            authority=authority,
-            binding=forget_binding,
-        )
-        self.assertFalse(replay)
-        self.assertEqual(result.result_category, "forgotten")
-        with channel_store.connect(path) as conn:
-            conn.execute(
+        cases = (
+            ("scope_type", "UPDATE memory_suppressions SET scope_type='project'"),
+            ("scope_ref", "UPDATE memory_suppressions SET scope_ref='tampered'"),
+            ("kind", "UPDATE memory_suppressions SET kind='task_or_progress'"),
+            (
+                "fingerprint_version",
                 """UPDATE memory_suppressions
-                   SET reason_category='privacy_policy'"""
-            )
-        self.assert_replay_rejected_without_growth(
-            path=path,
-            store=store,
-            binding=forget_binding,
+                   SET fingerprint_version=fingerprint_version+1""",
+            ),
+            (
+                "normalized_fingerprint",
+                """UPDATE memory_suppressions
+                   SET normalized_fingerprint=zeroblob(32)""",
+            ),
+            (
+                "reason_category",
+                """UPDATE memory_suppressions
+                   SET reason_category='privacy_policy'""",
+            ),
+            (
+                "created_at",
+                "UPDATE memory_suppressions SET created_at='tampered'",
+            ),
+            ("deleted", "DELETE FROM memory_suppressions"),
+            ("replaced", None),
         )
+        columns = (
+            "id",
+            "scope_type",
+            "scope_ref",
+            "kind",
+            "fingerprint_version",
+            "normalized_fingerprint",
+            "reason_category",
+            "created_at",
+        )
+        for index, (name, statement) in enumerate(cases):
+            with self.subTest(name=name):
+                (
+                    path,
+                    store,
+                    authority,
+                    remember_binding,
+                    remember_result,
+                ) = self.completed_remember_case(
+                    f"suppression-{index}"
+                )
+                forget_binding = memory_action_ledger.MemoryActionRequestBinding(
+                    request_id=str(index) * 32,
+                    action_kind="forget",
+                    origin="operator_cli",
+                    target_memory_key=remember_result.result_memory_key,
+                    scope_type=remember_binding.scope_type,
+                    scope_ref=remember_binding.scope_ref,
+                    kind=remember_binding.kind,
+                    sensitivity=remember_binding.sensitivity,
+                    normalized_content=None,
+                )
+                result, replay = self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=forget_binding,
+                )
+                self.assertFalse(replay)
+                self.assertEqual(result.result_category, "forgotten")
+                if name == "replaced":
+                    second_binding = self.binding(
+                        request_id="X" * 32,
+                        content="Synthetic replacement suppression memory",
+                    )
+                    second_result, second_replay = (
+                        self.execute_remember_for_store(
+                            store,
+                            authority,
+                            second_binding,
+                        )
+                    )
+                    self.assertFalse(second_replay)
+                    second_forget = memory_action_ledger.MemoryActionRequestBinding(
+                        request_id="Y" * 32,
+                        action_kind="forget",
+                        origin="operator_cli",
+                        target_memory_key=second_result.result_memory_key,
+                        scope_type=second_binding.scope_type,
+                        scope_ref=second_binding.scope_ref,
+                        kind=second_binding.kind,
+                        sensitivity=second_binding.sensitivity,
+                        normalized_content=None,
+                    )
+                    self.execute_forget(
+                        store=store,
+                        authority=authority,
+                        binding=second_forget,
+                    )
+                with channel_store.connect(path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("PRAGMA ignore_check_constraints=ON")
+                    if statement is not None:
+                        conn.execute(statement)
+                    else:
+                        rows = conn.execute(
+                            f"""SELECT {','.join(columns)}
+                                FROM memory_suppressions ORDER BY id"""
+                        ).fetchall()
+                        self.assertEqual(len(rows), 2)
+                        conn.execute("DELETE FROM memory_suppressions")
+                        placeholders = ",".join("?" for _ in columns)
+                        conn.execute(
+                            f"""INSERT INTO memory_suppressions
+                                ({','.join(columns)}) VALUES({placeholders})""",
+                            (
+                                rows[1]["id"],
+                                *(
+                                    rows[0][column]
+                                    for column in columns[1:]
+                                ),
+                            ),
+                        )
+                        conn.execute(
+                            f"""INSERT INTO memory_suppressions
+                                ({','.join(columns)}) VALUES({placeholders})""",
+                            (
+                                rows[0]["id"],
+                                *(
+                                    rows[1][column]
+                                    for column in columns[1:]
+                                ),
+                            ),
+                        )
+                    conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=forget_binding,
+                )
+
+    def test_forget_replay_rejects_every_tombstone_semantic_tamper(self):
+        cases = (
+            ("id", "UPDATE memory_items SET id=id+999999"),
+            (
+                "memory-key",
+                f"""UPDATE memory_items
+                    SET memory_key='{'T' * 32}'""",
+            ),
+            ("status", "UPDATE memory_items SET status='active'"),
+            ("kind", "UPDATE memory_items SET kind='task_or_progress'"),
+            (
+                "scope",
+                """UPDATE memory_items
+                   SET scope_type='project',scope_ref='tampered'""",
+            ),
+            (
+                "sensitivity",
+                "UPDATE memory_items SET sensitivity='sensitive'",
+            ),
+            (
+                "explicitness",
+                "UPDATE memory_items SET explicitness='inferred'",
+            ),
+            ("confidence", "UPDATE memory_items SET confidence=0.5"),
+            (
+                "fingerprint-version",
+                """UPDATE memory_items
+                   SET fingerprint_version=fingerprint_version+1""",
+            ),
+            ("updated-at", "UPDATE memory_items SET updated_at='tampered'"),
+            (
+                "supersession",
+                "UPDATE memory_items SET superseded_by_id=id",
+            ),
+            (
+                "dangling-supersession",
+                "UPDATE memory_items SET superseded_by_id=id+999999",
+            ),
+            ("valid-supersession", None),
+            (
+                "content",
+                """UPDATE memory_items
+                   SET normalized_content='FORGET_TAMPERED_CONTENT'""",
+            ),
+            (
+                "fingerprint",
+                """UPDATE memory_items
+                   SET normalized_fingerprint=zeroblob(32)""",
+            ),
+            ("deleted", "DELETE FROM memory_items"),
+        )
+        for index, (name, statement) in enumerate(cases):
+            with self.subTest(name=name):
+                (
+                    path,
+                    store,
+                    authority,
+                    remember_binding,
+                    remember_result,
+                ) = self.completed_remember_case(
+                    f"forget-tombstone-{index}"
+                )
+                binding = memory_action_ledger.MemoryActionRequestBinding(
+                    request_id=chr(75 + index) * 32,
+                    action_kind="forget",
+                    origin="operator_cli",
+                    target_memory_key=remember_result.result_memory_key,
+                    scope_type=remember_binding.scope_type,
+                    scope_ref=remember_binding.scope_ref,
+                    kind=remember_binding.kind,
+                    sensitivity=remember_binding.sensitivity,
+                    normalized_content=None,
+                )
+                result, replay = self.execute_forget(
+                    store=store,
+                    authority=authority,
+                    binding=binding,
+                )
+                self.assertFalse(replay)
+                self.assertEqual(result.result_category, "forgotten")
+                parameters = ()
+                if name == "valid-supersession":
+                    second_binding = self.binding(
+                        request_id="Z" * 32,
+                        content="Synthetic valid supersession target",
+                    )
+                    second_result, second_replay = (
+                        self.execute_remember_for_store(
+                            store,
+                            authority,
+                            second_binding,
+                        )
+                    )
+                    self.assertFalse(second_replay)
+                    statement = """UPDATE memory_items
+                                   SET superseded_by_id=(
+                                       SELECT id FROM memory_items
+                                       WHERE memory_key=?
+                                   )
+                                   WHERE memory_key=?"""
+                    parameters = (
+                        second_result.result_memory_key,
+                        binding.target_memory_key,
+                    )
+                with channel_store.connect(path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("PRAGMA ignore_check_constraints=ON")
+                    conn.execute(statement, parameters)
+                    conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                self.assert_replay_rejected_without_growth(
+                    path=path,
+                    store=store,
+                    binding=binding,
+                )
 
     def test_replay_rejects_missing_outcome_required_suppression_rows(self):
         def remove_and_replay(path, store, binding, reason):

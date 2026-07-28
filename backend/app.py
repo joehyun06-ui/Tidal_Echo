@@ -41,10 +41,20 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 try:
-    from . import channel_store, deployment_config, kelivo_service, memory_runtime
+    from . import (
+        channel_store,
+        deployment_config,
+        kelivo_service,
+        memory_explicit_actions,
+        memory_runtime,
+    )
     from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 except ImportError:  # support `python backend/app.py`
-    import channel_store, deployment_config, kelivo_service, memory_runtime
+    import channel_store
+    import deployment_config
+    import kelivo_service
+    import memory_explicit_actions
+    import memory_runtime
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 
 try:
@@ -128,9 +138,11 @@ LOOP_TIMEOUT_SAFETY_MARGIN_SECONDS = DEPLOYMENT.timeouts.safety_margin
 LOOP_DISPATCH_TIMEOUT_SECONDS = DEPLOYMENT.timeouts.dispatch
 validate_loop_timeouts = deployment_config.validate_loop_timeouts
 KELIVO_PERSONA, KELIVO_PERSONA_SOURCE = deployment_config.load_server_persona()
-MEMORY_SERVICE = (
-    memory_runtime.bootstrap_memory_runtime_from_environment(TELEGRAM).read_service
+MEMORY_SERVICE = memory_runtime.bootstrap_memory_read_service_from_environment(
+    TELEGRAM
 )
+MEMORY_EXPLICIT_ENTRY_SERVICES = None
+MEMORY_EXPLICIT_ENTRY_ERROR = ""
 MEMORY_STARTUP_ERROR = ""
 CORE_STARTUP_ERROR = ""
 
@@ -155,6 +167,56 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {max(1, int(DEPLOYMENT.sqlite_busy_timeout_seconds * 1000))}")
     return conn
+
+
+def _compose_explicit_memory_entry() -> None:
+    global MEMORY_SERVICE
+    global MEMORY_EXPLICIT_ENTRY_ERROR, MEMORY_EXPLICIT_ENTRY_SERVICES
+    config = DEPLOYMENT.memory
+    if not config.explicit_entry_enabled:
+        return
+    if MEMORY_EXPLICIT_ENTRY_SERVICES is not None:
+        return
+    if not config.entry_configuration_valid:
+        MEMORY_EXPLICIT_ENTRY_ERROR = (
+            config.entry_error_category or "memory_explicit_entry_invalid"
+        )
+        return
+    if CORE_STARTUP_ERROR or MEMORY_STARTUP_ERROR:
+        MEMORY_EXPLICIT_ENTRY_ERROR = (
+            MEMORY_STARTUP_ERROR or "memory_schema_invalid"
+        )
+        return
+    memory_ready, memory_error = MEMORY_SERVICE.readiness()
+    if not memory_ready:
+        MEMORY_EXPLICIT_ENTRY_ERROR = (
+            memory_error or "memory_explicit_entry_invalid"
+        )
+        return
+    try:
+        runtime = memory_runtime.bootstrap_memory_runtime_from_environment(
+            TELEGRAM
+        )
+        backend = memory_explicit_actions.create_entry_backend(
+            runtime.privileged_actions
+        )
+        services = (
+            memory_explicit_actions.bind_operator_cli(backend),
+            memory_explicit_actions.bind_mcp(backend),
+            memory_explicit_actions.bind_telegram(backend),
+            memory_explicit_actions.bind_operit(backend),
+        )
+    except (
+        memory_explicit_actions.ExplicitMemoryActionError,
+        memory_runtime.MemoryRuntimeError,
+    ) as error:
+        MEMORY_EXPLICIT_ENTRY_ERROR = str(
+            getattr(error, "category", "memory_explicit_entry_invalid")
+        )
+        return
+    MEMORY_SERVICE = runtime.read_service
+    MEMORY_EXPLICIT_ENTRY_SERVICES = services
+    MEMORY_EXPLICIT_ENTRY_ERROR = ""
 
 
 def init_db() -> None:
@@ -203,6 +265,7 @@ def init_db() -> None:
             channel_store.run_migrations(DB_PATH)
         except (OSError, sqlite3.Error, ValueError):
             MEMORY_STARTUP_ERROR = "memory_schema_invalid"
+    _compose_explicit_memory_entry()
     channel_store.recover_inflight_generations(DB_PATH)
     channel_store.recover_inflight_deliveries(DB_PATH)
     # A process restart makes every prior in-flight dispatch uncertain; never
@@ -1079,6 +1142,11 @@ async def readyz():
     else:
         memory_ready, memory_error = await asyncio.to_thread(MEMORY_SERVICE.readiness)
     checks["memory_core"] = memory_ready
+    if DEPLOYMENT.memory.explicit_entry_enabled:
+        checks["memory_explicit_entry"] = bool(
+            MEMORY_EXPLICIT_ENTRY_SERVICES is not None
+            and not MEMORY_EXPLICIT_ENTRY_ERROR
+        )
     if DEPLOYMENT.kelivo.enabled:
         checks["kelivo"] = await asyncio.to_thread(
             kelivo_service.client_mapping_ready,
@@ -1104,6 +1172,13 @@ async def readyz():
         errors["database"] = "core_schema_invalid"
     if DEPLOYMENT.memory.enabled and memory_error:
         errors["memory_core"] = memory_error
+    if (
+        DEPLOYMENT.memory.explicit_entry_enabled
+        and not checks["memory_explicit_entry"]
+    ):
+        errors["memory_explicit_entry"] = (
+            MEMORY_EXPLICIT_ENTRY_ERROR or "memory_explicit_entry_invalid"
+        )
     if errors:
         payload["errors"] = errors
     return JSONResponse(payload, status_code=200 if ready else 503)

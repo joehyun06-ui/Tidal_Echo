@@ -92,6 +92,7 @@ FAILED_CATEGORIES = frozenset({
 
 _UNIT_OF_WORK_TOKEN = object()
 _TRUSTED_STORE_OUTCOME_TOKEN = object()
+_REGISTERED_FORGET_TARGET_TOKEN = object()
 
 
 class MemoryActionLedgerError(RuntimeError):
@@ -160,6 +161,32 @@ class TrustedStoreOutcomeV1:
 
     def __repr__(self) -> str:
         return "<TrustedStoreOutcomeV1>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RegisteredForgetTargetV1:
+    _seal: object = field(repr=False, compare=False)
+    _owner_uow_token: object = field(repr=False, compare=False)
+    _owner_store: object = field(repr=False, compare=False)
+    _metadata: object = field(repr=False, compare=False)
+    _metadata_snapshot: tuple[object, ...] = field(repr=False)
+    action_kind: str
+    target_memory_key: str = field(repr=False)
+    request_id: str | None = field(default=None, repr=False)
+    binding_digest: bytes | None = field(default=None, repr=False)
+    origin: str | None = None
+
+    def __repr__(self) -> str:
+        return "<RegisteredForgetTargetV1>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ForgetTerminalReplayV1:
+    binding: MemoryActionRequestBinding = field(repr=False)
+    result: MemoryActionLedgerResult = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "<ForgetTerminalReplayV1>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -655,6 +682,9 @@ class _MemoryActionUnitOfWork:
         "_store_outcome",
         "_store_outcome_semantics",
         "_store_outcome_owner_token",
+        "_forget_target_owner_token",
+        "_forget_target_metadata_identity",
+        "_forget_target_registration",
         "_deferred_actions",
         "_store_completed",
         "_store_failed",
@@ -682,6 +712,9 @@ class _MemoryActionUnitOfWork:
         self._store_outcome: TrustedStoreOutcomeV1 | None = None
         self._store_outcome_semantics: StoreOutcomeSemanticsV1 | None = None
         self._store_outcome_owner_token = object()
+        self._forget_target_owner_token = object()
+        self._forget_target_metadata_identity: object | None = None
+        self._forget_target_registration: _RegisteredForgetTargetV1 | None = None
         self._deferred_actions: list[str] = []
         self._store_completed = False
         self._store_failed = False
@@ -735,6 +768,199 @@ class _MemoryActionUnitOfWork:
             raise MemoryActionLedgerError("conflict") from None
         except (OSError, sqlite3.Error, ValueError):
             raise MemoryActionLedgerError("storage_unavailable") from None
+
+    @staticmethod
+    def _snapshot_forget_target(
+        store: object,
+        metadata: object,
+    ) -> tuple[object, ...]:
+        try:
+            snapshot = store._forget_target_snapshot(metadata)
+        except Exception:
+            raise MemoryActionLedgerError("invalid_state") from None
+        if not isinstance(snapshot, tuple) or len(snapshot) != 11:
+            raise MemoryActionLedgerError("invalid_state")
+        return snapshot
+
+    def _register_forget_target(
+        self,
+        *,
+        store: object,
+        metadata: object,
+        issuance: object = None,
+    ) -> None:
+        self._require_active()
+        if (
+            store is not self._store
+            or self._binding is not None
+            or self._replay is not None
+            or self._terminal is not None
+            or self._forget_target_registration is not None
+        ):
+            raise MemoryActionLedgerError("invalid_state")
+        try:
+            snapshot = store._consume_forget_target_issuance(
+                transaction=self,
+                metadata=metadata,
+                issuance=issuance,
+            )
+        except Exception:
+            raise MemoryActionLedgerError("invalid_state") from None
+        if not isinstance(snapshot, tuple) or len(snapshot) != 11:
+            raise MemoryActionLedgerError("invalid_state")
+        memory_key = snapshot[1]
+        if (
+            not isinstance(memory_key, str)
+            or MEMORY_KEY_PATTERN.fullmatch(memory_key) is None
+        ):
+            raise MemoryActionLedgerError("invalid_state")
+        self._forget_target_registration = _RegisteredForgetTargetV1(
+            _seal=_REGISTERED_FORGET_TARGET_TOKEN,
+            _owner_uow_token=self._forget_target_owner_token,
+            _owner_store=self._store,
+            _metadata=metadata,
+            _metadata_snapshot=snapshot,
+            action_kind="forget",
+            target_memory_key=memory_key,
+        )
+        self._forget_target_metadata_identity = metadata
+
+    def _require_prepared_forget_target(
+        self,
+        *,
+        store: object,
+        metadata: object,
+    ) -> object:
+        self._require_active()
+        registration = self._forget_target_registration
+        if (
+            store is not self._store
+            or self._binding is not None
+            or self._replay is not None
+            or self._terminal is not None
+            or type(registration) is not _RegisteredForgetTargetV1
+            or registration._seal is not _REGISTERED_FORGET_TARGET_TOKEN
+            or registration._owner_uow_token
+            is not self._forget_target_owner_token
+            or registration._owner_store is not self._store
+            or registration._metadata is not metadata
+            or metadata is not self._forget_target_metadata_identity
+            or registration.request_id is not None
+            or registration.binding_digest is not None
+            or registration.origin is not None
+            or self._snapshot_forget_target(store, metadata)
+            != registration._metadata_snapshot
+        ):
+            raise MemoryActionLedgerError("invalid_state")
+        return metadata
+
+    def _seal_registered_forget_target(
+        self,
+        binding: MemoryActionRequestBinding,
+        binding_digest: bytes,
+    ) -> None:
+        registration = self._forget_target_registration
+        if binding.action_kind != "forget":
+            if registration is not None:
+                raise MemoryActionLedgerError("invalid_state")
+            return
+        if (
+            type(registration) is not _RegisteredForgetTargetV1
+            or registration._seal is not _REGISTERED_FORGET_TARGET_TOKEN
+            or registration._owner_uow_token
+            is not self._forget_target_owner_token
+            or registration._owner_store is not self._store
+            or registration._metadata
+            is not self._forget_target_metadata_identity
+            or registration.action_kind != "forget"
+            or registration.request_id is not None
+            or registration.binding_digest is not None
+            or registration.origin is not None
+            or registration.target_memory_key != binding.target_memory_key
+            or registration._metadata_snapshot[1]
+            != binding.target_memory_key
+            or registration._metadata_snapshot[2] != binding.kind
+            or registration._metadata_snapshot[3] != binding.scope_type
+            or registration._metadata_snapshot[4] != binding.scope_ref
+            or registration._metadata_snapshot[6] != binding.sensitivity
+            or binding.normalized_content is not None
+            or self._snapshot_forget_target(
+                self._store,
+                registration._metadata,
+            )
+            != registration._metadata_snapshot
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
+        self._forget_target_registration = _RegisteredForgetTargetV1(
+            _seal=_REGISTERED_FORGET_TARGET_TOKEN,
+            _owner_uow_token=self._forget_target_owner_token,
+            _owner_store=self._store,
+            _metadata=registration._metadata,
+            _metadata_snapshot=registration._metadata_snapshot,
+            action_kind="forget",
+            target_memory_key=registration.target_memory_key,
+            request_id=binding.request_id,
+            binding_digest=bytes(binding_digest),
+            origin=binding.origin,
+        )
+
+    def _require_registered_forget_target(
+        self,
+        *,
+        store: object,
+    ) -> object:
+        self._require_active()
+        registration = self._forget_target_registration
+        binding = self._binding
+        digest = self._binding_digest
+        if (
+            store is not self._store
+            or type(registration) is not _RegisteredForgetTargetV1
+            or registration._seal is not _REGISTERED_FORGET_TARGET_TOKEN
+            or registration._owner_uow_token
+            is not self._forget_target_owner_token
+            or registration._owner_store is not self._store
+            or registration._metadata
+            is not self._forget_target_metadata_identity
+            or type(binding) is not MemoryActionRequestBinding
+            or binding.action_kind != "forget"
+            or registration.action_kind != "forget"
+            or registration.request_id != binding.request_id
+            or registration.origin != binding.origin
+            or registration.target_memory_key != binding.target_memory_key
+            or not isinstance(digest, bytes)
+            or not isinstance(registration.binding_digest, bytes)
+            or not hmac.compare_digest(registration.binding_digest, digest)
+            or self._snapshot_forget_target(
+                store,
+                registration._metadata,
+            )
+            != registration._metadata_snapshot
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
+        return registration._metadata
+
+    def _validate_registered_forget_target(
+        self,
+        *,
+        store: object,
+        registered_metadata: object,
+        current_metadata: object,
+    ) -> None:
+        exact = self._require_registered_forget_target(store=store)
+        registration = self._forget_target_registration
+        if (
+            registered_metadata is not exact
+            or current_metadata is registered_metadata
+            or type(registration) is not _RegisteredForgetTargetV1
+            or self._snapshot_forget_target(store, current_metadata)
+            != registration._metadata_snapshot
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
+
+    def _clear_forget_target_registration(self) -> None:
+        self._forget_target_metadata_identity = None
+        self._forget_target_registration = None
 
     @staticmethod
     def _semantic_error() -> MemoryActionLedgerError:
@@ -932,12 +1158,101 @@ class _MemoryActionUnitOfWork:
             updated_at=row["updated_at"],
         )
 
+    def _forgotten_item_semantic(
+        self,
+        memory_key: str,
+        *,
+        relation: str,
+    ) -> TerminalMemoryItemSemanticV1:
+        row = self._execute(
+            """SELECT id,memory_key,status,kind,scope_type,scope_ref,
+                      sensitivity,fingerprint_version,explicitness,confidence,
+                      updated_at,
+                      normalized_content IS NULL AS content_absent,
+                      normalized_fingerprint IS NULL AS fingerprint_absent,
+                      superseded_by_id IS NULL AS supersession_absent
+               FROM memory_items WHERE memory_key=?""",
+            (memory_key,),
+        ).fetchone()
+        if row is None:
+            raise self._semantic_error()
+        try:
+            confidence = row["confidence"]
+            if (
+                type(row["id"]) is not int
+                or row["id"] <= 0
+                or not isinstance(row["memory_key"], str)
+                or MEMORY_KEY_PATTERN.fullmatch(row["memory_key"]) is None
+                or row["memory_key"] != memory_key
+                or row["status"] != "forgotten"
+                or row["kind"] not in memory_policy.KINDS
+                or row["scope_type"] not in memory_policy.SCOPE_TYPES
+                or not isinstance(row["scope_ref"], str)
+                or row["sensitivity"] not in memory_policy.SENSITIVITIES
+                or type(row["fingerprint_version"]) is not int
+                or row["fingerprint_version"]
+                != memory_policy.FINGERPRINT_VERSION
+                or row["explicitness"] != "explicit"
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or float(confidence) != 1.0
+                or not isinstance(row["updated_at"], str)
+                or not row["updated_at"]
+                or type(row["supersession_absent"]) is not int
+                or row["supersession_absent"] != 1
+                or type(row["content_absent"]) is not int
+                or row["content_absent"] != 1
+                or type(row["fingerprint_absent"]) is not int
+                or row["fingerprint_absent"] != 1
+            ):
+                raise self._semantic_error()
+            if row["scope_type"] == "global_user":
+                if row["scope_ref"] != "":
+                    raise self._semantic_error()
+            elif (
+                SCOPE_REF_PATTERN.fullmatch(row["scope_ref"]) is None
+                or (
+                    row["scope_type"] == "channel"
+                    and row["scope_ref"] not in memory_policy.KNOWN_CHANNELS
+                )
+            ):
+                raise self._semantic_error()
+        except MemoryActionLedgerError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise self._semantic_error() from None
+        return TerminalMemoryItemSemanticV1(
+            relation=relation,
+            memory_id=int(row["id"]),
+            memory_key=memory_key,
+            status="forgotten",
+            kind=row["kind"],
+            scope_type=row["scope_type"],
+            scope_ref=row["scope_ref"],
+            sensitivity=row["sensitivity"],
+            content_present=False,
+            normalized_content=None,
+            fingerprint_version=int(row["fingerprint_version"]),
+            normalized_fingerprint=None,
+            superseded_by_memory_key=None,
+            explicitness=row["explicitness"],
+            confidence=float(confidence),
+            updated_at=row["updated_at"],
+        )
+
     def _source_semantics(
         self,
         *,
         canonical_message_id: int,
-        item_ids: tuple[int, ...],
+        items: tuple[TerminalMemoryItemSemanticV1, ...],
     ) -> tuple[TerminalMemorySourceSemanticV1, ...]:
+        item_keys = {item.memory_id: item.memory_key for item in items}
+        if (
+            len(item_keys) != len(items)
+            or len(set(item_keys.values())) != len(items)
+        ):
+            raise self._semantic_error()
+        item_ids = tuple(item_keys)
         clauses = ["ms.canonical_message_id=?"]
         parameters: list[object] = [canonical_message_id]
         if item_ids:
@@ -945,9 +1260,8 @@ class _MemoryActionUnitOfWork:
             clauses.append(f"ms.memory_id IN ({placeholders})")
             parameters.extend(item_ids)
         rows = self._execute(
-            f"""SELECT ms.*,mi.memory_key
+            f"""SELECT ms.*
                 FROM memory_sources ms
-                JOIN memory_items mi ON mi.id=ms.memory_id
                 WHERE {' OR '.join(clauses)}
                 ORDER BY ms.id""",
             tuple(parameters),
@@ -955,13 +1269,12 @@ class _MemoryActionUnitOfWork:
         result: list[TerminalMemorySourceSemanticV1] = []
         for row in rows:
             try:
+                memory_id = row["memory_id"]
                 if (
                     type(row["id"]) is not int
                     or int(row["id"]) <= 0
-                    or type(row["memory_id"]) is not int
-                    or int(row["memory_id"]) <= 0
-                    or not isinstance(row["memory_key"], str)
-                    or MEMORY_KEY_PATTERN.fullmatch(row["memory_key"]) is None
+                    or type(memory_id) is not int
+                    or memory_id not in item_keys
                     or type(row["canonical_message_id"]) is not int
                     or int(row["canonical_message_id"]) <= 0
                     or type(row["evidence_event_id"]) is not int
@@ -985,8 +1298,8 @@ class _MemoryActionUnitOfWork:
                 raise self._semantic_error() from None
             result.append(TerminalMemorySourceSemanticV1(
                 source_id=int(row["id"]),
-                memory_id=int(row["memory_id"]),
-                memory_key=row["memory_key"],
+                memory_id=memory_id,
+                memory_key=item_keys[memory_id],
                 canonical_message_id=int(row["canonical_message_id"]),
                 evidence_event_id=int(row["evidence_event_id"]),
                 channel=row["channel"],
@@ -1192,6 +1505,7 @@ class _MemoryActionUnitOfWork:
         *,
         canonical_message_id: int,
         semantics: StoreOutcomeSemanticsV1,
+        preloaded_items: tuple[TerminalMemoryItemSemanticV1, ...] = (),
     ) -> TerminalSemanticSnapshotV1:
         if (
             type(semantics) is not StoreOutcomeSemanticsV1
@@ -1220,15 +1534,35 @@ class _MemoryActionUnitOfWork:
         ][semantics.store_outcome]
         result_memory_key = semantics.result_memory_key
         canonical = self._canonical_semantic(canonical_message_id)
-        items: list[TerminalMemoryItemSemanticV1] = []
+        items: list[TerminalMemoryItemSemanticV1] = list(preloaded_items)
         target_key = binding.target_memory_key
-        if target_key is not None:
+        if preloaded_items:
+            expected_relation = (
+                "target_result"
+                if target_key == result_memory_key
+                else "target"
+            )
+            if (
+                binding.action_kind != "forget"
+                or len(preloaded_items) != 1
+                or preloaded_items[0].memory_key != target_key
+                or preloaded_items[0].relation != expected_relation
+            ):
+                raise self._semantic_error()
+        elif target_key is not None:
             relation = (
                 "target_result"
                 if target_key == result_memory_key
                 else "target"
             )
-            items.append(self._item_semantic(target_key, relation=relation))
+            items.append(
+                self._forgotten_item_semantic(
+                    target_key,
+                    relation=relation,
+                )
+                if binding.action_kind == "forget"
+                else self._item_semantic(target_key, relation=relation)
+            )
         if (
             result_memory_key is not None
             and result_memory_key != target_key
@@ -1237,10 +1571,9 @@ class _MemoryActionUnitOfWork:
                 result_memory_key,
                 relation="result",
             ))
-        item_ids = tuple(item.memory_id for item in items)
         sources = self._source_semantics(
             canonical_message_id=canonical_message_id,
-            item_ids=item_ids,
+            items=tuple(items),
         )
         evidence = self._evidence_semantics(
             canonical_message_id=canonical_message_id,
@@ -1342,6 +1675,11 @@ class _MemoryActionUnitOfWork:
         expected_channel, expected_source = ORIGIN_CANONICAL_PROJECTION[
             binding.origin
         ]
+        expected_text = (
+            f"Forget explicit memory: {binding.target_memory_key}"
+            if binding.action_kind == "forget"
+            else binding.normalized_content
+        )
         if (
             snapshot.canonical.channel != expected_channel
             or snapshot.canonical.source != expected_source
@@ -1350,11 +1688,7 @@ class _MemoryActionUnitOfWork:
                 ("channel", expected_channel),
                 ("source", expected_source),
             )
-            or (
-                binding.normalized_content is not None
-                and snapshot.canonical.normalized_text
-                != binding.normalized_content
-            )
+            or snapshot.canonical.normalized_text != expected_text
         ):
             raise self._semantic_error()
 
@@ -1704,7 +2038,17 @@ class _MemoryActionUnitOfWork:
         self,
         binding: MemoryActionRequestBinding,
         stored: StoredTerminalRowV1,
-    ) -> StoreOutcomeSemanticsV1:
+        *,
+        preloaded_forget_target: TerminalMemoryItemSemanticV1 | None = None,
+    ) -> tuple[
+        StoreOutcomeSemanticsV1,
+        tuple[TerminalMemoryItemSemanticV1, ...],
+    ]:
+        if (
+            stored.action_kind != "forget"
+            and preloaded_forget_target is not None
+        ):
+            raise self._semantic_error()
         try:
             store_outcome = TERMINAL_CATEGORY_TO_STORE_OUTCOME[
                 stored.action_kind
@@ -1713,14 +2057,20 @@ class _MemoryActionUnitOfWork:
             raise self._semantic_error() from None
         result_item_id = None
         target_item_id = None
-        if stored.result_memory_key is not None:
+        if (
+            stored.action_kind != "forget"
+            and stored.result_memory_key is not None
+        ):
             row = self._execute(
                 "SELECT id FROM memory_items WHERE memory_key=?",
                 (stored.result_memory_key,),
             ).fetchone()
             if row is not None and type(row["id"]) is int:
                 result_item_id = int(row["id"])
-        if stored.target_memory_key is not None:
+        if (
+            stored.action_kind != "forget"
+            and stored.target_memory_key is not None
+        ):
             row = self._execute(
                 "SELECT id FROM memory_items WHERE memory_key=?",
                 (stored.target_memory_key,),
@@ -1746,6 +2096,7 @@ class _MemoryActionUnitOfWork:
         source_ids = tuple(int(row["id"]) for row in source_rows)
 
         suppression_ids: tuple[int, ...] = ()
+        preloaded_items: tuple[TerminalMemoryItemSemanticV1, ...] = ()
         if store_outcome == "suppressed":
             semantics = self._suppression_semantics(
                 binding=binding,
@@ -1774,24 +2125,24 @@ class _MemoryActionUnitOfWork:
             suppression_ids = tuple(
                 suppression.suppression_id for suppression in semantics
             )
-        elif store_outcome == "forgotten":
-            semantics = self._suppression_semantics(
-                binding=binding,
-                relation="forgotten_target",
-                normalized_content=binding.normalized_content,
-                fingerprint_version=memory_policy.FINGERPRINT_VERSION,
-                reason_category="user_forget",
-            )
-            suppression_ids = tuple(
-                suppression.suppression_id for suppression in semantics
-            )
-        elif store_outcome == "already_forgotten":
+        elif store_outcome in {"forgotten", "already_forgotten"}:
             if binding.target_memory_key is None:
                 raise self._semantic_error()
-            target = self._item_semantic(
-                binding.target_memory_key,
-                relation="target_result",
-            )
+            target = preloaded_forget_target
+            if target is None:
+                target = self._forgotten_item_semantic(
+                    binding.target_memory_key,
+                    relation="target_result",
+                )
+            elif (
+                type(target) is not TerminalMemoryItemSemanticV1
+                or target.relation != "target_result"
+                or target.memory_key != binding.target_memory_key
+            ):
+                raise self._semantic_error()
+            result_item_id = target.memory_id
+            target_item_id = target.memory_id
+            preloaded_items = (target,)
             rows = self._execute(
                 """SELECT id FROM memory_suppressions
                    WHERE scope_type=? AND scope_ref=? AND kind=?
@@ -1828,6 +2179,151 @@ class _MemoryActionUnitOfWork:
                 if store_outcome in {"corrected", "forgotten"}
                 else ()
             ),
+        ), preloaded_items
+
+    def _validate_existing_terminal(
+        self,
+        validated: MemoryActionRequestBinding,
+        digest: bytes,
+        stored: StoredTerminalRowV1,
+        *,
+        preloaded_forget_target: TerminalMemoryItemSemanticV1 | None = None,
+    ) -> MemoryActionLedgerResult:
+        if (
+            type(validated) is not MemoryActionRequestBinding
+            or not isinstance(digest, bytes)
+            or len(digest) != 32
+            or type(stored) is not StoredTerminalRowV1
+            or stored.request_id != validated.request_id
+            or stored.action_kind != validated.action_kind
+            or stored.origin != validated.origin
+            or stored.target_memory_key != validated.target_memory_key
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
+        result = _safe_ledger_result(stored)
+        snapshot = None
+        if result.status == "completed":
+            semantics, preloaded_items = self._replay_store_outcome(
+                validated,
+                stored,
+                preloaded_forget_target=preloaded_forget_target,
+            )
+            snapshot = self._build_terminal_semantic_snapshot(
+                validated,
+                canonical_message_id=stored.canonical_message_id,
+                semantics=semantics,
+                preloaded_items=preloaded_items,
+            )
+        expected_digest = _terminal_binding_digest(
+            self._secret,
+            validated,
+            stored_row=stored,
+            semantic_snapshot=snapshot,
+        )
+        if not hmac.compare_digest(stored.terminal_digest, expected_digest):
+            raise MemoryActionLedgerError("request_binding_conflict")
+        if result.status == "completed":
+            self._validate_terminal_semantic_snapshot(
+                validated,
+                snapshot,
+                canonical_message_id=stored.canonical_message_id,
+                result_category=result.result_category,
+                result_memory_key=result.result_memory_key,
+                expected_action_id=None,
+            )
+        self._binding = validated
+        self._binding_digest = bytes(digest)
+        self._replay = result
+        return result
+
+    def _lookup_existing_terminal(
+        self,
+        binding: MemoryActionRequestBinding,
+    ) -> MemoryActionLedgerResult | None:
+        self._require_active()
+        if (
+            self._binding is not None
+            or self._replay is not None
+            or self._terminal is not None
+            or self._forget_target_metadata_identity is not None
+            or self._forget_target_registration is not None
+        ):
+            raise MemoryActionLedgerError("invalid_state")
+        validated = _validate_binding(binding)
+        digest = request_binding_digest(self._secret, validated)
+        row = self._execute(
+            "SELECT * FROM memory_action_requests WHERE request_id=?",
+            (validated.request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._validate_existing_terminal(
+            validated,
+            digest,
+            _stored_terminal_row(row),
+        )
+
+    def lookup_forget_terminal(
+        self,
+        *,
+        request_id: str,
+        origin: str,
+        target_memory_key: str,
+    ) -> _ForgetTerminalReplayV1 | None:
+        self._require_active()
+        if (
+            self._binding is not None
+            or self._replay is not None
+            or self._terminal is not None
+            or self._forget_target_metadata_identity is not None
+            or self._forget_target_registration is not None
+            or not isinstance(request_id, str)
+            or REQUEST_ID_PATTERN.fullmatch(request_id) is None
+            or origin not in ORIGINS
+            or not isinstance(target_memory_key, str)
+            or MEMORY_KEY_PATTERN.fullmatch(target_memory_key) is None
+        ):
+            raise MemoryActionLedgerError("invalid_request")
+        row = self._execute(
+            "SELECT * FROM memory_action_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        stored = _stored_terminal_row(row)
+        if (
+            stored.request_id != request_id
+            or stored.action_kind != "forget"
+            or stored.origin != origin
+            or stored.target_memory_key != target_memory_key
+            or stored.status != "completed"
+        ):
+            raise MemoryActionLedgerError("request_binding_conflict")
+        target = self._forgotten_item_semantic(
+            target_memory_key,
+            relation="target_result",
+        )
+        validated = _validate_binding(MemoryActionRequestBinding(
+            request_id=stored.request_id,
+            action_kind="forget",
+            origin=stored.origin,
+            target_memory_key=stored.target_memory_key,
+            scope_type=target.scope_type,
+            scope_ref=target.scope_ref,
+            kind=target.kind,
+            sensitivity=target.sensitivity,
+            normalized_content=None,
+        ))
+        digest = request_binding_digest(self._secret, validated)
+        result = self._validate_existing_terminal(
+            validated,
+            digest,
+            stored,
+            preloaded_forget_target=target,
+        )
+        return _ForgetTerminalReplayV1(
+            binding=validated,
+            result=result,
         )
 
     def claim_request(
@@ -1843,48 +2339,16 @@ class _MemoryActionUnitOfWork:
             "SELECT * FROM memory_action_requests WHERE request_id=?",
             (validated.request_id,),
         ).fetchone()
+        if row is not None:
+            return self._validate_existing_terminal(
+                validated,
+                digest,
+                _stored_terminal_row(row),
+            )
+        self._seal_registered_forget_target(validated, digest)
         self._binding = validated
         self._binding_digest = digest
-        if row is None:
-            return None
-        stored = _stored_terminal_row(row)
-        if (
-            stored.request_id != validated.request_id
-            or stored.action_kind != validated.action_kind
-            or stored.origin != validated.origin
-            or stored.target_memory_key != validated.target_memory_key
-        ):
-            raise MemoryActionLedgerError("request_binding_conflict")
-        result = _safe_ledger_result(stored)
-        snapshot = None
-        if result.status == "completed":
-            semantics = self._replay_store_outcome(validated, stored)
-            snapshot = self._build_terminal_semantic_snapshot(
-                validated,
-                canonical_message_id=stored.canonical_message_id,
-                semantics=semantics,
-            )
-        expected_digest = _terminal_binding_digest(
-            self._secret,
-            validated,
-            stored_row=stored,
-            semantic_snapshot=snapshot,
-        )
-        if (
-            not hmac.compare_digest(stored.terminal_digest, expected_digest)
-        ):
-            raise MemoryActionLedgerError("request_binding_conflict")
-        if result.status == "completed":
-            self._validate_terminal_semantic_snapshot(
-                validated,
-                snapshot,
-                canonical_message_id=stored.canonical_message_id,
-                result_category=result.result_category,
-                result_memory_key=result.result_memory_key,
-                expected_action_id=None,
-            )
-        self._replay = result
-        return result
+        return None
 
     def _insert_canonical_action(self, *, text: str, metadata: dict) -> int:
         self._require_active()
@@ -2008,6 +2472,7 @@ class _MemoryActionUnitOfWork:
         try:
             store_outcome = store_result.outcome
             item = store_result.item
+            store_memory_id = store_result._memory_id
         except AttributeError:
             raise MemoryActionLedgerError("invalid_state") from None
         mapping = STORE_OUTCOME_TO_TERMINAL_CATEGORY[binding.action_kind]
@@ -2056,8 +2521,24 @@ class _MemoryActionUnitOfWork:
                 raise self._semantic_error()
             return int(row["id"])
 
-        result_item_id = item_id(result_memory_key)
-        target_item_id = item_id(binding.target_memory_key)
+        if binding.action_kind == "forget":
+            registered = self._require_registered_forget_target(store=store)
+            registration = self._forget_target_registration
+            if (
+                type(registration) is not _RegisteredForgetTargetV1
+                or type(store_memory_id) is not int
+                or store_memory_id <= 0
+                or store_memory_id != registration._metadata_snapshot[0]
+                or getattr(registered, "memory_id", None) != store_memory_id
+            ):
+                raise self._semantic_error()
+            result_item_id = store_memory_id
+            target_item_id = store_memory_id
+        else:
+            if store_memory_id is not None:
+                raise self._semantic_error()
+            result_item_id = item_id(result_memory_key)
+            target_item_id = item_id(binding.target_memory_key)
         evidence_rows = self._execute(
             """SELECT id FROM memory_evidence_events
                WHERE action_id=? AND canonical_message_id=? ORDER BY id""",
@@ -2317,6 +2798,7 @@ class _MemoryActionUnitOfWork:
                 except sqlite3.Error:
                     uncertain = True
             self._finish_deferred_actions(consumed=uncertain)
+            self._clear_forget_target_registration()
             conn.close()
             self._closed = True
             self._connection = None
@@ -2325,6 +2807,7 @@ class _MemoryActionUnitOfWork:
                 if uncertain else "storage_unavailable"
             ) from None
         self._finish_deferred_actions(consumed=True)
+        self._clear_forget_target_registration()
         conn.close()
         self._closed = True
         self._connection = None
@@ -2345,6 +2828,7 @@ class _MemoryActionUnitOfWork:
             finally:
                 conn.close()
         self._finish_deferred_actions(consumed=False)
+        self._clear_forget_target_registration()
         self._connection = None
         self._closed = True
 

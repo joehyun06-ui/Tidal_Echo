@@ -520,3 +520,103 @@ outcome action ID。本轮已拆分 replayable semantics 与 owner-bound live en
 `false`，不得为本 PR 配置真实 Memory Secret。旧 v7 代码会忽略 additive v8
 表；应用回滚不得手工删除 v8 marker/table。若必须物理降级 schema，只能在停写后
 恢复一致的 pre-v8 整库备份。
+
+### Memory Phase 1.5 PR B: explicit action entry（默认关闭）
+
+PR B 增加内部 `ExplicitMemoryActionService`、固定 origin 的 facade 和受审查的
+事务组合 backend。它不增加 CLI、MCP、HTTP route、Telegram/Operit/Kelivo/
+Galatea adapter、provider/model、outbox 或外部消息。四个 facade 只在 composition
+root 内创建，分别固定为 `operator_cli -> web/relay`、`mcp -> relay/mcp`、
+`telegram -> telegram/telegram` 和 `operit -> operit_share/operit`；调用方不能
+覆盖 provenance、canonical ID、Store outcome、category 或 result key。
+
+每个新 request 在同一个 outer `BEGIN IMMEDIATE` 中完成 target resolution、
+完整 binding、claim、全新 server-owned canonical action、固定 privileged action、
+Store savepoint、owner-bound outcome/semantic validation、terminal INSERT 与 COMMIT。
+同 ID/同 binding 只做 terminal replay；同 ID/不同 binding/action 返回
+`request_binding_conflict`。不确定 COMMIT 只用新查询 UoW 查 terminal：存在则
+replay，不存在则固定返回 `transaction_outcome_uncertain`，绝不盲目重执行。
+
+Forget canonical 固定为
+`Forget explicit memory: <public memory_key>`，binding/capability 的
+`normalized_content=None`。Target resolution 与 Store action 使用明确的
+metadata-only projection；active 旧正文不会被 SELECT、物化到 Python/SQLite result
+row 或 dict，也不会被复制。Terminal snapshot 只读取 tombstone metadata 与 SQL
+`IS NULL` 缺失标志，不把正文或 fingerprint 值返回 Python。Canonical、result、
+error、repr、readiness 和日志均不含旧正文；restart replay 依赖
+target/tombstone/suppression 与已认证 terminal snapshot。Category 与 result key
+始终来自真实 Store outcome。
+
+Forget prepare 必须在当前 outer UoW 内调用 Store 的专用 metadata getter。Store
+立即把 exact metadata object 注册到该 UoW；claim 再把 registration seal 到 exact
+Store/UoW identity、11 个 metadata 字段、request ID、origin、target key 与
+request-binding digest。Privileged action 不接受 caller metadata，也不重复查询
+target，只能取得当前 UoW 已注册的 exact object；Store 写侧 B 查询会再次逐一比较
+11 个字段。伪造、替换、篡改、旧类实例、未注册或跨 Store/UoW/request/origin 的
+对象均 fail closed。该 registration 只属于新写入路径：同一 `BEGIN IMMEDIATE`
+先按 request ID、固定 origin 与公开 target key probe terminal；只有 row 不存在时
+才执行 A、创建 registration，并在 `claim_request()` 再次确认 row 不存在后 seal。
+Registration 在 commit、rollback 或 uncertain close 时清除；不进入数据库、
+terminal、result、repr 或日志。
+
+已完成 Forget terminal replay 会从实际持久化 request columns 与当前 C tombstone
+重建完整 binding，验证 canonical/evidence/source/suppression semantic 与 terminal
+HMAC，然后直接 commit lookup UoW。Replay 不执行 A/B，不创建、seal 或消费
+registration，不签发 capability，也不调用 Store。Uncertain commit 关闭原 UoW 后
+只执行同 binding existing-terminal lookup；terminal 不存在时固定返回
+`transaction_outcome_uncertain`，绝不进入 new-request claim 或盲目重试。
+
+Forget 对 `memory_items` 的读取只有精确 A/B/C 三类：A 为 11 字段
+prepare/registration projection（仅每个新 request 一次）；
+B 为 Store projection（active 在 UPDATE 前后各一次，already-forgotten 一次）；
+C 为只含 tombstone metadata 与三个 `IS NULL` absence flag 的 terminal projection
+（completion 与每次 completed replay 各一次）。实际 `memory_items` 序列为：
+new active `A -> B(key) -> B(id) -> C`，new already-forgotten
+`A -> B(key) -> C`，same-process/fresh-runtime/真实两进程 restart replay 与
+uncertain lookup 均只有 `C`。Completion 使用真实 Store outcome 携带并与
+registration/B row 核对的内部 item ID；replay 使用 C 的已验证 item ID，因此 Forget
+不再执行独立 `SELECT id`。Tombstone semantic 无 self-join；source semantic 只查询
+`memory_sources`，并从已验证 terminal item 建立 `memory_id -> memory_key` 映射。
+测试 gate 不再按 statement keyword 或是否出现 `SELECT` 放行。每个
+`memory_items` authorizer event 必须属于精确 A/B/C、精确 content-clearing Forget
+UPDATE，或 SQLite 外键校验只读取 `memory_items.id` 的精确 `memory_sources`
+INSERT。Gate 分别验证 read/update columns、cursor description、完成状态与 raw SQL
+statement key。该 key 只规范化换行、token 外空白与安全标点周围的格式，不折叠或
+改写 literal、`?`、quoted identifier、comment、clause 或 expression；合法格式的
+Memory key literal 与整数 ID literal 不会被转换成 `?`。未知 literal A/B、
+quoted identifier、comment adjacency、schema qualification、CTE、alias、join、
+subquery、UPSERT、trigger 与 write `RETURNING` 均被拒绝。Gate 持久 violation/
+record 只保存固定 category、registered name 或 `unknown`、安全 schema column、
+registered statement description 与布尔状态，不保存 SQL、statement key、数据库
+路径、trigger 文本、parameter 或 literal。合法 Forget UPDATE 无 `RETURNING`
+且不返回 row。
+
+真实 restart 测试由两个独立 `sys.executable -m` subprocess 共享一个临时 SQLite
+文件完成，不再把 in-process fresh runtime bootstrap 称为 process restart。
+Subprocess stdin 限制为 16 KiB exact phase schema，拒绝尾随、缺失、额外或错误类型
+字段；stdout/stderr/JSON/repr/argv/error 同时检查正文、synthetic Secret、
+fingerprint、registration/UoW 类型与对象地址泄漏。永久回归还包括 Forget 同
+request 2/4/8 SQLite caller single-winner，以及完整 tombstone/suppression
+tamper matrix。真实 completed-replay SQLite case 覆盖 tombstone 的 `id`、
+memory key、status、kind、scope、sensitivity、explicitness、confidence、
+fingerprint version、updated time、content/fingerprint absence、self/dangling/
+valid-target supersession 与 row deletion；suppression 覆盖全字段、删除和结构合法
+但归属错误的 replacement。每个 replay 均 fail closed，且不执行 A、registration、
+capability 或 Store，不修改 terminal，也不增加业务表。
+
+环境变量保持：
+
+```dotenv
+MEMORY_CORE_ENABLED=false
+MEMORY_EXPLICIT_WRITES_ENABLED=false
+MEMORY_EXPLICIT_ENTRY_ENABLED=false
+```
+
+只有三者都为 true，且 fingerprint Key ID/HMAC Secret、profile、v7/v8 schema
+全部有效时，App 才构造内部 entry backend 与四个 facade。否则没有 authority/
+writer、没有 route writer，并由独立的 `memory_explicit_entry` readiness 状态
+fail closed；entry-only 错误不破坏 `memory_core` 的只读 readiness。
+
+PR B 不修改 DDL、migration tuple 或 schema version：
+`migration_v9_needed=false`。本 PR 不批准部署、生产 Secret、Core/writes/entry
+启用或生产 Memory action；生产继续保持 read-only，并等待独立安全复审。

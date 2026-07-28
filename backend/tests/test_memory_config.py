@@ -24,6 +24,8 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.enabled)
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
+        self.assertFalse(config.explicit_entry_enabled)
+        self.assertTrue(config.entry_configuration_valid)
         self.assertEqual(config.max_item_chars, 1000)
         self.assertEqual(config.forget_retention_policy, "tombstone_without_content")
         self.assertEqual(config.fingerprint_key_id, "")
@@ -108,6 +110,50 @@ class MemoryConfigTests(unittest.TestCase):
                 deployment_config.DeploymentConfigError, category
             ):
                 self.load({name: value})
+
+    def test_explicit_entry_is_default_closed_and_has_independent_validity(self):
+        disabled = self.load({"MEMORY_CORE_ENABLED": "true"})
+        self.assertFalse(disabled.explicit_entry_enabled)
+        self.assertTrue(disabled.entry_configuration_valid)
+
+        cases = (
+            (
+                {"MEMORY_EXPLICIT_ENTRY_ENABLED": "true"},
+                "memory_explicit_entry_requires_core",
+            ),
+            (
+                {
+                    "MEMORY_CORE_ENABLED": "true",
+                    "MEMORY_EXPLICIT_ENTRY_ENABLED": "true",
+                },
+                "memory_explicit_entry_requires_writes",
+            ),
+            (
+                {
+                    "MEMORY_CORE_ENABLED": "true",
+                    "MEMORY_EXPLICIT_WRITES_ENABLED": "true",
+                    "MEMORY_EXPLICIT_ENTRY_ENABLED": "true",
+                    "MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID,
+                },
+                "memory_fingerprint_hmac_secret_missing",
+            ),
+        )
+        for environ, category in cases:
+            with self.subTest(category=category):
+                config = self.load(environ)
+                self.assertTrue(config.explicit_entry_enabled)
+                self.assertFalse(config.entry_configuration_valid)
+                self.assertEqual(config.entry_error_category, category)
+
+        enabled = self.load({
+            "MEMORY_CORE_ENABLED": "true",
+            "MEMORY_EXPLICIT_WRITES_ENABLED": "true",
+            "MEMORY_EXPLICIT_ENTRY_ENABLED": "true",
+            "MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID,
+            "MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET,
+        })
+        self.assertTrue(enabled.entry_configuration_valid)
+        self.assertEqual(enabled.entry_error_category, "")
 
 
 if __name__ == "__main__":

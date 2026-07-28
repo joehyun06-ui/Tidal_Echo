@@ -192,6 +192,9 @@ class MemoryConfig:
     fingerprint_hmac_secret: str = field(repr=False)
     configuration_valid: bool = True
     error_category: str = ""
+    explicit_entry_enabled: bool = False
+    entry_configuration_valid: bool = True
+    entry_error_category: str = ""
 
 
 @dataclass(frozen=True)
@@ -394,6 +397,10 @@ def load_deployment_config(
     memory_explicit_writes = parse_strict_bool(
         env.get("MEMORY_EXPLICIT_WRITES_ENABLED", "false"),
         "invalid_memory_explicit_writes_enabled",
+    )
+    memory_explicit_entry = parse_strict_bool(
+        env.get("MEMORY_EXPLICIT_ENTRY_ENABLED", "false"),
+        "invalid_memory_explicit_entry_enabled",
     )
     memory_sensitive_storage = parse_strict_bool(
         env.get("MEMORY_SENSITIVE_STORAGE_ENABLED", "false"),
@@ -600,6 +607,21 @@ def load_deployment_config(
                 memory_configuration_valid = False
                 memory_error_category = "memory_fingerprint_hmac_secret_must_be_distinct"
 
+    memory_entry_configuration_valid = True
+    memory_entry_error_category = ""
+    if memory_explicit_entry:
+        if not memory_enabled:
+            memory_entry_configuration_valid = False
+            memory_entry_error_category = "memory_explicit_entry_requires_core"
+        elif not memory_explicit_writes:
+            memory_entry_configuration_valid = False
+            memory_entry_error_category = "memory_explicit_entry_requires_writes"
+        elif not memory_configuration_valid:
+            memory_entry_configuration_valid = False
+            memory_entry_error_category = (
+                memory_error_category or "memory_configuration_invalid"
+            )
+
     try:
         timeouts = LoopTimeouts(
             model_total=parse_positive_finite_float(env.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"),
@@ -710,6 +732,9 @@ def load_deployment_config(
             fingerprint_hmac_secret=memory_hmac_secret,
             configuration_valid=memory_configuration_valid,
             error_category=memory_error_category,
+            explicit_entry_enabled=memory_explicit_entry,
+            entry_configuration_valid=memory_entry_configuration_valid,
+            entry_error_category=memory_entry_error_category,
         ),
     )
 

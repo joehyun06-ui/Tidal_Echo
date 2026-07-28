@@ -231,6 +231,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
         content: str,
         sensitivity: str,
         canonical_message_id: int,
+        _transaction: object | None = None,
     ) -> dict:
         self._require_enabled()
         sources = self._one_source(canonical_message_id)
@@ -264,6 +265,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
                 sensitivity=sensitivity,
                 sources=validated,
                 authorization=envelope,
+                _transaction=_transaction,
             )
             return {"outcome": result.outcome, "memory": result.item}
         except (
@@ -282,6 +284,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
         content: str,
         sensitivity: str,
         canonical_message_id: int,
+        _transaction: object | None = None,
     ) -> dict:
         if kind in {"decision", "assistant_experience"}:
             raise MemoryServiceError("unsupported_evidence")
@@ -294,6 +297,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
             content=content,
             sensitivity=sensitivity,
             canonical_message_id=canonical_message_id,
+            _transaction=_transaction,
         )
 
     def confirm_project_decision(
@@ -304,6 +308,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
         content: str,
         sensitivity: str,
         canonical_message_id: int,
+        _transaction: object | None = None,
     ) -> dict:
         return self._execute_create(
             action_type=memory_runtime.ACTION_CONFIRM_DECISION,
@@ -314,6 +319,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
             content=content,
             sensitivity=sensitivity,
             canonical_message_id=canonical_message_id,
+            _transaction=_transaction,
         )
 
     def record_assistant_experience(
@@ -343,6 +349,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
         content: str,
         sensitivity: str,
         canonical_message_id: int,
+        _transaction: object | None = None,
     ) -> dict:
         self._require_enabled()
         self._validate_memory_key(memory_key)
@@ -382,6 +389,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
                 sensitivity=sensitivity,
                 sources=validated,
                 authorization=envelope,
+                _transaction=_transaction,
             )
             return {"outcome": result.outcome, "memory": result.item}
         except MemoryServiceError:
@@ -398,27 +406,38 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
         *,
         memory_key: str,
         canonical_message_id: int,
+        _transaction: object | None = None,
     ) -> dict:
         self._require_enabled()
         self._validate_memory_key(memory_key)
         sources = self._one_source(canonical_message_id)
         try:
-            current = self._store.get_item_by_key(memory_key)
-            if current is None:
-                raise MemoryServiceError("not_found")
+            if (
+                type(_transaction)
+                is not memory_store.memory_action_ledger._MemoryActionUnitOfWork
+                or _transaction._store is not self._store
+            ):
+                raise MemoryServiceError("transaction_context_invalid")
+            current = _transaction._require_registered_forget_target(
+                store=self._store,
+            )
+            if type(current) is not memory_store._ForgetTargetMetadataV1:
+                raise MemoryServiceError("invalid_state")
+            if current.kind == "assistant_experience":
+                raise MemoryServiceError("unsupported_evidence")
             validated = self._policy.validate_provenance_inputs(
-                current["kind"], sources,
+                current.kind, sources,
             )
             envelope = memory_runtime.issue_action_envelope(
                 self._authority,
                 self._binding(
                     action_type=memory_runtime.ACTION_FORGET_USER,
                     canonical_message_id=canonical_message_id,
-                    kind=current["kind"],
-                    scope_type=current["scope_type"],
-                    scope_ref=current["scope_ref"],
-                    normalized_content=current["normalized_content"],
-                    sensitivity=current["sensitivity"],
+                    kind=current.kind,
+                    scope_type=current.scope_type,
+                    scope_ref=current.scope_ref,
+                    normalized_content=None,
+                    sensitivity=current.sensitivity,
                     memory_key=memory_key,
                 ),
             )
@@ -426,6 +445,7 @@ class PrivilegedMemoryActions(_PrivilegedServiceBase):
                 memory_key=memory_key,
                 sources=validated,
                 authorization=envelope,
+                _transaction=_transaction,
             )
             return {
                 "outcome": result.outcome,

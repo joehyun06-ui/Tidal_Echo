@@ -349,6 +349,43 @@ def finish_action_consumption(
             authority._consumed_actions.add(action_id)
 
 
+def bootstrap_memory_read_service_from_environment(telegram_config):
+    """Create the ordinary read service without constructing write authority."""
+    deployment = deployment_config.load_deployment_config(telegram_config)
+    config = deployment.memory
+    policy = memory_policy.MemoryPolicy(
+        max_item_chars=config.max_item_chars,
+        sensitive_storage_enabled=config.sensitive_storage_enabled,
+    )
+    expected_profile = None
+    if config.explicit_writes_enabled and config.configuration_valid:
+        expected_profile = (
+            config.fingerprint_key_id,
+            memory_policy.fingerprint_profile_check(
+                config.fingerprint_hmac_secret
+            ),
+            memory_policy.NORMALIZATION_VERSION,
+            memory_policy.FINGERPRINT_VERSION,
+        )
+    try:
+        from . import memory_service, memory_store
+    except ImportError:
+        import memory_service
+        import memory_store
+    reader = memory_store.MemoryReader(
+        str(Path(deployment.db_path)),
+        expected_profile=expected_profile,
+    )
+    return memory_service.MemoryReadService(
+        reader,
+        enabled=config.enabled,
+        configuration_valid=config.configuration_valid,
+        error_category=config.error_category,
+        explicit_writes_enabled=config.explicit_writes_enabled,
+        policy=policy,
+    )
+
+
 def bootstrap_memory_runtime_from_environment(telegram_config) -> MemoryRuntime:
     """Create the process's only Memory runtime from the formal deployment loader."""
     global _PROCESS_AUTHORITY, _PROCESS_BOOTSTRAPPED
