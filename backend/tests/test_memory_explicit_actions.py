@@ -153,19 +153,24 @@ class _ForgetSqlAuthorizerGate:
         ),
         "SOURCE_INSERT_FK": (),
     }
+    _SAFE_COLUMNS = frozenset().union(
+        *_READ_COLUMNS.values(),
+        *_WRITE_READ_COLUMNS.values(),
+        *_WRITE_UPDATE_COLUMNS.values(),
+    )
 
-    def __init__(self, read_fingerprints, write_fingerprints, fingerprint):
-        self._read_fingerprints = dict(read_fingerprints)
-        self._write_fingerprints = dict(write_fingerprints)
+    def __init__(self, read_keys, write_keys, statement_key):
+        self._read_keys = dict(read_keys)
+        self._write_keys = dict(write_keys)
         self._read_reverse = {
-            value: name for name, value in self._read_fingerprints.items()
+            value: name for name, value in self._read_keys.items()
         }
         self._write_reverse = {
-            value: name for name, value in self._write_fingerprints.items()
+            value: name for name, value in self._write_keys.items()
         }
         if set(self._read_reverse).intersection(self._write_reverse):
-            raise AssertionError("sql_gate_fingerprint_collision")
-        self._fingerprint = fingerprint
+            raise AssertionError("sql_gate_statement_key_collision")
+        self._statement_key = statement_key
         self._current_statement = None
         self._current_record = None
         self.sequence = []
@@ -180,15 +185,23 @@ class _ForgetSqlAuthorizerGate:
     def execute(self, operation, sql, parameters):
         if self._current_statement is not None:
             raise AssertionError("nested_sql_gate_statement")
-        self._current_statement = str(sql)
-        fingerprint = self._fingerprint(self._current_statement)
+        if type(sql) is not str:
+            raise AssertionError("sql_gate_statement_type")
+        self._current_statement = sql
+        statement_key = self._statement_key(self._current_statement)
+        name = (
+            self._read_reverse.get(statement_key)
+            or self._write_reverse.get(statement_key)
+        )
+        if name in self._read_keys:
+            statement_class = "registered_read"
+        elif name in self._write_keys:
+            statement_class = "registered_write"
+        else:
+            statement_class = "unknown"
         self._current_record = {
-            "raw_sql": self._current_statement,
-            "fingerprint": fingerprint,
-            "name": (
-                self._read_reverse.get(fingerprint)
-                or self._write_reverse.get(fingerprint)
-            ),
+            "name": name or "unknown",
+            "statement_class": statement_class,
             "read_events": [],
             "write_events": [],
             "read_recorded": False,
@@ -208,25 +221,30 @@ class _ForgetSqlAuthorizerGate:
             self._current_record["completed"] = True
             return cursor
         finally:
-            self.records.append(dict(self._current_record))
+            retained = dict(self._current_record)
+            if retained["name"] == "unknown":
+                retained["description"] = None
+            self.records.append(retained)
             self._current_statement = None
             self._current_record = None
 
     def _deny(self, action, table, column, database, trigger, reason):
         if self.violation is None:
+            statement_class = (
+                self._current_record["statement_class"]
+                if self._current_record is not None
+                else "no_statement"
+            )
             self.violation = {
                 "reason": reason,
                 "action": int(action),
-                "database": str(database or ""),
-                "table": str(table or ""),
-                "column": str(column or ""),
-                "trigger": str(trigger or ""),
-                "raw_sql": str(self._current_statement or ""),
-                "fingerprint": (
-                    str(self._current_record["fingerprint"])
-                    if self._current_record is not None
+                "table": "memory_items",
+                "column": (
+                    str(column)
+                    if isinstance(column, str) and column in self._SAFE_COLUMNS
                     else ""
                 ),
+                "statement_class": statement_class,
             }
         return sqlite3.SQLITE_DENY
 
@@ -250,10 +268,11 @@ class _ForgetSqlAuthorizerGate:
         name = self._current_record["name"]
         if action == sqlite3.SQLITE_READ:
             event = {
-                "database": str(database or ""),
-                "table": str(table),
-                "column": str(column or ""),
-                "trigger": str(trigger or ""),
+                "column": (
+                    str(column)
+                    if isinstance(column, str) and column in self._SAFE_COLUMNS
+                    else ""
+                ),
             }
             self._current_record["read_events"].append(event)
             if name in self._READ_COLUMNS:
@@ -280,10 +299,11 @@ class _ForgetSqlAuthorizerGate:
 
         event = {
             "action": int(action),
-            "database": str(database or ""),
-            "table": str(table),
-            "column": str(column or ""),
-            "trigger": str(trigger or ""),
+            "column": (
+                str(column)
+                if isinstance(column, str) and column in self._SAFE_COLUMNS
+                else ""
+            ),
         }
         self._current_record["write_events"].append(event)
         if (
@@ -542,32 +562,37 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             ).fetchall()
 
     @staticmethod
-    def _sql_fingerprint(statement: str) -> str:
-        normalized = " ".join(statement.upper().split())
-        normalized = re.sub(r"\s*,\s*", ",", normalized)
-        normalized = re.sub(r"\s*=\s*", "=", normalized)
-        normalized = re.sub(
-            r"WHERE MEMORY_KEY='[A-Z0-9_-]+'",
-            "WHERE MEMORY_KEY=?",
-            normalized,
+    def _raw_statement_key(statement: str) -> str:
+        if type(statement) is not str:
+            raise AssertionError("sql_gate_statement_type")
+        statement = statement.replace("\r\n", "\n").replace("\r", "\n").strip()
+        protected = re.compile(
+            r"""(
+                '(?:''|[^'])*'
+                |"(?:\"\"|[^"])*"
+                |`(?:``|[^`])*`
+                |\[(?:\]\]|[^\]])*\]
+                |--[^\n]*(?:\n|$)
+                |/\*.*?\*/
+            )""",
+            re.DOTALL | re.VERBOSE,
         )
-        normalized = re.sub(
-            r"WHERE ID=[0-9]+",
-            "WHERE ID=?",
-            normalized,
-        )
-        return normalized
+        pieces = protected.split(statement)
+        for index in range(0, len(pieces), 2):
+            pieces[index] = re.sub(r"\s+", " ", pieces[index])
+            pieces[index] = re.sub(r"\s*([,=])\s*", r"\1", pieces[index])
+        return "".join(pieces).strip()
 
     @classmethod
-    def _forget_sql_fingerprints(cls) -> dict[str, str]:
+    def _forget_sql_read_keys(cls) -> dict[str, str]:
         return {
-            "A": cls._sql_fingerprint(
+            "A": cls._raw_statement_key(
                 """SELECT id,memory_key,kind,scope_type,scope_ref,status,
                           sensitivity,fingerprint_version,
                           normalized_fingerprint,superseded_by_id,updated_at
                    FROM memory_items WHERE memory_key=?"""
             ),
-            "B_KEY": cls._sql_fingerprint(
+            "B_KEY": cls._raw_statement_key(
                 """SELECT id,memory_key,kind,scope_type,scope_ref,status,
                           sensitivity,fingerprint_version,
                           normalized_fingerprint,superseded_by_id,updated_at,
@@ -575,7 +600,7 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                           last_confirmed_at,created_at
                    FROM memory_items WHERE memory_key=?"""
             ),
-            "B_ID": cls._sql_fingerprint(
+            "B_ID": cls._raw_statement_key(
                 """SELECT id,memory_key,kind,scope_type,scope_ref,status,
                           sensitivity,fingerprint_version,
                           normalized_fingerprint,superseded_by_id,updated_at,
@@ -583,7 +608,7 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                           last_confirmed_at,created_at
                    FROM memory_items WHERE id=?"""
             ),
-            "C": cls._sql_fingerprint(
+            "C": cls._raw_statement_key(
                 """SELECT id,memory_key,status,kind,scope_type,scope_ref,
                           sensitivity,fingerprint_version,explicitness,
                           confidence,updated_at,
@@ -595,16 +620,16 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         }
 
     @classmethod
-    def _forget_sql_write_fingerprints(cls) -> dict[str, str]:
+    def _forget_sql_write_keys(cls) -> dict[str, str]:
         return {
-            "FORGET_UPDATE": cls._sql_fingerprint(
+            "FORGET_UPDATE": cls._raw_statement_key(
                 """UPDATE memory_items
                    SET status='forgotten',normalized_content=NULL,
                        normalized_fingerprint=NULL,superseded_by_id=NULL,
                        updated_at=?
                    WHERE id=? AND status='active'"""
             ),
-            "SOURCE_INSERT_FK": cls._sql_fingerprint(
+            "SOURCE_INSERT_FK": cls._raw_statement_key(
                 """INSERT INTO memory_sources
                    (memory_id,evidence_event_id,canonical_message_id,
                     channel,source,evidence_role,evidence_type,created_at)
@@ -623,12 +648,12 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         original_execute = ledger_module._MemoryActionUnitOfWork._execute
         statements = []
         row_keys = []
-        allowed_reads = self._forget_sql_fingerprints()
-        allowed_writes = self._forget_sql_write_fingerprints()
+        allowed_reads = self._forget_sql_read_keys()
+        allowed_writes = self._forget_sql_write_keys()
         gate = _ForgetSqlAuthorizerGate(
             allowed_reads,
             allowed_writes,
-            self._sql_fingerprint,
+            self._raw_statement_key,
         )
 
         def traced_connect(*args, **kwargs):
@@ -653,11 +678,11 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             def __getattr__(self, name):
                 return getattr(self._cursor, name)
 
-        c_fingerprint = self._forget_sql_fingerprints()["C"]
+        c_statement_key = self._forget_sql_read_keys()["C"]
 
         def capture_execute(uow, sql, parameters=()):
             cursor = original_execute(uow, sql, parameters)
-            if self._sql_fingerprint(str(sql)) == c_fingerprint:
+            if self._raw_statement_key(str(sql)) == c_statement_key:
                 return CursorProxy(cursor)
             return cursor
 
@@ -864,7 +889,10 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(len(update_records), 1)
         self.assertIsNone(update_records[0]["description"])
         self.assertTrue(update_records[0]["completed"])
-        self.assertNotIn("RETURNING", update_records[0]["raw_sql"].upper())
+        self.assertEqual(
+            update_records[0]["statement_class"],
+            "registered_write",
+        )
         source_fk_records = tuple(
             record for record in records
             if record["name"] == "SOURCE_INSERT_FK"
@@ -1003,6 +1031,19 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
 
     def test_forget_sql_authorizer_rejects_equivalent_unapproved_reads(self):
         target = self._remember("J", "Synthetic authorizer gate target")
+        with channel_store.connect(self.path) as target_connection:
+            target_id = int(target_connection.execute(
+                "SELECT id FROM memory_items WHERE memory_key=?",
+                (target.memory_key,),
+            ).fetchone()[0])
+        a_projection = """id,memory_key,kind,scope_type,scope_ref,status,
+                          sensitivity,fingerprint_version,
+                          normalized_fingerprint,superseded_by_id,updated_at"""
+        b_projection = """id,memory_key,kind,scope_type,scope_ref,status,
+                          sensitivity,fingerprint_version,
+                          normalized_fingerprint,superseded_by_id,updated_at,
+                          explicitness,confidence,first_observed_at,
+                          last_confirmed_at,created_at"""
         insert_columns = """(
             memory_key,kind,scope_type,scope_ref,normalized_content,
             normalized_fingerprint,fingerprint_version,status,explicitness,
@@ -1015,6 +1056,56 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             "now", "now", None, "now", "now",
         )
         statements = (
+            (
+                f"""SELECT {a_projection}
+                    FROM memory_items
+                    WHERE memory_key='{target.memory_key}'""",
+                (),
+            ),
+            (
+                f"""SELECT {b_projection}
+                    FROM memory_items WHERE id={target_id}""",
+                (),
+            ),
+            (
+                f'''SELECT {a_projection}
+                    FROM memory_items
+                    WHERE memory_key="{target.memory_key}"''',
+                (),
+            ),
+            (
+                f"""SELECT {a_projection}
+                    FROM memory_items
+                    WHERE normalized_fingerprint=X'{'00' * 32}'""",
+                (),
+            ),
+            (
+                f"""SELECT {b_projection}
+                    FROM memory_items WHERE id=CAST(? AS INTEGER)""",
+                (target_id,),
+            ),
+            (
+                f"""SELECT {a_projection}
+                    FROM memory_items WHERE memory_key=?||''""",
+                (target.memory_key,),
+            ),
+            (
+                f"""SELECT {a_projection}
+                    FROM memory_items /* exact-shape-comment */
+                    WHERE memory_key=?""",
+                (target.memory_key,),
+            ),
+            (
+                f"""SELECT {a_projection}
+                    FROM memory_items WHERE memory_key=?;""",
+                (target.memory_key,),
+            ),
+            (
+                f"""SELECT {a_projection}
+                    FROM memory_items
+                    WHERE memory_key=? AND status='active'""",
+                (target.memory_key,),
+            ),
             (
                 """SELECT normalized_content FROM "memory_items"
                    WHERE memory_key=?""",
@@ -1176,13 +1267,13 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                        FROM memory_items ORDER BY id"""
                 ).fetchall())
 
-        for statement, parameters in statements:
-            with self.subTest(statement=statement):
+        for case_index, (statement, parameters) in enumerate(statements):
+            with self.subTest(case=case_index):
                 before = item_snapshot()
                 gate = _ForgetSqlAuthorizerGate(
-                    self._forget_sql_fingerprints(),
-                    self._forget_sql_write_fingerprints(),
-                    self._sql_fingerprint,
+                    self._forget_sql_read_keys(),
+                    self._forget_sql_write_keys(),
+                    self._raw_statement_key,
                 )
                 connection = gate.wrap(channel_store.connect(self.path))
                 try:
@@ -1193,6 +1284,11 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 self.assertIsNotNone(gate.violation)
                 self.assertEqual(gate.sequence, [])
                 self.assertEqual(gate.write_sequence, [])
+                self.assertEqual(gate.records[-1]["name"], "unknown")
+                self.assertEqual(
+                    gate.records[-1]["statement_class"],
+                    "unknown",
+                )
                 self.assertFalse(gate.records[-1]["completed"])
                 self.assertEqual(item_snapshot(), before)
 
@@ -1214,9 +1310,9 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
             )
         before = item_snapshot()
         gate = _ForgetSqlAuthorizerGate(
-            self._forget_sql_fingerprints(),
-            self._forget_sql_write_fingerprints(),
-            self._sql_fingerprint,
+            self._forget_sql_read_keys(),
+            self._forget_sql_write_keys(),
+            self._raw_statement_key,
         )
         connection = gate.wrap(channel_store.connect(self.path))
         try:
@@ -1228,10 +1324,106 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         finally:
             connection.close()
         self.assertIsNotNone(gate.violation)
-        self.assertEqual(gate.violation["trigger"], "forget_gate_read_trigger")
+        self.assertEqual(gate.violation["statement_class"], "unknown")
         self.assertEqual(gate.sequence, [])
         self.assertEqual(gate.write_sequence, [])
         self.assertEqual(item_snapshot(), before)
+
+    def test_forget_sql_gate_diagnostics_and_records_are_data_free(self):
+        plaintext = "GATE_PLAINTEXT_SENTINEL_7f3149"
+        secret = "GATE_SECRET_SENTINEL!Aa9#7f3149d0Q2X8"
+        memory_key = "Y" * 32
+        fingerprint = memory_policy.fingerprint_content(
+            secret,
+            scope_type="global_user",
+            scope_ref="",
+            kind="project",
+            normalized_content=plaintext,
+        ).hex()
+        identity = "_RegisteredForgetTargetV1_identity_marker"
+        forbidden = (
+            plaintext,
+            secret,
+            memory_key,
+            fingerprint,
+            identity,
+        )
+        statement = f"""SELECT normalized_content FROM memory_items
+                         WHERE memory_key='{memory_key}'
+                         /* {plaintext} {secret} {fingerprint} {identity} */"""
+        gate = _ForgetSqlAuthorizerGate(
+            self._forget_sql_read_keys(),
+            self._forget_sql_write_keys(),
+            self._raw_statement_key,
+        )
+        log_messages = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                log_messages.append(record.getMessage())
+
+        handler = CaptureHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        self.addCleanup(root_logger.removeHandler, handler)
+        connection = gate.wrap(channel_store.connect(self.path))
+        try:
+            connection.execute(
+                f'''SELECT ? AS "{plaintext}", ? AS "{secret}",
+                           ? AS "{memory_key}", ? AS "{fingerprint}",
+                           ? AS "{identity}"''',
+                forbidden,
+            ).fetchall()
+            with self.assertRaises(sqlite3.DatabaseError) as raised:
+                connection.execute(statement).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            set(gate.violation),
+            {"reason", "action", "table", "column", "statement_class"},
+        )
+        self.assertEqual(gate.violation["table"], "memory_items")
+        self.assertEqual(gate.violation["statement_class"], "unknown")
+        self.assertEqual(gate.sequence, [])
+        self.assertEqual(gate.write_sequence, [])
+        self.assertIsNone(gate._current_statement)
+        self.assertIsNone(gate._current_record)
+        self.assertEqual(
+            set(gate.records[-1]),
+            {
+                "name",
+                "statement_class",
+                "read_events",
+                "write_events",
+                "read_recorded",
+                "write_recorded",
+                "description",
+                "completed",
+            },
+        )
+        self.assertEqual(gate.records[-1]["name"], "unknown")
+        self.assertTrue(all(
+            record["description"] is None
+            for record in gate.records
+            if record["name"] == "unknown"
+        ))
+        observed = (
+            gate.violation,
+            gate.records,
+            str(raised.exception),
+            repr(raised.exception),
+            repr(gate.violation),
+            repr(gate.records),
+            tuple(log_messages),
+        )
+        failure_message = self._formatMessage(
+            "sql_gate_diagnostics_not_data_free",
+            repr(observed),
+        )
+        for value in forbidden:
+            self.assertNotIn(value, repr(observed))
+            self.assertNotIn(value, failure_message)
 
     def test_tampered_forget_replay_still_uses_only_c_before_fail_closed(self):
         target = self._remember("U", "Synthetic tampered SQL replay target")
@@ -1303,6 +1495,298 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 )
             )
         self.assertEqual(after, before)
+
+    def test_completed_forget_tombstone_matrix_is_c_only_and_data_free(
+        self,
+    ):
+        tables = (
+            "messages",
+            "memory_action_requests",
+            "memory_evidence_events",
+            "memory_items",
+            "memory_sources",
+            "memory_suppressions",
+        )
+        cases = (
+            (
+                "id",
+                """UPDATE memory_items SET id=id+1000000
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "memory_key",
+                """UPDATE memory_items SET memory_key=?
+                   WHERE memory_key=?""",
+                lambda memory_key: ("Z" * 32, memory_key),
+            ),
+            (
+                "status",
+                """UPDATE memory_items SET status='active'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "kind",
+                """UPDATE memory_items SET kind='task_or_progress'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "scope",
+                """UPDATE memory_items
+                   SET scope_type='project',scope_ref='tampered'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "sensitivity",
+                """UPDATE memory_items SET sensitivity='sensitive'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "explicitness",
+                """UPDATE memory_items SET explicitness='inferred'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "confidence",
+                """UPDATE memory_items SET confidence=0.5
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "fingerprint_version",
+                """UPDATE memory_items
+                   SET fingerprint_version=fingerprint_version+1
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "updated_at",
+                """UPDATE memory_items SET updated_at='tampered'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "content",
+                """UPDATE memory_items
+                   SET normalized_content='TOMBSTONE_TAMPERED_CONTENT'
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "fingerprint",
+                """UPDATE memory_items SET normalized_fingerprint=zeroblob(32)
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "self_supersession",
+                """UPDATE memory_items SET superseded_by_id=id
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "dangling_supersession",
+                """UPDATE memory_items SET superseded_by_id=id+1000000
+                   WHERE memory_key=?""",
+                lambda memory_key: (memory_key,),
+            ),
+            (
+                "valid_supersession",
+                """UPDATE memory_items SET superseded_by_id=(
+                       SELECT id FROM memory_items WHERE memory_key=?
+                   ) WHERE memory_key=?""",
+                None,
+            ),
+            (
+                "deleted",
+                "DELETE FROM memory_items WHERE memory_key=?",
+                lambda memory_key: (memory_key,),
+            ),
+        )
+
+        for index, (name, statement, parameters) in enumerate(cases):
+            with self.subTest(name=name):
+                path = str(
+                    Path(self.temp.name) / f"tombstone-missing-{name}.sqlite3"
+                )
+                with channel_store.connect(path) as connection:
+                    connection.execute(
+                        channel_store.RELAY_TABLE_DDL["messages"]
+                    )
+                channel_store.run_migrations(path)
+                runtime = bootstrap_runtime(path, memory_config())
+                backend = memory_explicit_actions.create_entry_backend(
+                    runtime.privileged_actions
+                )
+                service = memory_explicit_actions.bind_operator_cli(backend)
+                content = f"TOMBSTONE_{name}_PLAINTEXT_SENTINEL_7f31"
+                target = service.remember_explicit_user_memory(
+                    memory_explicit_actions.RememberExplicitMemoryRequest(
+                        chr(65 + index) * 32,
+                        "project",
+                        "global_user",
+                        "",
+                        content,
+                        "normal",
+                    )
+                )
+                request = memory_explicit_actions.ForgetExplicitMemoryRequest(
+                    chr(75 + index) * 32,
+                    target.memory_key,
+                )
+                completed = service.forget_explicit_user_memory(request)
+                self.assertEqual(completed.category, "forgotten")
+                self.assertFalse(completed.replayed)
+                if name == "valid_supersession":
+                    replacement = service.remember_explicit_user_memory(
+                        memory_explicit_actions.RememberExplicitMemoryRequest(
+                            "Q" * 32,
+                            "project",
+                            "global_user",
+                            "",
+                            "Synthetic valid supersession target",
+                            "normal",
+                        )
+                    )
+                    tamper_parameters = (
+                        replacement.memory_key,
+                        target.memory_key,
+                    )
+                else:
+                    tamper_parameters = parameters(target.memory_key)
+
+                def counts():
+                    with channel_store.connect(path) as connection:
+                        return {
+                            table: int(connection.execute(
+                                f"SELECT count(*) FROM {table}"
+                            ).fetchone()[0])
+                            for table in tables
+                        }
+
+                with channel_store.connect(path) as connection:
+                    terminal_before = tuple(connection.execute(
+                        """SELECT request_id,action_kind,origin,
+                                  request_binding_digest,target_memory_key,
+                                  canonical_message_id,result_memory_key,status,
+                                  result_category,created_at,updated_at
+                           FROM memory_action_requests WHERE request_id=?""",
+                        (request.request_id,),
+                    ).fetchone())
+                    connection.execute("PRAGMA foreign_keys=OFF")
+                    connection.execute("PRAGMA ignore_check_constraints=ON")
+                    changed = connection.execute(
+                        statement,
+                        tamper_parameters,
+                    )
+                    self.assertEqual(changed.rowcount, 1)
+                    connection.execute("PRAGMA ignore_check_constraints=OFF")
+                    connection.execute("PRAGMA foreign_keys=ON")
+                before = counts()
+
+                store = backend._store
+                actions = backend._actions
+                store_type = type(store)
+                action_type = type(actions)
+                store_module = importlib.import_module(store_type.__module__)
+                ledger_module = store_module.memory_action_ledger
+                runtime_module = importlib.import_module(
+                    type(actions._authority).__module__
+                )
+                self.service = service
+                with (
+                    mock.patch.object(
+                        ledger_module._MemoryActionUnitOfWork,
+                        "_register_forget_target",
+                        side_effect=AssertionError(
+                            "tampered_replay_registered_target"
+                        ),
+                    ),
+                    mock.patch.object(
+                        ledger_module._MemoryActionUnitOfWork,
+                        "_seal_registered_forget_target",
+                        side_effect=AssertionError(
+                            "tampered_replay_sealed_target"
+                        ),
+                    ),
+                    mock.patch.object(
+                        store_type,
+                        "_get_forget_target_metadata",
+                        side_effect=AssertionError(
+                            "tampered_replay_executed_A"
+                        ),
+                    ),
+                    mock.patch.object(
+                        action_type,
+                        "forget_explicit_user_memory",
+                        side_effect=AssertionError(
+                            "tampered_replay_executed_Store"
+                        ),
+                    ),
+                    mock.patch.object(
+                        runtime_module,
+                        "issue_action_envelope",
+                        side_effect=AssertionError(
+                            "tampered_replay_issued_capability"
+                        ),
+                    ),
+                    mock.patch.object(
+                        store_type,
+                        "_finish_action",
+                        side_effect=AssertionError(
+                            "tampered_replay_consumed_capability"
+                        ),
+                    ),
+                ):
+                    error, sequence, _row_keys, writes, records = (
+                        self._capture_forget_sql(
+                            lambda: service.forget_explicit_user_memory(
+                                request
+                            ),
+                            error_pattern=(
+                                "terminal_semantics_invalid"
+                                "|request_binding_conflict"
+                            ),
+                        )
+                    )
+
+                self.assertIn(
+                    error.category,
+                    {
+                        "terminal_semantics_invalid",
+                        "request_binding_conflict",
+                    },
+                )
+                self.assertEqual(str(error), error.category)
+                self.assertEqual(sequence, ("C",))
+                self.assertEqual(writes, ())
+                self.assertTrue(all(
+                    record["statement_class"] in {
+                        "registered_read",
+                        "registered_write",
+                        "unknown",
+                    }
+                    for record in records
+                ))
+                self.assertEqual(counts(), before)
+                with channel_store.connect(path) as connection:
+                    terminal_after = tuple(connection.execute(
+                        """SELECT request_id,action_kind,origin,
+                                  request_binding_digest,target_memory_key,
+                                  canonical_message_id,result_memory_key,status,
+                                  result_category,created_at,updated_at
+                           FROM memory_action_requests WHERE request_id=?""",
+                        (request.request_id,),
+                    ).fetchone())
+                self.assertEqual(terminal_after, terminal_before)
+                observed = repr((error, records, before, terminal_after))
+                self.assertNotIn(content, observed)
+                self.assertNotRegex(observed, r"object at 0x[0-9a-f]+")
 
     def test_completed_forget_replay_requires_no_live_registration_or_store(self):
         target = self._remember("K", "Synthetic no-registration replay target")

@@ -581,17 +581,28 @@ registration/B row 核对的内部 item ID；replay 使用 C 的已验证 item I
 `memory_items` authorizer event 必须属于精确 A/B/C、精确 content-clearing Forget
 UPDATE，或 SQLite 外键校验只读取 `memory_items.id` 的精确 `memory_sources`
 INSERT。Gate 分别验证 read/update columns、cursor description、完成状态与 raw SQL
-fingerprint；quoted identifier、comment adjacency、schema qualification、CTE、
-alias、join、subquery、UPSERT、trigger 与 write `RETURNING` 均被拒绝。合法 Forget
-UPDATE 无 `RETURNING` 且不返回 row。
+statement key。该 key 只规范化换行、token 外空白与安全标点周围的格式，不折叠或
+改写 literal、`?`、quoted identifier、comment、clause 或 expression；合法格式的
+Memory key literal 与整数 ID literal 不会被转换成 `?`。未知 literal A/B、
+quoted identifier、comment adjacency、schema qualification、CTE、alias、join、
+subquery、UPSERT、trigger 与 write `RETURNING` 均被拒绝。Gate 持久 violation/
+record 只保存固定 category、registered name 或 `unknown`、安全 schema column、
+registered statement description 与布尔状态，不保存 SQL、statement key、数据库
+路径、trigger 文本、parameter 或 literal。合法 Forget UPDATE 无 `RETURNING`
+且不返回 row。
 
 真实 restart 测试由两个独立 `sys.executable -m` subprocess 共享一个临时 SQLite
 文件完成，不再把 in-process fresh runtime bootstrap 称为 process restart。
 Subprocess stdin 限制为 16 KiB exact phase schema，拒绝尾随、缺失、额外或错误类型
 字段；stdout/stderr/JSON/repr/argv/error 同时检查正文、synthetic Secret、
 fingerprint、registration/UoW 类型与对象地址泄漏。永久回归还包括 Forget 同
-request 2/4/8 SQLite caller single-winner，以及 fingerprint version、合法
-supersession 与 suppression 全字段/删除/结构合法替换 tamper。
+request 2/4/8 SQLite caller single-winner，以及完整 tombstone/suppression
+tamper matrix。真实 completed-replay SQLite case 覆盖 tombstone 的 `id`、
+memory key、status、kind、scope、sensitivity、explicitness、confidence、
+fingerprint version、updated time、content/fingerprint absence、self/dangling/
+valid-target supersession 与 row deletion；suppression 覆盖全字段、删除和结构合法
+但归属错误的 replacement。每个 replay 均 fail closed，且不执行 A、registration、
+capability 或 Store，不修改 terminal，也不增加业务表。
 
 环境变量保持：
 

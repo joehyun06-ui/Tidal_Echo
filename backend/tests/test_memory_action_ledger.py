@@ -2878,6 +2878,12 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
 
     def test_forget_replay_rejects_every_tombstone_semantic_tamper(self):
         cases = (
+            ("id", "UPDATE memory_items SET id=id+999999"),
+            (
+                "memory-key",
+                f"""UPDATE memory_items
+                    SET memory_key='{'T' * 32}'""",
+            ),
             ("status", "UPDATE memory_items SET status='active'"),
             ("kind", "UPDATE memory_items SET kind='task_or_progress'"),
             (
@@ -2889,6 +2895,11 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 "sensitivity",
                 "UPDATE memory_items SET sensitivity='sensitive'",
             ),
+            (
+                "explicitness",
+                "UPDATE memory_items SET explicitness='inferred'",
+            ),
+            ("confidence", "UPDATE memory_items SET confidence=0.5"),
             (
                 "fingerprint-version",
                 """UPDATE memory_items
@@ -2914,6 +2925,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 """UPDATE memory_items
                    SET normalized_fingerprint=zeroblob(32)""",
             ),
+            ("deleted", "DELETE FROM memory_items"),
         )
         for index, (name, statement) in enumerate(cases):
             with self.subTest(name=name):

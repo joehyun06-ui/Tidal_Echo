@@ -553,10 +553,18 @@ statement-keyword or `SELECT`-presence shortcut. Every `memory_items`
 authorizer event must belong to an exact A/B/C projection, the exact
 content-clearing Forget UPDATE, or the exact `memory_sources` insert whose
 SQLite foreign-key check reads only `memory_items.id`. The gate separately
-validates read/update columns, cursor description, completion state, and raw
-statement fingerprint. It rejects quoted, comment-adjacent, schema-qualified,
-CTE, alias, join, subquery, UPSERT, trigger, and write-`RETURNING` bypasses;
-the legitimate Forget UPDATE has no `RETURNING` and produces no row.
+validates read/update columns, cursor description, completion state, and a
+conservative raw-statement key. That key normalizes only line endings,
+token-external whitespace, and spacing around safe punctuation; it preserves
+every literal, parameter placeholder, quoted identifier, comment, clause, and
+expression. In particular, literal Memory keys and integer IDs are never
+folded into `?`. Unknown literal A/B lookalikes, quoted, comment-adjacent,
+schema-qualified, CTE, alias, join, subquery, UPSERT, trigger, and
+write-`RETURNING` bypasses are rejected. Persistent gate violations and
+records contain only fixed categories, registered names or `unknown`, safe
+schema column names, descriptions for registered statements, and booleans;
+they retain no SQL, statement key, database path, trigger text, parameter, or
+literal. The legitimate Forget UPDATE has no `RETURNING` and produces no row.
 Restart coverage uses two independent `sys.executable` module subprocesses
 over one temporary SQLite database, not an in-process runtime bootstrap.
 Their stdin JSON is bounded to 16 KiB and validated against an exact
@@ -565,8 +573,13 @@ stderr, JSON, repr, argv, and error leakage of plaintext, the synthetic HMAC
 secret, its fingerprint, internal registration/UoW type names, or object
 addresses. Permanent tests also cover same-request Forget with 2/4/8
 independent SQLite callers and the complete tombstone/suppression tamper
-matrix, including valid-target supersession and structurally valid
-suppression replacement.
+matrix. Real completed-replay SQLite cases cover every tombstone semantic
+field (`id`, key, status, kind, scope, sensitivity, explicitness, confidence,
+fingerprint version, updated time, content/fingerprint absence, and
+supersession), self/dangling/valid-target supersession, and row deletion.
+Suppression cases cover every field, deletion, and structurally valid
+replacement. Every replay fails closed without A, registration, capability,
+Store execution, terminal mutation, or business-table growth.
 
 `MEMORY_EXPLICIT_ENTRY_ENABLED=false` is the default. False constructs no
 entry backend, service, facade, authority, or writer. True additionally

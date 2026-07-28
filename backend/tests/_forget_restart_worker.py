@@ -195,9 +195,9 @@ def _run() -> None:
             ledger_module._MemoryActionUnitOfWork.lookup_forget_terminal
         )
         gate = _ForgetSqlAuthorizerGate(
-            ExplicitMemoryActionBackendTests._forget_sql_fingerprints(),
-            ExplicitMemoryActionBackendTests._forget_sql_write_fingerprints(),
-            ExplicitMemoryActionBackendTests._sql_fingerprint,
+            ExplicitMemoryActionBackendTests._forget_sql_read_keys(),
+            ExplicitMemoryActionBackendTests._forget_sql_write_keys(),
+            ExplicitMemoryActionBackendTests._raw_statement_key,
         )
         registration_absent = {"before": False, "after": False}
 
