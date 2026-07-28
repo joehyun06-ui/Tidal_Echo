@@ -540,6 +540,7 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
 
         ledger_without_profile = self.copy_database("profile-ledger-state")
         with channel_store.connect(str(ledger_without_profile)) as conn:
+            stamp = channel_store.now_iso()
             conn.execute(
                 """INSERT INTO memory_action_requests
                    (request_id,action_kind,origin,request_binding_digest,
@@ -549,8 +550,8 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
                 (
                     "A" * 32,
                     b"d" * 32,
-                    channel_store.now_iso(),
-                    channel_store.now_iso(),
+                    stamp,
+                    stamp,
                 ),
             )
         self.assert_failure(
