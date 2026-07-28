@@ -145,6 +145,25 @@ def _policy_from_config(config: deployment_config.MemoryConfig) -> MemoryRuntime
     )
 
 
+def memory_fingerprint_profile_from_config(
+    config: deployment_config.MemoryConfig,
+) -> tuple[str, bytes, int, int]:
+    """Derive the non-secret persisted profile contract from frozen config."""
+    if type(config) is not deployment_config.MemoryConfig:
+        raise MemoryRuntimeError("memory_configuration_invalid")
+    try:
+        return (
+            config.fingerprint_key_id,
+            memory_policy.fingerprint_profile_check(
+                config.fingerprint_hmac_secret
+            ),
+            memory_policy.NORMALIZATION_VERSION,
+            memory_policy.FINGERPRINT_VERSION,
+        )
+    except memory_policy.MemoryPolicyError:
+        raise MemoryRuntimeError("memory_configuration_invalid") from None
+
+
 def require_runtime_authority(authority: object) -> MemoryRuntimePolicy:
     current = _PROCESS_AUTHORITY
     if (
@@ -349,9 +368,7 @@ def finish_action_consumption(
             authority._consumed_actions.add(action_id)
 
 
-def bootstrap_memory_read_service_from_environment(telegram_config):
-    """Create the ordinary read service without constructing write authority."""
-    deployment = deployment_config.load_deployment_config(telegram_config)
+def _bootstrap_memory_read_service(deployment):
     config = deployment.memory
     policy = memory_policy.MemoryPolicy(
         max_item_chars=config.max_item_chars,
@@ -359,13 +376,8 @@ def bootstrap_memory_read_service_from_environment(telegram_config):
     )
     expected_profile = None
     if config.explicit_writes_enabled and config.configuration_valid:
-        expected_profile = (
-            config.fingerprint_key_id,
-            memory_policy.fingerprint_profile_check(
-                config.fingerprint_hmac_secret
-            ),
-            memory_policy.NORMALIZATION_VERSION,
-            memory_policy.FINGERPRINT_VERSION,
+        expected_profile = memory_fingerprint_profile_from_config(
+            config
         )
     try:
         from . import memory_service, memory_store
@@ -386,13 +398,26 @@ def bootstrap_memory_read_service_from_environment(telegram_config):
     )
 
 
-def bootstrap_memory_runtime_from_environment(telegram_config) -> MemoryRuntime:
-    """Create the process's only Memory runtime from the formal deployment loader."""
+def bootstrap_memory_read_service(
+    deployment: deployment_config.DeploymentConfig,
+):
+    """Create the ordinary read service from one frozen deployment snapshot."""
+    if type(deployment) is not deployment_config.DeploymentConfig:
+        raise MemoryRuntimeError("deployment_config_invalid")
+    return _bootstrap_memory_read_service(deployment)
+
+
+def bootstrap_memory_read_service_from_environment(telegram_config):
+    """Create the ordinary read service without constructing write authority."""
+    deployment = deployment_config.load_deployment_config(telegram_config)
+    return bootstrap_memory_read_service(deployment)
+
+
+def _bootstrap_memory_runtime(deployment) -> MemoryRuntime:
     global _PROCESS_AUTHORITY, _PROCESS_BOOTSTRAPPED
     with _BOOTSTRAP_LOCK:
         if _PROCESS_BOOTSTRAPPED:
             raise MemoryRuntimeError("memory_runtime_already_initialized")
-        deployment = deployment_config.load_deployment_config(telegram_config)
         policy = _policy_from_config(deployment.memory)
         authority = _RuntimeAuthority(
             _AUTHORITY_CONSTRUCTOR_TOKEN,
@@ -410,7 +435,7 @@ def bootstrap_memory_runtime_from_environment(telegram_config) -> MemoryRuntime:
             path = str(Path(deployment.db_path))
             store = memory_store.MemoryStore(path, authority)
             expected_profile = (
-                store._profile_parameters()
+                memory_fingerprint_profile_from_config(deployment.memory)
                 if policy.explicit_writes_enabled and policy.configuration_valid
                 else None
             )
@@ -436,3 +461,20 @@ def bootstrap_memory_runtime_from_environment(telegram_config) -> MemoryRuntime:
             raise
         _PROCESS_BOOTSTRAPPED = True
         return runtime
+
+
+def bootstrap_memory_runtime(
+    deployment: deployment_config.DeploymentConfig,
+) -> MemoryRuntime:
+    """Create the process's only Memory runtime from frozen deployment config."""
+    if type(deployment) is not deployment_config.DeploymentConfig:
+        raise MemoryRuntimeError("deployment_config_invalid")
+    return _bootstrap_memory_runtime(deployment)
+
+
+def bootstrap_memory_runtime_from_environment(telegram_config) -> MemoryRuntime:
+    """Create the process's only Memory runtime from the formal deployment loader."""
+    if _PROCESS_BOOTSTRAPPED:
+        raise MemoryRuntimeError("memory_runtime_already_initialized")
+    deployment = deployment_config.load_deployment_config(telegram_config)
+    return bootstrap_memory_runtime(deployment)

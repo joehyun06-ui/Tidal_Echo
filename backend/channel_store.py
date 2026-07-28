@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Iterable
 
 
@@ -35,6 +37,50 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout * 1000))}")
     return conn
+
+
+def connect_read_only(
+    path: str | os.PathLike[str],
+    *,
+    timeout_seconds: float,
+) -> sqlite3.Connection:
+    """Open an existing SQLite database without permitting writes or creation."""
+    if isinstance(timeout_seconds, bool):
+        raise ValueError("invalid_sqlite_busy_timeout")
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("invalid_sqlite_busy_timeout") from None
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
+        raise ValueError("invalid_sqlite_busy_timeout")
+    try:
+        database = Path(path)
+    except (TypeError, ValueError):
+        raise ValueError("invalid_sqlite_path") from None
+    if not database.is_absolute():
+        raise ValueError("invalid_sqlite_path")
+    try:
+        if not database.is_file():
+            raise FileNotFoundError("sqlite_database_missing")
+        uri = f"{database.as_uri()}?mode=ro"
+    except OSError:
+        raise OSError("sqlite_database_unavailable") from None
+    conn = sqlite3.connect(
+        uri,
+        timeout=timeout,
+        isolation_level=None,
+        factory=ClosingConnection,
+        uri=True,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout * 1000))}")
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 SCHEMA_MIGRATIONS_DDL = """CREATE TABLE schema_migrations (
@@ -1944,6 +1990,48 @@ def validate_memory_action_schema(conn: sqlite3.Connection) -> None:
             raise sqlite3.DatabaseError(
                 f"invalid memory action trigger fingerprint: {name}"
             )
+
+
+def validate_memory_operator_schema_v1_v8(
+    conn: sqlite3.Connection,
+) -> None:
+    """Validate the exact supported operator schema using data-free failures."""
+    try:
+        validate_core_schema_v1_v6(
+            conn,
+            require_relay_tables=True,
+        )
+        marker_rows = conn.execute(
+            """SELECT version,name,status FROM schema_migrations
+               ORDER BY version"""
+        ).fetchall()
+        actual_markers = [tuple(row) for row in marker_rows]
+        expected_markers = [
+            (version, name, "applied")
+            for version, name, _apply in MIGRATIONS
+        ]
+        if actual_markers[:6] != expected_markers[:6]:
+            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+        if (
+            len(actual_markers) < 7
+            or actual_markers[6]
+            != (7, "explicit_memory_core_foundation", "applied")
+        ):
+            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+        validate_memory_schema(conn)
+        if (
+            len(actual_markers) < 8
+            or actual_markers[7]
+            != (8, "explicit_memory_action_request_ledger", "applied")
+        ):
+            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+        validate_memory_action_schema(conn)
+        if actual_markers != expected_markers:
+            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+    except (sqlite3.Error, TypeError, ValueError):
+        raise sqlite3.DatabaseError(
+            "memory_operator_schema_invalid"
+        ) from None
 
 
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
