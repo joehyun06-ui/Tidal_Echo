@@ -62,7 +62,16 @@ def bootstrap(path: str, runtime_config: deployment_config.MemoryConfig):
     channel_store = importlib.import_module("backend.channel_store")
     memory_policy = importlib.import_module("backend.memory_policy")
     memory_store = importlib.import_module("backend.memory_store")
-    deployment = SimpleNamespace(memory=runtime_config, db_path=Path(path))
+    deployment = dataclasses.replace(
+        deployment_config.load_deployment_config(
+            SimpleNamespace(requested=False, enabled=False),
+            {
+                "TELEGRAM_ENABLED": "false",
+                "RELAY_DB": path,
+            },
+        ),
+        memory=runtime_config,
+    )
     with mock.patch.object(
         deployment_config,
         "load_deployment_config",
