@@ -608,8 +608,11 @@ Authority, Store, writer, backend, or service:
 3. opens it through a `mode=ro`, `query_only=ON`, foreign-key-enabled
    connection using the frozen busy timeout;
 4. validates the exact v1-v8 marker set, complete core/relay/v7/v8 schema, and
-   the configured fingerprint profile; and
-5. closes the connection and returns a frozen, slotted, representation-safe
+   the configured fingerprint profile;
+5. rejects attached databases and compares every application-defined
+   table, view, index, and trigger in `main.sqlite_schema` with the exact
+   object set derived from the authoritative v1-v8 DDL registries; and
+6. closes the connection and returns a frozen, slotted, representation-safe
    `MemoryOperatorPreflightV1`.
 
 The v1-v8 validator rejects missing, duplicate, renamed, non-applied, or
@@ -617,22 +620,38 @@ unknown markers, including any v9+ marker. Profile validation shares the
 connection-aware rules used by `MemoryReader`: an absent profile is accepted
 only when all Memory and action-ledger business state is empty; every mismatch
 returns `memory_fingerprint_profile_mismatch` without exposing the Secret,
-key check, fingerprint, path, SQL, or stored data.
+key check, fingerprint, path, SQL, or stored data. SQLite-owned names under
+the reserved `sqlite_%` namespace, including `sqlite_sequence` and automatic
+indexes, are excluded from the application object set; no application view is
+currently approved.
 
 `compose_operator_memory_service_from_environment(...)` runs that same
 preflight against the same frozen deployment snapshot. Only after it succeeds
-does the function call `bootstrap_memory_runtime(deployment)`, create the
-reviewed entry backend, bind `operator_cli`, and return the exact
-`ExplicitMemoryActionService`. It never binds MCP, Telegram, or Operit and
-does not separately return Runtime Authority or privileged actions or expose
-them through the facade's public API, representation, or logs. The exact
-service necessarily retains its reviewed backend object graph under the
-existing trusted-same-process threat model; this is a composition and misuse
-boundary, not a Python sandbox.
+does the function enter a bootstrap-lock-protected pending runtime scope,
+create the reviewed entry backend, and bind `operator_cli`. The process
+Authority is published only after the exact `ExplicitMemoryActionService` is
+fully constructed. Failure during action-secret, Store, reader, privileged
+writer, backend, or binding construction invalidates only that exact
+unpublished Authority, leaves the process unbootstrapped, and permits a safe
+retry. `KeyboardInterrupt`, `SystemExit`, and other `BaseException` values are
+not translated into business failures, but the pending runtime is still
+cleaned. A successfully published runtime cannot be reset or rolled back by
+this mechanism. The function never binds MCP, Telegram, or Operit and does not
+separately return Runtime Authority or privileged actions or expose them
+through the facade's public API, representation, or logs. The exact service
+necessarily retains its reviewed backend object graph under the existing
+trusted-same-process threat model; this is a composition and misuse boundary,
+not a Python sandbox.
 
 The existing `*_from_environment` runtime bootstraps remain available and now
 delegate to exact-type frozen-`DeploymentConfig` variants. This change adds no
 DDL or migration: `migration_v9_needed=false`.
+
+The object allowlist does not claim an atomic binding to the preflighted file
+identity. A local actor with database-directory write access can still replace
+the database, symlink, WAL, or SHM between preflight and a later action. That
+TOCTOU remains an accepted residual risk of the existing trusted-host threat
+model.
 
 ## Deferred phases
 
