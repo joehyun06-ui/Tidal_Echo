@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -128,6 +129,8 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
         self,
         path: Path,
         category: str,
+        *,
+        forbidden_values: tuple[str, ...] = (),
         **overrides: str,
     ) -> None:
         before = path.read_bytes() if path.exists() else None
@@ -171,6 +174,10 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(result.category, category)
         self.assertEqual(repr(result), "<MemoryOperatorPreflightV1>")
         self.assertEqual(output.getvalue(), "")
+        public_output = result.category + repr(result) + output.getvalue()
+        self.assertNotIn(str(path), public_output)
+        for value in forbidden_values:
+            self.assertNotIn(value, public_output)
         self.assertEqual(path.read_bytes() if path.exists() else None, before)
         bootstrap.assert_not_called()
         store.assert_not_called()
@@ -516,6 +523,126 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
             )
         self.assert_failure(duplicate, "memory_operator_schema_invalid")
 
+    def test_unreviewed_main_schema_object_matrix_is_rejected(self):
+        critical_trigger = """
+            CREATE TABLE operator_plaintext_copy(value TEXT);
+            CREATE TRIGGER copy_operator_message
+            AFTER INSERT ON messages
+            BEGIN
+                INSERT INTO operator_plaintext_copy(value) VALUES(NEW.text);
+            END;
+        """
+        cases = (
+            (
+                "extra-table",
+                "CREATE TABLE operator_extra_table(value TEXT)",
+                "DROP TABLE operator_extra_table",
+            ),
+            (
+                "extra-view",
+                "CREATE VIEW operator_extra_view AS SELECT id FROM messages",
+                "DROP VIEW operator_extra_view",
+            ),
+            (
+                "extra-index",
+                "CREATE INDEX operator_extra_index ON messages(ts)",
+                "DROP INDEX operator_extra_index",
+            ),
+            (
+                "messages-trigger",
+                critical_trigger,
+                """DROP TRIGGER copy_operator_message;
+                   DROP TABLE operator_plaintext_copy""",
+            ),
+            (
+                "memory-items-trigger",
+                """CREATE TRIGGER operator_memory_items_trigger
+                   AFTER INSERT ON memory_items BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_items_trigger",
+            ),
+            (
+                "memory-sources-trigger",
+                """CREATE TRIGGER operator_memory_sources_trigger
+                   AFTER INSERT ON memory_sources BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_sources_trigger",
+            ),
+            (
+                "memory-suppressions-trigger",
+                """CREATE TRIGGER operator_memory_suppressions_trigger
+                   AFTER INSERT ON memory_suppressions BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_suppressions_trigger",
+            ),
+            (
+                "memory-evidence-third-trigger",
+                """CREATE TRIGGER operator_memory_evidence_trigger
+                   AFTER INSERT ON memory_evidence_events
+                   BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_evidence_trigger",
+            ),
+            (
+                "memory-action-third-trigger",
+                """CREATE TRIGGER operator_memory_action_trigger
+                   AFTER INSERT ON memory_action_requests
+                   BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_action_trigger",
+            ),
+        )
+        for name, create_sql, remove_sql in cases:
+            with self.subTest(name=name):
+                path = self.copy_database(name)
+                with channel_store.connect(str(path)) as conn:
+                    conn.executescript(create_sql)
+                self.assert_failure(
+                    path,
+                    "memory_operator_schema_invalid",
+                    forbidden_values=(
+                        "operator_plaintext_copy",
+                        "copy_operator_message",
+                        "VALUES(NEW.text)",
+                    ),
+                )
+                with channel_store.connect(str(path)) as conn:
+                    conn.executescript(remove_sql)
+                recovered = self.preflight(path)
+                self.assertTrue(recovered.ready)
+                self.assertEqual(recovered.category, "ready")
+
+    def test_attached_database_is_rejected_without_leak_and_retry_succeeds(self):
+        path = self.copy_database("attached-database")
+        attached = self.root / "operator-attachment.sqlite3"
+        sqlite3.connect(attached).close()
+        real_connect = channel_store.connect_read_only
+
+        @contextlib.contextmanager
+        def connect_with_attachment(database, *, timeout_seconds):
+            with real_connect(
+                database,
+                timeout_seconds=timeout_seconds,
+            ) as conn:
+                conn.execute(
+                    "ATTACH DATABASE ? AS operator_attachment",
+                    (f"{attached.as_uri()}?mode=ro",),
+                )
+                yield conn
+
+        with mock.patch.object(
+            channel_store,
+            "connect_read_only",
+            new=connect_with_attachment,
+        ):
+            self.assert_failure(
+                path,
+                "memory_operator_schema_invalid",
+                forbidden_values=(
+                    "operator_attachment",
+                    str(attached),
+                    attached.as_uri(),
+                ),
+            )
+        recovered = self.preflight(path)
+        self.assertTrue(recovered.ready)
+        self.assertEqual(recovered.category, "ready")
+
     def test_profile_failure_matrix_and_empty_profile_success(self):
         empty = self.copy_database("profile-empty")
         self.assertTrue(self.preflight(empty).ready)
@@ -746,6 +873,493 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
         combined = completed.stdout + completed.stderr
         self.assertNotIn(TEST_SECRET, combined)
         self.assertNotIn(str(path), combined)
+
+    def test_composition_stage_failures_rollback_and_retry_in_subprocess(self):
+        code = textwrap.dedent(
+            """
+            import json
+            import os
+            from types import SimpleNamespace
+            from unittest import mock
+            from backend import (
+                memory_explicit_actions,
+                memory_operator_composition,
+                memory_runtime,
+                memory_service,
+                memory_store,
+            )
+
+            stage = os.environ["INJECT_STAGE"]
+            injected = {"done": False}
+            captured = {"stores": [], "actions": [], "backends": [], "services": []}
+            counts = {"operator": 0, "mcp": 0, "telegram": 0, "operit": 0}
+            real_token_bytes = memory_runtime.secrets.token_bytes
+            real_store_init = memory_store.MemoryStore.__init__
+            real_reader_init = memory_store.MemoryReader.__init__
+            real_actions_init = memory_service.PrivilegedMemoryActions.__init__
+            real_backend = memory_explicit_actions.create_entry_backend
+            real_operator = memory_explicit_actions.bind_operator_cli
+
+            def should_fail(name):
+                if stage == name and not injected["done"]:
+                    injected["done"] = True
+                    return True
+                return False
+
+            def token_bytes(size):
+                if should_fail("action-secret"):
+                    raise RuntimeError("raw-action-secret-stage-sentinel")
+                return real_token_bytes(size)
+
+            def store_init(self, *args, **kwargs):
+                real_store_init(self, *args, **kwargs)
+                captured["stores"].append(self)
+                if should_fail("store"):
+                    raise memory_store.MemoryStoreError(
+                        "injected_store_failure"
+                    )
+
+            def reader_init(self, *args, **kwargs):
+                real_reader_init(self, *args, **kwargs)
+                if should_fail("reader"):
+                    raise memory_store.MemoryStoreError(
+                        "injected_reader_failure"
+                    )
+
+            def actions_init(self, *args, **kwargs):
+                real_actions_init(self, *args, **kwargs)
+                captured["actions"].append(self)
+                if should_fail("writer"):
+                    raise memory_service.MemoryServiceError(
+                        "injected_writer_failure"
+                    )
+
+            def backend(actions):
+                result = real_backend(actions)
+                captured["backends"].append(result)
+                if should_fail("backend"):
+                    raise memory_explicit_actions.ExplicitMemoryActionError(
+                        "injected_backend_failure"
+                    )
+                return result
+
+            def operator(entry_backend):
+                counts["operator"] += 1
+                result = real_operator(entry_backend)
+                captured["services"].append(result)
+                if should_fail("bind"):
+                    raise memory_explicit_actions.ExplicitMemoryActionError(
+                        "injected_bind_failure"
+                    )
+                return result
+
+            def unexpected(name):
+                def call(*args, **kwargs):
+                    counts[name] += 1
+                    raise AssertionError(name + " binding forbidden")
+                return call
+
+            telegram = SimpleNamespace(requested=False, enabled=False)
+            with (
+                mock.patch.object(
+                    memory_runtime.secrets,
+                    "token_bytes",
+                    side_effect=token_bytes,
+                ),
+                mock.patch.object(
+                    memory_store.MemoryStore,
+                    "__init__",
+                    new=store_init,
+                ),
+                mock.patch.object(
+                    memory_store.MemoryReader,
+                    "__init__",
+                    new=reader_init,
+                ),
+                mock.patch.object(
+                    memory_service.PrivilegedMemoryActions,
+                    "__init__",
+                    new=actions_init,
+                ),
+                mock.patch.object(
+                    memory_explicit_actions,
+                    "create_entry_backend",
+                    side_effect=backend,
+                ),
+                mock.patch.object(
+                    memory_explicit_actions,
+                    "bind_operator_cli",
+                    side_effect=operator,
+                ),
+                mock.patch.object(
+                    memory_explicit_actions,
+                    "bind_mcp",
+                    side_effect=unexpected("mcp"),
+                ),
+                mock.patch.object(
+                    memory_explicit_actions,
+                    "bind_telegram",
+                    side_effect=unexpected("telegram"),
+                ),
+                mock.patch.object(
+                    memory_explicit_actions,
+                    "bind_operit",
+                    side_effect=unexpected("operit"),
+                ),
+            ):
+                try:
+                    memory_operator_composition.compose_operator_memory_service_from_environment(
+                        telegram,
+                        os.environ,
+                    )
+                except memory_operator_composition.MemoryOperatorCompositionError as error:
+                    first_category = error.category
+                    first_repr = repr(error)
+                else:
+                    raise AssertionError("first composition unexpectedly succeeded")
+
+                after_failure = {
+                    "authority_none": memory_runtime._PROCESS_AUTHORITY is None,
+                    "bootstrapped": memory_runtime._PROCESS_BOOTSTRAPPED,
+                }
+                invalidated = []
+                for store in captured["stores"]:
+                    try:
+                        store._require_write_runtime()
+                    except memory_store.MemoryStoreError as error:
+                        invalidated.append(error.category)
+                    else:
+                        invalidated.append("store_still_usable")
+                for actions in captured["actions"]:
+                    try:
+                        actions._require_enabled()
+                    except memory_service.MemoryServiceError as error:
+                        invalidated.append(error.category)
+                    else:
+                        invalidated.append("writer_still_usable")
+
+                service = memory_operator_composition.compose_operator_memory_service_from_environment(
+                    telegram,
+                    os.environ,
+                )
+
+            print(json.dumps({
+                "after_failure": after_failure,
+                "counts": counts,
+                "first_category": first_category,
+                "first_repr": first_repr,
+                "invalidated": invalidated,
+                "retry_repr": repr(service),
+                "retry_type": type(service).__name__,
+            }, sort_keys=True))
+            """
+        )
+        stages = (
+            "action-secret",
+            "store",
+            "reader",
+            "writer",
+            "backend",
+            "bind",
+        )
+        for stage in stages:
+            with self.subTest(stage=stage):
+                path = self.copy_database(f"rollback-{stage}")
+                before = database_snapshot(path)
+                environment = os.environ.copy()
+                environment.update(operator_environment(path))
+                environment["INJECT_STAGE"] = stage
+                completed = subprocess.run(
+                    [sys.executable, "-c", code],
+                    cwd=Path(__file__).resolve().parents[2],
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                payload = json.loads(completed.stdout)
+                self.assertEqual(
+                    payload["after_failure"],
+                    {"authority_none": True, "bootstrapped": False},
+                )
+                self.assertEqual(
+                    payload["first_repr"],
+                    "<MemoryOperatorCompositionError>",
+                )
+                self.assertEqual(
+                    payload["first_category"],
+                    (
+                        "memory_operator_composition_failed"
+                        if stage == "action-secret"
+                        else f"injected_{stage}_failure"
+                    ),
+                )
+                self.assertTrue(
+                    all(
+                        category == "runtime_authority_invalid"
+                        for category in payload["invalidated"]
+                    )
+                )
+                self.assertEqual(
+                    payload["counts"]["operator"],
+                    2 if stage == "bind" else 1,
+                )
+                self.assertEqual(payload["counts"]["mcp"], 0)
+                self.assertEqual(payload["counts"]["telegram"], 0)
+                self.assertEqual(payload["counts"]["operit"], 0)
+                self.assertEqual(
+                    payload["retry_repr"],
+                    "<ExplicitMemoryActionService>",
+                )
+                self.assertEqual(
+                    payload["retry_type"],
+                    "ExplicitMemoryActionService",
+                )
+                self.assertEqual(completed.stderr, "")
+                self.assertEqual(database_snapshot(path), before)
+                public_output = completed.stdout + completed.stderr
+                self.assertNotIn("raw-action-secret-stage-sentinel", public_output)
+                self.assertNotIn(TEST_SECRET, public_output)
+                self.assertNotIn(str(path), public_output)
+                self.assertNotRegex(public_output, r"0x[0-9a-fA-F]+")
+
+    def test_base_exception_cleans_pending_runtime_without_translation(self):
+        path = self.copy_database("base-exception-cleanup")
+        before = database_snapshot(path)
+        code = textwrap.dedent(
+            """
+            import json
+            import os
+            from types import SimpleNamespace
+            from unittest import mock
+            from backend import (
+                memory_explicit_actions,
+                memory_operator_composition,
+                memory_runtime,
+            )
+
+            real_operator = memory_explicit_actions.bind_operator_cli
+            injected = {"done": False}
+
+            def operator(backend):
+                if not injected["done"]:
+                    injected["done"] = True
+                    raise KeyboardInterrupt("raw-base-exception-sentinel")
+                return real_operator(backend)
+
+            telegram = SimpleNamespace(requested=False, enabled=False)
+            with mock.patch.object(
+                memory_explicit_actions,
+                "bind_operator_cli",
+                side_effect=operator,
+            ):
+                try:
+                    memory_operator_composition.compose_operator_memory_service_from_environment(
+                        telegram,
+                        os.environ,
+                    )
+                except KeyboardInterrupt:
+                    after_failure = {
+                        "authority_none": memory_runtime._PROCESS_AUTHORITY is None,
+                        "bootstrapped": memory_runtime._PROCESS_BOOTSTRAPPED,
+                    }
+                else:
+                    raise AssertionError("KeyboardInterrupt was translated")
+                service = memory_operator_composition.compose_operator_memory_service_from_environment(
+                    telegram,
+                    os.environ,
+                )
+            print(json.dumps({
+                "after_failure": after_failure,
+                "retry_repr": repr(service),
+            }, sort_keys=True))
+            """
+        )
+        environment = os.environ.copy()
+        environment.update(operator_environment(path))
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {
+                "after_failure": {
+                    "authority_none": True,
+                    "bootstrapped": False,
+                },
+                "retry_repr": "<ExplicitMemoryActionService>",
+            },
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(database_snapshot(path), before)
+        self.assertNotIn("raw-base-exception-sentinel", completed.stdout)
+
+    def test_concurrent_composition_publishes_only_one_runtime(self):
+        path = self.copy_database("concurrent-publish")
+        before = database_snapshot(path)
+        code = textwrap.dedent(
+            """
+            import json
+            import os
+            import threading
+            from types import SimpleNamespace
+            from backend import memory_operator_composition
+
+            barrier = threading.Barrier(2)
+            results = []
+            result_lock = threading.Lock()
+            telegram = SimpleNamespace(requested=False, enabled=False)
+
+            def worker():
+                barrier.wait(timeout=10)
+                try:
+                    service = memory_operator_composition.compose_operator_memory_service_from_environment(
+                        telegram,
+                        os.environ,
+                    )
+                except memory_operator_composition.MemoryOperatorCompositionError as error:
+                    result = error.category
+                else:
+                    result = repr(service)
+                with result_lock:
+                    results.append(result)
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            print(json.dumps({
+                "alive": [thread.is_alive() for thread in threads],
+                "results": sorted(results),
+            }, sort_keys=True))
+            """
+        )
+        environment = os.environ.copy()
+        environment.update(operator_environment(path))
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {
+                "alive": [False, False],
+                "results": [
+                    "<ExplicitMemoryActionService>",
+                    "memory_runtime_already_initialized",
+                ],
+            },
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(database_snapshot(path), before)
+
+    def test_waiter_succeeds_after_pending_backend_failure(self):
+        path = self.copy_database("concurrent-rollback")
+        before = database_snapshot(path)
+        code = textwrap.dedent(
+            """
+            import json
+            import os
+            import threading
+            from types import SimpleNamespace
+            from unittest import mock
+            from backend import (
+                memory_explicit_actions,
+                memory_operator_composition,
+            )
+
+            entered = threading.Event()
+            release = threading.Event()
+            call_lock = threading.Lock()
+            call_count = 0
+            results = []
+            result_lock = threading.Lock()
+            real_backend = memory_explicit_actions.create_entry_backend
+            telegram = SimpleNamespace(requested=False, enabled=False)
+
+            def backend(actions):
+                global call_count
+                with call_lock:
+                    call_count += 1
+                    current = call_count
+                if current == 1:
+                    entered.set()
+                    if not release.wait(timeout=10):
+                        raise AssertionError("release timeout")
+                    raise memory_explicit_actions.ExplicitMemoryActionError(
+                        "injected_backend_failure"
+                    )
+                return real_backend(actions)
+
+            def worker():
+                try:
+                    service = memory_operator_composition.compose_operator_memory_service_from_environment(
+                        telegram,
+                        os.environ,
+                    )
+                except memory_operator_composition.MemoryOperatorCompositionError as error:
+                    result = error.category
+                else:
+                    result = repr(service)
+                with result_lock:
+                    results.append(result)
+
+            with mock.patch.object(
+                memory_explicit_actions,
+                "create_entry_backend",
+                side_effect=backend,
+            ):
+                first = threading.Thread(target=worker)
+                first.start()
+                if not entered.wait(timeout=10):
+                    raise AssertionError("backend was not reached")
+                second = threading.Thread(target=worker)
+                second.start()
+                release.set()
+                first.join(timeout=10)
+                second.join(timeout=10)
+            print(json.dumps({
+                "alive": [first.is_alive(), second.is_alive()],
+                "calls": call_count,
+                "results": sorted(results),
+            }, sort_keys=True))
+            """
+        )
+        environment = os.environ.copy()
+        environment.update(operator_environment(path))
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {
+                "alive": [False, False],
+                "calls": 2,
+                "results": [
+                    "<ExplicitMemoryActionService>",
+                    "injected_backend_failure",
+                ],
+            },
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(database_snapshot(path), before)
 
     def test_failed_compose_never_bootstraps_runtime_in_subprocess(self):
         missing = self.root / "compose-missing.sqlite3"
