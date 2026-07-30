@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib
 import io
 import json
@@ -59,7 +60,16 @@ def bootstrap_runtime(path: str, config: deployment_config.MemoryConfig):
     memory_policy = importlib.import_module("backend.memory_policy")
     memory_store = importlib.import_module("backend.memory_store")
     memory_service = importlib.import_module("backend.memory_service")
-    deployment = SimpleNamespace(memory=config, db_path=Path(path))
+    deployment = dataclasses.replace(
+        deployment_config.load_deployment_config(
+            SimpleNamespace(requested=False, enabled=False),
+            {
+                "TELEGRAM_ENABLED": "false",
+                "RELAY_DB": path,
+            },
+        ),
+        memory=config,
+    )
     with mock.patch.object(
         deployment_config,
         "load_deployment_config",

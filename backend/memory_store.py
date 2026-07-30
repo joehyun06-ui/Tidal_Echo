@@ -187,6 +187,7 @@ _PROFILE_STATE_TABLES = (
     "memory_sources",
     "memory_suppressions",
     "memory_evidence_events",
+    "memory_action_requests",
 )
 
 
@@ -1825,30 +1826,54 @@ class MemoryReader:
         expected = self._expected_profile
         if expected is None:
             raise MemoryStoreError("memory_fingerprint_profile_mismatch")
-        key_id, key_check, normalization_version, fingerprint_version = expected
         try:
             with channel_store.connect(self.path) as conn:
-                rows = conn.execute(
-                    "SELECT * FROM memory_fingerprint_profile ORDER BY singleton"
-                ).fetchall()
-                if len(rows) > 1:
-                    raise MemoryStoreError("memory_fingerprint_profile_mismatch")
-                if not rows:
-                    if MemoryStore._memory_state_count(conn):
-                        raise MemoryStoreError(
-                            "memory_fingerprint_profile_mismatch"
-                        )
-                    return True
-                if not MemoryStore._profile_matches(
-                    rows[0],
-                    key_id=key_id,
-                    key_check=key_check,
-                    normalization_version=normalization_version,
-                    fingerprint_version=fingerprint_version,
-                ):
-                    raise MemoryStoreError("memory_fingerprint_profile_mismatch")
-                return True
+                validate_memory_fingerprint_profile(
+                    conn,
+                    expected_profile=expected,
+                )
+            return True
         except MemoryStoreError:
             raise
         except (OSError, sqlite3.Error, ValueError):
             raise MemoryStoreError("storage_unavailable") from None
+
+
+def validate_memory_fingerprint_profile(
+    conn: sqlite3.Connection,
+    *,
+    expected_profile: tuple[str, bytes, int, int],
+) -> None:
+    """Validate the configured fingerprint profile on an existing connection."""
+    if (
+        type(expected_profile) is not tuple
+        or len(expected_profile) != 4
+        or type(expected_profile[0]) is not str
+        or not expected_profile[0]
+        or type(expected_profile[1]) is not bytes
+        or type(expected_profile[2]) is not int
+        or expected_profile[2] <= 0
+        or type(expected_profile[3]) is not int
+        or expected_profile[3] <= 0
+    ):
+        raise MemoryStoreError("memory_fingerprint_profile_mismatch")
+    key_id, key_check, normalization_version, fingerprint_version = (
+        expected_profile
+    )
+    rows = conn.execute(
+        "SELECT * FROM memory_fingerprint_profile ORDER BY singleton"
+    ).fetchall()
+    if len(rows) > 1:
+        raise MemoryStoreError("memory_fingerprint_profile_mismatch")
+    if not rows:
+        if MemoryStore._memory_state_count(conn):
+            raise MemoryStoreError("memory_fingerprint_profile_mismatch")
+        return
+    if not MemoryStore._profile_matches(
+        rows[0],
+        key_id=key_id,
+        key_check=key_check,
+        normalization_version=normalization_version,
+        fingerprint_version=fingerprint_version,
+    ):
+        raise MemoryStoreError("memory_fingerprint_profile_mismatch")

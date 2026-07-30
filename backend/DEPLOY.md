@@ -620,3 +620,41 @@ fail closed；entry-only 错误不破坏 `memory_core` 的只读 readiness。
 PR B 不修改 DDL、migration tuple 或 schema version：
 `migration_v9_needed=false`。本 PR 不批准部署、生产 Secret、Core/writes/entry
 启用或生产 Memory action；生产继续保持 read-only，并等待独立安全复审。
+
+### Memory operator preflight（仅供后续 CLI 组合根）
+
+`backend.memory_operator_composition` 是无 FastAPI 副作用的正式 API；本阶段
+不提供 CLI 命令，也不批准部署或启用生产 flags。调用方可先调用
+`preflight_operator_memory_from_environment(...)`。它只加载一次部署配置，
+使用 SQLite `mode=ro`、`PRAGMA query_only=ON`、`foreign_keys=ON` 和冻结的
+busy timeout，完整验证 core/relay v1-v6、Memory v7、ledger v8、精确 marker
+集合及 fingerprint profile。验证最后还会将 `main.sqlite_schema` 中全部
+application-defined table、view、index、trigger 与现有 DDL registries 派生的
+正式 v1-v8 对象集精确比较；任何额外对象或 attached database 都会 fail closed。
+SQLite 保留的 `sqlite_%` 命名空间（例如 `sqlite_sequence` 和 autoindex）
+不属于 application-defined 对象。数据库不存在时不会创建文件；失败不会运行
+migration、recovery、路径准备、brain target 初始化或任何业务写入。
+
+只有 preflight 全部成功后，
+`compose_operator_memory_service_from_environment(...)` 才在 bootstrap lock
+内创建尚未发布的 Runtime Authority/runtime，并只执行
+`create_entry_backend(runtime.privileged_actions)` 与
+`bind_operator_cli(backend)`。只有 operator service 完整构造成功后才发布
+进程唯一 Authority；action-secret、Store、reader、writer、backend 或 bind
+任一阶段失败（包括 `BaseException`）都会使本次 pending Authority 失效，
+保持 runtime 未发布并允许修正后安全重试。已成功发布的 runtime 永远不能通过
+该机制撤销或 reset。返回值是 repr-safe 的
+`ExplicitMemoryActionService`；不会绑定 MCP、Telegram、Operit，不会创建
+HTTP/provider/network/outbox 入口，也不会单独返回 Authority/writer 或把它们放入
+公共 API、repr 或日志。Exact service 内部的 reviewed backend object graph 仍按
+既有 trusted-same-process threat model 持有写权限；该边界不是 Python sandbox。
+
+该 API 不改变上线流程或生产默认值。不要为本变更配置真实 Memory Secret，
+不要启用 `MEMORY_EXPLICIT_WRITES_ENABLED` 或
+`MEMORY_EXPLICIT_ENTRY_ENABLED`，不要对生产 SQLite 或备份运行 operator
+preflight。`migration_v9_needed=false`。
+
+本地攻击者若已拥有数据库目录写权限，仍可在 preflight 关闭连接后、action
+重新打开 SQLite 前替换数据库、symlink 或 WAL/SHM；这是既有 trusted-host
+威胁模型内明确接受的 TOCTOU 残余风险，object allowlist 不声称提供原子文件
+identity 绑定。
