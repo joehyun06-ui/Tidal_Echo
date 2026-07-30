@@ -14,6 +14,7 @@ try:
         deployment_config,
         memory_explicit_actions,
         memory_runtime,
+        memory_service,
         memory_store,
     )
 except ImportError:  # support direct module execution in local tooling
@@ -21,6 +22,7 @@ except ImportError:  # support direct module execution in local tooling
     import deployment_config
     import memory_explicit_actions
     import memory_runtime
+    import memory_service
     import memory_store
 
 
@@ -179,18 +181,27 @@ def compose_operator_memory_service_from_environment(
     if not preflight.ready:
         raise MemoryOperatorCompositionError(preflight.category)
     try:
-        runtime = memory_runtime.bootstrap_memory_runtime(deployment)
-        backend = memory_explicit_actions.create_entry_backend(
-            runtime.privileged_actions
-        )
-        return memory_explicit_actions.bind_operator_cli(backend)
+        with memory_runtime._bootstrap_memory_runtime_scope(
+            deployment
+        ) as runtime:
+            backend = memory_explicit_actions.create_entry_backend(
+                runtime.privileged_actions
+            )
+            service = memory_explicit_actions.bind_operator_cli(backend)
+        return service
     except (
         memory_explicit_actions.ExplicitMemoryActionError,
         memory_runtime.MemoryRuntimeError,
+        memory_service.MemoryServiceError,
+        memory_store.MemoryStoreError,
     ) as error:
         raise MemoryOperatorCompositionError(
             _category(
                 error.category,
                 "memory_operator_composition_failed",
             )
+        ) from None
+    except Exception:
+        raise MemoryOperatorCompositionError(
+            "memory_operator_composition_failed"
         ) from None

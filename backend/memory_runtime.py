@@ -8,6 +8,7 @@ import json
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -125,7 +126,7 @@ _AUTHORITY_CONSTRUCTOR_TOKEN = object()
 _PROCESS_RUNTIME_IDENTITY = object()
 _PROCESS_AUTHORITY: _RuntimeAuthority | None = None
 _PROCESS_BOOTSTRAPPED = False
-_BOOTSTRAP_LOCK = threading.Lock()
+_BOOTSTRAP_LOCK = threading.RLock()
 
 
 def _policy_from_config(config: deployment_config.MemoryConfig) -> MemoryRuntimePolicy:
@@ -413,25 +414,28 @@ def bootstrap_memory_read_service_from_environment(telegram_config):
     return bootstrap_memory_read_service(deployment)
 
 
-def _bootstrap_memory_runtime(deployment) -> MemoryRuntime:
+@contextmanager
+def _bootstrap_memory_runtime_scope(deployment):
+    """Build one pending runtime and publish it only after the scope succeeds."""
     global _PROCESS_AUTHORITY, _PROCESS_BOOTSTRAPPED
     with _BOOTSTRAP_LOCK:
-        if _PROCESS_BOOTSTRAPPED:
+        if _PROCESS_BOOTSTRAPPED or _PROCESS_AUTHORITY is not None:
             raise MemoryRuntimeError("memory_runtime_already_initialized")
         policy = _policy_from_config(deployment.memory)
-        authority = _RuntimeAuthority(
-            _AUTHORITY_CONSTRUCTOR_TOKEN,
-            identity=_PROCESS_RUNTIME_IDENTITY,
-            policy=policy,
-            action_secret=secrets.token_bytes(32),
-        )
-        _PROCESS_AUTHORITY = authority
+        authority = None
         try:
-            from . import memory_service, memory_store
-        except ImportError:
-            import memory_service
-            import memory_store
-        try:
+            authority = _RuntimeAuthority(
+                _AUTHORITY_CONSTRUCTOR_TOKEN,
+                identity=_PROCESS_RUNTIME_IDENTITY,
+                policy=policy,
+                action_secret=secrets.token_bytes(32),
+            )
+            _PROCESS_AUTHORITY = authority
+            try:
+                from . import memory_service, memory_store
+            except ImportError:
+                import memory_service
+                import memory_store
             path = str(Path(deployment.db_path))
             store = memory_store.MemoryStore(path, authority)
             expected_profile = (
@@ -456,11 +460,21 @@ def _bootstrap_memory_runtime(deployment) -> MemoryRuntime:
                 read_service=read_service,
                 privileged_actions=privileged_actions,
             )
-        except Exception:
-            _PROCESS_AUTHORITY = None
+            yield runtime
+            if (
+                _PROCESS_BOOTSTRAPPED
+                or _PROCESS_AUTHORITY is not authority
+            ):
+                raise MemoryRuntimeError("runtime_authority_invalid")
+            _PROCESS_BOOTSTRAPPED = True
+        except BaseException:
+            if (
+                not _PROCESS_BOOTSTRAPPED
+                and authority is not None
+                and _PROCESS_AUTHORITY is authority
+            ):
+                _PROCESS_AUTHORITY = None
             raise
-        _PROCESS_BOOTSTRAPPED = True
-        return runtime
 
 
 def bootstrap_memory_runtime(
@@ -469,7 +483,9 @@ def bootstrap_memory_runtime(
     """Create the process's only Memory runtime from frozen deployment config."""
     if type(deployment) is not deployment_config.DeploymentConfig:
         raise MemoryRuntimeError("deployment_config_invalid")
-    return _bootstrap_memory_runtime(deployment)
+    with _bootstrap_memory_runtime_scope(deployment) as runtime:
+        pass
+    return runtime
 
 
 def bootstrap_memory_runtime_from_environment(telegram_config) -> MemoryRuntime:
