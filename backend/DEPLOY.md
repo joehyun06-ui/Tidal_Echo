@@ -658,3 +658,35 @@ preflight。`migration_v9_needed=false`。
 重新打开 SQLite 前替换数据库、symlink 或 WAL/SHM；这是既有 trusted-host
 威胁模型内明确接受的 TOCTOU 残余风险，object allowlist 不声称提供原子文件
 identity 绑定。
+
+### 一次性 operator CLI
+
+正式入口为：
+
+```bash
+python -m backend.memory_operator_cli <command>
+```
+
+只允许 `remember`、`correct`、`forget`、`status`、`validate` 和
+`generate-request-id`。命令行不接受任何业务参数；前三个写命令只从 binary
+stdin 读取一个不超过 32 KiB 的严格 UTF-8 JSON object。正文、replacement、
+scope ref 和 Secret 不得放入 argv、交互 prompt、文件路径参数或环境变量正文。
+stdout 永远只有一个固定七字段单行 JSON object；失败时 stderr 只有一个固定
+ASCII public category，不输出 usage、traceback、异常文本、SQL、路径或输入回显。
+
+写命令只调用 C0 的
+`compose_operator_memory_service_from_environment(...)`，然后调用返回的
+operator-only service；provenance 固定为
+`operator_cli -> channel=web, source=relay`。CLI 不直接接触 Store、writer、
+Runtime Authority、UoW、capability 或 SQL，不运行 migration、初始化或
+recovery，也不导入 App/FastAPI，不监听网络，不绑定 MCP/Telegram/Operit，
+不调用 provider、model 或 outbox。
+
+`status` 只检查正式配置与 Core/writes/entry flags，不打开数据库；
+`validate` 只运行只读 preflight；`generate-request-id` 不打开数据库且不要求
+Memory flags 已启用。写命令要求现有 v1-v8 SQLite、有效 fingerprint profile
+边界以及显式启用的本机一次性环境。
+
+本入口仍不批准部署、生产 Memory Secret 或生产写入。Render 和生产默认值保持
+不变；不得为合入该 CLI 而启用生产 writes/entry，也不得对生产 SQLite 或备份
+运行命令。`migration_v9_needed=false`。

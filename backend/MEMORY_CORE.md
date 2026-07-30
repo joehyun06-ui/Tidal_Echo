@@ -653,6 +653,49 @@ the database, symlink, WAL, or SHM between preflight and a later action. That
 TOCTOU remains an accepted residual risk of the existing trusted-host threat
 model.
 
+## One-shot operator CLI
+
+`python -m backend.memory_operator_cli <command>` is the only command-line
+entry point for the operator composition root. It is a one-shot, local process;
+it does not import `backend.app`, construct FastAPI, listen on a socket, start a
+worker, register a route or tool, or call a provider, model, network transport,
+or outbox. It is not installed in App state and is not reachable from chat,
+MCP, Telegram, Operit, Kelivo, or Galatea.
+
+The exact commands are `remember`, `correct`, `forget`, `status`, `validate`,
+and `generate-request-id`. Commands accept no business arguments. The three
+write commands read one strict UTF-8 JSON object from binary stdin, bounded to
+32 KiB, and reject BOMs, duplicate keys, non-finite numbers, trailing values,
+missing or additional fields, and non-exact field types. Memory content,
+replacement content, scope references, and Secrets are never accepted through
+argv. `status`, `validate`, and `generate-request-id` require empty or
+whitespace-only stdin.
+
+Write commands call only
+`compose_operator_memory_service_from_environment(...)` and then one method on
+the returned origin-bound operator service. They do not call preflight
+separately or directly access Runtime Authority, Store, privileged actions,
+capabilities, unit-of-work objects, or SQL. The C0 projection remains fixed to
+`operator_cli -> channel=web, source=relay`. `status` loads the formal
+deployment configuration once without opening SQLite; `validate` performs only
+the public read-only operator preflight; `generate-request-id` calls only the
+formal request-ID issuer and does not require Memory activation.
+
+Every invocation emits exactly one single-line, seven-field JSON object on
+stdout. Failures also emit exactly one fixed ASCII public category on stderr
+and use the frozen exit-code mapping: input 2, readiness 3, request-binding
+conflict 4, not-found/unsupported action 5, storage unavailable 6, uncertain
+transaction outcome 7, and internal error 1. Unknown internal categories fail
+closed as `internal_error`; exception text, tracebacks, input content, paths,
+SQL, and object representations are never public output.
+
+The CLI does not create or repair a database, run migrations or recovery, or
+change production activation. Operators must provision an existing validated
+v1-v8 SQLite database and explicitly enable Core, writes, and entry in the
+one-shot local process environment. This code does not approve a production
+Memory Secret, production writes/entry, or deployment.
+`migration_v9_needed=false`.
+
 ## Deferred phases
 
 Phase 2 may add model-assisted candidate extraction with an independently
