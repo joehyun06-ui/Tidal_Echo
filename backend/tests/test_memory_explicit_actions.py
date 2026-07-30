@@ -4,6 +4,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
@@ -28,6 +29,55 @@ from backend.tests.test_memory_service import (
     bootstrap_runtime,
     memory_config,
 )
+
+
+_ACTION_TABLES = (
+    "messages",
+    "memory_action_requests",
+    "memory_evidence_events",
+    "memory_items",
+    "memory_sources",
+    "memory_suppressions",
+)
+
+
+def _operator_process_environment(
+    path: str,
+    *,
+    secret: str,
+    key_id: str,
+) -> dict[str, str]:
+    environment = {
+        name: os.environ[name]
+        for name in (
+            "COMSPEC",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        )
+        if name in os.environ
+    }
+    environment.update(
+        {
+            "TELEGRAM_ENABLED": "false",
+            "MEMORY_CORE_ENABLED": "true",
+            "MEMORY_EXPLICIT_WRITES_ENABLED": "true",
+            "MEMORY_EXPLICIT_ENTRY_ENABLED": "true",
+            "MEMORY_SENSITIVE_STORAGE_ENABLED": "false",
+            "MEMORY_MAX_ITEM_CHARS": "1000",
+            "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",
+            "MEMORY_FINGERPRINT_KEY_ID": key_id,
+            "MEMORY_FINGERPRINT_HMAC_SECRET": secret,
+            "RELAY_DB": path,
+            "SQLITE_BUSY_TIMEOUT_SECONDS": "5",
+            "HEARTBEAT_TIMEZONE": "UTC",
+        }
+    )
+    return environment
 
 
 class _AuthorizerCursorProxy:
@@ -561,6 +611,45 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 "SELECT direction,kind,text,meta FROM messages ORDER BY id"
             ).fetchall()
 
+    def _action_counts(self, path: str | None = None) -> dict[str, int]:
+        with channel_store.connect(self.path if path is None else path) as connection:
+            return {
+                table: int(
+                    connection.execute(
+                        f"SELECT count(*) FROM {table}"
+                    ).fetchone()[0]
+                )
+                for table in _ACTION_TABLES
+            }
+
+    def _correct_without_new_action_side_effects(self, service, request):
+        backend = service._backend
+        actions = backend._actions
+        store = backend._store
+        store_module = importlib.import_module(type(store).__module__)
+        ledger_module = store_module.memory_action_ledger
+        runtime_module = importlib.import_module(
+            type(actions._authority).__module__
+        )
+        with (
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_insert_canonical_action",
+                side_effect=AssertionError("correct_replay_inserted_canonical"),
+            ),
+            mock.patch.object(
+                type(actions),
+                "correct_explicit_user_memory",
+                side_effect=AssertionError("correct_replay_executed_store"),
+            ),
+            mock.patch.object(
+                runtime_module,
+                "issue_action_envelope",
+                side_effect=AssertionError("correct_replay_issued_capability"),
+            ),
+        ):
+            return service.correct_explicit_user_memory(request)
+
     @staticmethod
     def _raw_statement_key(statement: str) -> str:
         if type(statement) is not str:
@@ -869,6 +958,370 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
         self.assertTrue(second_replay.replayed)
         self.assertEqual(second_replay.category, "already_forgotten")
         self.assertEqual(len(self._canonical_rows()), canonical_count)
+
+    def test_corrected_exact_replay_same_service_and_fresh_runtime(self):
+        original_plaintext = "CORRECT_REPLAY_ORIGINAL_SENTINEL_3c729a"
+        replacement_plaintext = "CORRECT_REPLAY_REPLACEMENT_SENTINEL_81e4bf"
+        target = self._remember("a", original_plaintext)
+        request_id = "b" * 32
+        request = memory_explicit_actions.CorrectExplicitMemoryRequest(
+            request_id,
+            target.memory_key,
+            replacement_plaintext,
+            "normal",
+        )
+        completed = self.service.correct_explicit_user_memory(request)
+        self.assertEqual(completed.category, "corrected")
+        self.assertFalse(completed.replayed)
+        before_replay = self._action_counts()
+
+        same_service = self._correct_without_new_action_side_effects(
+            self.service,
+            request,
+        )
+        self.assertEqual(
+            (
+                same_service.request_id,
+                same_service.action_kind,
+                same_service.status,
+                same_service.category,
+                same_service.memory_key,
+            ),
+            (
+                completed.request_id,
+                completed.action_kind,
+                completed.status,
+                completed.category,
+                completed.memory_key,
+            ),
+        )
+        self.assertTrue(same_service.replayed)
+        self.assertEqual(self._action_counts(), before_replay)
+
+        self._fresh_runtime()
+        restarted_request = (
+            memory_explicit_actions.CorrectExplicitMemoryRequest(
+                request_id,
+                target.memory_key,
+                replacement_plaintext,
+                "normal",
+            )
+        )
+        fresh_runtime = self._correct_without_new_action_side_effects(
+            self.service,
+            restarted_request,
+        )
+        self.assertEqual(
+            (
+                fresh_runtime.request_id,
+                fresh_runtime.action_kind,
+                fresh_runtime.status,
+                fresh_runtime.category,
+                fresh_runtime.memory_key,
+            ),
+            (
+                completed.request_id,
+                completed.action_kind,
+                completed.status,
+                completed.category,
+                completed.memory_key,
+            ),
+        )
+        self.assertTrue(fresh_runtime.replayed)
+        self.assertEqual(self._action_counts(), before_replay)
+        observed = repr((same_service, fresh_runtime, self.service))
+        self.assertNotIn(original_plaintext, observed)
+        self.assertNotIn(replacement_plaintext, observed)
+        self.assertNotIn(TEST_HMAC_SECRET, observed)
+        self.assertNotIn(self.path, observed)
+        self.assertNotRegex(observed, r"object at 0x[0-9a-f]+")
+
+    def test_correct_conflicts_precede_new_request_active_check(self):
+        path = str(Path(self.temp.name) / "correct-conflict-order.sqlite3")
+        with channel_store.connect(path) as connection:
+            connection.execute(channel_store.RELAY_TABLE_DDL["messages"])
+        channel_store.run_migrations(path)
+        runtime = bootstrap_runtime(path, memory_config(sensitive=True))
+        explicit = importlib.reload(
+            importlib.import_module("backend.memory_explicit_actions")
+        )
+        backend = explicit.create_entry_backend(runtime.privileged_actions)
+        service = explicit.bind_operator_cli(backend)
+
+        def remember(marker: str, content: str):
+            return service.remember_explicit_user_memory(
+                explicit.RememberExplicitMemoryRequest(
+                    marker * 32,
+                    "project",
+                    "global_user",
+                    "",
+                    content,
+                    "normal",
+                )
+            )
+
+        target = remember("c", "Synthetic conflict target one")
+        other_target = remember("d", "Synthetic conflict target two")
+        request = explicit.CorrectExplicitMemoryRequest(
+            "e" * 32,
+            target.memory_key,
+            "Synthetic authenticated replacement",
+            "normal",
+        )
+        service.correct_explicit_user_memory(request)
+        service.correct_explicit_user_memory(
+            explicit.CorrectExplicitMemoryRequest(
+                "f" * 32,
+                other_target.memory_key,
+                "Synthetic second target replacement",
+                "normal",
+            )
+        )
+        before = self._action_counts(path)
+        ledger_module = importlib.import_module(
+            type(backend._store._action_unit_of_work()).__module__
+        )
+        runtime_module = importlib.import_module(
+            type(backend._actions._authority).__module__
+        )
+        original_target = explicit.MemoryActionEntryBackend._target
+        original_claim = ledger_module._MemoryActionUnitOfWork.claim_request
+        cases = (
+            (
+                "replacement",
+                service,
+                explicit.CorrectExplicitMemoryRequest(
+                    request.request_id,
+                    target.memory_key,
+                    "Synthetic different replacement",
+                    "normal",
+                ),
+            ),
+            (
+                "sensitivity",
+                service,
+                explicit.CorrectExplicitMemoryRequest(
+                    request.request_id,
+                    target.memory_key,
+                    request.replacement_content,
+                    "sensitive",
+                ),
+            ),
+            (
+                "target",
+                service,
+                explicit.CorrectExplicitMemoryRequest(
+                    request.request_id,
+                    other_target.memory_key,
+                    request.replacement_content,
+                    "normal",
+                ),
+            ),
+            (
+                "origin",
+                explicit.bind_mcp(backend),
+                explicit.CorrectExplicitMemoryRequest(
+                    request.request_id,
+                    target.memory_key,
+                    request.replacement_content,
+                    "normal",
+                ),
+            ),
+        )
+        for name, current_service, conflict_request in cases:
+            with self.subTest(name=name):
+                events: list[str] = []
+
+                def prepare_target(current_backend, uow, memory_key):
+                    events.append("prepare_target")
+                    return original_target(current_backend, uow, memory_key)
+
+                def claim(current_uow, binding):
+                    events.append("claim_request")
+                    return original_claim(current_uow, binding)
+
+                with (
+                    mock.patch.object(
+                        explicit.MemoryActionEntryBackend,
+                        "_target",
+                        new=prepare_target,
+                    ),
+                    mock.patch.object(
+                        ledger_module._MemoryActionUnitOfWork,
+                        "claim_request",
+                        new=claim,
+                    ),
+                    mock.patch.object(
+                        type(backend._actions),
+                        "correct_explicit_user_memory",
+                        side_effect=AssertionError(
+                            "binding_conflict_executed_store"
+                        ),
+                    ),
+                    mock.patch.object(
+                        runtime_module,
+                        "issue_action_envelope",
+                        side_effect=AssertionError(
+                            "binding_conflict_issued_capability"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        explicit.ExplicitMemoryActionError,
+                        "request_binding_conflict",
+                    ),
+                ):
+                    current_service.correct_explicit_user_memory(
+                        conflict_request
+                    )
+                self.assertEqual(
+                    events,
+                    ["prepare_target", "claim_request"],
+                )
+                self.assertEqual(self._action_counts(path), before)
+
+    def test_new_correct_on_superseded_target_rejects_after_claim(self):
+        target = self._remember(
+            "g",
+            "Synthetic new request eligibility target",
+        )
+        self.service.correct_explicit_user_memory(
+            memory_explicit_actions.CorrectExplicitMemoryRequest(
+                "h" * 32,
+                target.memory_key,
+                "Synthetic completed correction",
+                "normal",
+            )
+        )
+        before = self._action_counts()
+        backend = self.service._backend
+        ledger_module = importlib.import_module(
+            type(backend._store._action_unit_of_work()).__module__
+        )
+        runtime_module = importlib.import_module(
+            type(backend._actions._authority).__module__
+        )
+        original_target = memory_explicit_actions.MemoryActionEntryBackend._target
+        original_claim = ledger_module._MemoryActionUnitOfWork.claim_request
+        events: list[str] = []
+
+        def prepare_target(current_backend, uow, memory_key):
+            events.append("prepare_target")
+            return original_target(current_backend, uow, memory_key)
+
+        def claim(current_uow, binding):
+            events.append("claim_request")
+            value = original_claim(current_uow, binding)
+            self.assertIsNone(value)
+            return value
+
+        request = memory_explicit_actions.CorrectExplicitMemoryRequest(
+            "i" * 32,
+            target.memory_key,
+            "Synthetic forbidden second correction",
+            "normal",
+        )
+        with (
+            mock.patch.object(
+                memory_explicit_actions.MemoryActionEntryBackend,
+                "_target",
+                new=prepare_target,
+            ),
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "claim_request",
+                new=claim,
+            ),
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_insert_canonical_action",
+                side_effect=AssertionError(
+                    "new_ineligible_correct_inserted_canonical"
+                ),
+            ),
+            mock.patch.object(
+                type(backend._actions),
+                "correct_explicit_user_memory",
+                side_effect=AssertionError(
+                    "new_ineligible_correct_executed_store"
+                ),
+            ),
+            mock.patch.object(
+                runtime_module,
+                "issue_action_envelope",
+                side_effect=AssertionError(
+                    "new_ineligible_correct_issued_capability"
+                ),
+            ),
+            self.assertRaisesRegex(
+                memory_explicit_actions.ExplicitMemoryActionError,
+                "invalid_state",
+            ),
+        ):
+            self.service.correct_explicit_user_memory(request)
+        self.assertEqual(events, ["prepare_target", "claim_request"])
+        self.assertEqual(self._action_counts(), before)
+
+    def test_unchanged_and_suppressed_correct_exact_replays(self):
+        unchanged_target = self._remember(
+            "j",
+            "Synthetic unchanged correct content",
+        )
+        unchanged_request = (
+            memory_explicit_actions.CorrectExplicitMemoryRequest(
+                "k" * 32,
+                unchanged_target.memory_key,
+                "Synthetic unchanged correct content",
+                "normal",
+            )
+        )
+        unchanged = self.service.correct_explicit_user_memory(
+            unchanged_request
+        )
+        self.assertEqual(unchanged.category, "unchanged")
+        before_unchanged_replay = self._action_counts()
+        unchanged_replay = self._correct_without_new_action_side_effects(
+            self.service,
+            unchanged_request,
+        )
+        self.assertTrue(unchanged_replay.replayed)
+        self.assertEqual(unchanged_replay.category, unchanged.category)
+        self.assertEqual(unchanged_replay.memory_key, unchanged.memory_key)
+        self.assertEqual(self._action_counts(), before_unchanged_replay)
+
+        suppressed_content = "Synthetic suppressed correction content"
+        suppressed_target = self._remember(
+            "l",
+            "Synthetic suppression correction target",
+        )
+        suppression_seed = self._remember("m", suppressed_content)
+        self.service.forget_explicit_user_memory(
+            memory_explicit_actions.ForgetExplicitMemoryRequest(
+                "n" * 32,
+                suppression_seed.memory_key,
+            )
+        )
+        suppressed_request = (
+            memory_explicit_actions.CorrectExplicitMemoryRequest(
+                "o" * 32,
+                suppressed_target.memory_key,
+                suppressed_content,
+                "normal",
+            )
+        )
+        suppressed = self.service.correct_explicit_user_memory(
+            suppressed_request
+        )
+        self.assertEqual(suppressed.category, "suppressed")
+        self.assertIsNone(suppressed.memory_key)
+        before_suppressed_replay = self._action_counts()
+        suppressed_replay = self._correct_without_new_action_side_effects(
+            self.service,
+            suppressed_request,
+        )
+        self.assertTrue(suppressed_replay.replayed)
+        self.assertEqual(suppressed_replay.category, suppressed.category)
+        self.assertIsNone(suppressed_replay.memory_key)
+        self.assertEqual(self._action_counts(), before_suppressed_replay)
 
     def test_forget_memory_item_sql_is_exact_a_b_c_for_all_entry_paths(self):
         target = self._remember("5", "Synthetic SQL allowlist target")
@@ -2085,6 +2538,232 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 )
                 self.assertNotIn(str(valid), completed.stderr)
                 self.assertNotIn(TEST_HMAC_SECRET, completed.stderr)
+
+    def test_correct_replay_survives_two_formal_composition_processes(self):
+        path = str(Path(self.temp.name) / "correct-restart.sqlite3")
+        with channel_store.connect(path) as connection:
+            for statement in channel_store.RELAY_TABLE_DDL.values():
+                connection.execute(statement)
+        channel_store.run_migrations(path)
+        secret = "CORRECT_RESTART_HMAC_SENTINEL!Aa9#72c4e6F1"
+        key_id = "correct-restart-key"
+        runtime = bootstrap_runtime(
+            path,
+            memory_config(secret=secret, key_id=key_id),
+        )
+        explicit = importlib.reload(
+            importlib.import_module("backend.memory_explicit_actions")
+        )
+        service = explicit.bind_operator_cli(
+            explicit.create_entry_backend(runtime.privileged_actions)
+        )
+        original_plaintext = "CORRECT_PROCESS_ORIGINAL_SENTINEL_2d6a91"
+        replacement_plaintext = (
+            "CORRECT_PROCESS_REPLACEMENT_SENTINEL_44c8e7"
+        )
+        target = service.remember_explicit_user_memory(
+            explicit.RememberExplicitMemoryRequest(
+                "p" * 32,
+                "project",
+                "global_user",
+                "",
+                original_plaintext,
+                "normal",
+            )
+        )
+        request_id = "q" * 32
+        payload = {
+            "request_id": request_id,
+            "memory_key": target.memory_key,
+            "replacement_content": replacement_plaintext,
+            "sensitivity": "normal",
+        }
+        args = [
+            sys.executable,
+            "-B",
+            "-m",
+            "backend.tests._correct_restart_worker",
+        ]
+        environment = _operator_process_environment(
+            path,
+            secret=secret,
+            key_id=key_id,
+        )
+        composition = importlib.import_module(
+            "backend.memory_operator_composition"
+        )
+        telegram = importlib.import_module("backend.telegram_integration")
+        preflight = composition.preflight_operator_memory_from_environment(
+            telegram.TelegramConfig.from_env(environment),
+            environment,
+        )
+        self.assertTrue(preflight.ready, preflight.category)
+        fingerprint = memory_policy.fingerprint_content(
+            secret,
+            scope_type="global_user",
+            scope_ref="",
+            kind="project",
+            normalized_content=replacement_plaintext,
+        ).hex()
+        forbidden = (
+            original_plaintext,
+            replacement_plaintext,
+            secret,
+            fingerprint,
+            path,
+            "_MemoryActionUnitOfWork",
+            "MemoryStore",
+            "RuntimeMemoryAuthority",
+            "object at 0x",
+        )
+
+        def run() -> dict[str, object]:
+            completed = subprocess.run(
+                args,
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=45,
+                check=False,
+            )
+            observed = (
+                completed.stdout,
+                completed.stderr,
+                repr(args),
+            )
+            for value in forbidden:
+                self.assertTrue(all(value not in item for item in observed))
+            self.assertEqual(
+                completed.returncode,
+                0,
+                (
+                    "correct_restart_subprocess_failed",
+                    completed.stdout,
+                    completed.stderr,
+                ),
+            )
+            self.assertEqual(completed.stderr, "")
+            try:
+                result = json.loads(completed.stdout)
+            except (TypeError, ValueError):
+                self.fail("correct_restart_subprocess_output_invalid")
+            self.assertIs(type(result), dict)
+            self.assertEqual(
+                frozenset(result),
+                frozenset(
+                    {
+                        "category",
+                        "memory_key",
+                        "replayed",
+                        "result_repr",
+                        "service_repr",
+                    }
+                ),
+            )
+            for value in forbidden:
+                self.assertNotIn(value, repr(result))
+            return result
+
+        before = self._action_counts(path)
+        completed = run()
+        self.assertEqual(completed["category"], "corrected")
+        self.assertFalse(completed["replayed"])
+        after_complete = self._action_counts(path)
+        self.assertEqual(
+            {
+                table: after_complete[table] - before[table]
+                for table in _ACTION_TABLES
+            },
+            {
+                "messages": 1,
+                "memory_action_requests": 1,
+                "memory_evidence_events": 1,
+                "memory_items": 1,
+                "memory_sources": 1,
+                "memory_suppressions": 1,
+            },
+        )
+
+        replay = run()
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["category"], completed["category"])
+        self.assertEqual(replay["memory_key"], completed["memory_key"])
+        self.assertEqual(self._action_counts(path), after_complete)
+        worker_source = (
+            Path(__file__).with_name("_correct_restart_worker.py")
+            .read_text(encoding="utf-8")
+        )
+        for forbidden_source in (
+            "memory_action_ledger",
+            "memory_store",
+            "_action_unit_of_work",
+            "claim_request",
+            "run_migrations",
+            "backend.app",
+        ):
+            self.assertNotIn(forbidden_source, worker_source)
+
+    def test_correct_restart_worker_rejects_nonexact_or_unbounded_payload(self):
+        args = [
+            sys.executable,
+            "-B",
+            "-m",
+            "backend.tests._correct_restart_worker",
+        ]
+        environment = _operator_process_environment(
+            str(Path(self.temp.name) / "unused.sqlite3"),
+            secret=TEST_HMAC_SECRET,
+            key_id="phase1-test-key",
+        )
+        valid = {
+            "request_id": "r" * 32,
+            "memory_key": "s" * 32,
+            "replacement_content": "Synthetic bounded worker content",
+            "sensitivity": "normal",
+        }
+        invalid = (
+            b"",
+            b"\xef\xbb\xbf{}",
+            b"null",
+            json.dumps({**valid, "extra": "rejected"}).encode(),
+            json.dumps(
+                {
+                    key: value
+                    for key, value in valid.items()
+                    if key != "memory_key"
+                }
+            ).encode(),
+            json.dumps({**valid, "sensitivity": True}).encode(),
+            (
+                '{"request_id":"%s","request_id":"%s",'
+                '"memory_key":"%s","replacement_content":"x",'
+                '"sensitivity":"normal"}'
+                % ("r" * 32, "r" * 32, "s" * 32)
+            ).encode(),
+            b"x" * (16 * 1024 + 1),
+        )
+        for raw in invalid:
+            with self.subTest(length=len(raw)):
+                completed = subprocess.run(
+                    args,
+                    cwd=Path(__file__).resolve().parents[2],
+                    env=environment,
+                    input=raw,
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.stdout, b"")
+                self.assertEqual(
+                    completed.stderr,
+                    b"correct_restart_payload_invalid\r\n"
+                    if os.name == "nt"
+                    else b"correct_restart_payload_invalid\n",
+                )
+                self.assertNotIn(TEST_HMAC_SECRET.encode(), completed.stderr)
 
     def test_forget_uncertain_lookup_uses_terminal_without_registration(self):
         target = self._remember("S", "Synthetic uncertain registration target")
@@ -3361,6 +4040,344 @@ class ExplicitMemoryActionBackendTests(NoNetworkMixin, unittest.TestCase):
                 self.assertEqual(len(successes), 1)
                 self.assertEqual(len(failures), 1)
                 self.assertEqual(failures[0].category, "invalid_state")
+
+    def test_concurrent_same_correct_is_one_writer_for_2_4_8_callers(self):
+        for workers, marker in ((2, "t"), (4, "u"), (8, "v")):
+            with self.subTest(workers=workers):
+                path = str(
+                    Path(self.temp.name)
+                    / f"correct-concurrent-{workers}.sqlite3"
+                )
+                with channel_store.connect(path) as connection:
+                    connection.execute(
+                        channel_store.RELAY_TABLE_DDL["messages"]
+                    )
+                channel_store.run_migrations(path)
+                runtime = bootstrap_runtime(path, memory_config())
+                explicit = importlib.reload(
+                    importlib.import_module(
+                        "backend.memory_explicit_actions"
+                    )
+                )
+                backend = explicit.create_entry_backend(
+                    runtime.privileged_actions
+                )
+                service = explicit.bind_operator_cli(backend)
+                original_plaintext = (
+                    f"CORRECT_CONCURRENCY_ORIGINAL_SENTINEL_{workers}_2a91"
+                )
+                replacement_plaintext = (
+                    f"CORRECT_CONCURRENCY_REPLACEMENT_SENTINEL_{workers}_7e43"
+                )
+                target = service.remember_explicit_user_memory(
+                    explicit.RememberExplicitMemoryRequest(
+                        marker * 32,
+                        "project",
+                        "global_user",
+                        "",
+                        original_plaintext,
+                        "normal",
+                    )
+                )
+                request = explicit.CorrectExplicitMemoryRequest(
+                    marker.upper() * 32,
+                    target.memory_key,
+                    replacement_plaintext,
+                    "normal",
+                )
+                actions = backend._actions
+                action_type = type(actions)
+                original_action = action_type.correct_explicit_user_memory
+                runtime_module = importlib.import_module(
+                    type(actions._authority).__module__
+                )
+                original_issue = runtime_module.issue_action_envelope
+                calls = {"store": 0, "capability": 0}
+                call_lock = threading.Lock()
+
+                def correct_action(current_actions, **kwargs):
+                    with call_lock:
+                        calls["store"] += 1
+                    return original_action(current_actions, **kwargs)
+
+                def issue_capability(*args, **kwargs):
+                    with call_lock:
+                        calls["capability"] += 1
+                    return original_issue(*args, **kwargs)
+
+                before = self._action_counts(path)
+                with (
+                    mock.patch.object(
+                        action_type,
+                        "correct_explicit_user_memory",
+                        new=correct_action,
+                    ),
+                    mock.patch.object(
+                        runtime_module,
+                        "issue_action_envelope",
+                        new=issue_capability,
+                    ),
+                ):
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        results = list(
+                            pool.map(
+                                lambda _index: (
+                                    service.correct_explicit_user_memory(
+                                        request
+                                    )
+                                ),
+                                range(workers),
+                            )
+                        )
+                after = self._action_counts(path)
+                self.assertEqual(calls, {"store": 1, "capability": 1})
+                self.assertEqual(
+                    sum(not result.replayed for result in results),
+                    1,
+                )
+                self.assertEqual(
+                    sum(result.replayed for result in results),
+                    workers - 1,
+                )
+                self.assertEqual(
+                    {result.category for result in results},
+                    {"corrected"},
+                )
+                self.assertEqual(
+                    {result.memory_key for result in results},
+                    {results[0].memory_key},
+                )
+                self.assertEqual(
+                    {
+                        table: after[table] - before[table]
+                        for table in _ACTION_TABLES
+                    },
+                    {
+                        "messages": 1,
+                        "memory_action_requests": 1,
+                        "memory_evidence_events": 1,
+                        "memory_items": 1,
+                        "memory_sources": 1,
+                        "memory_suppressions": 1,
+                    },
+                )
+                observed = repr((results, calls))
+                self.assertNotIn(original_plaintext, observed)
+                self.assertNotIn(replacement_plaintext, observed)
+                self.assertNotIn(TEST_HMAC_SECRET, observed)
+                self.assertNotIn(path, observed)
+                self.assertNotRegex(observed, r"object at 0x[0-9a-f]+")
+
+    def test_correct_terminal_digest_tamper_fails_before_side_effects(self):
+        target = self._remember(
+            "w",
+            "Synthetic correct terminal tamper target",
+        )
+        request = memory_explicit_actions.CorrectExplicitMemoryRequest(
+            "x" * 32,
+            target.memory_key,
+            "Synthetic correct terminal tamper replacement",
+            "normal",
+        )
+        self.service.correct_explicit_user_memory(request)
+        with channel_store.connect(self.path) as connection:
+            connection.execute(
+                "DROP TRIGGER memory_action_requests_immutable_update"
+            )
+            changed = connection.execute(
+                """UPDATE memory_action_requests
+                   SET request_binding_digest=zeroblob(32)
+                   WHERE request_id=?""",
+                (request.request_id,),
+            )
+            self.assertEqual(changed.rowcount, 1)
+            connection.execute(
+                channel_store.MEMORY_ACTION_REQUEST_TRIGGER_DDL[
+                    "memory_action_requests_immutable_update"
+                ]
+            )
+        before = self._action_counts()
+        backend = self.service._backend
+        ledger_module = importlib.import_module(
+            type(backend._store._action_unit_of_work()).__module__
+        )
+        runtime_module = importlib.import_module(
+            type(backend._actions._authority).__module__
+        )
+        with (
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_insert_canonical_action",
+                side_effect=AssertionError(
+                    "tampered_correct_inserted_canonical"
+                ),
+            ),
+            mock.patch.object(
+                type(backend._actions),
+                "correct_explicit_user_memory",
+                side_effect=AssertionError(
+                    "tampered_correct_executed_store"
+                ),
+            ),
+            mock.patch.object(
+                runtime_module,
+                "issue_action_envelope",
+                side_effect=AssertionError(
+                    "tampered_correct_issued_capability"
+                ),
+            ),
+            self.assertRaisesRegex(
+                memory_explicit_actions.ExplicitMemoryActionError,
+                "request_binding_conflict",
+            ) as raised,
+        ):
+            self.service.correct_explicit_user_memory(request)
+        self.assertEqual(raised.exception.category, "request_binding_conflict")
+        self.assertEqual(self._action_counts(), before)
+
+    def test_correct_terminal_semantic_tamper_fails_before_side_effects(self):
+        target = self._remember(
+            "0",
+            "Synthetic correct semantic tamper target",
+        )
+        request = memory_explicit_actions.CorrectExplicitMemoryRequest(
+            "1" * 32,
+            target.memory_key,
+            "Synthetic correct semantic tamper replacement",
+            "normal",
+        )
+        self.service.correct_explicit_user_memory(request)
+        with channel_store.connect(self.path) as connection:
+            changed = connection.execute(
+                """UPDATE memory_items SET updated_at='tampered'
+                   WHERE memory_key=?""",
+                (target.memory_key,),
+            )
+            self.assertEqual(changed.rowcount, 1)
+        before = self._action_counts()
+        backend = self.service._backend
+        ledger_module = importlib.import_module(
+            type(backend._store._action_unit_of_work()).__module__
+        )
+        runtime_module = importlib.import_module(
+            type(backend._actions._authority).__module__
+        )
+        with (
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "_insert_canonical_action",
+                side_effect=AssertionError(
+                    "semantic_tamper_inserted_canonical"
+                ),
+            ),
+            mock.patch.object(
+                type(backend._actions),
+                "correct_explicit_user_memory",
+                side_effect=AssertionError(
+                    "semantic_tamper_executed_store"
+                ),
+            ),
+            mock.patch.object(
+                runtime_module,
+                "issue_action_envelope",
+                side_effect=AssertionError(
+                    "semantic_tamper_issued_capability"
+                ),
+            ),
+            self.assertRaisesRegex(
+                memory_explicit_actions.ExplicitMemoryActionError,
+                "request_binding_conflict|terminal_semantics_invalid",
+            ) as raised,
+        ):
+            self.service.correct_explicit_user_memory(request)
+        self.assertIn(
+            raised.exception.category,
+            {"request_binding_conflict", "terminal_semantics_invalid"},
+        )
+        self.assertEqual(self._action_counts(), before)
+
+    def test_correct_uncertain_commit_resolves_terminal_without_reexecution(self):
+        target = self._remember(
+            "y",
+            "Synthetic uncertain correct target",
+        )
+        request = memory_explicit_actions.CorrectExplicitMemoryRequest(
+            "z" * 32,
+            target.memory_key,
+            "Synthetic uncertain correct replacement",
+            "normal",
+        )
+        backend = self.service._backend
+        ledger_module = importlib.import_module(
+            type(backend._store._action_unit_of_work()).__module__
+        )
+        runtime_module = importlib.import_module(
+            type(backend._actions._authority).__module__
+        )
+        original_commit = ledger_module._MemoryActionUnitOfWork.commit
+        original_action = (
+            type(backend._actions).correct_explicit_user_memory
+        )
+        original_issue = runtime_module.issue_action_envelope
+        calls = {"commit": 0, "store": 0, "capability": 0}
+
+        def commit_then_uncertain(uow):
+            calls["commit"] += 1
+            result = original_commit(uow)
+            if calls["commit"] == 1:
+                raise ledger_module.MemoryActionLedgerError(
+                    "transaction_outcome_uncertain"
+                )
+            return result
+
+        def correct_action(current_actions, **kwargs):
+            calls["store"] += 1
+            return original_action(current_actions, **kwargs)
+
+        def issue_capability(*args, **kwargs):
+            calls["capability"] += 1
+            return original_issue(*args, **kwargs)
+
+        before = self._action_counts()
+        with (
+            mock.patch.object(
+                ledger_module._MemoryActionUnitOfWork,
+                "commit",
+                new=commit_then_uncertain,
+            ),
+            mock.patch.object(
+                type(backend._actions),
+                "correct_explicit_user_memory",
+                new=correct_action,
+            ),
+            mock.patch.object(
+                runtime_module,
+                "issue_action_envelope",
+                new=issue_capability,
+            ),
+        ):
+            result = self.service.correct_explicit_user_memory(request)
+        after = self._action_counts()
+        self.assertTrue(result.replayed)
+        self.assertEqual(result.category, "corrected")
+        self.assertEqual(
+            calls,
+            {"commit": 2, "store": 1, "capability": 1},
+        )
+        self.assertEqual(
+            {
+                table: after[table] - before[table]
+                for table in _ACTION_TABLES
+            },
+            {
+                "messages": 1,
+                "memory_action_requests": 1,
+                "memory_evidence_events": 1,
+                "memory_items": 1,
+                "memory_sources": 1,
+                "memory_suppressions": 1,
+            },
+        )
 
     def test_uncertain_commit_queries_terminal_without_reexecuting(self):
         original = memory_action_ledger._MemoryActionUnitOfWork.commit

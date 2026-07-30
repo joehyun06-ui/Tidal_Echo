@@ -106,6 +106,9 @@ def issue_request_id() -> str:
 
 
 _ENTRY_BACKEND_CONSTRUCTOR_TOKEN = object()
+_TARGET_STATUSES = frozenset(
+    {"candidate", "active", "superseded", "forgotten", "rejected"}
+)
 
 
 class MemoryActionEntryBackend:
@@ -140,8 +143,7 @@ class MemoryActionEntryBackend:
             raise ExplicitMemoryActionError("invalid_memory_key")
         return memory_key
 
-    @staticmethod
-    def _target(uow, memory_key: str, *, allow_forgotten: bool) -> dict:
+    def _target(self, uow, memory_key: str) -> dict:
         row = uow._execute(
             """SELECT memory_key,kind,scope_type,scope_ref,status,sensitivity
                FROM memory_items WHERE memory_key=?""",
@@ -149,16 +151,34 @@ class MemoryActionEntryBackend:
         ).fetchone()
         if row is None:
             raise ExplicitMemoryActionError("not_found")
-        allowed = {"active", "forgotten"} if allow_forgotten else {"active"}
-        if row["status"] not in allowed:
+        row_memory_key = row["memory_key"]
+        kind = row["kind"]
+        scope_type = row["scope_type"]
+        scope_ref = row["scope_ref"]
+        status = row["status"]
+        sensitivity = row["sensitivity"]
+        if (
+            type(row_memory_key) is not str
+            or row_memory_key != memory_key
+            or _MEMORY_KEY.fullmatch(row_memory_key) is None
+            or type(status) is not str
+            or status not in _TARGET_STATUSES
+            or type(sensitivity) is not str
+            or sensitivity not in memory_policy.SENSITIVITIES
+        ):
             raise ExplicitMemoryActionError("invalid_state")
+        try:
+            self._policy.validate_kind(kind)
+            self._policy.validate_scope(scope_type, scope_ref)
+        except memory_policy.MemoryPolicyError:
+            raise ExplicitMemoryActionError("invalid_state") from None
         return {
-            "memory_key": row["memory_key"],
-            "kind": row["kind"],
-            "scope_type": row["scope_type"],
-            "scope_ref": row["scope_ref"],
-            "status": row["status"],
-            "sensitivity": row["sensitivity"],
+            "memory_key": row_memory_key,
+            "kind": kind,
+            "scope_type": scope_type,
+            "scope_ref": scope_ref,
+            "status": status,
+            "sensitivity": sensitivity,
         }
 
     @staticmethod
@@ -200,6 +220,7 @@ class MemoryActionEntryBackend:
         source: str,
         action,
         lookup_replay=None,
+        validate_new_request=None,
     ) -> ExplicitMemoryActionResult:
         binding = None
         try:
@@ -223,6 +244,8 @@ class MemoryActionEntryBackend:
                 if replay is not None:
                     committed = uow.commit()
                     return self._safe_result(committed, binding, replayed=True)
+                if validate_new_request is not None:
+                    validate_new_request(uow, binding)
                 canonical_id = uow._insert_canonical_action(
                     text=canonical_text(binding),
                     metadata={"channel": channel, "source": source},
@@ -296,11 +319,14 @@ class MemoryActionEntryBackend:
             request.replacement_content,
             request.sensitivity,
         )
+        prepared_target_status = None
 
         def prepare(uow):
-            target = self._target(uow, memory_key, allow_forgotten=False)
+            nonlocal prepared_target_status
+            target = self._target(uow, memory_key)
             if target["kind"] == "assistant_experience":
                 raise ExplicitMemoryActionError("unsupported_evidence")
+            prepared_target_status = target["status"]
             return memory_action_ledger.MemoryActionRequestBinding(
                 request_id=request.request_id,
                 action_kind="correct",
@@ -312,6 +338,10 @@ class MemoryActionEntryBackend:
                 sensitivity=request.sensitivity,
                 normalized_content=normalized,
             )
+
+        def validate_new_request(_uow, _binding):
+            if prepared_target_status != "active":
+                raise ExplicitMemoryActionError("invalid_state")
 
         def execute(uow, canonical_id, _binding):
             self._actions.correct_explicit_user_memory(
@@ -328,6 +358,7 @@ class MemoryActionEntryBackend:
             channel=channel,
             source=source,
             action=execute,
+            validate_new_request=validate_new_request,
         )
 
     def forget(self, request, *, origin: str, channel: str, source: str):
