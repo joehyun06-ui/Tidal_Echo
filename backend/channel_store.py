@@ -1992,6 +1992,71 @@ def validate_memory_action_schema(conn: sqlite3.Connection) -> None:
             )
 
 
+def _ddl_object_name(sql: str, object_type: str) -> str:
+    tokens = _sql_fingerprint(sql)
+    if (
+        len(tokens) < 3
+        or tokens[0] != "create"
+        or tokens[1] != object_type
+        or not tokens[2]
+    ):
+        raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+    return tokens[2]
+
+
+def _validate_memory_operator_main_schema_objects(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject attached databases and every unreviewed application object."""
+    databases = conn.execute("PRAGMA database_list").fetchall()
+    if (
+        len(databases) != 1
+        or type(databases[0]["name"]) is not str
+        or databases[0]["name"] != "main"
+    ):
+        raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+
+    table_names = {
+        _ddl_object_name(SCHEMA_MIGRATIONS_DDL, "table"),
+        *RELAY_TABLE_DDL,
+        *CORE_V1_TABLE_DDL,
+        *CORE_V2_TABLE_DDL,
+        *KELIVO_TABLE_DDL,
+        *HEARTBEAT_TABLE_DDL,
+        *HEARTBEAT_HARDENING_TABLE_DDL,
+        *MEMORY_TABLE_DDL,
+        _ddl_object_name(MEMORY_ACTION_REQUEST_TABLE_DDL, "table"),
+    }
+    index_names = {
+        *CORE_V1_INDEX_DDL,
+        *CORE_V2_INDEX_DDL,
+        *KELIVO_INDEX_DDL,
+        *HEARTBEAT_INDEX_DDL,
+        *HEARTBEAT_HARDENING_INDEX_DDL,
+        *MEMORY_INDEX_DDL,
+        *MEMORY_ACTION_REQUEST_INDEX_DDL,
+    }
+    trigger_names = {
+        *MEMORY_TRIGGER_DDL,
+        *MEMORY_ACTION_REQUEST_TRIGGER_DDL,
+    }
+    expected = {
+        *(("table", name) for name in table_names),
+        *(("index", name) for name in index_names),
+        *(("trigger", name) for name in trigger_names),
+    }
+    actual = {
+        (row["type"], row["name"])
+        for row in conn.execute(
+            """SELECT type,name FROM main.sqlite_schema
+               WHERE type IN ('table','index','trigger','view')
+                 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"""
+        )
+    }
+    if actual != expected:
+        raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+
+
 def validate_memory_operator_schema_v1_v8(
     conn: sqlite3.Connection,
 ) -> None:
@@ -2028,6 +2093,7 @@ def validate_memory_operator_schema_v1_v8(
         validate_memory_action_schema(conn)
         if actual_markers != expected_markers:
             raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+        _validate_memory_operator_main_schema_objects(conn)
     except (sqlite3.Error, TypeError, ValueError):
         raise sqlite3.DatabaseError(
             "memory_operator_schema_invalid"
