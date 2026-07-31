@@ -255,11 +255,13 @@ def _read_stdin(stdin: object | None) -> bytes:
     stream = _binary_stdin(stdin)
     chunks: list[bytes] = []
     remaining = _READ_LIMIT
-    while remaining:
+    while remaining > 0:
         chunk = stream.read(remaining)
         if chunk in (b"", None):
             break
         if type(chunk) is not bytes:
+            raise _InputInvalid
+        if len(chunk) > remaining:
             raise _InputInvalid
         chunks.append(chunk)
         remaining -= len(chunk)
