@@ -653,6 +653,65 @@ the database, symlink, WAL, or SHM between preflight and a later action. That
 TOCTOU remains an accepted residual risk of the existing trusted-host threat
 model.
 
+## One-shot operator CLI
+
+`python -m backend.memory_operator_cli <command>` is the only command-line
+entry point for the operator composition root. It is a one-shot, local process;
+it does not import `backend.app`, construct FastAPI, listen on a socket, start a
+worker, register a route or tool, or call a provider, model, network transport,
+or outbox. It is not installed in App state and is not reachable from chat,
+MCP, Telegram, Operit, Kelivo, or Galatea.
+
+The exact commands are `remember`, `correct`, `forget`, `status`, `validate`,
+and `generate-request-id`. Commands accept no business arguments. The three
+write commands read one strict UTF-8 JSON object from binary stdin, bounded to
+32 KiB, and reject BOMs, duplicate keys, non-finite numbers, trailing values,
+missing or additional fields, and non-exact field types. Memory content,
+replacement content, scope references, and Secrets are never accepted through
+argv. `status`, `validate`, and `generate-request-id` require empty or
+whitespace-only stdin.
+
+After argv validation and the bounded stdin parse,
+`generate-request-id` dispatches immediately. It calls the formal request-ID
+issuer exactly once, before reading or validating Telegram, Memory, database,
+Kelivo, Loop, Heartbeat, Secret, or path configuration. It is therefore a
+genuinely offline operation and remains available when any of those unrelated
+environment values are missing or malformed.
+
+Every other command requires the one-shot operator environment to set
+`TELEGRAM_ENABLED=false`. Invalid strict-boolean syntax or `true` fails as
+`readiness_failed`. The CLI constructs the formal disabled `TelegramConfig`
+from only that fixed setting; caller-supplied Telegram API bases, allowlists,
+and test-mode values are deliberately ignored. Consequently no custom
+hostname is resolved and the operator path performs no DNS, socket, HTTP,
+provider, transport, or outbox operation.
+
+Write commands call only
+`compose_operator_memory_service_from_environment(...)` and then one method on
+the returned origin-bound operator service. They do not call preflight
+separately or directly access Runtime Authority, Store, privileged actions,
+capabilities, unit-of-work objects, or SQL. The C0 projection remains fixed to
+`operator_cli -> channel=web, source=relay`. `status` loads the formal
+deployment configuration once without opening SQLite; `validate` performs only
+the public read-only operator preflight; `generate-request-id` calls only the
+formal request-ID issuer and does not require Memory activation.
+
+Every invocation emits exactly one single-line, seven-field JSON object on
+stdout. Failures also emit exactly one fixed ASCII public category on stderr
+and use the frozen exit-code mapping: input 2, readiness 3, request-binding
+conflict 4, not-found/unsupported action 5, storage unavailable 6, uncertain
+transaction outcome 7, and internal error 1. Unknown internal categories fail
+closed as `internal_error`; exception text, tracebacks, input content, paths,
+SQL, and object representations are never public output.
+
+The CLI does not create or repair a database, run migrations or recovery, or
+change production activation. Operators must provision an existing validated
+v1-v8 SQLite database and explicitly enable Core, writes, and entry in the
+one-shot local process environment. Each process accepts exactly one command;
+batching multiple actions in one process is unsupported. This code does not approve a production
+Memory Secret, production writes/entry, or deployment.
+`migration_v9_needed=false`.
+
 ## Deferred phases
 
 Phase 2 may add model-assisted candidate extraction with an independently
@@ -665,4 +724,4 @@ implemented or enabled by this change.
 Phase 1.5 PR B is an internal, default-disabled entry composition. It does not
 approve deployment, production Secret configuration, Core/write/entry
 activation, or a transport. It must remain Draft until independent security
-review completes.
+review completes. Exact test totals remain pending the new exact-head CI run.
