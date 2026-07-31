@@ -69,6 +69,8 @@ _ACTION_CATEGORY_MAP = {
     "forbidden_test_content": "input_invalid",
     "forbidden_log_content": "input_invalid",
     "technical_identifier_forbidden": "input_invalid",
+    "invalid_state": "unsupported_action",
+    "conflict": "request_binding_conflict",
     "request_binding_conflict": "request_binding_conflict",
     "not_found": "not_found",
     "unsupported_evidence": "unsupported_action",
@@ -82,7 +84,11 @@ _ACTION_CATEGORY_MAP = {
 }
 
 _COMPOSITION_STORAGE_CATEGORIES = frozenset(
-    {"memory_storage_unavailable", "storage_unavailable"}
+    {
+        "memory_storage_missing",
+        "memory_storage_unavailable",
+        "storage_unavailable",
+    }
 )
 _COMPOSITION_READINESS_CATEGORIES = frozenset(
     {
@@ -154,7 +160,6 @@ _COMPOSITION_READINESS_CATEGORIES = frozenset(
         "memory_fingerprint_key_id_missing",
         "memory_fingerprint_profile_mismatch",
         "memory_operator_schema_invalid",
-        "memory_storage_missing",
         "model_fallback_not_allowed",
         "operit_share_api_key_missing",
         "operit_share_api_key_must_be_distinct",
@@ -488,6 +493,31 @@ def _generate_request_id() -> dict[str, object]:
     )
 
 
+def _operator_telegram_config(
+    environ: Mapping[str, str],
+) -> telegram_integration.TelegramConfig:
+    try:
+        telegram_enabled = deployment_config.parse_strict_bool(
+            environ.get("TELEGRAM_ENABLED", "false"),
+            "invalid_telegram_enabled",
+        )
+    except deployment_config.DeploymentConfigError:
+        raise _PublicFailure("readiness_failed") from None
+    if telegram_enabled:
+        raise _PublicFailure("readiness_failed")
+    config = telegram_integration.TelegramConfig.from_env(
+        {"TELEGRAM_ENABLED": "false"}
+    )
+    if (
+        type(config) is not telegram_integration.TelegramConfig
+        or config.requested is not False
+        or config.enabled is not False
+        or config.error != ""
+    ):
+        raise _PublicFailure("internal_error")
+    return config
+
+
 def _composition_failure(category: object) -> _PublicFailure:
     if category in _COMPOSITION_STORAGE_CATEGORIES:
         return _PublicFailure("storage_unavailable")
@@ -564,7 +594,6 @@ def main(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
-    environ = dict(os.environ)
     args = list(sys.argv[1:] if argv is None else argv)
     output_stream = sys.stdout if stdout is None else stdout
     error_stream = sys.stderr if stderr is None else stderr
@@ -587,16 +616,16 @@ def main(
         else:
             _require_whitespace_only(raw)
 
-        telegram_config = telegram_integration.TelegramConfig.from_env(
-            environ
-        )
+        if command == "generate-request-id":
+            payload = _generate_request_id()
+        else:
+            environ = dict(os.environ)
+            telegram_config = _operator_telegram_config(environ)
         if command == "status":
             payload = _status(telegram_config, environ)
         elif command == "validate":
             payload = _validate(telegram_config, environ)
-        elif command == "generate-request-id":
-            payload = _generate_request_id()
-        else:
+        elif command in _WRITE_COMMANDS:
             payload = _write_action(
                 command,
                 request,
