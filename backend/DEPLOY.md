@@ -674,6 +674,14 @@ scope ref 和 Secret 不得放入 argv、交互 prompt、文件路径参数或�
 stdout 永远只有一个固定七字段单行 JSON object；失败时 stderr 只有一个固定
 ASCII public category，不输出 usage、traceback、异常文本、SQL、路径或输入回显。
 
+完成 argv 验证和 bounded stdin 解析后，`generate-request-id` 立即分派，只调用一次
+正式 request-ID issuer；它发生在任何 Telegram、Memory、数据库路径、Secret、
+Kelivo、Loop 或 Heartbeat 配置读取/验证之前，因此是真正的 offline 命令。其它命令的
+一次性 operator 环境必须显式设置 `TELEGRAM_ENABLED=false`；非法 strict bool 或
+`true` 固定返回 `readiness_failed` / exit 3。CLI 只用这个固定 false 值构造正式
+disabled `TelegramConfig`，始终忽略调用方的 Telegram custom API base、allowlist
+和 test-mode 配置，不解析 custom hostname。
+
 写命令只调用 C0 的
 `compose_operator_memory_service_from_environment(...)`，然后调用返回的
 operator-only service；provenance 固定为
@@ -685,8 +693,11 @@ recovery，也不导入 App/FastAPI，不监听网络，不绑定 MCP/Telegram/O
 `status` 只检查正式配置与 Core/writes/entry flags，不打开数据库；
 `validate` 只运行只读 preflight；`generate-request-id` 不打开数据库且不要求
 Memory flags 已启用。写命令要求现有 v1-v8 SQLite、有效 fingerprint profile
-边界以及显式启用的本机一次性环境。
+边界以及显式启用的本机一次性环境。所有 operator 命令均不执行 DNS、socket、
+HTTP、provider、transport 或 outbox 路径。每个进程只接受一个命令，不支持同进程
+batch。
 
 本入口仍不批准部署、生产 Memory Secret 或生产写入。Render 和生产默认值保持
 不变；不得为合入该 CLI 而启用生产 writes/entry，也不得对生产 SQLite 或备份
-运行命令。`migration_v9_needed=false`。
+运行命令。`migration_v9_needed=false`。新 exact-head CI 运行前，测试精确数字
+标记为待确认，不沿用旧的 17-tests 覆盖声明。
