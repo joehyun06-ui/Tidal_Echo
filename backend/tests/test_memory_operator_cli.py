@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -174,12 +176,46 @@ class MemoryOperatorCliTests(unittest.TestCase):
         self.assertEqual(tuple(result), OUTPUT_KEYS)
         return completed, result
 
+    def invoke_main(
+        self,
+        command: str,
+        *,
+        raw: bytes = b"",
+        environment: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[bytes], dict[str, object]]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(
+            os.environ,
+            {} if environment is None else environment,
+            clear=True,
+        ):
+            returncode = memory_operator_cli.main(
+                [command],
+                stdin=io.BytesIO(raw),
+                stdout=stdout,
+                stderr=stderr,
+            )
+        completed = subprocess.CompletedProcess(
+            [command],
+            returncode,
+            stdout.getvalue().encode("utf-8"),
+            stderr.getvalue().encode("utf-8"),
+        )
+        lines = completed.stdout.decode("utf-8").splitlines()
+        self.assertEqual(len(lines), 1, completed.stdout)
+        result = json.loads(lines[0])
+        self.assertEqual(tuple(result), OUTPUT_KEYS)
+        return completed, result
+
     def assert_success(
         self,
         completed: subprocess.CompletedProcess[bytes],
         result: dict[str, object],
         *,
         action: str,
+        category: str,
+        replayed: bool,
     ) -> None:
         self.assertEqual(
             completed.returncode,
@@ -189,9 +225,34 @@ class MemoryOperatorCliTests(unittest.TestCase):
         self.assertEqual(completed.stderr, b"")
         self.assertTrue(result["ok"])
         self.assertEqual(result["action"], action)
-        self.assertFalse(result["replayed"] if action not in {
-            "remember", "correct", "forget"
-        } else False)
+        self.assertEqual(result["category"], category)
+        self.assertIs(result["replayed"], replayed)
+
+        if action in {"remember", "correct", "forget"}:
+            self.assertEqual(result["status"], "completed")
+            self.assertRegex(
+                str(result["request_id"]),
+                r"^[A-Za-z0-9_-]{32,96}$",
+            )
+            if category == "suppressed":
+                self.assertIsNone(result["memory_key"])
+            else:
+                self.assertRegex(
+                    str(result["memory_key"]),
+                    r"^[A-Za-z0-9_-]{32,96}$",
+                )
+            return
+
+        self.assertIsNone(result["memory_key"])
+        self.assertIs(result["replayed"], False)
+        if action == "generate_request_id":
+            self.assertEqual(result["status"], "generated")
+            self.assertRegex(
+                str(result["request_id"]),
+                r"^[A-Za-z0-9_-]{32,96}$",
+            )
+        else:
+            self.assertIsNone(result["request_id"])
 
     def assert_failure(
         self,
@@ -314,6 +375,8 @@ class MemoryOperatorCliTests(unittest.TestCase):
             "forbidden_test_content": "input_invalid",
             "forbidden_log_content": "input_invalid",
             "technical_identifier_forbidden": "input_invalid",
+            "invalid_state": "unsupported_action",
+            "conflict": "request_binding_conflict",
             "request_binding_conflict": "request_binding_conflict",
             "not_found": "not_found",
             "unsupported_evidence": "unsupported_action",
@@ -328,6 +391,19 @@ class MemoryOperatorCliTests(unittest.TestCase):
             "memory_fingerprint_profile_mismatch": "readiness_failed",
         }
         self.assertEqual(memory_operator_cli._ACTION_CATEGORY_MAP, expected_map)
+        self.assertEqual(
+            memory_operator_cli._PUBLIC_EXIT_CODES,
+            {
+                "internal_error": 1,
+                "input_invalid": 2,
+                "readiness_failed": 3,
+                "request_binding_conflict": 4,
+                "not_found": 5,
+                "unsupported_action": 5,
+                "storage_unavailable": 6,
+                "transaction_outcome_uncertain": 7,
+            },
+        )
         for internal, public in expected_map.items():
             with self.subTest(internal=internal):
                 failure = memory_operator_cli._action_failure(internal)
@@ -358,6 +434,25 @@ class MemoryOperatorCliTests(unittest.TestCase):
             ).category,
             "internal_error",
         )
+        for internal in (
+            "entry_composition_invalid",
+            "memory_operation_failed",
+            "terminal_semantics_invalid",
+            "memory_runtime_already_initialized",
+            "runtime_authority_invalid",
+            "memory_operator_composition_failed",
+        ):
+            with self.subTest(internal_error=internal):
+                self.assertEqual(
+                    memory_operator_cli._composition_failure(
+                        internal
+                    ).category,
+                    "internal_error",
+                )
+                self.assertEqual(
+                    memory_operator_cli._action_failure(internal).category,
+                    "internal_error",
+                )
 
     def test_status_is_config_only_and_database_need_not_exist(self):
         missing = self.root / "status-missing.sqlite3"
@@ -482,8 +577,8 @@ class MemoryOperatorCliTests(unittest.TestCase):
         self.assert_failure(
             completed,
             result,
-            exit_code=3,
-            category="readiness_failed",
+            exit_code=6,
+            category="storage_unavailable",
             action="validate",
             forbidden=(str(missing), TEST_SECRET, TEST_KEY_ID),
         )
@@ -584,10 +679,17 @@ class MemoryOperatorCliTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
-        self.assertIs(
+        self.assertEqual(
             captured["telegram_environ"],
-            captured["compose_environ"],
+            {"TELEGRAM_ENABLED": "false"},
         )
+        self.assertIsNotNone(captured["compose_environ"])
+        self.assertEqual(captured["compose_environ"], environment)
+        telegram_config = captured["telegram_config"]
+        self.assertIs(type(telegram_config), telegram_integration.TelegramConfig)
+        self.assertIs(telegram_config.requested, False)
+        self.assertIs(telegram_config.enabled, False)
+        self.assertEqual(telegram_config.error, "")
         composition.assert_called_once()
         preflight.assert_not_called()
         migrations.assert_not_called()
@@ -621,6 +723,389 @@ class MemoryOperatorCliTests(unittest.TestCase):
             values.append(result["request_id"])
         self.assertEqual(len(set(values)), 2)
 
+    def test_all_commands_ignore_custom_telegram_base_without_network(self):
+        path = self.copy_database("network-free")
+        environment = operator_environment(
+            path,
+            TELEGRAM_API_BASE="https://review.example.invalid",
+            TELEGRAM_API_BASE_ALLOWLIST="https://review.example.invalid",
+            TELEGRAM_TEST_MODE="false",
+        )
+        request_ids = {
+            "remember": "R" * 32,
+            "correct": "C" * 32,
+            "forget": "F" * 32,
+        }
+        memory_key = "a" * 64
+        service = mock.Mock()
+        for command, category in (
+            ("remember", "created"),
+            ("correct", "corrected"),
+            ("forget", "forgotten"),
+        ):
+            getattr(
+                service,
+                {
+                    "remember": "remember_explicit_user_memory",
+                    "correct": "correct_explicit_user_memory",
+                    "forget": "forget_explicit_user_memory",
+                }[command],
+            ).return_value = (
+                memory_explicit_actions.ExplicitMemoryActionResult(
+                    request_id=request_ids[command],
+                    action_kind=command,
+                    status="completed",
+                    category=category,
+                    memory_key=memory_key,
+                    kind="project",
+                    scope_type="global_user",
+                    sensitivity="normal",
+                    replayed=False,
+                )
+            )
+        real_from_env = telegram_integration.TelegramConfig.from_env
+        telegram_environments: list[dict[str, str]] = []
+
+        def telegram_from_env(
+            environ: dict[str, str],
+        ) -> telegram_integration.TelegramConfig:
+            telegram_environments.append(dict(environ))
+            return real_from_env(environ)
+
+        forbidden = AssertionError("network/provider/outbox forbidden")
+        with (
+            mock.patch.object(
+                telegram_integration.TelegramConfig,
+                "from_env",
+                side_effect=telegram_from_env,
+            ) as telegram_config,
+            mock.patch.object(
+                memory_operator_composition,
+                "compose_operator_memory_service_from_environment",
+                return_value=service,
+            ) as composition,
+            mock.patch.object(
+                socket,
+                "getaddrinfo",
+                side_effect=forbidden,
+            ) as getaddrinfo,
+            mock.patch.object(
+                socket,
+                "create_connection",
+                side_effect=forbidden,
+            ) as create_connection,
+            mock.patch.object(
+                socket.socket,
+                "connect",
+                side_effect=forbidden,
+            ) as connect,
+            mock.patch.object(
+                socket.socket,
+                "connect_ex",
+                side_effect=forbidden,
+            ) as connect_ex,
+            mock.patch.object(
+                urllib.request,
+                "urlopen",
+                side_effect=forbidden,
+            ) as urlopen,
+            mock.patch.object(
+                telegram_integration.TelegramClient,
+                "send_part",
+                side_effect=forbidden,
+            ) as telegram_send,
+            mock.patch.object(
+                channel_store,
+                "enqueue_telegram_update",
+                side_effect=forbidden,
+            ) as enqueue_outbox,
+        ):
+            completed, result = self.invoke_main(
+                "generate-request-id",
+                raw=b" \n",
+                environment=environment,
+            )
+            self.assert_success(
+                completed,
+                result,
+                action="generate_request_id",
+                category="generated",
+                replayed=False,
+            )
+            for command, category in (
+                ("status", "configured"),
+                ("validate", "ready"),
+            ):
+                completed, result = self.invoke_main(
+                    command,
+                    environment=environment,
+                )
+                self.assert_success(
+                    completed,
+                    result,
+                    action=command,
+                    category=category,
+                    replayed=False,
+                )
+
+            payloads = {
+                "remember": self.remember_payload(
+                    request_ids["remember"],
+                    "Synthetic custom Telegram base content",
+                ),
+                "correct": {
+                    "request_id": request_ids["correct"],
+                    "memory_key": memory_key,
+                    "replacement_content": "Synthetic network-free replacement",
+                    "sensitivity": "normal",
+                },
+                "forget": {
+                    "request_id": request_ids["forget"],
+                    "memory_key": memory_key,
+                },
+            }
+            for command, category in (
+                ("remember", "created"),
+                ("correct", "corrected"),
+                ("forget", "forgotten"),
+            ):
+                completed, result = self.invoke_main(
+                    command,
+                    raw=json.dumps(payloads[command]).encode("utf-8"),
+                    environment=environment,
+                )
+                self.assert_success(
+                    completed,
+                    result,
+                    action=command,
+                    category=category,
+                    replayed=False,
+                )
+
+            completed, result = self.invoke_main(
+                "remember",
+                raw=b"{}",
+                environment=environment,
+            )
+            self.assert_failure(
+                completed,
+                result,
+                exit_code=2,
+                category="input_invalid",
+                action="remember",
+            )
+
+        self.assertEqual(
+            telegram_environments,
+            [{"TELEGRAM_ENABLED": "false"}] * 5,
+        )
+        self.assertEqual(telegram_config.call_count, 5)
+        self.assertEqual(composition.call_count, 3)
+        for entrypoint in (
+            getaddrinfo,
+            create_connection,
+            connect,
+            connect_ex,
+            urlopen,
+            telegram_send,
+            enqueue_outbox,
+        ):
+            entrypoint.assert_not_called()
+
+    def test_generate_is_environment_independent_and_bad_telegram_flags_fail_closed(
+        self,
+    ):
+        path = self.copy_database("telegram-flag-matrix")
+        remember = json.dumps(
+            self.remember_payload(
+                "W" * 32,
+                "Synthetic Telegram flag matrix content",
+            )
+        ).encode("utf-8")
+        for telegram_value in ("not-a-bool", "true"):
+            with self.subTest(telegram_enabled=telegram_value):
+                environment = operator_environment(
+                    path,
+                    TELEGRAM_ENABLED=telegram_value,
+                    TELEGRAM_API_BASE="https://review.example.invalid",
+                    TELEGRAM_API_BASE_ALLOWLIST=(
+                        "https://review.example.invalid"
+                    ),
+                    MEMORY_CORE_ENABLED="malformed",
+                    MEMORY_EXPLICIT_WRITES_ENABLED="malformed",
+                    MEMORY_FINGERPRINT_HMAC_SECRET="",
+                    RELAY_DB=str(self.root / "does-not-exist.sqlite3"),
+                    KELIVO_ENABLED="malformed",
+                    LOOP_PORT="malformed",
+                    HEARTBEAT_ENABLED="malformed",
+                )
+                before = snapshot(path)
+                issued = "G" * 32
+                forbidden = AssertionError("network forbidden")
+                with (
+                    mock.patch.object(
+                        memory_explicit_actions,
+                        "issue_request_id",
+                        return_value=issued,
+                    ) as issuer,
+                    mock.patch.object(
+                        telegram_integration.TelegramConfig,
+                        "from_env",
+                        side_effect=AssertionError(
+                            "TelegramConfig forbidden"
+                        ),
+                    ) as telegram_config,
+                    mock.patch.object(
+                        socket,
+                        "getaddrinfo",
+                        side_effect=forbidden,
+                    ) as getaddrinfo,
+                    mock.patch.object(
+                        socket.socket,
+                        "connect",
+                        side_effect=forbidden,
+                    ) as connect,
+                    mock.patch.object(
+                        urllib.request,
+                        "urlopen",
+                        side_effect=forbidden,
+                    ) as urlopen,
+                    mock.patch.object(
+                        memory_operator_composition,
+                        "compose_operator_memory_service_from_environment",
+                        side_effect=AssertionError(
+                            "composition forbidden"
+                        ),
+                    ) as composition,
+                ):
+                    completed, result = self.invoke_main(
+                        "generate-request-id",
+                        raw=b"\n",
+                        environment=environment,
+                    )
+                    self.assert_success(
+                        completed,
+                        result,
+                        action="generate_request_id",
+                        category="generated",
+                        replayed=False,
+                    )
+                    self.assertEqual(result["request_id"], issued)
+                    issuer.assert_called_once_with()
+
+                    for command, raw in (
+                        ("status", b""),
+                        ("validate", b""),
+                        ("remember", remember),
+                    ):
+                        completed, result = self.invoke_main(
+                            command,
+                            raw=raw,
+                            environment=environment,
+                        )
+                        self.assert_failure(
+                            completed,
+                            result,
+                            exit_code=3,
+                            category="readiness_failed",
+                            action=command,
+                        )
+
+                telegram_config.assert_not_called()
+                composition.assert_not_called()
+                getaddrinfo.assert_not_called()
+                connect.assert_not_called()
+                urlopen.assert_not_called()
+                self.assertEqual(snapshot(path), before)
+
+    def test_operator_telegram_disabled_contract_fails_closed(self):
+        formal = telegram_integration.TelegramConfig.from_env(
+            {"TELEGRAM_ENABLED": "false"}
+        )
+        invalid_configs = (
+            object(),
+            dataclasses.replace(formal, requested=True),
+            dataclasses.replace(formal, enabled=True),
+            dataclasses.replace(formal, error="invalid"),
+        )
+        for index, invalid_config in enumerate(invalid_configs):
+            with self.subTest(index=index):
+                with (
+                    mock.patch.object(
+                        telegram_integration.TelegramConfig,
+                        "from_env",
+                        return_value=invalid_config,
+                    ) as from_env,
+                    mock.patch.object(
+                        deployment_config,
+                        "load_deployment_config",
+                        side_effect=AssertionError(
+                            "deployment config must not load"
+                        ),
+                    ) as load_config,
+                ):
+                    completed, result = self.invoke_main(
+                        "status",
+                        environment={"TELEGRAM_ENABLED": "false"},
+                    )
+                self.assert_failure(
+                    completed,
+                    result,
+                    exit_code=1,
+                    category="internal_error",
+                    action="status",
+                )
+                from_env.assert_called_once_with(
+                    {"TELEGRAM_ENABLED": "false"}
+                )
+                load_config.assert_not_called()
+
+    def test_generate_does_not_snapshot_environment(self):
+        class ForbiddenEnvironment:
+            def __iter__(self):
+                raise AssertionError("environment iterated")
+
+            def __getitem__(self, _key):
+                raise AssertionError("environment indexed")
+
+            def get(self, _key, _default=None):
+                raise AssertionError("environment read")
+
+            def keys(self):
+                raise AssertionError("environment keys read")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        issued = "Z" * 32
+        with (
+            mock.patch.object(
+                memory_operator_cli.os,
+                "environ",
+                ForbiddenEnvironment(),
+            ),
+            mock.patch.object(
+                memory_explicit_actions,
+                "issue_request_id",
+                return_value=issued,
+            ) as issuer,
+            mock.patch.object(
+                telegram_integration.TelegramConfig,
+                "from_env",
+                side_effect=AssertionError("Telegram config constructed"),
+            ) as telegram_config,
+        ):
+            exit_code = memory_operator_cli.main(
+                ["generate-request-id"],
+                stdin=io.BytesIO(b"\n"),
+                stdout=stdout,
+                stderr=stderr,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue())["request_id"], issued)
+        issuer.assert_called_once_with()
+        telegram_config.assert_not_called()
+
     def test_real_remember_correct_forget_and_fresh_process_replays(self):
         path = self.copy_database("lifecycle")
         content = "Synthetic operator CLI lifecycle content"
@@ -633,9 +1118,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
             path=path,
             payload=remember,
         )
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(created["category"], "created")
-        self.assertFalse(created["replayed"])
+        self.assert_success(
+            completed,
+            created,
+            action="remember",
+            category="created",
+            replayed=False,
+        )
         memory_key = created["memory_key"]
         self.assertRegex(memory_key, r"\A[A-Za-z0-9_-]{32,96}\Z")
         after_remember = counts(path)
@@ -666,9 +1155,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
             path=path,
             payload=remember,
         )
-        self.assertEqual(completed.returncode, 0)
-        self.assertTrue(replay["replayed"])
-        self.assertEqual(replay["category"], "created")
+        self.assert_success(
+            completed,
+            replay,
+            action="remember",
+            category="created",
+            replayed=True,
+        )
         self.assertEqual(replay["memory_key"], memory_key)
         self.assertEqual(counts(path), after_remember)
 
@@ -708,9 +1201,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
             path=path,
             payload=correct_request,
         )
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(corrected["category"], "corrected")
-        self.assertFalse(corrected["replayed"])
+        self.assert_success(
+            completed,
+            corrected,
+            action="correct",
+            category="corrected",
+            replayed=False,
+        )
         replacement_key = corrected["memory_key"]
         self.assertNotEqual(replacement_key, memory_key)
         after_correct = counts(path)
@@ -734,13 +1231,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
             path=path,
             payload=correct_request,
         )
-        self.assertEqual(
-            completed.returncode,
-            0,
-            (completed.stdout, completed.stderr),
+        self.assert_success(
+            completed,
+            correct_replay,
+            action="correct",
+            category="corrected",
+            replayed=True,
         )
-        self.assertTrue(correct_replay["replayed"])
-        self.assertEqual(correct_replay["category"], "corrected")
         self.assertEqual(counts(path), after_correct)
 
         forget_request = {
@@ -752,9 +1249,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
             path=path,
             payload=forget_request,
         )
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(forgotten["category"], "forgotten")
-        self.assertFalse(forgotten["replayed"])
+        self.assert_success(
+            completed,
+            forgotten,
+            action="forget",
+            category="forgotten",
+            replayed=False,
+        )
         after_forget = counts(path)
         self.assertEqual(
             {
@@ -775,9 +1276,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
             path=path,
             payload=forget_request,
         )
-        self.assertEqual(completed.returncode, 0)
-        self.assertTrue(forget_replay["replayed"])
-        self.assertEqual(forget_replay["category"], "forgotten")
+        self.assert_success(
+            completed,
+            forget_replay,
+            action="forget",
+            category="forgotten",
+            replayed=True,
+        )
         self.assertEqual(counts(path), after_forget)
         public = (
             completed.stdout.decode("utf-8")
@@ -792,6 +1297,426 @@ class MemoryOperatorCliTests(unittest.TestCase):
             str(path),
         ):
             self.assertNotIn(secret, public)
+
+    def test_real_success_category_matrix_has_exact_store_effects(self):
+        path = self.copy_database("success-matrix")
+        base_effect = {
+            "messages": 1,
+            "memory_action_requests": 1,
+            "memory_evidence_events": 1,
+            "memory_items": 0,
+            "memory_sources": 1,
+            "memory_suppressions": 0,
+        }
+
+        def execute(
+            command: str,
+            payload: dict[str, object],
+            *,
+            category: str,
+            replayed: bool,
+            evidence: int = 1,
+            items: int = 0,
+            sources: int = 1,
+            suppressions: int = 0,
+        ) -> dict[str, object]:
+            before = counts(path)
+            completed, result = self.run_cli(
+                command,
+                path=path,
+                payload=payload,
+            )
+            self.assert_success(
+                completed,
+                result,
+                action=command,
+                category=category,
+                replayed=replayed,
+            )
+            after = counts(path)
+            expected = (
+                {table: 0 for table in BUSINESS_TABLES}
+                if replayed
+                else {
+                    **base_effect,
+                    "memory_evidence_events": evidence,
+                    "memory_items": items,
+                    "memory_sources": sources,
+                    "memory_suppressions": suppressions,
+                }
+            )
+            self.assertEqual(
+                {
+                    table: after[table] - before[table]
+                    for table in BUSINESS_TABLES
+                },
+                expected,
+            )
+            if not replayed:
+                with channel_store.connect(str(path)) as connection:
+                    canonical = connection.execute(
+                        "SELECT meta FROM messages ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                self.assertEqual(
+                    json.loads(canonical["meta"]),
+                    {"channel": "web", "source": "relay"},
+                )
+            return result
+
+        primary_request = self.remember_payload(
+            "1" * 32,
+            "Synthetic success matrix primary",
+        )
+        primary = execute(
+            "remember",
+            primary_request,
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        execute(
+            "remember",
+            primary_request,
+            category="created",
+            replayed=True,
+        )
+        existing = execute(
+            "remember",
+            self.remember_payload(
+                "2" * 32,
+                "Synthetic success matrix primary",
+            ),
+            category="idempotent_existing",
+            replayed=False,
+        )
+        self.assertEqual(existing["memory_key"], primary["memory_key"])
+
+        suppression_seed = execute(
+            "remember",
+            self.remember_payload(
+                "3" * 32,
+                "Synthetic success matrix suppressed remember",
+            ),
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        execute(
+            "forget",
+            {
+                "request_id": "4" * 32,
+                "memory_key": suppression_seed["memory_key"],
+            },
+            category="forgotten",
+            replayed=False,
+            suppressions=1,
+        )
+        suppressed_remember_request = self.remember_payload(
+            "5" * 32,
+            "Synthetic success matrix suppressed remember",
+        )
+        execute(
+            "remember",
+            suppressed_remember_request,
+            category="suppressed",
+            replayed=False,
+            evidence=0,
+            sources=0,
+        )
+        execute(
+            "remember",
+            suppressed_remember_request,
+            category="suppressed",
+            replayed=True,
+        )
+
+        unchanged_target = execute(
+            "remember",
+            self.remember_payload(
+                "6" * 32,
+                "Synthetic success matrix unchanged",
+            ),
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        unchanged_request = {
+            "request_id": "7" * 32,
+            "memory_key": unchanged_target["memory_key"],
+            "replacement_content": "Synthetic success matrix unchanged",
+            "sensitivity": "normal",
+        }
+        unchanged = execute(
+            "correct",
+            unchanged_request,
+            category="unchanged",
+            replayed=False,
+        )
+        self.assertEqual(
+            unchanged["memory_key"],
+            unchanged_target["memory_key"],
+        )
+        execute(
+            "correct",
+            unchanged_request,
+            category="unchanged",
+            replayed=True,
+        )
+
+        correction_target = execute(
+            "remember",
+            self.remember_payload(
+                "8" * 32,
+                "Synthetic success matrix correction target",
+            ),
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        correction_request = {
+            "request_id": "9" * 32,
+            "memory_key": correction_target["memory_key"],
+            "replacement_content": (
+                "Synthetic success matrix corrected replacement"
+            ),
+            "sensitivity": "normal",
+        }
+        corrected = execute(
+            "correct",
+            correction_request,
+            category="corrected",
+            replayed=False,
+            items=1,
+            suppressions=1,
+        )
+        execute(
+            "correct",
+            correction_request,
+            category="corrected",
+            replayed=True,
+        )
+
+        for field, changed in (
+            (
+                "replacement_content",
+                "Synthetic different correction binding",
+            ),
+            ("sensitivity", "sensitive"),
+            ("memory_key", unchanged_target["memory_key"]),
+        ):
+            conflicting = dict(correction_request)
+            conflicting[field] = changed
+            before = counts(path)
+            completed, result = self.run_cli(
+                "correct",
+                path=path,
+                payload=conflicting,
+                environment=(
+                    operator_environment(
+                        path,
+                        MEMORY_SENSITIVE_STORAGE_ENABLED="true",
+                    )
+                    if field == "sensitivity"
+                    else None
+                ),
+            )
+            self.assert_failure(
+                completed,
+                result,
+                exit_code=4,
+                category="request_binding_conflict",
+                action="correct",
+            )
+            self.assertEqual(counts(path), before)
+
+        before = counts(path)
+        completed, result = self.run_cli(
+            "correct",
+            path=path,
+            payload={
+                **correction_request,
+                "request_id": "A" * 32,
+            },
+        )
+        self.assert_failure(
+            completed,
+            result,
+            exit_code=5,
+            category="unsupported_action",
+            action="correct",
+        )
+        self.assertEqual(counts(path), before)
+
+        suppressed_target = execute(
+            "remember",
+            self.remember_payload(
+                "B" * 32,
+                "Synthetic suppressed correction target",
+            ),
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        corrected_suppression_seed = execute(
+            "remember",
+            self.remember_payload(
+                "C" * 32,
+                "Synthetic corrected suppression content",
+            ),
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        execute(
+            "forget",
+            {
+                "request_id": "D" * 32,
+                "memory_key": corrected_suppression_seed["memory_key"],
+            },
+            category="forgotten",
+            replayed=False,
+            suppressions=1,
+        )
+        suppressed_correct_request = {
+            "request_id": "E" * 32,
+            "memory_key": suppressed_target["memory_key"],
+            "replacement_content": (
+                "Synthetic corrected suppression content"
+            ),
+            "sensitivity": "normal",
+        }
+        execute(
+            "correct",
+            suppressed_correct_request,
+            category="suppressed",
+            replayed=False,
+            evidence=0,
+            sources=0,
+        )
+        execute(
+            "correct",
+            suppressed_correct_request,
+            category="suppressed",
+            replayed=True,
+        )
+
+        forgotten_target = execute(
+            "remember",
+            self.remember_payload(
+                "F" * 32,
+                "Synthetic forgotten target matrix",
+            ),
+            category="created",
+            replayed=False,
+            items=1,
+        )
+        forgotten_request = {
+            "request_id": "G" * 32,
+            "memory_key": forgotten_target["memory_key"],
+        }
+        execute(
+            "forget",
+            forgotten_request,
+            category="forgotten",
+            replayed=False,
+            suppressions=1,
+        )
+        execute(
+            "forget",
+            forgotten_request,
+            category="forgotten",
+            replayed=True,
+        )
+        already_request = {
+            "request_id": "H" * 32,
+            "memory_key": forgotten_target["memory_key"],
+        }
+        execute(
+            "forget",
+            already_request,
+            category="already_forgotten",
+            replayed=False,
+        )
+        execute(
+            "forget",
+            already_request,
+            category="already_forgotten",
+            replayed=True,
+        )
+
+        for target_key, marker in (
+            (correction_target["memory_key"], "I"),
+            (forgotten_target["memory_key"], "J"),
+        ):
+            before = counts(path)
+            completed, result = self.run_cli(
+                "correct",
+                path=path,
+                payload={
+                    "request_id": marker * 32,
+                    "memory_key": target_key,
+                    "replacement_content": (
+                        "Synthetic stale target replacement"
+                    ),
+                    "sensitivity": "normal",
+                },
+            )
+            self.assert_failure(
+                completed,
+                result,
+                exit_code=5,
+                category="unsupported_action",
+                action="correct",
+            )
+            self.assertEqual(counts(path), before)
+
+        before = counts(path)
+        completed, result = self.run_cli(
+            "forget",
+            path=path,
+            payload={
+                "request_id": "K" * 32,
+                "memory_key": "f" * 64,
+            },
+        )
+        self.assert_failure(
+            completed,
+            result,
+            exit_code=5,
+            category="not_found",
+            action="forget",
+        )
+        self.assertEqual(counts(path), before)
+
+        for memory_key, marker in (
+            (primary["memory_key"], "L"),
+            (unchanged_target["memory_key"], "M"),
+            (corrected["memory_key"], "N"),
+            (suppressed_target["memory_key"], "O"),
+        ):
+            execute(
+                "forget",
+                {
+                    "request_id": marker * 32,
+                    "memory_key": memory_key,
+                },
+                category="forgotten",
+                replayed=False,
+                suppressions=1,
+            )
+
+        with channel_store.connect(str(path)) as connection:
+            statuses = {
+                row["memory_key"]: row["status"]
+                for row in connection.execute(
+                    "SELECT memory_key,status FROM memory_items"
+                )
+            }
+        self.assertEqual(statuses[correction_target["memory_key"]], "superseded")
+        self.assertEqual(statuses[suppressed_target["memory_key"]], "forgotten")
+        self.assertEqual(statuses[corrected["memory_key"]], "forgotten")
+        self.assertEqual(statuses[unchanged_target["memory_key"]], "forgotten")
+        self.assertEqual(statuses[primary["memory_key"]], "forgotten")
 
     def test_not_found_and_unsupported_action_are_closed(self):
         path = self.copy_database("closed-errors")
@@ -971,6 +1896,245 @@ class MemoryOperatorCliTests(unittest.TestCase):
                 )
                 self.forget(path, results[0]["memory_key"], "H")
 
+    def test_same_correct_request_concurrency_for_2_4_8_processes(self):
+        for workers, marker in ((2, "Q"), (4, "R"), (8, "S")):
+            with self.subTest(workers=workers):
+                path = self.copy_database(f"correct-concurrent-{workers}")
+                completed, target = self.run_cli(
+                    "remember",
+                    path=path,
+                    payload=self.remember_payload(
+                        marker * 32,
+                        f"Synthetic concurrent correct target {workers}",
+                    ),
+                )
+                self.assert_success(
+                    completed,
+                    target,
+                    action="remember",
+                    category="created",
+                    replayed=False,
+                )
+                before = counts(path)
+                payload = {
+                    "request_id": str(workers) * 32,
+                    "memory_key": target["memory_key"],
+                    "replacement_content": (
+                        f"Synthetic concurrent correction {workers}"
+                    ),
+                    "sensitivity": "normal",
+                }
+                raw = json.dumps(payload, separators=(",", ":")).encode()
+                environment = operator_environment(path)
+                processes = [
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-B",
+                            "-m",
+                            "backend.memory_operator_cli",
+                            "correct",
+                        ],
+                        cwd=Path(__file__).resolve().parents[2],
+                        env=environment,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    for _index in range(workers)
+                ]
+                observed: list[
+                    tuple[
+                        subprocess.CompletedProcess[bytes],
+                        dict[str, object],
+                    ]
+                ] = []
+                for process in processes:
+                    stdout, stderr = process.communicate(raw, timeout=30)
+                    result = json.loads(stdout)
+                    completed = subprocess.CompletedProcess(
+                        ["correct"],
+                        process.returncode,
+                        stdout,
+                        stderr,
+                    )
+                    self.assertEqual(len(stdout.splitlines()), 1)
+                    observed.append((completed, result))
+                results = [item[1] for item in observed]
+                self.assertEqual(
+                    sum(result["replayed"] is False for result in results),
+                    1,
+                )
+                self.assertEqual(
+                    sum(result["replayed"] is True for result in results),
+                    workers - 1,
+                )
+                fresh = [
+                    item for item in observed
+                    if item[1]["replayed"] is False
+                ]
+                replays = [
+                    item for item in observed
+                    if item[1]["replayed"] is True
+                ]
+                self.assert_success(
+                    fresh[0][0],
+                    fresh[0][1],
+                    action="correct",
+                    category="corrected",
+                    replayed=False,
+                )
+                for completed, result in replays:
+                    self.assert_success(
+                        completed,
+                        result,
+                        action="correct",
+                        category="corrected",
+                        replayed=True,
+                    )
+                replacement_keys = {
+                    result["memory_key"] for result in results
+                }
+                self.assertEqual(len(replacement_keys), 1)
+                replacement_key = replacement_keys.pop()
+                after = counts(path)
+                self.assertEqual(
+                    {
+                        table: after[table] - before[table]
+                        for table in BUSINESS_TABLES
+                    },
+                    {
+                        "messages": 1,
+                        "memory_action_requests": 1,
+                        "memory_evidence_events": 1,
+                        "memory_items": 1,
+                        "memory_sources": 1,
+                        "memory_suppressions": 1,
+                    },
+                )
+                with channel_store.connect(str(path)) as connection:
+                    rows = {
+                        row["memory_key"]: row["status"]
+                        for row in connection.execute(
+                            "SELECT memory_key,status FROM memory_items"
+                        )
+                    }
+                self.assertEqual(
+                    rows[target["memory_key"]],
+                    "superseded",
+                )
+                self.assertEqual(rows[replacement_key], "active")
+                self.forget(path, replacement_key, marker.lower())
+
+    def test_same_correct_id_different_binding_concurrency_is_closed(self):
+        path = self.copy_database("correct-binding-race")
+        completed, target = self.run_cli(
+            "remember",
+            path=path,
+            payload=self.remember_payload(
+                "T" * 32,
+                "Synthetic correct binding race target",
+            ),
+        )
+        self.assert_success(
+            completed,
+            target,
+            action="remember",
+            category="created",
+            replayed=False,
+        )
+        request_id = "U" * 32
+        payloads = tuple(
+            {
+                "request_id": request_id,
+                "memory_key": target["memory_key"],
+                "replacement_content": (
+                    f"Synthetic correct binding race replacement {suffix}"
+                ),
+                "sensitivity": "normal",
+            }
+            for suffix in ("alpha", "beta")
+        )
+        before = counts(path)
+        environment = operator_environment(path)
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "backend.memory_operator_cli",
+                    "correct",
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _payload in payloads
+        ]
+        observed = []
+        for process, payload in zip(processes, payloads, strict=True):
+            stdout, stderr = process.communicate(
+                json.dumps(payload, separators=(",", ":")).encode(),
+                timeout=30,
+            )
+            observed.append((process.returncode, json.loads(stdout), stderr))
+        self.assertEqual(sorted(item[0] for item in observed), [0, 4])
+        success = next(item for item in observed if item[0] == 0)
+        failure = next(item for item in observed if item[0] == 4)
+        self.assert_success(
+            subprocess.CompletedProcess(
+                ["correct"],
+                success[0],
+                json.dumps(success[1]).encode(),
+                success[2],
+            ),
+            success[1],
+            action="correct",
+            category="corrected",
+            replayed=False,
+        )
+        self.assertEqual(
+            failure[1],
+            {
+                "ok": False,
+                "request_id": None,
+                "action": "correct",
+                "status": "failed",
+                "category": "request_binding_conflict",
+                "memory_key": None,
+                "replayed": False,
+            },
+        )
+        self.assertEqual(failure[2], b"request_binding_conflict\n")
+        after = counts(path)
+        self.assertEqual(
+            {
+                table: after[table] - before[table]
+                for table in BUSINESS_TABLES
+            },
+            {
+                "messages": 1,
+                "memory_action_requests": 1,
+                "memory_evidence_events": 1,
+                "memory_items": 1,
+                "memory_sources": 1,
+                "memory_suppressions": 1,
+            },
+        )
+        with channel_store.connect(str(path)) as connection:
+            rows = {
+                row["memory_key"]: row["status"]
+                for row in connection.execute(
+                    "SELECT memory_key,status FROM memory_items"
+                )
+            }
+        self.assertEqual(rows[target["memory_key"]], "superseded")
+        self.assertEqual(rows[success[1]["memory_key"]], "active")
+        self.forget(path, success[1]["memory_key"], "V")
+
     def test_same_id_different_binding_concurrency_is_closed(self):
         path = self.copy_database("binding-race")
         request_id = "I" * 32
@@ -1050,8 +2214,13 @@ class MemoryOperatorCliTests(unittest.TestCase):
                 "sensitivity": "normal",
             },
         )
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(stale["category"], "internal_error")
+        self.assert_failure(
+            completed,
+            stale,
+            exit_code=5,
+            category="unsupported_action",
+            action="correct",
+        )
 
         completed, second = self.run_cli(
             "correct",
@@ -1356,6 +2525,90 @@ class MemoryOperatorCliTests(unittest.TestCase):
             },
         )
         self.assertEqual(snapshot(path), before)
+
+    def test_oversized_injected_reader_and_unclosed_pipe_are_bounded(self):
+        class ContractViolatingReader:
+            def __init__(self) -> None:
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int) -> bytes:
+                self.read_sizes.append(size)
+                if len(self.read_sizes) != 1:
+                    raise AssertionError("reader called more than once")
+                return b"x" * (size + 1)
+
+        reader = ContractViolatingReader()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        exit_code = memory_operator_cli.main(
+            ["remember"],
+            stdin=reader,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        self.assertEqual(reader.read_sizes, [32 * 1024 + 1])
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "input_invalid\n")
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "ok": False,
+                "request_id": None,
+                "action": "remember",
+                "status": "failed",
+                "category": "input_invalid",
+                "memory_key": None,
+                "replayed": False,
+            },
+        )
+        self.assertNotIn("reader-content", stdout.getvalue())
+
+        path = self.copy_database("unclosed-pipe")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "backend.memory_operator_cli",
+                "remember",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            env=operator_environment(path),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertIsNotNone(process.stdin)
+        self.assertIsNotNone(process.stdout)
+        self.assertIsNotNone(process.stderr)
+        try:
+            process.stdin.write(b"x" * (32 * 1024 + 1))
+            process.stdin.flush()
+            returncode = process.wait(timeout=15)
+            pipe_stdout = process.stdout.read()
+            pipe_stderr = process.stderr.read()
+        finally:
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(pipe_stderr, b"input_invalid\n")
+        self.assertEqual(
+            json.loads(pipe_stdout),
+            {
+                "ok": False,
+                "request_id": None,
+                "action": "remember",
+                "status": "failed",
+                "category": "input_invalid",
+                "memory_key": None,
+                "replayed": False,
+            },
+        )
+        self.assertNotIn(b"pipe-content", pipe_stdout + pipe_stderr)
 
     def test_invalid_input_never_reaches_config_runtime_backend_or_service(self):
         stdout = io.StringIO()
