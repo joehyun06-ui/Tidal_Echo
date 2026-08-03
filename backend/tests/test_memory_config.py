@@ -22,6 +22,7 @@ class MemoryConfigTests(unittest.TestCase):
     def test_defaults_are_disabled_and_bounded(self):
         config = self.load()
         self.assertFalse(config.enabled)
+        self.assertFalse(config.context_injection_enabled)
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
         self.assertFalse(config.explicit_entry_enabled)
@@ -31,6 +32,45 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertEqual(config.fingerprint_key_id, "")
         self.assertEqual(config.fingerprint_hmac_secret, "")
         self.assertTrue(config.configuration_valid)
+
+    def test_context_injection_is_strict_and_requires_core_and_kelivo(self):
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            "invalid_memory_context_injection_enabled",
+        ):
+            self.load({"MEMORY_CONTEXT_INJECTION_ENABLED": "maybe"})
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            "memory_context_injection_requires_core",
+        ):
+            self.load({
+                "MEMORY_CONTEXT_INJECTION_ENABLED": "true",
+                "KELIVO_ENABLED": "true",
+            })
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            "memory_context_injection_requires_kelivo",
+        ):
+            self.load({
+                "MEMORY_CONTEXT_INJECTION_ENABLED": "true",
+                "MEMORY_CORE_ENABLED": "true",
+            })
+
+    def test_context_injection_needs_no_writes_entry_or_sensitive_storage(self):
+        config = self.load({
+            "MEMORY_CONTEXT_INJECTION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+            "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+            "KELIVO_CLIENT_ID": "primary-kelivo",
+            "KELIVO_API_SESSION": "shared-test-session",
+            "KELIVO_MODEL_ALIAS": "ouou-home",
+            "LLM_MODEL": "test-provider-model",
+        })
+        self.assertTrue(config.context_injection_enabled)
+        self.assertFalse(config.explicit_writes_enabled)
+        self.assertFalse(config.explicit_entry_enabled)
+        self.assertFalse(config.sensitive_storage_enabled)
 
     def test_enabled_read_only_does_not_require_hmac(self):
         config = self.load({"MEMORY_CORE_ENABLED": "true"})

@@ -142,6 +142,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                 ],
                 "session_id": "shared",
                 "prompt_contract_version": "kelivo-provider-prompt-v1",
+                "transient_memory_dispatch": "kelivo-transient-memory-dispatch-v1",
                 "use_default_persona": False,
                 "single_route": True,
                 "temperature": 0.4,
@@ -155,6 +156,104 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[-1], {"role": "user", "content": "current"})
         self.assertEqual(generated.await_args.kwargs["temperature"], 0.4)
         self.assertEqual(generated.await_args.kwargs["max_tokens"], 123)
+
+    async def test_loop_chat_transient_marker_is_fixed_and_allows_102_messages(self):
+        auth = {
+            "X-API-Loop-Internal-Token": "test-internal-loop-token-1234567890"
+        }
+        generated = mock.AsyncMock(return_value={
+            "outcome": "success", "text": "ok", "model": "model-one",
+            "tried": [], "usage": {},
+        })
+        messages = [
+            {"role": "assistant", "content": f"history-{index}"}
+            for index in range(101)
+        ] + [{"role": "user", "content": "current"}]
+        body = {
+            "provider_model": "model-one",
+            "provider_messages": messages,
+            "session_id": "shared",
+            "prompt_contract_version": "kelivo-provider-prompt-v1",
+            "transient_memory_dispatch": "kelivo-transient-memory-dispatch-v1",
+            "use_default_persona": False,
+            "single_route": True,
+            "temperature": 0.4,
+            "max_tokens": 123,
+        }
+        no_marker_body = {
+            key: value
+            for key, value in body.items()
+            if key != "transient_memory_dispatch"
+        }
+        with mock.patch.object(
+            self.module, "run_kelivo_provider_contract", new=generated
+        ):
+            no_marker_101 = await request(
+                self.module,
+                "POST",
+                "/loop/chat",
+                headers=auth,
+                json={**no_marker_body, "provider_messages": messages[1:]},
+            )
+            no_marker_102 = await request(
+                self.module,
+                "POST",
+                "/loop/chat",
+                headers=auth,
+                json=no_marker_body,
+            )
+            marker_102 = await request(
+                self.module, "POST", "/loop/chat", headers=auth, json=body
+            )
+            invalid_markers = []
+            for invalid_marker in (None, "", "wrong-version"):
+                invalid_markers.append(await request(
+                    self.module,
+                    "POST",
+                    "/loop/chat",
+                    headers=auth,
+                    json={**body, "transient_memory_dispatch": invalid_marker},
+                ))
+            marker_103 = await request(
+                self.module,
+                "POST",
+                "/loop/chat",
+                headers=auth,
+                json={
+                    **body,
+                    "provider_messages": [
+                        *messages[:-1],
+                        {"role": "assistant", "content": "extra"},
+                        messages[-1],
+                    ],
+                },
+            )
+        self.assertEqual(no_marker_101.status_code, 200)
+        self.assertEqual(marker_102.status_code, 200)
+        self.assertEqual(
+            [len(call.args[1]) for call in generated.await_args_list],
+            [101, 102],
+        )
+        self.assertTrue(all(
+            call.args[1][-1]["role"] == "user"
+            for call in generated.await_args_list
+        ))
+        self.assertEqual(
+            (no_marker_102.status_code, no_marker_102.json()["detail"]),
+            (400, "invalid_messages"),
+        )
+        self.assertEqual(
+            [
+                (response.status_code, response.json()["detail"])
+                for response in invalid_markers
+            ],
+            [(400, "invalid_prompt_contract")] * 3,
+        )
+        self.assertEqual(
+            (marker_103.status_code, marker_103.json()["detail"]),
+            (400, "invalid_messages"),
+        )
+        self.assertEqual(generated.await_count, 2)
 
     async def test_frozen_provider_model_mismatch_is_rejected_without_dispatch(self):
         os.environ["LLM_MODEL"] = "currently-allowed"

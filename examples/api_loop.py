@@ -733,18 +733,25 @@ async def loop_chat(request: Request):
         raise HTTPException(status_code=400, detail="invalid body")
     allowed = {
         "provider_messages", "provider_model", "prompt_contract_version", "use_default_persona", "session_id",
-        "single_route", "temperature", "max_tokens",
+        "single_route", "temperature", "max_tokens", "transient_memory_dispatch",
     }
     if set(body) - allowed or body.get("prompt_contract_version") != "kelivo-provider-prompt-v1":
         raise HTTPException(status_code=400, detail="invalid_prompt_contract")
     if body.get("use_default_persona") is not False:
         raise HTTPException(status_code=400, detail="invalid_prompt_contract")
+    transient_marker_present = "transient_memory_dispatch" in body
+    if (
+        transient_marker_present
+        and body["transient_memory_dispatch"] != "kelivo-transient-memory-dispatch-v1"
+    ):
+        raise HTTPException(status_code=400, detail="invalid_prompt_contract")
+    provider_message_limit = 102 if transient_marker_present else 101
     session_id = str(body.get("session_id") or "").strip()
     provider_messages = body.get("provider_messages")
     provider_model = body.get("provider_model")
     if not isinstance(provider_model, str) or not provider_model or provider_model != provider_model.strip():
         raise HTTPException(status_code=400, detail="invalid_provider_model")
-    if not isinstance(provider_messages, list) or not provider_messages or len(provider_messages) > 101 or any(
+    if not isinstance(provider_messages, list) or not provider_messages or len(provider_messages) > provider_message_limit or any(
         not isinstance(item, dict)
         or set(item) != {"role", "content"}
         or item.get("role") not in {"system", "developer", "user", "assistant"}

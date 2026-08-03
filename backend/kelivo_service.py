@@ -37,6 +37,7 @@ ALLOWED_REQUEST_KEYS = frozenset({
     "model", "messages", "tools", "temperature", "max_tokens", "stream", "stream_options",
 })
 PROMPT_CONTRACT_VERSION = "kelivo-provider-prompt-v1"
+TRANSIENT_MEMORY_DISPATCH_VERSION = "kelivo-transient-memory-dispatch-v1"
 OPERIT_SHARE_PREFIX = "[Operit Share]\n"
 OPERIT_SHARE_IDENTITY_SCOPE = {"channel": "operit_share", "source": "operit"}
 
@@ -1163,6 +1164,25 @@ class LoopGenerationClient:
         self, messages: tuple[dict[str, str], ...], api_session: str, provider_model: str,
         temperature: float, max_tokens: int, context: dict[str, Any],
     ) -> dict[str, Any]:
+        transient_marker_present = "transient_memory_dispatch" in context
+        transient_marker = context.get("transient_memory_dispatch")
+        if (
+            transient_marker_present
+            and transient_marker != TRANSIENT_MEMORY_DISPATCH_VERSION
+        ):
+            raise GenerationError("invalid_transient_memory_dispatch", False)
+        message_limit = 102 if transient_marker_present else 101
+        if len(messages) > message_limit:
+            raise GenerationError("invalid_loopback_message_count", False)
+        payload = {
+            "provider_messages": list(messages), "session_id": api_session,
+            "provider_model": provider_model,
+            "prompt_contract_version": context.get("prompt_contract_version"),
+            "use_default_persona": False, "single_route": True,
+            "temperature": temperature, "max_tokens": max_tokens,
+        }
+        if transient_marker_present:
+            payload["transient_memory_dispatch"] = transient_marker
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout_seconds, trust_env=False, transport=self.transport,
@@ -1170,13 +1190,7 @@ class LoopGenerationClient:
                 async with client.stream(
                     "POST", self.url,
                     headers={"X-API-Loop-Internal-Token": self.internal_token},
-                    json={
-                        "provider_messages": list(messages), "session_id": api_session,
-                        "provider_model": provider_model,
-                        "prompt_contract_version": context.get("prompt_contract_version"),
-                        "use_default_persona": False, "single_route": True,
-                        "temperature": temperature, "max_tokens": max_tokens,
-                    },
+                    json=payload,
                 ) as response:
                     data = bytearray()
                     async for chunk in response.aiter_bytes():
