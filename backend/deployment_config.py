@@ -184,6 +184,7 @@ class HeartbeatConfig:
 @dataclass(frozen=True)
 class MemoryConfig:
     enabled: bool
+    context_injection_enabled: bool
     explicit_writes_enabled: bool
     sensitive_storage_enabled: bool
     max_item_chars: int
@@ -394,6 +395,10 @@ def load_deployment_config(
     memory_enabled = parse_strict_bool(
         env.get("MEMORY_CORE_ENABLED", "false"), "invalid_memory_core_enabled"
     )
+    memory_context_injection = parse_strict_bool(
+        env.get("MEMORY_CONTEXT_INJECTION_ENABLED", "false"),
+        "invalid_memory_context_injection_enabled",
+    )
     memory_explicit_writes = parse_strict_bool(
         env.get("MEMORY_EXPLICIT_WRITES_ENABLED", "false"),
         "invalid_memory_explicit_writes_enabled",
@@ -417,6 +422,10 @@ def load_deployment_config(
         raise DeploymentConfigError("invalid_memory_forget_retention_policy")
     if not memory_enabled and (memory_explicit_writes or memory_sensitive_storage):
         raise DeploymentConfigError("invalid_memory_feature_relationship")
+    if memory_context_injection and not memory_enabled:
+        raise DeploymentConfigError("memory_context_injection_requires_core")
+    if memory_context_injection and not kelivo_enabled:
+        raise DeploymentConfigError("memory_context_injection_requires_kelivo")
     if telegram_enabled != bool(telegram_config.requested):
         raise DeploymentConfigError("telegram_config_invalid")
 
@@ -724,6 +733,7 @@ def load_deployment_config(
         heartbeat=heartbeat_config,
         memory=MemoryConfig(
             enabled=memory_enabled,
+            context_injection_enabled=memory_context_injection,
             explicit_writes_enabled=memory_explicit_writes,
             sensitive_storage_enabled=memory_sensitive_storage,
             max_item_chars=memory_max_item_chars,

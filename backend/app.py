@@ -45,6 +45,7 @@ try:
         channel_store,
         deployment_config,
         kelivo_service,
+        memory_context_integration,
         memory_explicit_actions,
         memory_runtime,
     )
@@ -53,6 +54,7 @@ except ImportError:  # support `python backend/app.py`
     import channel_store
     import deployment_config
     import kelivo_service
+    import memory_context_integration
     import memory_explicit_actions
     import memory_runtime
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
@@ -1335,16 +1337,34 @@ async def _run_completion_state_machine(
 
     dispatch_started = False
     try:
+        provider_messages = prepared.messages
+        dispatch_context = prepared.context_bundle or {}
+        if (
+            channel == "kelivo"
+            and DEPLOYMENT.memory.context_injection_enabled
+        ):
+            transient_dispatch = await asyncio.to_thread(
+                memory_context_integration.prepare_transient_memory_dispatch,
+                MEMORY_SERVICE,
+                prepared.messages,
+                enabled=True,
+            )
+            provider_messages = transient_dispatch.provider_messages
+            if transient_dispatch.memory_applied:
+                dispatch_context = dict(dispatch_context)
+                dispatch_context["transient_memory_dispatch"] = (
+                    kelivo_service.TRANSIENT_MEMORY_DISPATCH_VERSION
+                )
         if KELIVO_GENERATOR is None:
             raise kelivo_service.GenerationError("generation_service_unavailable", False)
         dispatch_started = True
         result = await KELIVO_GENERATOR(
-            prepared.messages,
+            provider_messages,
             prepared.api_session,
             prepared.provider_model,
             prepared.temperature,
             prepared.max_tokens,
-            prepared.context_bundle or {},
+            dispatch_context,
         )
         completion_task = asyncio.create_task(asyncio.to_thread(
             kelivo_service.complete_request, DB_PATH, client_id,
@@ -1355,6 +1375,15 @@ async def _run_completion_state_machine(
         except asyncio.CancelledError:
             await asyncio.shield(completion_task)
             raise
+    except memory_context_integration.MemoryContextIntegrationError:
+        try:
+            await asyncio.to_thread(
+                kelivo_service.fail_request, DB_PATH, client_id,
+                idempotency_key, "memory_context_unavailable", False,
+            )
+        except Exception:
+            pass
+        return _completion_error(channel, 503, "memory_context_unavailable")
     except kelivo_service.GenerationError as exc:
         try:
             await asyncio.to_thread(
@@ -1374,6 +1403,14 @@ async def _run_completion_state_machine(
                 await asyncio.shield(asyncio.to_thread(
                     kelivo_service.fail_request, DB_PATH, client_id,
                     idempotency_key, "client_cancelled_after_dispatch", True,
+                ))
+            except Exception:
+                pass
+        else:
+            try:
+                await asyncio.shield(asyncio.to_thread(
+                    kelivo_service.fail_request, DB_PATH, client_id,
+                    idempotency_key, "request_cancelled_before_dispatch", False,
                 ))
             except Exception:
                 pass
