@@ -71,20 +71,75 @@ class MemoryContextIntegrationTests(unittest.TestCase):
 
     def test_disabled_is_exact_noop_and_never_reads(self):
         service = FakeReadService(error=AssertionError("must not read"))
-        result = memory_context_integration.prepare_transient_memory_dispatch(
-            service, self.base, enabled=False
-        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+            ) as selector,
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+        ):
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                service, self.base, enabled=False, smart_retrieval_enabled=False
+            )
         self.assertIs(result.provider_messages, self.base)
         self.assertFalse(result.memory_applied)
         self.assertEqual(service.calls, [])
+        selector.assert_not_called()
+        renderer.assert_not_called()
+
+    def test_flags_must_be_exact_bool_and_invalid_combination_never_reads(self):
+        service = FakeReadService(error=AssertionError("must not read"))
+        for enabled, smart in ((0, False), (True, 1), ("true", False)):
+            with self.subTest(enabled=enabled, smart=smart), self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ):
+                memory_context_integration.prepare_transient_memory_dispatch(
+                    service,
+                    self.base,
+                    enabled=enabled,
+                    smart_retrieval_enabled=smart,
+                )
+
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+            ) as selector,
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ),
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                service,
+                self.base,
+                enabled=False,
+                smart_retrieval_enabled=True,
+            )
+        self.assertEqual(service.calls, [])
+        selector.assert_not_called()
+        renderer.assert_not_called()
 
     def test_empty_memory_preserves_original_tuple_and_dicts(self):
         service = FakeReadService([])
-        result = memory_context_integration.prepare_transient_memory_dispatch(
-            service, self.base, enabled=True
-        )
+        with mock.patch.object(
+            memory_context_integration.memory_retrieval,
+            "select_relevant_memory_items",
+        ) as selector:
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                service, self.base, enabled=True, smart_retrieval_enabled=False
+            )
         self.assertIs(result.provider_messages, self.base)
         self.assertFalse(result.memory_applied)
+        selector.assert_not_called()
         self.assertEqual(service.calls, [{
             "scope_type": "global_user",
             "scope_ref": "",
@@ -98,7 +153,7 @@ class MemoryContextIntegrationTests(unittest.TestCase):
         service = FakeReadService([safe_item(plaintext)])
         original = tuple(dict(message) for message in self.base)
         result = memory_context_integration.prepare_transient_memory_dispatch(
-            service, self.base, enabled=True
+            service, self.base, enabled=True, smart_retrieval_enabled=False
         )
         self.assertTrue(result.memory_applied)
         self.assertEqual(len(result.provider_messages), len(self.base) + 1)
@@ -113,10 +168,41 @@ class MemoryContextIntegrationTests(unittest.TestCase):
         self.assertIs(result.provider_messages[-1], self.base[-1])
         self.assertNotIn(plaintext, repr(result))
 
+    def test_legacy_path_is_phase2_renderer_output_and_never_selects(self):
+        items = [
+            safe_item("first legacy memory", marker="A"),
+            safe_item("second legacy memory", marker="B"),
+        ]
+        expected_message = (
+            memory_context_integration.memory_context
+            .render_memory_developer_message(
+                items,
+                scope_type="global_user",
+                max_items=10,
+                character_budget=2000,
+            )
+        )
+        with mock.patch.object(
+            memory_context_integration.memory_retrieval,
+            "select_relevant_memory_items",
+        ) as selector:
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService(items),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=False,
+            )
+        selector.assert_not_called()
+        self.assertEqual(
+            result.provider_messages,
+            (*self.base[:-1], expected_message, self.base[-1]),
+        )
+
     def test_renderer_revalidates_order_and_budgets(self):
         items = [safe_item(str(index) * 10, marker=chr(65 + index)) for index in range(11)]
         result = memory_context_integration.prepare_transient_memory_dispatch(
-            FakeReadService(items), self.base, enabled=True
+            FakeReadService(items), self.base, enabled=True,
+            smart_retrieval_enabled=False,
         )
         decoded = json.loads(result.provider_messages[-2]["content"])
         self.assertEqual(decoded["memory_context"]["item_count"], 10)
@@ -137,7 +223,8 @@ class MemoryContextIntegrationTests(unittest.TestCase):
             with self.subTest(plaintext=plaintext):
                 try:
                     memory_context_integration.prepare_transient_memory_dispatch(
-                        FakeReadService([item]), self.base, enabled=True
+                        FakeReadService([item]), self.base, enabled=True,
+                        smart_retrieval_enabled=False,
                     )
                 except memory_context_integration.MemoryContextIntegrationError as error:
                     self.assertEqual(error.category, "memory_context_unavailable")
@@ -154,7 +241,7 @@ class MemoryContextIntegrationTests(unittest.TestCase):
             r"^memory_context_unavailable$",
         ) as raised:
             memory_context_integration.prepare_transient_memory_dispatch(
-                service, self.base, enabled=True
+                service, self.base, enabled=True, smart_retrieval_enabled=False
             )
         self.assertNotIn(plaintext, repr(raised.exception))
 
@@ -168,8 +255,613 @@ class MemoryContextIntegrationTests(unittest.TestCase):
                 r"^memory_context_unavailable$",
             ):
                 memory_context_integration.prepare_transient_memory_dispatch(
-                    FakeReadService([safe_item("valid")]), self.base, enabled=True
+                    FakeReadService([safe_item("valid")]), self.base, enabled=True,
+                    smart_retrieval_enabled=False,
                 )
+
+    def test_smart_path_uses_only_final_user_and_fixed_two_stage_budgets(self):
+        base = (
+            {"role": "user", "content": "orchid history"},
+            {"role": "assistant", "content": "older blue discussion"},
+            {"role": "user", "content": "blue tea today"},
+        )
+        relevant = safe_item("The user prefers blue tea", marker="A")
+        unrelated = safe_item("orchid history", marker="B")
+        service = FakeReadService([unrelated, relevant])
+        selections = []
+        rendered_items = []
+        real_selector = (
+            memory_context_integration.memory_retrieval.select_relevant_memory_items
+        )
+        real_renderer = (
+            memory_context_integration.memory_context.render_memory_developer_message
+        )
+
+        def select(*args, **kwargs):
+            selection = real_selector(*args, **kwargs)
+            selections.append(selection)
+            return selection
+
+        def render(items, **kwargs):
+            rendered_items.append(items)
+            return real_renderer(items, **kwargs)
+
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                side_effect=select,
+            ) as selector,
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+                side_effect=render,
+            ) as renderer,
+        ):
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                service,
+                base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+
+        self.assertEqual(service.calls, [{
+            "scope_type": "global_user",
+            "scope_ref": "",
+            "limit": 20,
+            "character_budget": 8000,
+            "include_sensitive": False,
+        }])
+        self.assertEqual(selector.call_count, 1)
+        selector_input = selector.call_args.args[0]
+        self.assertIs(type(selector_input), tuple)
+        self.assertEqual(selector_input, tuple(service.items))
+        self.assertTrue(all(
+            selector_item is not original
+            for selector_item, original in zip(selector_input, service.items)
+        ))
+        self.assertEqual(service.items, [unrelated, relevant])
+        self.assertEqual(selector.call_args.kwargs, {
+            "query_text": "blue tea today",
+            "scope_type": "global_user",
+            "max_items": 10,
+            "character_budget": 2000,
+        })
+        self.assertEqual(renderer.call_count, 1)
+        self.assertIs(rendered_items[0], selections[0].items)
+        self.assertEqual(
+            [item["normalized_content"] for item in selections[0].items],
+            [relevant["normalized_content"]],
+        )
+        self.assertTrue(result.memory_applied)
+        self.assertEqual(result.provider_messages[-1], base[-1])
+        rendered = result.provider_messages[-2]["content"]
+        self.assertIn(relevant["normalized_content"], rendered)
+        self.assertNotIn(unrelated["normalized_content"], rendered)
+
+    def test_smart_selector_mutation_cannot_invent_candidate_plaintext(self):
+        original_text = "original memory"
+        invented_text = "INVENTED-BY-SELECTOR"
+        original_item = safe_item(original_text)
+        service = FakeReadService([original_item])
+
+        def mutate_and_forge(items, **_kwargs):
+            items[0]["normalized_content"] = invented_text
+            return (
+                memory_context_integration.memory_retrieval
+                .MemoryRetrievalSelectionV1(
+                    items=(dict(items[0]),),
+                    candidate_count=1,
+                    selected_count=1,
+                    query_signal_count=1,
+                )
+            )
+
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                side_effect=mutate_and_forge,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ) as raised,
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                service,
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+
+        renderer.assert_not_called()
+        self.assertEqual(original_item["normalized_content"], original_text)
+        self.assertEqual(service.items, [original_item])
+        for private in (original_text, invented_text, original_item["memory_key"]):
+            self.assertNotIn(private, str(raised.exception))
+            self.assertNotIn(private, repr(raised.exception))
+
+    def test_smart_legal_selector_uses_separate_input_and_validation_snapshot(self):
+        original_item = safe_item("current original memory")
+        service = FakeReadService([original_item])
+        captured = {}
+        real_selector = (
+            memory_context_integration.memory_retrieval.select_relevant_memory_items
+        )
+        real_validator = memory_context_integration._validated_selection_items
+
+        def select(items, **kwargs):
+            captured["selector_input"] = items
+            return real_selector(items, **kwargs)
+
+        def validate(selection, *, candidates):
+            captured["candidate_snapshot"] = candidates
+            return real_validator(selection, candidates=candidates)
+
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                side_effect=select,
+            ),
+            mock.patch.object(
+                memory_context_integration,
+                "_validated_selection_items",
+                side_effect=validate,
+            ),
+        ):
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                service,
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+
+        selector_input = captured["selector_input"]
+        candidate_snapshot = captured["candidate_snapshot"]
+        self.assertIsNot(selector_input, candidate_snapshot)
+        self.assertEqual(selector_input, candidate_snapshot)
+        self.assertIsNot(selector_input[0], candidate_snapshot[0])
+        self.assertIsNot(selector_input[0], original_item)
+        self.assertIsNot(candidate_snapshot[0], original_item)
+        self.assertEqual(original_item["normalized_content"], "current original memory")
+        self.assertTrue(result.memory_applied)
+        self.assertIn(
+            original_item["normalized_content"],
+            result.provider_messages[-2]["content"],
+        )
+
+    def test_smart_no_match_is_exact_noop_without_recency_fallback(self):
+        base = (
+            {"role": "user", "content": "orchid history"},
+            {"role": "assistant", "content": "orchid answer"},
+            {"role": "user", "content": "weather today"},
+        )
+        service = FakeReadService([safe_item("orchid history")])
+        result = memory_context_integration.prepare_transient_memory_dispatch(
+            service,
+            base,
+            enabled=True,
+            smart_retrieval_enabled=True,
+        )
+        self.assertIs(result.provider_messages, base)
+        self.assertFalse(result.memory_applied)
+        self.assertEqual(len(service.calls), 1)
+
+    def test_smart_selector_failures_and_invalid_results_are_data_free(self):
+        private_text = "PRIVATE-QUERY-MEMORY-TOKEN-SCORE"
+        uninitialized_selection = object.__new__(
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1
+        )
+        invalid_selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(safe_item(private_text),),
+                candidate_count=1,
+                selected_count=0,
+                query_signal_count=1,
+            )
+        )
+        failures = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalError(
+                "invalid_query"
+            ),
+            RuntimeError(private_text),
+            object(),
+            uninitialized_selection,
+            invalid_selection,
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                side_effect = failure if isinstance(failure, Exception) else None
+                return_value = failure if side_effect is None else mock.DEFAULT
+                with mock.patch.object(
+                    memory_context_integration.memory_retrieval,
+                    "select_relevant_memory_items",
+                    side_effect=side_effect,
+                    return_value=return_value,
+                ), self.assertRaisesRegex(
+                    memory_context_integration.MemoryContextIntegrationError,
+                    r"^memory_context_unavailable$",
+                ) as raised:
+                    memory_context_integration.prepare_transient_memory_dispatch(
+                        FakeReadService([safe_item("current")]),
+                        self.base,
+                        enabled=True,
+                        smart_retrieval_enabled=True,
+                    )
+                self.assertNotIn(private_text, str(raised.exception))
+                self.assertNotIn(private_text, repr(raised.exception))
+
+    def test_smart_forged_non_candidate_fails_before_renderer_data_free(self):
+        query = "PRIVATE-QUERY-TOKEN-SCORE"
+        candidate = safe_item(f"{query} real candidate", marker="A")
+        forged = safe_item(f"{query} FORGED-MEMORY-PLAINTEXT", marker="Z")
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(forged),),
+                candidate_count=1,
+                selected_count=1,
+                query_signal_count=1,
+            )
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ) as raised,
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService([candidate]),
+                ({"role": "user", "content": query},),
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_not_called()
+        for private in (
+            query,
+            candidate["normalized_content"],
+            forged["normalized_content"],
+            forged["memory_key"],
+            "token",
+            "score",
+        ):
+            self.assertNotIn(private, str(raised.exception))
+            self.assertNotIn(private, repr(raised.exception))
+
+    def test_smart_duplicate_selection_cannot_consume_one_candidate_twice(self):
+        candidate = safe_item("current duplicate candidate")
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(candidate), dict(candidate)),
+                candidate_count=1,
+                selected_count=2,
+                query_signal_count=1,
+            )
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ),
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService([candidate]),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_not_called()
+
+    def test_smart_duplicate_selection_can_consume_two_identical_candidates(self):
+        candidate = safe_item("current duplicate candidate")
+        candidates = [dict(candidate), dict(candidate)]
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(candidate), dict(candidate)),
+                candidate_count=2,
+                selected_count=2,
+                query_signal_count=1,
+            )
+        )
+        real_renderer = (
+            memory_context_integration.memory_context.render_memory_developer_message
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+                wraps=real_renderer,
+            ) as renderer,
+        ):
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService(candidates),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_called_once()
+        decoded = json.loads(result.provider_messages[-2]["content"])
+        self.assertEqual(decoded["memory_context"]["item_count"], 2)
+        self.assertEqual(candidates, [candidate, candidate])
+
+    def test_smart_nonempty_selection_requires_bounded_query_signal(self):
+        candidate = safe_item("current signal candidate")
+        selections = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(candidate),),
+                candidate_count=1,
+                selected_count=1,
+                query_signal_count=0,
+            ),
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(),
+                candidate_count=1,
+                selected_count=0,
+                query_signal_count=(
+                    memory_context_integration.memory_retrieval.QUERY_MAX_CHARS + 1
+                ),
+            ),
+        )
+        for selection in selections:
+            with (
+                self.subTest(query_signal_count=selection.query_signal_count),
+                mock.patch.object(
+                    memory_context_integration.memory_retrieval,
+                    "select_relevant_memory_items",
+                    return_value=selection,
+                ),
+                mock.patch.object(
+                    memory_context_integration.memory_context,
+                    "render_memory_developer_message",
+                ) as renderer,
+                self.assertRaisesRegex(
+                    memory_context_integration.MemoryContextIntegrationError,
+                    r"^memory_context_unavailable$",
+                ),
+            ):
+                memory_context_integration.prepare_transient_memory_dispatch(
+                    FakeReadService([candidate]),
+                    self.base,
+                    enabled=True,
+                    smart_retrieval_enabled=True,
+                )
+            renderer.assert_not_called()
+
+    def test_smart_combined_final_budget_excess_fails_instead_of_truncating(self):
+        first = safe_item("current " + "A" * 1095, marker="A")
+        second = safe_item("current " + "B" * 1095, marker="B")
+        self.assertLessEqual(len(first["normalized_content"]), 2000)
+        self.assertLessEqual(len(second["normalized_content"]), 2000)
+        self.assertGreater(
+            len(first["normalized_content"]) + len(second["normalized_content"]),
+            2000,
+        )
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(first), dict(second)),
+                candidate_count=2,
+                selected_count=2,
+                query_signal_count=1,
+            )
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ),
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService([first, second]),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_not_called()
+
+    def test_smart_single_item_over_final_budget_fails_before_renderer(self):
+        candidate = safe_item("current " + "X" * 2000)
+        self.assertGreater(len(candidate["normalized_content"]), 2000)
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(candidate),),
+                candidate_count=1,
+                selected_count=1,
+                query_signal_count=1,
+            )
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ),
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService([candidate]),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_not_called()
+
+    def test_smart_legal_reordered_candidate_subset_preserves_result_order(self):
+        first = safe_item("current alpha memory", marker="A")
+        second = safe_item("current beta memory", marker="B")
+        third = safe_item("current gamma memory", marker="C")
+        candidates = [first, second, third]
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(second), dict(first)),
+                candidate_count=3,
+                selected_count=2,
+                query_signal_count=1,
+            )
+        )
+        with mock.patch.object(
+            memory_context_integration.memory_retrieval,
+            "select_relevant_memory_items",
+            return_value=selection,
+        ):
+            result = memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService(candidates),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        decoded = json.loads(result.provider_messages[-2]["content"])
+        self.assertEqual(
+            [
+                item["normalized_content"]
+                for item in decoded["memory_context"]["items"]
+            ],
+            [second["normalized_content"], first["normalized_content"]],
+        )
+        self.assertEqual(candidates, [first, second, third])
+
+    def test_smart_candidate_equality_exception_is_fixed_and_data_free(self):
+        private_text = "PRIVATE-EQUALITY-PLAINTEXT-MEMORY-KEY-TOKEN-SCORE"
+
+        class ExplodingEquality:
+            def __eq__(self, _other):
+                raise RuntimeError(private_text)
+
+        candidate = safe_item("current equality candidate")
+        candidate["comparison"] = ExplodingEquality()
+        selected = dict(candidate)
+        selected["comparison"] = ExplodingEquality()
+        selection = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(selected,),
+                candidate_count=1,
+                selected_count=1,
+                query_signal_count=1,
+            )
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=selection,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ) as raised,
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService([candidate]),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_not_called()
+        self.assertNotIn(private_text, str(raised.exception))
+        self.assertNotIn(private_text, repr(raised.exception))
+
+    def test_smart_renderer_revalidates_selector_output(self):
+        private_text = "SENSITIVE-SELECTOR-PLAINTEXT"
+        sensitive_item = safe_item(private_text, sensitivity="sensitive")
+        forged = (
+            memory_context_integration.memory_retrieval.MemoryRetrievalSelectionV1(
+                items=(dict(sensitive_item),),
+                candidate_count=1,
+                selected_count=1,
+                query_signal_count=1,
+            )
+        )
+        real_renderer = (
+            memory_context_integration.memory_context.render_memory_developer_message
+        )
+        with (
+            mock.patch.object(
+                memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                return_value=forged,
+            ),
+            mock.patch.object(
+                memory_context_integration.memory_context,
+                "render_memory_developer_message",
+                wraps=real_renderer,
+            ) as renderer,
+            self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ) as raised,
+        ):
+            memory_context_integration.prepare_transient_memory_dispatch(
+                FakeReadService([sensitive_item]),
+                self.base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        renderer.assert_called_once()
+        self.assertNotIn(private_text, str(raised.exception))
+        self.assertNotIn(private_text, repr(raised.exception))
+
+    def test_unicode_query_failure_is_fixed_and_happens_before_read(self):
+        service = FakeReadService(error=AssertionError("must not read"))
+        base = ({"role": "user", "content": "\ud800"},)
+        with self.assertRaisesRegex(
+            memory_context_integration.MemoryContextIntegrationError,
+            r"^memory_context_unavailable$",
+        ) as raised:
+            memory_context_integration.prepare_transient_memory_dispatch(
+                service,
+                base,
+                enabled=True,
+                smart_retrieval_enabled=True,
+            )
+        self.assertEqual(service.calls, [])
+        self.assertNotIn("UnicodeEncodeError", repr(raised.exception))
 
     def test_100_client_messages_without_persona_become_101_with_memory(self):
         self.assertEqual(
@@ -187,7 +879,8 @@ class MemoryContextIntegrationTests(unittest.TestCase):
             + [{"role": "user", "content": "current"}]
         )
         result = memory_context_integration.prepare_transient_memory_dispatch(
-            FakeReadService([safe_item("memory")]), client_messages, enabled=True
+            FakeReadService([safe_item("memory")]), client_messages, enabled=True,
+            smart_retrieval_enabled=False,
         )
         self.assertEqual(len(result.provider_messages), 101)
         self.assertEqual(result.provider_messages[-1]["role"], "user")
@@ -200,10 +893,11 @@ class MemoryContextIntegrationTests(unittest.TestCase):
         )
         base = ({"role": "system", "content": "server persona"}, *client_messages)
         empty = memory_context_integration.prepare_transient_memory_dispatch(
-            FakeReadService([]), base, enabled=True
+            FakeReadService([]), base, enabled=True, smart_retrieval_enabled=False
         )
         applied = memory_context_integration.prepare_transient_memory_dispatch(
-            FakeReadService([safe_item("memory")]), base, enabled=True
+            FakeReadService([safe_item("memory")]), base, enabled=True,
+            smart_retrieval_enabled=False,
         )
 
         self.assertIs(empty.provider_messages, base)
@@ -225,7 +919,7 @@ class MemoryContextIntegrationTests(unittest.TestCase):
             r"^memory_context_unavailable$",
         ):
             memory_context_integration.prepare_transient_memory_dispatch(
-                no_memory_read, base, enabled=True
+                no_memory_read, base, enabled=True, smart_retrieval_enabled=False
             )
         self.assertEqual(no_memory_read.calls, [])
 
@@ -239,7 +933,8 @@ class MemoryContextIntegrationTests(unittest.TestCase):
                 r"^memory_context_unavailable$",
             ):
                 memory_context_integration.prepare_transient_memory_dispatch(
-                    FakeReadService([safe_item("memory")]), base, enabled=True
+                    FakeReadService([safe_item("memory")]), base, enabled=True,
+                    smart_retrieval_enabled=False,
                 )
 
     def test_module_has_no_database_network_log_or_hash_behavior(self):
@@ -251,8 +946,27 @@ class MemoryContextIntegrationTests(unittest.TestCase):
                 imports.update(alias.name.split(".", 1)[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imports.add(node.module.split(".", 1)[0])
-        self.assertEqual(imports, {"__future__", "dataclasses", "typing", "memory_context"})
-        for forbidden in ("sqlite3", "httpx", "requests", "print(", "logging", "bundle_hash"):
+        self.assertEqual(
+            imports,
+            {
+                "__future__",
+                "dataclasses",
+                "typing",
+                "memory_context",
+                "memory_retrieval",
+            },
+        )
+        for forbidden in (
+            "sqlite3",
+            "httpx",
+            "requests",
+            "socket",
+            "print(",
+            "logging",
+            "hash(",
+            "bundle_hash",
+            "os.environ",
+        ):
             self.assertNotIn(forbidden, source)
 
         with (
@@ -260,7 +974,8 @@ class MemoryContextIntegrationTests(unittest.TestCase):
             mock.patch.object(socket, "create_connection") as network,
         ):
             memory_context_integration.prepare_transient_memory_dispatch(
-                FakeReadService([]), self.base, enabled=True
+                FakeReadService([]), self.base, enabled=True,
+                smart_retrieval_enabled=False,
             )
         database.assert_not_called()
         network.assert_not_called()
@@ -283,6 +998,7 @@ class MemoryContextDispatchIntegrationTests(
             "backend.memory_explicit_actions",
             "backend.memory_context",
             "backend.memory_context_integration",
+            "backend.memory_retrieval",
         )
         missing = object()
         modules_before = {
@@ -341,6 +1057,15 @@ class MemoryContextDispatchIntegrationTests(
 
         self.module.KELIVO_GENERATOR = generate
 
+    def enable_smart_retrieval(self):
+        self.module.DEPLOYMENT = dataclasses.replace(
+            self.module.DEPLOYMENT,
+            memory=dataclasses.replace(
+                self.module.DEPLOYMENT.memory,
+                smart_retrieval_enabled=True,
+            ),
+        )
+
     @staticmethod
     def payload(text: str = "current question") -> dict:
         return {
@@ -386,6 +1111,7 @@ class MemoryContextDispatchIntegrationTests(
         plaintext = "MEMORY-PLAINTEXT-NEVER-PERSIST"
         service = FakeReadService([safe_item(plaintext)])
         self.module.MEMORY_SERVICE = service
+        self.assertFalse(self.module.DEPLOYMENT.memory.smart_retrieval_enabled)
 
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -394,6 +1120,13 @@ class MemoryContextDispatchIntegrationTests(
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(service.calls), 1)
+        self.assertEqual(service.calls[0], {
+            "scope_type": "global_user",
+            "scope_ref": "",
+            "limit": 10,
+            "character_budget": 2000,
+            "include_sensitive": False,
+        })
         self.assertEqual(len(self.provider_calls), 1)
         messages, context = self.provider_calls[0]
         self.assertEqual(messages[-1], {"role": "user", "content": "current question"})
@@ -419,8 +1152,175 @@ class MemoryContextDispatchIntegrationTests(
         self.assertNotIn(plaintext, stdout.getvalue())
         self.assertNotIn(plaintext, stderr.getvalue())
 
+    async def test_smart_dispatch_uses_final_user_and_persists_no_memory_metadata(self):
+        self.enable_smart_retrieval()
+        relevant_text = "blue tea PRIVATE-MEMORY-ONLY"
+        early_only_text = "orchid history PRIVATE-EARLY-MEMORY"
+        service = FakeReadService([
+            safe_item(early_only_text, marker="A"),
+            safe_item(relevant_text, marker="B"),
+        ])
+        self.module.MEMORY_SERVICE = service
+        response = await request(
+            self.module,
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                **self.headers,
+                "Idempotency-Key": "smart-final-query-key-0001",
+            },
+            json={
+                "model": "ouou-home",
+                "messages": [
+                    {"role": "user", "content": "orchid history"},
+                    {"role": "assistant", "content": "earlier reply"},
+                    {"role": "user", "content": "blue tea today"},
+                ],
+                "stream": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(service.calls, [{
+            "scope_type": "global_user",
+            "scope_ref": "",
+            "limit": 20,
+            "character_budget": 8000,
+            "include_sensitive": False,
+        }])
+        self.assertEqual(len(self.provider_calls), 1)
+        messages, context = self.provider_calls[0]
+        self.assertEqual(messages[-1], {"role": "user", "content": "blue tea today"})
+        self.assertEqual(messages[-2]["role"], "developer")
+        self.assertIn(relevant_text, messages[-2]["content"])
+        self.assertNotIn(early_only_text, messages[-2]["content"])
+        self.assertEqual(
+            context["transient_memory_dispatch"],
+            "kelivo-transient-memory-dispatch-v1",
+        )
+        with self.module.db() as conn:
+            row = conn.execute(
+                """SELECT provider_messages_json,context_bundle_json,
+                          context_bundle_hash,request_identity_hash
+                   FROM kelivo_requests"""
+            ).fetchone()
+            snapshot_count = conn.execute(
+                "SELECT count(*) FROM companion_context_snapshots"
+            ).fetchone()[0]
+            database_dump = "\n".join(conn.iterdump())
+        self.assertEqual(snapshot_count, 0)
+        for plaintext in (relevant_text, early_only_text):
+            self.assertNotIn(plaintext, row["provider_messages_json"])
+            self.assertNotIn(plaintext, row["context_bundle_json"])
+            self.assertNotIn(plaintext, database_dump)
+        for metadata in (
+            "candidate_count",
+            "selected_count",
+            "query_signal_count",
+            "transient_memory_dispatch",
+        ):
+            self.assertNotIn(metadata, database_dump)
+
+    async def test_smart_no_match_dispatches_base_without_marker_or_fallback(self):
+        self.enable_smart_retrieval()
+        private_text = "orchid-only-memory"
+        self.module.MEMORY_SERVICE = FakeReadService([safe_item(private_text)])
+        response = await self.post(
+            key="smart-no-match-key-0001",
+            text="weather today",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.provider_calls), 1)
+        messages, context = self.provider_calls[0]
+        self.assertEqual(messages[-1], {"role": "user", "content": "weather today"})
+        self.assertFalse(any(message["role"] == "developer" for message in messages[1:]))
+        self.assertNotIn("transient_memory_dispatch", context)
+        self.assertNotIn(private_text, json.dumps(self.provider_calls))
+
+    async def test_smart_selector_runs_after_begin_dispatch_before_provider(self):
+        self.enable_smart_retrieval()
+        self.module.MEMORY_SERVICE = FakeReadService([
+            safe_item("current question memory")
+        ])
+        events = []
+        original_begin = self.module.kelivo_service.begin_dispatch
+        original_selector = (
+            self.module.memory_context_integration.memory_retrieval
+            .select_relevant_memory_items
+        )
+
+        def begin(*args, **kwargs):
+            events.append("begin_dispatch")
+            return original_begin(*args, **kwargs)
+
+        def select(*args, **kwargs):
+            events.append("selector")
+            return original_selector(*args, **kwargs)
+
+        async def generate(*args):
+            events.append("provider")
+            self.provider_calls.append((args[0], args[-1]))
+            return {"text": "ordered", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = generate
+        with (
+            mock.patch.object(
+                self.module.kelivo_service,
+                "begin_dispatch",
+                side_effect=begin,
+            ),
+            mock.patch.object(
+                self.module.memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                side_effect=select,
+            ),
+        ):
+            response = await self.post(key="smart-order-key-0001")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events, ["begin_dispatch", "selector", "provider"])
+
+    async def test_smart_selector_failure_is_pre_provider_deterministic_failed(self):
+        self.enable_smart_retrieval()
+        private_text = "PRIVATE-SELECTOR-FAILURE"
+        self.module.MEMORY_SERVICE = FakeReadService([
+            safe_item("current question memory")
+        ])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                self.module.memory_context_integration.memory_retrieval,
+                "select_relevant_memory_items",
+                side_effect=RuntimeError(private_text),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            response = await self.post(key="smart-selector-failure-key-0001")
+
+        self.assertEqual(
+            (response.status_code, response.json()["error"]["code"]),
+            (503, "memory_context_unavailable"),
+        )
+        self.assertEqual(self.provider_calls, [])
+        with self.module.db() as conn:
+            row = conn.execute(
+                "SELECT status,error_category FROM kelivo_requests"
+            ).fetchone()
+            database_dump = "\n".join(conn.iterdump())
+        self.assertEqual(
+            (row["status"], row["error_category"]),
+            ("failed", "memory_context_unavailable"),
+        )
+        self.assertNotIn(private_text, database_dump)
+        self.assertNotIn(private_text, stdout.getvalue())
+        self.assertNotIn(private_text, stderr.getvalue())
+
     async def test_100_client_messages_persist_base_101_but_dispatch_102(self):
-        plaintext = "TRANSIENT-102ND-MESSAGE"
+        self.enable_smart_retrieval()
+        plaintext = "current TRANSIENT-102ND-MESSAGE"
         service = FakeReadService([safe_item(plaintext)])
         self.module.MEMORY_SERVICE = service
         client_messages = [
@@ -460,7 +1360,8 @@ class MemoryContextDispatchIntegrationTests(
         self.assertNotIn(plaintext, row["provider_messages_json"])
 
     async def test_empty_and_forgotten_visibility_are_reread_per_new_dispatch(self):
-        plaintext = "VISIBLE-ONLY-ON-FIRST-DISPATCH"
+        self.enable_smart_retrieval()
+        plaintext = "same question VISIBLE-ONLY-ON-FIRST-DISPATCH"
         service = FakeReadService([safe_item(plaintext)])
         self.module.MEMORY_SERVICE = service
         first = await self.post(key="memory-visible-key-0001", text="same question")
@@ -482,6 +1383,10 @@ class MemoryContextDispatchIntegrationTests(
                           context_bundle_hash,request_identity_hash
                    FROM kelivo_requests ORDER BY id"""
             ).fetchall()
+            snapshot_count = conn.execute(
+                "SELECT count(*) FROM companion_context_snapshots"
+            ).fetchone()[0]
+        self.assertEqual(snapshot_count, 0)
         for field in (
             "provider_messages_json",
             "context_bundle_json",
@@ -491,25 +1396,35 @@ class MemoryContextDispatchIntegrationTests(
             self.assertEqual(rows[0][field], rows[1][field])
 
     async def test_explicit_and_automatic_replays_do_not_reread_memory(self):
-        service = FakeReadService([safe_item("replay memory")])
+        self.enable_smart_retrieval()
+        service = FakeReadService([safe_item("current question automatic memory")])
         self.module.MEMORY_SERVICE = service
-        explicit_first = await self.post(key="memory-replay-key-0001")
-        explicit_replay = await self.post(key="memory-replay-key-0001")
-        automatic_headers = {"Authorization": self.headers["Authorization"]}
-        automatic_first = await request(
-            self.module,
-            "POST",
-            "/v1/chat/completions",
-            headers=automatic_headers,
-            json=self.payload("automatic"),
+        real_selector = (
+            self.module.memory_context_integration.memory_retrieval
+            .select_relevant_memory_items
         )
-        automatic_replay = await request(
-            self.module,
-            "POST",
-            "/v1/chat/completions",
-            headers=automatic_headers,
-            json=self.payload("automatic"),
-        )
+        with mock.patch.object(
+            self.module.memory_context_integration.memory_retrieval,
+            "select_relevant_memory_items",
+            wraps=real_selector,
+        ) as selector:
+            explicit_first = await self.post(key="memory-replay-key-0001")
+            explicit_replay = await self.post(key="memory-replay-key-0001")
+            automatic_headers = {"Authorization": self.headers["Authorization"]}
+            automatic_first = await request(
+                self.module,
+                "POST",
+                "/v1/chat/completions",
+                headers=automatic_headers,
+                json=self.payload("automatic"),
+            )
+            automatic_replay = await request(
+                self.module,
+                "POST",
+                "/v1/chat/completions",
+                headers=automatic_headers,
+                json=self.payload("automatic"),
+            )
 
         self.assertEqual(
             [
@@ -523,10 +1438,12 @@ class MemoryContextDispatchIntegrationTests(
         self.assertEqual(explicit_first.json(), explicit_replay.json())
         self.assertEqual(automatic_first.json(), automatic_replay.json())
         self.assertEqual(len(service.calls), 2)
+        self.assertEqual(selector.call_count, 2)
         self.assertEqual(len(self.provider_calls), 2)
 
     async def test_blocked_duplicate_does_not_reread_memory(self):
-        service = FakeReadService([safe_item("one read")])
+        self.enable_smart_retrieval()
+        service = FakeReadService([safe_item("current question one read")])
         self.module.MEMORY_SERVICE = service
         started = asyncio.Event()
         release = asyncio.Event()
@@ -538,16 +1455,27 @@ class MemoryContextDispatchIntegrationTests(
             return {"text": "done", "usage": {}}
 
         self.module.KELIVO_GENERATOR = pending
-        first = asyncio.create_task(self.post(key="memory-blocked-key-0001"))
-        await started.wait()
-        blocked = await self.post(key="memory-blocked-key-0001")
+        real_selector = (
+            self.module.memory_context_integration.memory_retrieval
+            .select_relevant_memory_items
+        )
+        with mock.patch.object(
+            self.module.memory_context_integration.memory_retrieval,
+            "select_relevant_memory_items",
+            wraps=real_selector,
+        ) as selector:
+            first = asyncio.create_task(self.post(key="memory-blocked-key-0001"))
+            await started.wait()
+            blocked = await self.post(key="memory-blocked-key-0001")
+            release.set()
+            first_response = await first
         self.assertEqual(
             (blocked.status_code, blocked.json()["error"]["code"]),
             (409, "idempotency_in_progress"),
         )
         self.assertEqual(len(service.calls), 1)
-        release.set()
-        self.assertEqual((await first).status_code, 200)
+        self.assertEqual(selector.call_count, 1)
+        self.assertEqual(first_response.status_code, 200)
 
     async def test_read_and_render_failures_fail_closed_without_provider(self):
         private_text = "PRIVATE-MEMORY-FAILURE-DETAIL"
@@ -638,32 +1566,38 @@ class MemoryContextDispatchIntegrationTests(
         self.assertEqual(len(self.provider_calls), 1)
 
     async def test_operit_and_disabled_kelivo_never_read_memory(self):
+        self.enable_smart_retrieval()
         service = FakeReadService(error=AssertionError("memory must not be read"))
         self.module.MEMORY_SERVICE = service
-        operit = await request(
-            self.module,
-            "POST",
-            "/v1/operit/share",
-            headers={
-                "Authorization": "Bearer test-operit-share-key-distinct-1234567890"
-            },
-            json=self.payload("operit share"),
-        )
+        with mock.patch.object(
+            self.module.memory_context_integration.memory_retrieval,
+            "select_relevant_memory_items",
+        ) as selector:
+            operit = await request(
+                self.module,
+                "POST",
+                "/v1/operit/share",
+                headers={
+                    "Authorization": "Bearer test-operit-share-key-distinct-1234567890"
+                },
+                json=self.payload("operit share"),
+            )
+            self.module.DEPLOYMENT = dataclasses.replace(
+                self.module.DEPLOYMENT,
+                memory=dataclasses.replace(
+                    self.module.DEPLOYMENT.memory,
+                    context_injection_enabled=False,
+                ),
+            )
+            disabled = await self.post(
+                key="memory-disabled-key-0001", text="disabled"
+            )
         self.assertEqual(operit.status_code, 200)
-        self.assertEqual(service.calls, [])
-        self.assertNotIn("transient_memory_dispatch", self.provider_calls[-1][1])
-
-        self.module.DEPLOYMENT = dataclasses.replace(
-            self.module.DEPLOYMENT,
-            memory=dataclasses.replace(
-                self.module.DEPLOYMENT.memory,
-                context_injection_enabled=False,
-            ),
-        )
-        disabled = await self.post(key="memory-disabled-key-0001", text="disabled")
         self.assertEqual(disabled.status_code, 200)
         self.assertEqual(service.calls, [])
+        self.assertNotIn("transient_memory_dispatch", self.provider_calls[-2][1])
         self.assertNotIn("transient_memory_dispatch", self.provider_calls[-1][1])
+        selector.assert_not_called()
 
     async def test_disabled_100_client_messages_plus_persona_dispatch_101(self):
         service = FakeReadService(error=AssertionError("memory must not be read"))

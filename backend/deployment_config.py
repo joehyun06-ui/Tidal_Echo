@@ -185,6 +185,7 @@ class HeartbeatConfig:
 class MemoryConfig:
     enabled: bool
     context_injection_enabled: bool
+    smart_retrieval_enabled: bool
     explicit_writes_enabled: bool
     sensitive_storage_enabled: bool
     max_item_chars: int
@@ -399,6 +400,10 @@ def load_deployment_config(
         env.get("MEMORY_CONTEXT_INJECTION_ENABLED", "false"),
         "invalid_memory_context_injection_enabled",
     )
+    memory_smart_retrieval = parse_strict_bool(
+        env.get("MEMORY_SMART_RETRIEVAL_ENABLED", "false"),
+        "invalid_memory_smart_retrieval_enabled",
+    )
     memory_explicit_writes = parse_strict_bool(
         env.get("MEMORY_EXPLICIT_WRITES_ENABLED", "false"),
         "invalid_memory_explicit_writes_enabled",
@@ -422,6 +427,12 @@ def load_deployment_config(
         raise DeploymentConfigError("invalid_memory_forget_retention_policy")
     if not memory_enabled and (memory_explicit_writes or memory_sensitive_storage):
         raise DeploymentConfigError("invalid_memory_feature_relationship")
+    if memory_smart_retrieval and not memory_enabled:
+        raise DeploymentConfigError("memory_smart_retrieval_requires_core")
+    if memory_smart_retrieval and not memory_context_injection:
+        raise DeploymentConfigError(
+            "memory_smart_retrieval_requires_context_injection"
+        )
     if memory_context_injection and not memory_enabled:
         raise DeploymentConfigError("memory_context_injection_requires_core")
     if memory_context_injection and not kelivo_enabled:
@@ -734,6 +745,7 @@ def load_deployment_config(
         memory=MemoryConfig(
             enabled=memory_enabled,
             context_injection_enabled=memory_context_injection,
+            smart_retrieval_enabled=memory_smart_retrieval,
             explicit_writes_enabled=memory_explicit_writes,
             sensitive_storage_enabled=memory_sensitive_storage,
             max_item_chars=memory_max_item_chars,

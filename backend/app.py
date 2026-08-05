@@ -1348,6 +1348,9 @@ async def _run_completion_state_machine(
                 MEMORY_SERVICE,
                 prepared.messages,
                 enabled=True,
+                smart_retrieval_enabled=(
+                    DEPLOYMENT.memory.smart_retrieval_enabled
+                ),
             )
             provider_messages = transient_dispatch.provider_messages
             if transient_dispatch.memory_applied:
