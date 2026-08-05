@@ -23,6 +23,7 @@ class MemoryConfigTests(unittest.TestCase):
         config = self.load()
         self.assertFalse(config.enabled)
         self.assertFalse(config.context_injection_enabled)
+        self.assertFalse(config.smart_retrieval_enabled)
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
         self.assertFalse(config.explicit_entry_enabled)
@@ -71,6 +72,69 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.explicit_entry_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
+
+    def test_smart_retrieval_is_strict_and_defaults_closed(self):
+        for value in ("", "maybe", " true ", "真"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                r"^invalid_memory_smart_retrieval_enabled$",
+            ):
+                self.load({"MEMORY_SMART_RETRIEVAL_ENABLED": value})
+
+        disabled = self.load({"MEMORY_SMART_RETRIEVAL_ENABLED": "false"})
+        self.assertFalse(disabled.smart_retrieval_enabled)
+
+        enabled = self.load({
+            "MEMORY_SMART_RETRIEVAL_ENABLED": "true",
+            "MEMORY_CONTEXT_INJECTION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+            "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+            "KELIVO_CLIENT_ID": "primary-kelivo",
+            "KELIVO_API_SESSION": "shared-test-session",
+            "KELIVO_MODEL_ALIAS": "ouou-home",
+            "LLM_MODEL": "test-provider-model",
+        })
+        self.assertTrue(enabled.smart_retrieval_enabled)
+        self.assertFalse(enabled.explicit_writes_enabled)
+        self.assertFalse(enabled.explicit_entry_enabled)
+        self.assertFalse(enabled.sensitive_storage_enabled)
+
+    def test_smart_retrieval_dependency_rules_are_fixed(self):
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_smart_retrieval_requires_core$",
+        ):
+            self.load({"MEMORY_SMART_RETRIEVAL_ENABLED": "true"})
+
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_smart_retrieval_requires_context_injection$",
+        ):
+            self.load({
+                "MEMORY_SMART_RETRIEVAL_ENABLED": "true",
+                "MEMORY_CORE_ENABLED": "true",
+            })
+
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_context_injection_requires_kelivo$",
+        ):
+            self.load({
+                "MEMORY_SMART_RETRIEVAL_ENABLED": "true",
+                "MEMORY_CONTEXT_INJECTION_ENABLED": "true",
+                "MEMORY_CORE_ENABLED": "true",
+            })
+
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_context_injection_requires_core$",
+        ):
+            self.load({
+                "MEMORY_SMART_RETRIEVAL_ENABLED": "false",
+                "MEMORY_CONTEXT_INJECTION_ENABLED": "true",
+                "KELIVO_ENABLED": "true",
+            })
 
     def test_enabled_read_only_does_not_require_hmac(self):
         config = self.load({"MEMORY_CORE_ENABLED": "true"})

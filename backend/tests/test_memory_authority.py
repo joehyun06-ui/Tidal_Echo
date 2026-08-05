@@ -45,6 +45,7 @@ def config(
     return deployment_config.MemoryConfig(
         enabled=enabled,
         context_injection_enabled=False,
+        smart_retrieval_enabled=False,
         explicit_writes_enabled=writes,
         sensitive_storage_enabled=sensitive,
         max_item_chars=1000,

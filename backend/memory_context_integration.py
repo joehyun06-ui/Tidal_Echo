@@ -6,13 +6,18 @@ from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
 try:
-    from . import memory_context
+    from . import memory_context, memory_retrieval
 except ImportError:  # support direct module execution in local tooling
     import memory_context
+    import memory_retrieval
 
 
-RETRIEVAL_MAX_ITEMS = 10
-RETRIEVAL_CHARACTER_BUDGET = 2000
+LEGACY_RETRIEVAL_MAX_ITEMS = 10
+LEGACY_RETRIEVAL_CHARACTER_BUDGET = 2000
+SMART_CANDIDATE_MAX_ITEMS = 20
+SMART_CANDIDATE_CHARACTER_BUDGET = 8000
+SMART_FINAL_MAX_ITEMS = 10
+SMART_FINAL_CHARACTER_BUDGET = 2000
 CLIENT_MAX_MESSAGES = 100
 BASE_PROVIDER_MAX_MESSAGES = CLIENT_MAX_MESSAGES + 1
 TRANSIENT_DISPATCH_MAX_MESSAGES = BASE_PROVIDER_MAX_MESSAGES + 1
@@ -91,33 +96,120 @@ def _validate_base_messages(base_messages: object) -> tuple[dict[str, str], ...]
         raise MemoryContextIntegrationError() from None
 
 
+def _validated_selection_items(
+    selection: object,
+    *,
+    candidates: tuple[dict, ...],
+) -> tuple[dict, ...]:
+    try:
+        if type(selection) is not memory_retrieval.MemoryRetrievalSelectionV1:
+            raise MemoryContextIntegrationError()
+        if type(candidates) is not tuple or any(
+            type(candidate) is not dict for candidate in candidates
+        ):
+            raise MemoryContextIntegrationError()
+        items = selection.items
+        candidate_count = selection.candidate_count
+        selected_count = selection.selected_count
+        query_signal_count = selection.query_signal_count
+        if (
+            type(items) is not tuple
+            or type(candidate_count) is not int
+            or not 0 <= candidate_count <= SMART_CANDIDATE_MAX_ITEMS
+            or candidate_count != len(candidates)
+            or type(selected_count) is not int
+            or selected_count != len(items)
+            or not 0 <= selected_count <= min(
+                candidate_count, SMART_FINAL_MAX_ITEMS
+            )
+            or type(query_signal_count) is not int
+            or not 0 <= query_signal_count <= memory_retrieval.QUERY_MAX_CHARS
+            or (selected_count > 0 and query_signal_count == 0)
+        ):
+            raise MemoryContextIntegrationError()
+
+        remaining_candidates = list(candidates)
+        total_chars = 0
+        for item in items:
+            if type(item) is not dict:
+                raise MemoryContextIntegrationError()
+            matched_index = None
+            for index, candidate in enumerate(remaining_candidates):
+                if item == candidate:
+                    matched_index = index
+                    break
+            if matched_index is None:
+                raise MemoryContextIntegrationError()
+            remaining_candidates.pop(matched_index)
+            content = item["normalized_content"]
+            if type(content) is not str:
+                raise MemoryContextIntegrationError()
+            total_chars += len(content)
+            if total_chars > SMART_FINAL_CHARACTER_BUDGET:
+                raise MemoryContextIntegrationError()
+        return items
+    except MemoryContextIntegrationError:
+        raise
+    except Exception:
+        raise MemoryContextIntegrationError() from None
+
+
 def prepare_transient_memory_dispatch(
     read_service: MemoryReadServiceProtocol,
     base_messages: tuple[dict[str, str], ...],
     *,
     enabled: bool,
+    smart_retrieval_enabled: bool,
 ) -> TransientMemoryDispatch:
     """Read once, validate, and insert transient global-user Memory context."""
 
-    if type(enabled) is not bool:
+    if type(enabled) is not bool or type(smart_retrieval_enabled) is not bool:
+        raise MemoryContextIntegrationError()
+    if smart_retrieval_enabled and not enabled:
         raise MemoryContextIntegrationError()
     if not enabled:
         return TransientMemoryDispatch(base_messages, False)
 
     messages = _validate_base_messages(base_messages)
     try:
-        safe_items = read_service.get_active_memories(
-            scope_type="global_user",
-            scope_ref="",
-            limit=RETRIEVAL_MAX_ITEMS,
-            character_budget=RETRIEVAL_CHARACTER_BUDGET,
-            include_sensitive=False,
-        )
+        if smart_retrieval_enabled:
+            safe_items = read_service.get_active_memories(
+                scope_type="global_user",
+                scope_ref="",
+                limit=SMART_CANDIDATE_MAX_ITEMS,
+                character_budget=SMART_CANDIDATE_CHARACTER_BUDGET,
+                include_sensitive=False,
+            )
+            if type(safe_items) not in (list, tuple) or any(
+                type(item) is not dict for item in safe_items
+            ):
+                raise MemoryContextIntegrationError()
+            candidate_snapshot = tuple(dict(item) for item in safe_items)
+            selector_input = tuple(dict(item) for item in candidate_snapshot)
+            selection = memory_retrieval.select_relevant_memory_items(
+                selector_input,
+                query_text=messages[-1]["content"],
+                scope_type="global_user",
+                max_items=SMART_FINAL_MAX_ITEMS,
+                character_budget=SMART_FINAL_CHARACTER_BUDGET,
+            )
+            render_items = _validated_selection_items(
+                selection,
+                candidates=candidate_snapshot,
+            )
+        else:
+            render_items = read_service.get_active_memories(
+                scope_type="global_user",
+                scope_ref="",
+                limit=LEGACY_RETRIEVAL_MAX_ITEMS,
+                character_budget=LEGACY_RETRIEVAL_CHARACTER_BUDGET,
+                include_sensitive=False,
+            )
         developer_message = memory_context.render_memory_developer_message(
-            safe_items,
+            render_items,
             scope_type="global_user",
-            max_items=RETRIEVAL_MAX_ITEMS,
-            character_budget=RETRIEVAL_CHARACTER_BUDGET,
+            max_items=SMART_FINAL_MAX_ITEMS,
+            character_budget=SMART_FINAL_CHARACTER_BUDGET,
         )
         if developer_message is None:
             return TransientMemoryDispatch(messages, False)
