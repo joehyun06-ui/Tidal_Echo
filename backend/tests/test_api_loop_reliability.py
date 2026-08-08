@@ -14,6 +14,7 @@ from unittest import mock
 
 import httpx
 
+from backend import memory_formation_extractor
 from backend.tests._support import NoNetworkMixin, request
 
 
@@ -156,6 +157,211 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[-1], {"role": "user", "content": "current"})
         self.assertEqual(generated.await_args.kwargs["temperature"], 0.4)
         self.assertEqual(generated.await_args.kwargs["max_tokens"], 123)
+
+    async def test_loop_chat_extractor_session_is_stateless_and_persists_nothing(self):
+        source = "PRIVATE-EXTRACTOR-SOURCE"
+        provider_messages = [
+            {
+                "role": "developer",
+                "content": memory_formation_extractor.EXTRACTOR_INSTRUCTION,
+            },
+            {"role": "user", "content": source},
+        ]
+        with closing(sqlite3.connect(self.module.RELAY_DB)) as conn:
+            conn.execute(
+                "INSERT INTO messages(ts,direction,kind,text,meta) VALUES(?,?,?,?,?)",
+                (
+                    "2026-01-01T00:00:00+00:00",
+                    "in",
+                    "user",
+                    "NORMAL-SESSION-HISTORY",
+                    json.dumps({"api_session": "shared-test-session"}),
+                ),
+            )
+            conn.execute("CREATE TABLE kelivo_requests(id INTEGER PRIMARY KEY, provider_messages_json TEXT)")
+            conn.commit()
+            before_messages = conn.execute(
+                "SELECT direction,kind,text,meta FROM messages ORDER BY id"
+            ).fetchall()
+        generated = mock.AsyncMock(return_value={
+            "outcome": "success",
+            "text": "PRIVATE-EXTRACTOR-OUTPUT",
+            "model": "model-one",
+            "tried": [],
+            "usage": {},
+        })
+        with mock.patch.object(self.module, "run_kelivo_provider_contract", new=generated):
+            response = await request(
+                self.module,
+                "POST",
+                "/loop/chat",
+                headers={
+                    "X-API-Loop-Internal-Token": "test-internal-loop-token-1234567890"
+                },
+                json={
+                    "provider_model": "model-one",
+                    "provider_messages": provider_messages,
+                    "session_id": "memory-formation-extractor-v1",
+                    "prompt_contract_version": "kelivo-provider-prompt-v1",
+                    "use_default_persona": False,
+                    "single_route": True,
+                    "temperature": 0.0,
+                    "max_tokens": 256,
+                    "memory_formation_extractor": "memory-formation-extractor-v1",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(generated.await_args.args[1], provider_messages)
+        self.assertEqual(generated.await_args.kwargs, {
+            "temperature": 0.0,
+            "max_tokens": 256,
+        })
+        with closing(sqlite3.connect(self.module.RELAY_DB)) as conn:
+            after_messages = conn.execute(
+                "SELECT direction,kind,text,meta FROM messages ORDER BY id"
+            ).fetchall()
+            kelivo_rows = conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0]
+        self.assertEqual(after_messages, before_messages)
+        self.assertEqual(kelivo_rows, 0)
+        self.assertNotIn("PRIVATE-EXTRACTOR-OUTPUT", json.dumps(after_messages))
+        self.assertNotIn("NORMAL-SESSION-HISTORY", json.dumps(generated.await_args.args[1]))
+
+    async def test_loop_chat_extractor_timeout_cancels_without_persistence_and_leaves_normal_path_unchanged(self):
+        auth = {
+            "X-API-Loop-Internal-Token": "test-internal-loop-token-1234567890"
+        }
+        extractor_body = {
+            "provider_model": "model-one",
+            "provider_messages": [
+                {
+                    "role": "developer",
+                    "content": memory_formation_extractor.EXTRACTOR_INSTRUCTION,
+                },
+                {"role": "user", "content": "PRIVATE-TIMEOUT-SOURCE"},
+            ],
+            "session_id": "memory-formation-extractor-v1",
+            "prompt_contract_version": "kelivo-provider-prompt-v1",
+            "use_default_persona": False,
+            "single_route": True,
+            "temperature": 0.0,
+            "max_tokens": 256,
+            "memory_formation_extractor": "memory-formation-extractor-v1",
+        }
+        with closing(sqlite3.connect(self.module.RELAY_DB)) as conn:
+            conn.execute(
+                "CREATE TABLE kelivo_requests(id INTEGER PRIMARY KEY, provider_messages_json TEXT)"
+            )
+            conn.commit()
+        before_sessions = self.module.sessions_public()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked(*_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        with mock.patch.object(
+            self.module, "MEMORY_FORMATION_EXTRACTOR_TIMEOUT_SECONDS", 0.005,
+        ), mock.patch.object(
+            self.module, "run_kelivo_provider_contract", new=blocked,
+        ):
+            timed_out = await request(
+                self.module, "POST", "/loop/chat", headers=auth, json=extractor_body,
+            )
+        elapsed = loop.time() - began
+        self.assertTrue(started.is_set())
+        self.assertTrue(cancelled.is_set())
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(timed_out.status_code, 504)
+        self.assertEqual(timed_out.json(), {
+            "ok": False,
+            "dispatch_uncertain": False,
+            "error": "memory_formation_extractor_timeout",
+        })
+        with closing(sqlite3.connect(self.module.RELAY_DB)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM kelivo_requests").fetchone()[0], 0)
+        self.assertEqual(self.module.sessions_public(), before_sessions)
+
+        normal = mock.AsyncMock(return_value={
+            "outcome": "success", "text": "normal reply", "model": "model-one",
+            "tried": [], "usage": {},
+        })
+        with mock.patch.object(
+            self.module, "run_kelivo_provider_contract", new=normal,
+        ):
+            response = await request(self.module, "POST", "/loop/chat", headers=auth, json={
+                "provider_model": "model-one",
+                "provider_messages": [{"role": "user", "content": "normal request"}],
+                "session_id": "normal-session",
+                "prompt_contract_version": "kelivo-provider-prompt-v1",
+                "use_default_persona": False,
+                "single_route": True,
+                "temperature": 0.4,
+                "max_tokens": 123,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reply"], "normal reply")
+        self.assertEqual(normal.await_count, 1)
+
+    async def test_loop_chat_extractor_marker_and_contract_fail_closed(self):
+        auth = {
+            "X-API-Loop-Internal-Token": "test-internal-loop-token-1234567890"
+        }
+        body = {
+            "provider_model": "model-one",
+            "provider_messages": [
+                {
+                    "role": "developer",
+                    "content": memory_formation_extractor.EXTRACTOR_INSTRUCTION,
+                },
+                {"role": "user", "content": "source"},
+            ],
+            "session_id": "memory-formation-extractor-v1",
+            "prompt_contract_version": "kelivo-provider-prompt-v1",
+            "use_default_persona": False,
+            "single_route": True,
+            "temperature": 0.0,
+            "max_tokens": 256,
+            "memory_formation_extractor": "memory-formation-extractor-v1",
+        }
+        invalid_bodies = [
+            {**body, "memory_formation_extractor": value}
+            for value in (None, "", "wrong-version")
+        ] + [
+            {
+                **body,
+                "transient_memory_dispatch": "kelivo-transient-memory-dispatch-v1",
+            },
+            {**body, "session_id": "shared"},
+            {
+                **body,
+                "provider_messages": [
+                    {"role": "developer", "content": "wrong instruction"},
+                    {"role": "user", "content": "source"},
+                ],
+            },
+            {**body, "temperature": 0.1},
+            {**body, "max_tokens": 257},
+        ]
+        generated = mock.AsyncMock()
+        with mock.patch.object(
+            self.module, "run_kelivo_provider_contract", new=generated,
+        ):
+            responses = [
+                await request(
+                    self.module, "POST", "/loop/chat", headers=auth, json=invalid_body,
+                )
+                for invalid_body in invalid_bodies
+            ]
+        self.assertTrue(all(response.status_code == 400 for response in responses))
+        self.assertEqual(generated.await_count, 0)
 
     async def test_loop_chat_transient_marker_is_fixed_and_allows_102_messages(self):
         auth = {

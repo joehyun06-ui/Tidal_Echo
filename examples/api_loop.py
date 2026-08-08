@@ -36,7 +36,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from backend import deployment_config
+from backend import deployment_config, memory_formation_extractor
 
 
 def load_dotenv(path: Path) -> None:
@@ -82,6 +82,7 @@ LOOP_ASSISTANT_MAX_CHARS = deployment_config.parse_bounded_int(
     os.environ.get("LOOP_ASSISTANT_MAX_CHARS", "64000"), 1, 1_000_000,
     "invalid_loop_assistant_max_chars",
 )
+MEMORY_FORMATION_EXTRACTOR_TIMEOUT_SECONDS = 20.0
 LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = deployment_config.parse_positive_finite_float(
     os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"
 )
@@ -734,6 +735,7 @@ async def loop_chat(request: Request):
     allowed = {
         "provider_messages", "provider_model", "prompt_contract_version", "use_default_persona", "session_id",
         "single_route", "temperature", "max_tokens", "transient_memory_dispatch",
+        "memory_formation_extractor",
     }
     if set(body) - allowed or body.get("prompt_contract_version") != "kelivo-provider-prompt-v1":
         raise HTTPException(status_code=400, detail="invalid_prompt_contract")
@@ -744,6 +746,15 @@ async def loop_chat(request: Request):
         transient_marker_present
         and body["transient_memory_dispatch"] != "kelivo-transient-memory-dispatch-v1"
     ):
+        raise HTTPException(status_code=400, detail="invalid_prompt_contract")
+    extractor_marker_present = "memory_formation_extractor" in body
+    if (
+        extractor_marker_present
+        and body["memory_formation_extractor"]
+        != memory_formation_extractor.EXTRACTOR_CONTRACT_VERSION
+    ):
+        raise HTTPException(status_code=400, detail="invalid_prompt_contract")
+    if transient_marker_present and extractor_marker_present:
         raise HTTPException(status_code=400, detail="invalid_prompt_contract")
     provider_message_limit = 102 if transient_marker_present else 101
     session_id = str(body.get("session_id") or "").strip()
@@ -774,10 +785,39 @@ async def loop_chat(request: Request):
         raise HTTPException(status_code=400, detail="invalid_max_tokens")
     if temperature is None or max_tokens is None:
         raise HTTPException(status_code=400, detail="incomplete_provider_contract")
-    out = await run_kelivo_provider_contract(
-        provider_model, provider_messages,
-        temperature=float(temperature), max_tokens=max_tokens,
-    )
+    if extractor_marker_present and (
+        body.get("session_id") != memory_formation_extractor.EXTRACTOR_SESSION_ID
+        or len(provider_messages) != 2
+        or provider_messages[0] != {
+            "role": "developer",
+            "content": memory_formation_extractor.EXTRACTOR_INSTRUCTION,
+        }
+        or provider_messages[1].get("role") != "user"
+        or not provider_messages[1].get("content", "").strip()
+        or len(provider_messages[1]["content"])
+        > memory_formation_extractor.SOURCE_MAX_CHARS
+        or temperature != memory_formation_extractor.EXTRACTOR_TEMPERATURE
+        or max_tokens > memory_formation_extractor.EXTRACTOR_MAX_TOKENS
+    ):
+        raise HTTPException(status_code=400, detail="invalid_extractor_contract")
+    try:
+        if extractor_marker_present:
+            async with asyncio.timeout(MEMORY_FORMATION_EXTRACTOR_TIMEOUT_SECONDS):
+                out = await run_kelivo_provider_contract(
+                    provider_model, provider_messages,
+                    temperature=float(temperature), max_tokens=max_tokens,
+                )
+        else:
+            out = await run_kelivo_provider_contract(
+                provider_model, provider_messages,
+                temperature=float(temperature), max_tokens=max_tokens,
+            )
+    except TimeoutError:
+        return JSONResponse({
+            "ok": False,
+            "dispatch_uncertain": False,
+            "error": "memory_formation_extractor_timeout",
+        }, status_code=504)
     if out.get("outcome") != "success":
         return JSONResponse({"ok": False, "dispatch_uncertain": out.get("outcome") == "dispatch_uncertain",
                              "error": out.get("error")}, status_code=504 if out.get("outcome") == "dispatch_uncertain" else 502)

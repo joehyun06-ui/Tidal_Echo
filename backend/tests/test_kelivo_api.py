@@ -13,7 +13,7 @@ from unittest import mock
 
 import httpx
 
-from backend import deployment_config
+from backend import deployment_config, memory_formation_extractor
 from backend.tests._support import NoNetworkMixin, load_app, request
 
 
@@ -777,6 +777,71 @@ class KelivoApiTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                          ("provider-model", 0.61, 456))
         self.assertNotEqual(rows[0]["request_identity_hash"], rows[1]["request_identity_hash"])
         self.assertNotIn("must never be injected", json.dumps(captured[0]))
+
+    async def test_loop_adapter_forwards_only_exact_extractor_marker_and_rejects_mixed_dispatch(self):
+        captured = []
+
+        def handler(request):
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json={
+                "ok": True,
+                "reply": '{"version":"memory-formation-extractor-v1","proposals":[]}',
+                "api": {"usage": {}},
+            })
+
+        adapter = self.module.kelivo_service.LoopGenerationClient(
+            "http://127.0.0.1:9/loop/ingest",
+            2,
+            "test-internal-loop-token-1234567890",
+            transport=httpx.MockTransport(handler),
+        )
+        messages = (
+            {
+                "role": "developer",
+                "content": memory_formation_extractor.EXTRACTOR_INSTRUCTION,
+            },
+            {"role": "user", "content": "source"},
+        )
+        context = {
+            "prompt_contract_version": "kelivo-provider-prompt-v1",
+            "memory_formation_extractor": "memory-formation-extractor-v1",
+        }
+        result = await adapter.generate(
+            messages,
+            "memory-formation-extractor-v1",
+            "test-provider-model",
+            0.0,
+            256,
+            context,
+        )
+        self.assertIn("text", result)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0]["memory_formation_extractor"],
+            "memory-formation-extractor-v1",
+        )
+
+        invalid_contexts = (
+            {**context, "memory_formation_extractor": None},
+            {**context, "memory_formation_extractor": "wrong-version"},
+            {
+                **context,
+                "transient_memory_dispatch": "kelivo-transient-memory-dispatch-v1",
+            },
+        )
+        for invalid_context in invalid_contexts:
+            with self.subTest(context=invalid_context), self.assertRaises(
+                self.module.kelivo_service.GenerationError,
+            ):
+                await adapter.generate(
+                    messages,
+                    "memory-formation-extractor-v1",
+                    "test-provider-model",
+                    0.0,
+                    256,
+                    invalid_context,
+                )
+        self.assertEqual(len(captured), 1)
 
     async def test_dispatching_and_uncertain_are_never_redispatched(self):
         validated = self.module.kelivo_service.validate_completion(self.payload(), "ouou-home")
