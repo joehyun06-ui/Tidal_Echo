@@ -13,7 +13,7 @@ import time
 import unicodedata
 import urllib.parse
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
@@ -38,6 +38,7 @@ ALLOWED_REQUEST_KEYS = frozenset({
 })
 PROMPT_CONTRACT_VERSION = "kelivo-provider-prompt-v1"
 TRANSIENT_MEMORY_DISPATCH_VERSION = "kelivo-transient-memory-dispatch-v1"
+MEMORY_FORMATION_EXTRACTOR_DISPATCH_VERSION = "memory-formation-extractor-v1"
 OPERIT_SHARE_PREFIX = "[Operit Share]\n"
 OPERIT_SHARE_IDENTITY_SCOPE = {"channel": "operit_share", "source": "operit"}
 
@@ -93,6 +94,17 @@ class FrozenRequestContract:
     context_bundle_hash: str
     request_identity_hash: str
     automatic_fingerprint: str = ""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CanonicalFormationSource:
+    """Read-only canonical user source for shadow formation."""
+
+    canonical_message_id: int
+    text: str = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "<CanonicalFormationSource>"
 
 
 GenerationCallable = Callable[
@@ -1063,6 +1075,66 @@ def complete_request(
         return response
 
 
+def load_completed_canonical_formation_source(
+    path: str,
+    client_id: object,
+    idempotency_key: object,
+    *,
+    channel: object = "kelivo",
+) -> CanonicalFormationSource:
+    """Load the committed canonical user message for one completed request."""
+
+    if (
+        type(client_id) is not str
+        or not client_id
+        or type(idempotency_key) is not str
+        or not idempotency_key
+        or channel != "kelivo"
+    ):
+        raise KelivoError(503, "canonical_source_unavailable")
+    with channel_store.connect(path) as conn:
+        request = conn.execute(
+            """SELECT status,user_message_id,api_session,generation_id
+               FROM kelivo_requests WHERE client_id=? AND idempotency_key=?""",
+            (client_id, idempotency_key),
+        ).fetchone()
+        if request is None or request["status"] != "completed":
+            raise KelivoError(503, "canonical_source_unavailable")
+        canonical_message_id = request["user_message_id"]
+        if (
+            type(canonical_message_id) is not int
+            or canonical_message_id <= 0
+            or type(request["api_session"]) is not str
+            or not request["api_session"]
+            or type(request["generation_id"]) is not str
+            or not request["generation_id"]
+        ):
+            raise KelivoError(503, "canonical_source_unavailable")
+        message = conn.execute(
+            "SELECT id,direction,kind,text,meta FROM messages WHERE id=?",
+            (canonical_message_id,),
+        ).fetchone()
+    if (
+        message is None
+        or type(message["id"]) is not int
+        or message["id"] != canonical_message_id
+        or message["direction"] != "in"
+        or message["kind"] != "user"
+        or type(message["text"]) is not str
+        or not message["text"].strip()
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in message["text"])
+    ):
+        raise KelivoError(503, "canonical_source_unavailable")
+    expected_meta = canonical_completion_meta(
+        api_session=request["api_session"],
+        generation_id=request["generation_id"],
+        channel="kelivo",
+    )
+    if type(message["meta"]) is not str or message["meta"] != expected_meta:
+        raise KelivoError(503, "canonical_source_unavailable")
+    return CanonicalFormationSource(canonical_message_id, message["text"])
+
+
 class AdmissionLease:
     def __init__(self, global_sem: asyncio.Semaphore, client_sem: asyncio.Semaphore):
         self.global_sem, self.client_sem, self.released = global_sem, client_sem, False
@@ -1166,11 +1238,20 @@ class LoopGenerationClient:
     ) -> dict[str, Any]:
         transient_marker_present = "transient_memory_dispatch" in context
         transient_marker = context.get("transient_memory_dispatch")
+        extractor_marker_present = "memory_formation_extractor" in context
+        extractor_marker = context.get("memory_formation_extractor")
         if (
             transient_marker_present
             and transient_marker != TRANSIENT_MEMORY_DISPATCH_VERSION
         ):
             raise GenerationError("invalid_transient_memory_dispatch", False)
+        if (
+            extractor_marker_present
+            and extractor_marker != MEMORY_FORMATION_EXTRACTOR_DISPATCH_VERSION
+        ):
+            raise GenerationError("invalid_memory_formation_extractor", False)
+        if transient_marker_present and extractor_marker_present:
+            raise GenerationError("invalid_memory_formation_extractor", False)
         message_limit = 102 if transient_marker_present else 101
         if len(messages) > message_limit:
             raise GenerationError("invalid_loopback_message_count", False)
@@ -1183,6 +1264,8 @@ class LoopGenerationClient:
         }
         if transient_marker_present:
             payload["transient_memory_dispatch"] = transient_marker
+        if extractor_marker_present:
+            payload["memory_formation_extractor"] = extractor_marker
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout_seconds, trust_env=False, transport=self.transport,

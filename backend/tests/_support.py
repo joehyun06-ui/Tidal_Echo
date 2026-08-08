@@ -24,6 +24,8 @@ def clear_backend_app_modules():
         "backend.memory_store", "backend.memory_service",
         "backend.memory_explicit_actions", "backend.memory_context",
         "backend.memory_context_integration", "backend.memory_retrieval",
+        "backend.memory_formation_extractor",
+        "backend.memory_formation_integration",
     )
     for name in module_names:
         sys.modules.pop(name, None)
@@ -80,7 +82,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
              memory: bool = False, memory_writes: bool = False,
              memory_sensitive: bool = False, memory_secret: str = "",
              memory_entry: bool = False, memory_context: bool = False,
-             memory_smart: bool = False):
+             memory_smart: bool = False, memory_auto_formation: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -119,6 +121,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "MEMORY_SMART_RETRIEVAL_ENABLED": "true" if memory_smart else "false",
         "MEMORY_EXPLICIT_WRITES_ENABLED": "true" if memory_writes else "false",
         "MEMORY_EXPLICIT_ENTRY_ENABLED": "true" if memory_entry else "false",
+        "MEMORY_AUTO_FORMATION_ENABLED": "true" if memory_auto_formation else "false",
         "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
         "MEMORY_MAX_ITEM_CHARS": "1000",
         "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",

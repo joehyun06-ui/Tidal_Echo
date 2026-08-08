@@ -27,12 +27,53 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
         self.assertFalse(config.explicit_entry_enabled)
+        self.assertFalse(config.auto_formation_enabled)
         self.assertTrue(config.entry_configuration_valid)
         self.assertEqual(config.max_item_chars, 1000)
         self.assertEqual(config.forget_retention_policy, "tombstone_without_content")
         self.assertEqual(config.fingerprint_key_id, "")
         self.assertEqual(config.fingerprint_hmac_secret, "")
         self.assertTrue(config.configuration_valid)
+
+    def test_auto_formation_is_strict_default_off_and_has_only_core_kelivo_dependencies(self):
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^invalid_memory_auto_formation_enabled$",
+        ):
+            self.load({"MEMORY_AUTO_FORMATION_ENABLED": "maybe"})
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_auto_formation_requires_core$",
+        ):
+            self.load({
+                "MEMORY_AUTO_FORMATION_ENABLED": "true",
+                "KELIVO_ENABLED": "true",
+            })
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_auto_formation_requires_kelivo$",
+        ):
+            self.load({
+                "MEMORY_AUTO_FORMATION_ENABLED": "true",
+                "MEMORY_CORE_ENABLED": "true",
+            })
+
+        config = self.load({
+            "MEMORY_AUTO_FORMATION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+            "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+            "KELIVO_CLIENT_ID": "primary-kelivo",
+            "KELIVO_API_SESSION": "shared-test-session",
+            "KELIVO_MODEL_ALIAS": "ouou-home",
+            "LLM_MODEL": "test-provider-model",
+        })
+        self.assertTrue(config.auto_formation_enabled)
+        self.assertFalse(config.context_injection_enabled)
+        self.assertFalse(config.smart_retrieval_enabled)
+        self.assertFalse(config.explicit_writes_enabled)
+        self.assertFalse(config.explicit_entry_enabled)
+        self.assertFalse(config.sensitive_storage_enabled)
 
     def test_context_injection_is_strict_and_requires_core_and_kelivo(self):
         with self.assertRaisesRegex(

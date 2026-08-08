@@ -47,6 +47,8 @@ try:
         kelivo_service,
         memory_context_integration,
         memory_explicit_actions,
+        memory_formation_extractor,
+        memory_formation_integration,
         memory_runtime,
     )
     from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
@@ -56,6 +58,8 @@ except ImportError:  # support `python backend/app.py`
     import kelivo_service
     import memory_context_integration
     import memory_explicit_actions
+    import memory_formation_extractor
+    import memory_formation_integration
     import memory_runtime
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 
@@ -987,6 +991,140 @@ KELIVO_ADMISSION = kelivo_service.KelivoAdmissionController(
 KELIVO_KEY_LOCKS = kelivo_service.IdempotencyLockRegistry()
 
 
+def _log_memory_formation_shadow(
+    *,
+    status: str,
+    category: str = "",
+    proposal_count: int = 0,
+    candidate_count: int = 0,
+) -> None:
+    """Emit only fixed bounded shadow telemetry and never affect request flow."""
+
+    allowed_categories = frozenset({
+        "busy",
+        "candidate_rejected",
+        "extractor_invalid_output",
+        "extractor_unavailable",
+        "scheduler_unavailable",
+        "shutdown",
+        "source_ineligible",
+        "source_unavailable",
+    })
+    try:
+        if status == "completed":
+            proposals = max(0, min(int(proposal_count), 3))
+            candidates = max(0, min(int(candidate_count), 3))
+            print(
+                "[memory-formation-shadow] "
+                f"status=completed proposals={proposals} candidates={candidates}",
+                flush=True,
+            )
+        elif status in {"failed", "skipped"} and category in allowed_categories:
+            print(
+                f"[memory-formation-shadow] status={status} category={category}",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
+def _memory_formation_shadow_done(task: asyncio.Task) -> None:
+    if getattr(app.state, "memory_formation_shadow_task", None) is task:
+        app.state.memory_formation_shadow_task = None
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        _log_memory_formation_shadow(
+            status="failed", category="extractor_unavailable",
+        )
+
+
+async def _run_memory_formation_shadow_task(
+    *,
+    client_id: str,
+    idempotency_key: str,
+    provider_model: str,
+    generation_callable,
+) -> None:
+    try:
+        canonical = await asyncio.to_thread(
+            kelivo_service.load_completed_canonical_formation_source,
+            DB_PATH,
+            client_id,
+            idempotency_key,
+            channel="kelivo",
+        )
+
+        async def extractor(source_text: str):
+            return await memory_formation_extractor.extract_auto_memory_proposals(
+                generation_callable,
+                source_text,
+                provider_model=provider_model,
+                provider_prompt_contract_version=kelivo_service.PROMPT_CONTRACT_VERSION,
+            )
+
+        result = await memory_formation_integration.run_memory_formation_shadow(
+            canonical.canonical_message_id,
+            canonical.text,
+            extractor,
+            max_item_chars=DEPLOYMENT.memory.max_item_chars,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log_memory_formation_shadow(
+            status="failed", category="source_unavailable",
+        )
+        return
+    if result.status == "completed":
+        _log_memory_formation_shadow(
+            status="completed",
+            proposal_count=result.proposal_count,
+            candidate_count=result.candidate_count,
+        )
+    else:
+        _log_memory_formation_shadow(
+            status="failed", category=result.category,
+        )
+
+
+def _schedule_memory_formation_shadow(
+    *,
+    client_id: str,
+    idempotency_key: str,
+    provider_model: str,
+    generation_callable,
+) -> bool:
+    if not DEPLOYMENT.memory.auto_formation_enabled:
+        return False
+    if getattr(app.state, "shutting_down", False):
+        _log_memory_formation_shadow(status="skipped", category="shutdown")
+        return False
+    existing = getattr(app.state, "memory_formation_shadow_task", None)
+    if existing is not None and not existing.done():
+        _log_memory_formation_shadow(status="skipped", category="busy")
+        return False
+    try:
+        task = asyncio.create_task(_run_memory_formation_shadow_task(
+            client_id=client_id,
+            idempotency_key=idempotency_key,
+            provider_model=provider_model,
+            generation_callable=generation_callable,
+        ))
+    except Exception:
+        _log_memory_formation_shadow(
+            status="failed", category="scheduler_unavailable",
+        )
+        return False
+    app.state.memory_formation_shadow_task = task
+    task.add_done_callback(_memory_formation_shadow_done)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
@@ -1017,6 +1155,7 @@ async def lifespan(app: FastAPI):
     app.state.shutting_down = False
     app.state.worker_restart_requested = False
     app.state.telegram_worker_task = None
+    app.state.memory_formation_shadow_task = None
     if TELEGRAM.enabled:
         worker = TelegramWorker(DB_PATH, TELEGRAM, dispatch_telegram_generation)
         app.state.telegram_worker = worker
@@ -1027,6 +1166,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         app.state.shutting_down = True
+        shadow_task = getattr(app.state, "memory_formation_shadow_task", None)
+        if shadow_task is not None:
+            shadow_task.cancel()
+            try:
+                await shadow_task
+            except asyncio.CancelledError:
+                pass
+        app.state.memory_formation_shadow_task = None
         if worker_task:
             worker_task.cancel()
             try:
@@ -1430,6 +1577,18 @@ async def _run_completion_state_machine(
     finally:
         if lease:
             lease.release()
+    if channel == "kelivo" and DEPLOYMENT.memory.auto_formation_enabled:
+        try:
+            _schedule_memory_formation_shadow(
+                client_id=client_id,
+                idempotency_key=idempotency_key,
+                provider_model=prepared.provider_model,
+                generation_callable=KELIVO_GENERATOR,
+            )
+        except Exception:
+            _log_memory_formation_shadow(
+                status="failed", category="scheduler_unavailable",
+            )
     return JSONResponse(response)
 
 @app.get("/v1/models")

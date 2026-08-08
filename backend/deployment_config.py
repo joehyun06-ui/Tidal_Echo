@@ -197,6 +197,7 @@ class MemoryConfig:
     explicit_entry_enabled: bool = False
     entry_configuration_valid: bool = True
     entry_error_category: str = ""
+    auto_formation_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -412,6 +413,10 @@ def load_deployment_config(
         env.get("MEMORY_EXPLICIT_ENTRY_ENABLED", "false"),
         "invalid_memory_explicit_entry_enabled",
     )
+    memory_auto_formation = parse_strict_bool(
+        env.get("MEMORY_AUTO_FORMATION_ENABLED", "false"),
+        "invalid_memory_auto_formation_enabled",
+    )
     memory_sensitive_storage = parse_strict_bool(
         env.get("MEMORY_SENSITIVE_STORAGE_ENABLED", "false"),
         "invalid_memory_sensitive_storage_enabled",
@@ -437,6 +442,10 @@ def load_deployment_config(
         raise DeploymentConfigError("memory_context_injection_requires_core")
     if memory_context_injection and not kelivo_enabled:
         raise DeploymentConfigError("memory_context_injection_requires_kelivo")
+    if memory_auto_formation and not memory_enabled:
+        raise DeploymentConfigError("memory_auto_formation_requires_core")
+    if memory_auto_formation and not kelivo_enabled:
+        raise DeploymentConfigError("memory_auto_formation_requires_kelivo")
     if telegram_enabled != bool(telegram_config.requested):
         raise DeploymentConfigError("telegram_config_invalid")
 
@@ -757,6 +766,7 @@ def load_deployment_config(
             explicit_entry_enabled=memory_explicit_entry,
             entry_configuration_valid=memory_entry_configuration_valid,
             entry_error_category=memory_entry_error_category,
+            auto_formation_enabled=memory_auto_formation,
         ),
     )
 
