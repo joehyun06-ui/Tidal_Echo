@@ -28,6 +28,7 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.sensitive_storage_enabled)
         self.assertFalse(config.explicit_entry_enabled)
         self.assertFalse(config.auto_formation_enabled)
+        self.assertFalse(config.auto_candidate_persistence_enabled)
         self.assertTrue(config.entry_configuration_valid)
         self.assertEqual(config.max_item_chars, 1000)
         self.assertEqual(config.forget_retention_policy, "tombstone_without_content")
@@ -74,6 +75,106 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.explicit_entry_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
+
+    def test_auto_candidate_persistence_is_strict_and_default_off(self):
+        for value in ("", "maybe", " true ", "enabled", "真"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                r"^invalid_memory_auto_candidate_persistence_enabled$",
+            ):
+                self.load({
+                    "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": value,
+                })
+
+        disabled = self.load({
+            "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": "false",
+        })
+        self.assertFalse(disabled.auto_candidate_persistence_enabled)
+
+    def test_auto_candidate_persistence_dependencies_are_fixed(self):
+        common = {
+            "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": "true",
+            "MEMORY_AUTO_FORMATION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+        }
+        cases = (
+            (
+                {**common, "MEMORY_CORE_ENABLED": "false"},
+                "memory_auto_candidate_persistence_requires_core",
+            ),
+            (
+                {**common, "KELIVO_ENABLED": "false"},
+                "memory_auto_candidate_persistence_requires_kelivo",
+            ),
+            (
+                {**common, "MEMORY_AUTO_FORMATION_ENABLED": "false"},
+                "memory_auto_candidate_persistence_requires_auto_formation",
+            ),
+        )
+        for environ, category in cases:
+            with self.subTest(category=category), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                f"^{category}$",
+            ):
+                self.load(environ)
+
+    def test_auto_candidate_persistence_is_independent_of_explicit_and_sensitive(self):
+        config = self.load({
+            "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": "true",
+            "MEMORY_AUTO_FORMATION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+            "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+            "KELIVO_CLIENT_ID": "primary-kelivo",
+            "KELIVO_API_SESSION": "shared-test-session",
+            "KELIVO_MODEL_ALIAS": "ouou-home",
+            "LLM_MODEL": "test-provider-model",
+            "MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID,
+            "MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET,
+        })
+        self.assertTrue(config.auto_candidate_persistence_enabled)
+        self.assertTrue(config.auto_formation_enabled)
+        self.assertTrue(config.configuration_valid)
+        self.assertFalse(config.explicit_writes_enabled)
+        self.assertFalse(config.sensitive_storage_enabled)
+
+    def test_auto_candidate_persistence_invalid_fingerprint_profile_fails_closed(self):
+        common = {
+            "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": "true",
+            "MEMORY_AUTO_FORMATION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+            "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+            "KELIVO_CLIENT_ID": "primary-kelivo",
+            "KELIVO_API_SESSION": "shared-test-session",
+            "KELIVO_MODEL_ALIAS": "ouou-home",
+            "LLM_MODEL": "test-provider-model",
+        }
+        cases = (
+            (
+                {"MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET},
+                "memory_fingerprint_key_id_missing",
+            ),
+            (
+                {"MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID},
+                "memory_fingerprint_hmac_secret_missing",
+            ),
+            (
+                {
+                    "MEMORY_FINGERPRINT_KEY_ID": "unsafe/key",
+                    "MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET,
+                },
+                "memory_fingerprint_key_id_invalid",
+            ),
+        )
+        for values, category in cases:
+            with self.subTest(category=category):
+                config = self.load({**common, **values})
+                self.assertTrue(config.auto_candidate_persistence_enabled)
+                self.assertFalse(config.configuration_valid)
+                self.assertEqual(config.error_category, category)
+                self.assertFalse(config.explicit_writes_enabled)
 
     def test_context_injection_is_strict_and_requires_core_and_kelivo(self):
         with self.assertRaisesRegex(

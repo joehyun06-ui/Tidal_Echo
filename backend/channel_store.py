@@ -805,6 +805,142 @@ def _migration_008(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+MEMORY_CANDIDATE_PERSISTENCE_TABLE_DDL: dict[str, str] = {
+    "memory_candidate_sources": """CREATE TABLE memory_candidate_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            canonical_message_id INTEGER NOT NULL,
+            signal_type TEXT NOT NULL CHECK(signal_type IN
+                ('durable_preference','stable_profile','relationship_fact',
+                 'shared_episode','project_fact','project_decision','task_progress')),
+            span_start INTEGER NOT NULL
+                CHECK(typeof(span_start)='integer' AND span_start>=0),
+            span_end INTEGER NOT NULL
+                CHECK(typeof(span_end)='integer' AND span_end>span_start),
+            formation_contract_version TEXT NOT NULL
+                CHECK(length(formation_contract_version) BETWEEN 1 AND 128
+                      AND formation_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
+                      AND substr(formation_contract_version,1,1) GLOB '[A-Za-z0-9]'),
+            extractor_contract_version TEXT NOT NULL
+                CHECK(length(extractor_contract_version) BETWEEN 1 AND 128
+                      AND extractor_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
+                      AND substr(extractor_contract_version,1,1) GLOB '[A-Za-z0-9]'),
+            created_at TEXT NOT NULL,
+            UNIQUE(memory_id,canonical_message_id,signal_type,span_start,span_end,
+                   formation_contract_version,extractor_contract_version),
+            CHECK(
+                length(created_at) BETWEEN 25 AND 40
+                AND created_at NOT GLOB '*[^0-9T:+.-]*'
+                AND substr(created_at,5,1)='-'
+                AND substr(created_at,8,1)='-'
+                AND substr(created_at,11,1)='T'
+                AND substr(created_at,14,1)=':'
+                AND substr(created_at,17,1)=':'
+                AND substr(created_at,-6)='+00:00'
+            ),
+            FOREIGN KEY(memory_id)
+                REFERENCES memory_items(id) ON DELETE RESTRICT,
+            FOREIGN KEY(canonical_message_id)
+                REFERENCES messages(id) ON DELETE RESTRICT)""",
+    "memory_auto_formation_runs": """CREATE TABLE memory_auto_formation_runs (
+            canonical_message_id INTEGER PRIMARY KEY,
+            proposal_digest TEXT NOT NULL
+                CHECK(length(proposal_digest)=64
+                      AND proposal_digest NOT GLOB '*[^0-9a-f]*'),
+            proposal_count INTEGER NOT NULL
+                CHECK(typeof(proposal_count)='integer'
+                      AND proposal_count BETWEEN 0 AND 3),
+            candidate_count INTEGER NOT NULL
+                CHECK(typeof(candidate_count)='integer'
+                      AND candidate_count BETWEEN 0 AND 3),
+            created_count INTEGER NOT NULL
+                CHECK(typeof(created_count)='integer'
+                      AND created_count BETWEEN 0 AND 3),
+            existing_candidate_count INTEGER NOT NULL
+                CHECK(typeof(existing_candidate_count)='integer'
+                      AND existing_candidate_count BETWEEN 0 AND 3),
+            active_duplicate_count INTEGER NOT NULL
+                CHECK(typeof(active_duplicate_count)='integer'
+                      AND active_duplicate_count BETWEEN 0 AND 3),
+            suppressed_count INTEGER NOT NULL
+                CHECK(typeof(suppressed_count)='integer'
+                      AND suppressed_count BETWEEN 0 AND 3),
+            formation_contract_version TEXT NOT NULL
+                CHECK(length(formation_contract_version) BETWEEN 1 AND 128
+                      AND formation_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
+                      AND substr(formation_contract_version,1,1) GLOB '[A-Za-z0-9]'),
+            extractor_contract_version TEXT NOT NULL
+                CHECK(length(extractor_contract_version) BETWEEN 1 AND 128
+                      AND extractor_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
+                      AND substr(extractor_contract_version,1,1) GLOB '[A-Za-z0-9]'),
+            created_at TEXT NOT NULL,
+            CHECK(candidate_count<=proposal_count),
+            CHECK(
+                created_count+existing_candidate_count+active_duplicate_count
+                +suppressed_count=candidate_count
+            ),
+            CHECK(
+                length(created_at) BETWEEN 25 AND 40
+                AND created_at NOT GLOB '*[^0-9T:+.-]*'
+                AND substr(created_at,5,1)='-'
+                AND substr(created_at,8,1)='-'
+                AND substr(created_at,11,1)='T'
+                AND substr(created_at,14,1)=':'
+                AND substr(created_at,17,1)=':'
+                AND substr(created_at,-6)='+00:00'
+            ),
+            FOREIGN KEY(canonical_message_id)
+                REFERENCES messages(id) ON DELETE RESTRICT)""",
+}
+
+MEMORY_CANDIDATE_PERSISTENCE_INDEX_DDL: dict[str, str] = {
+    "idx_memory_candidate_sources_memory":
+        "CREATE INDEX idx_memory_candidate_sources_memory "
+        "ON memory_candidate_sources(memory_id,id)",
+    "idx_memory_candidate_sources_canonical":
+        "CREATE INDEX idx_memory_candidate_sources_canonical "
+        "ON memory_candidate_sources(canonical_message_id,id)",
+}
+
+MEMORY_CANDIDATE_PERSISTENCE_TRIGGER_DDL: dict[str, str] = {
+    "memory_candidate_sources_immutable_update":
+        """CREATE TRIGGER memory_candidate_sources_immutable_update
+           BEFORE UPDATE ON memory_candidate_sources
+           BEGIN
+             SELECT RAISE(ABORT,'memory_candidate_source_immutable');
+           END""",
+    "memory_candidate_sources_immutable_delete":
+        """CREATE TRIGGER memory_candidate_sources_immutable_delete
+           BEFORE DELETE ON memory_candidate_sources
+           BEGIN
+             SELECT RAISE(ABORT,'memory_candidate_source_immutable');
+           END""",
+    "memory_auto_formation_runs_immutable_update":
+        """CREATE TRIGGER memory_auto_formation_runs_immutable_update
+           BEFORE UPDATE ON memory_auto_formation_runs
+           BEGIN
+             SELECT RAISE(ABORT,'memory_auto_formation_run_immutable');
+           END""",
+    "memory_auto_formation_runs_immutable_delete":
+        """CREATE TRIGGER memory_auto_formation_runs_immutable_delete
+           BEFORE DELETE ON memory_auto_formation_runs
+           BEGIN
+             SELECT RAISE(ABORT,'memory_auto_formation_run_immutable');
+           END""",
+}
+
+
+def _migration_009(conn: sqlite3.Connection) -> None:
+    """Add candidate-only automatic provenance and exactly-once ledgers."""
+    validate_memory_action_schema(conn)
+    for statement in (
+        *MEMORY_CANDIDATE_PERSISTENCE_TABLE_DDL.values(),
+        *MEMORY_CANDIDATE_PERSISTENCE_INDEX_DDL.values(),
+        *MEMORY_CANDIDATE_PERSISTENCE_TRIGGER_DDL.values(),
+    ):
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -1992,6 +2128,249 @@ def validate_memory_action_schema(conn: sqlite3.Connection) -> None:
             )
 
 
+def validate_memory_candidate_persistence_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject a v9 marker unless both additive candidate ledgers are exact."""
+    validate_memory_action_schema(conn)
+    marker = conn.execute(
+        """SELECT name,status FROM schema_migrations
+           WHERE version=9"""
+    ).fetchone()
+    if (
+        marker is None
+        or marker["name"]
+        != "automatic_memory_candidate_persistence_foundation"
+        or marker["status"] != "applied"
+    ):
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate persistence migration marker"
+        )
+
+    expected_columns = {
+        "memory_candidate_sources": {
+            "id": ("INTEGER", 0, None, 1),
+            "memory_id": ("INTEGER", 1, None, 0),
+            "canonical_message_id": ("INTEGER", 1, None, 0),
+            "signal_type": ("TEXT", 1, None, 0),
+            "span_start": ("INTEGER", 1, None, 0),
+            "span_end": ("INTEGER", 1, None, 0),
+            "formation_contract_version": ("TEXT", 1, None, 0),
+            "extractor_contract_version": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+        "memory_auto_formation_runs": {
+            "canonical_message_id": ("INTEGER", 0, None, 1),
+            "proposal_digest": ("TEXT", 1, None, 0),
+            "proposal_count": ("INTEGER", 1, None, 0),
+            "candidate_count": ("INTEGER", 1, None, 0),
+            "created_count": ("INTEGER", 1, None, 0),
+            "existing_candidate_count": ("INTEGER", 1, None, 0),
+            "active_duplicate_count": ("INTEGER", 1, None, 0),
+            "suppressed_count": ("INTEGER", 1, None, 0),
+            "formation_contract_version": ("TEXT", 1, None, 0),
+            "extractor_contract_version": ("TEXT", 1, None, 0),
+            "created_at": ("TEXT", 1, None, 0),
+        },
+    }
+    for table, expected in expected_columns.items():
+        rows = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
+        if any(int(row["hidden"]) != 0 for row in rows):
+            raise sqlite3.DatabaseError(
+                f"invalid hidden memory candidate persistence column: {table}"
+            )
+        actual = {
+            row["name"]: (
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in rows
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(
+                f"invalid memory candidate persistence columns: {table}"
+            )
+
+    expected_indexes = {
+        "memory_candidate_sources": {
+            "sqlite_autoindex_memory_candidate_sources_1": (
+                True,
+                "u",
+                False,
+                (
+                    "memory_id",
+                    "canonical_message_id",
+                    "signal_type",
+                    "span_start",
+                    "span_end",
+                    "formation_contract_version",
+                    "extractor_contract_version",
+                ),
+            ),
+            "idx_memory_candidate_sources_memory": (
+                False, "c", False, ("memory_id", "id"),
+            ),
+            "idx_memory_candidate_sources_canonical": (
+                False, "c", False, ("canonical_message_id", "id"),
+            ),
+        },
+        "memory_auto_formation_runs": {},
+    }
+    for table, expected in expected_indexes.items():
+        actual_rows = {
+            row["name"]: row
+            for row in conn.execute(f"PRAGMA index_list({table})")
+        }
+        if set(actual_rows) != set(expected):
+            raise sqlite3.DatabaseError(
+                f"invalid memory candidate persistence index set: {table}"
+            )
+        for name, (unique, origin, partial, columns) in expected.items():
+            row = actual_rows[name]
+            if (
+                bool(row["unique"]),
+                row["origin"],
+                bool(row["partial"]),
+            ) != (unique, origin, partial):
+                raise sqlite3.DatabaseError(
+                    "invalid memory candidate persistence index attributes"
+                )
+            try:
+                _validate_index_xinfo(conn, name, columns)
+            except sqlite3.DatabaseError:
+                raise sqlite3.DatabaseError(
+                    "invalid memory candidate persistence index columns"
+                ) from None
+
+    expected_fks = {
+        "memory_candidate_sources": {
+            (
+                "memory_id", "memory_items", "id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+            (
+                "canonical_message_id", "messages", "id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+        },
+        "memory_auto_formation_runs": {
+            (
+                "canonical_message_id", "messages", "id",
+                "NO ACTION", "RESTRICT", "NONE",
+            ),
+        },
+    }
+    for table, expected in expected_fks.items():
+        actual = {
+            (
+                row["from"], row["table"], row["to"], row["on_update"],
+                row["on_delete"], row["match"],
+            )
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual != expected:
+            raise sqlite3.DatabaseError(
+                f"invalid memory candidate persistence foreign key: {table}"
+            )
+
+    for table, expected_sql in (
+        MEMORY_CANDIDATE_PERSISTENCE_TABLE_DDL.items()
+    ):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if (
+            row is None
+            or _sql_fingerprint(str(row["sql"]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError(
+                f"invalid memory candidate persistence table fingerprint: {table}"
+            )
+    for name, expected_sql in (
+        MEMORY_CANDIDATE_PERSISTENCE_INDEX_DDL.items()
+    ):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if (
+            row is None
+            or _sql_fingerprint(str(row["sql"]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError(
+                "invalid memory candidate persistence index fingerprint"
+            )
+
+    expected_triggers = {
+        "memory_candidate_sources": {
+            "memory_candidate_sources_immutable_update",
+            "memory_candidate_sources_immutable_delete",
+        },
+        "memory_auto_formation_runs": {
+            "memory_auto_formation_runs_immutable_update",
+            "memory_auto_formation_runs_immutable_delete",
+        },
+    }
+    for table, expected in expected_triggers.items():
+        actual = {
+            row["name"]: row["sql"]
+            for row in conn.execute(
+                """SELECT name,sql FROM sqlite_master
+                   WHERE type='trigger' AND tbl_name=?""",
+                (table,),
+            )
+        }
+        if set(actual) != expected:
+            raise sqlite3.DatabaseError(
+                f"invalid memory candidate persistence trigger set: {table}"
+            )
+        for name in expected:
+            if (
+                _sql_fingerprint(str(actual[name]))
+                != _sql_fingerprint(
+                    MEMORY_CANDIDATE_PERSISTENCE_TRIGGER_DDL[name]
+                )
+            ):
+                raise sqlite3.DatabaseError(
+                    "invalid memory candidate persistence trigger fingerprint"
+                )
+
+    actual_objects = {
+        (row["type"], row["name"])
+        for row in conn.execute(
+            """SELECT type,name FROM sqlite_master
+               WHERE (name LIKE 'memory_candidate_%'
+                      OR name LIKE 'memory_auto_formation_%'
+                      OR name LIKE 'idx_memory_candidate_%'
+                      OR name LIKE 'idx_memory_auto_formation_%'
+                      OR tbl_name IN (
+                          'memory_candidate_sources',
+                          'memory_auto_formation_runs'
+                      ))
+                 AND name NOT LIKE 'sqlite_autoindex_%'"""
+        )
+    }
+    expected_objects = {
+        ("table", "memory_candidate_sources"),
+        ("table", "memory_auto_formation_runs"),
+        ("index", "idx_memory_candidate_sources_memory"),
+        ("index", "idx_memory_candidate_sources_canonical"),
+        ("trigger", "memory_candidate_sources_immutable_update"),
+        ("trigger", "memory_candidate_sources_immutable_delete"),
+        ("trigger", "memory_auto_formation_runs_immutable_update"),
+        ("trigger", "memory_auto_formation_runs_immutable_delete"),
+    }
+    if actual_objects != expected_objects:
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate persistence object set"
+        )
+
+
 def _ddl_object_name(sql: str, object_type: str) -> str:
     tokens = _sql_fingerprint(sql)
     if (
@@ -2026,6 +2405,7 @@ def _validate_memory_operator_main_schema_objects(
         *HEARTBEAT_HARDENING_TABLE_DDL,
         *MEMORY_TABLE_DDL,
         _ddl_object_name(MEMORY_ACTION_REQUEST_TABLE_DDL, "table"),
+        *MEMORY_CANDIDATE_PERSISTENCE_TABLE_DDL,
     }
     index_names = {
         *CORE_V1_INDEX_DDL,
@@ -2035,10 +2415,12 @@ def _validate_memory_operator_main_schema_objects(
         *HEARTBEAT_HARDENING_INDEX_DDL,
         *MEMORY_INDEX_DDL,
         *MEMORY_ACTION_REQUEST_INDEX_DDL,
+        *MEMORY_CANDIDATE_PERSISTENCE_INDEX_DDL,
     }
     trigger_names = {
         *MEMORY_TRIGGER_DDL,
         *MEMORY_ACTION_REQUEST_TRIGGER_DDL,
+        *MEMORY_CANDIDATE_PERSISTENCE_TRIGGER_DDL,
     }
     expected = {
         *(("table", name) for name in table_names),
@@ -2057,7 +2439,7 @@ def _validate_memory_operator_main_schema_objects(
         raise sqlite3.DatabaseError("memory_operator_schema_invalid")
 
 
-def validate_memory_operator_schema_v1_v8(
+def validate_memory_operator_schema_v1_v9(
     conn: sqlite3.Connection,
 ) -> None:
     """Validate the exact supported operator schema using data-free failures."""
@@ -2091,6 +2473,17 @@ def validate_memory_operator_schema_v1_v8(
         ):
             raise sqlite3.DatabaseError("memory_operator_schema_invalid")
         validate_memory_action_schema(conn)
+        if (
+            len(actual_markers) < 9
+            or actual_markers[8]
+            != (
+                9,
+                "automatic_memory_candidate_persistence_foundation",
+                "applied",
+            )
+        ):
+            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+        validate_memory_candidate_persistence_schema(conn)
         if actual_markers != expected_markers:
             raise sqlite3.DatabaseError("memory_operator_schema_invalid")
         _validate_memory_operator_main_schema_objects(conn)
@@ -2109,6 +2502,11 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
     (6, "dylan_heartbeat_hardening", _migration_006),
     (7, "explicit_memory_core_foundation", _migration_007),
     (8, "explicit_memory_action_request_ledger", _migration_008),
+    (
+        9,
+        "automatic_memory_candidate_persistence_foundation",
+        _migration_009,
+    ),
 )
 CORE_MIGRATIONS = MIGRATIONS[:6]
 
@@ -2145,6 +2543,8 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 validate_memory_schema(conn)
             if requested_latest >= 8:
                 validate_memory_action_schema(conn)
+            if requested_latest >= 9:
+                validate_memory_candidate_persistence_schema(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

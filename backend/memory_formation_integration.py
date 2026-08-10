@@ -11,7 +11,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Final
 
-from backend.memory_formation import MemoryFormationError, build_auto_memory_candidates
+from backend.memory_formation import (
+    AutoMemoryProposalV1,
+    MemoryFormationError,
+    build_auto_memory_candidates,
+)
 from backend.memory_formation_extractor import (
     AutoMemoryExtractionV1,
     MemoryFormationExtractorError,
@@ -43,6 +47,10 @@ class MemoryFormationShadowResult:
 
 
 ExtractorCallable = Callable[[str], Awaitable[AutoMemoryExtractionV1]]
+AcceptedProposalsCallable = Callable[
+    [int, str, tuple[AutoMemoryProposalV1, ...]],
+    Awaitable[None],
+]
 
 
 def _result(
@@ -68,6 +76,7 @@ async def run_memory_formation_shadow(
     extractor_callable: ExtractorCallable,
     *,
     max_item_chars: object,
+    accepted_proposals_callable: AcceptedProposalsCallable | None = None,
 ) -> MemoryFormationShadowResult:
     """Run extractor and Phase 4A formation without retaining candidates."""
 
@@ -109,6 +118,17 @@ async def run_memory_formation_shadow(
         return _result("failed", category, proposal_count)
     candidate_count = len(candidates)
     del candidates
+    if accepted_proposals_callable is not None:
+        try:
+            await accepted_proposals_callable(
+                source_message_id,
+                source_text,
+                proposals,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
     if proposal_count == 0:
         return _result("completed", "no_proposals")
     return _result("completed", "completed", proposal_count, candidate_count)

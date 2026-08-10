@@ -112,7 +112,7 @@ def _preflight_operator_memory(
             database,
             timeout_seconds=deployment.sqlite_busy_timeout_seconds,
         ) as conn:
-            channel_store.validate_memory_operator_schema_v1_v8(conn)
+            channel_store.validate_memory_operator_schema_v1_v9(conn)
             expected_profile = (
                 memory_runtime.memory_fingerprint_profile_from_config(config)
             )

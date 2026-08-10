@@ -6,8 +6,9 @@ import re
 from typing import Sequence
 
 try:
-    from . import memory_policy, memory_runtime, memory_store
+    from . import memory_formation, memory_policy, memory_runtime, memory_store
 except ImportError:  # support direct module execution in local tooling
+    import memory_formation
     import memory_policy
     import memory_runtime
     import memory_store
@@ -38,6 +39,7 @@ class MemoryReadService:
         configuration_valid: bool,
         error_category: str,
         explicit_writes_enabled: bool,
+        auto_candidate_persistence_enabled: bool,
         policy: memory_policy.MemoryPolicy,
     ):
         self._reader = reader
@@ -45,6 +47,9 @@ class MemoryReadService:
         self._configuration_valid = bool(configuration_valid)
         self._error_category = str(error_category)
         self._explicit_writes_enabled = bool(explicit_writes_enabled)
+        self._auto_candidate_persistence_enabled = bool(
+            auto_candidate_persistence_enabled
+        )
         self._policy = policy
 
     @staticmethod
@@ -72,7 +77,10 @@ class MemoryReadService:
             return False, self._error_category or "memory_configuration_invalid"
         if not self._reader.validate_schema():
             return False, "memory_schema_invalid"
-        if self._explicit_writes_enabled:
+        if (
+            self._explicit_writes_enabled
+            or self._auto_candidate_persistence_enabled
+        ):
             try:
                 if not self._reader.validate_runtime_profile_state():
                     return False, "memory_fingerprint_profile_mismatch"
@@ -184,6 +192,42 @@ class _PrivilegedServiceBase:
             raise MemoryServiceError("feature_disabled")
         if not policy.configuration_valid:
             raise MemoryServiceError("memory_configuration_invalid")
+
+
+class AutomaticCandidatePersistence(_PrivilegedServiceBase):
+    """Internal automatic-only persistence boundary retained by the runtime."""
+
+    def persist(
+        self,
+        *,
+        canonical_message_id: int,
+        source_text: str,
+        proposals: list[memory_formation.AutoMemoryProposalV1]
+        | tuple[memory_formation.AutoMemoryProposalV1, ...],
+        formation_contract_version: str,
+        extractor_contract_version: str,
+    ) -> memory_store.AutoCandidatePersistenceResult:
+        self._require_enabled()
+        try:
+            policy = memory_runtime.require_runtime_authority(self._authority)
+            if not policy.auto_candidate_persistence_enabled:
+                raise MemoryServiceError(
+                    "auto_candidate_persistence_disabled"
+                )
+            return self._store.persist_auto_memory_candidates(
+                canonical_message_id=canonical_message_id,
+                source_text=source_text,
+                proposals=proposals,
+                formation_contract_version=formation_contract_version,
+                extractor_contract_version=extractor_contract_version,
+            )
+        except MemoryServiceError:
+            raise
+        except (
+            memory_runtime.MemoryRuntimeError,
+            memory_store.MemoryStoreError,
+        ) as error:
+            raise self._translate_error(error) from None
 
 
 class PrivilegedMemoryActions(_PrivilegedServiceBase):

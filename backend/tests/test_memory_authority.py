@@ -19,6 +19,7 @@ from backend import (
     deployment_config,
     memory_policy,
     memory_runtime,
+    memory_service,
     memory_store,
 )
 from backend.tests._support import NoNetworkMixin
@@ -38,6 +39,7 @@ def config(
     *,
     enabled: bool = True,
     writes: bool = True,
+    auto_candidate_persistence: bool = False,
     sensitive: bool = False,
     secret: str = TEST_SECRET,
     key_id: str = "authority-test-key",
@@ -47,6 +49,7 @@ def config(
         context_injection_enabled=False,
         smart_retrieval_enabled=False,
         explicit_writes_enabled=writes,
+        auto_candidate_persistence_enabled=auto_candidate_persistence,
         sensitive_storage_enabled=sensitive,
         max_item_chars=1000,
         forget_retention_policy="tombstone_without_content",
@@ -58,11 +61,12 @@ def config(
 
 
 def bootstrap(path: str, runtime_config: deployment_config.MemoryConfig):
-    global channel_store, memory_policy, memory_runtime, memory_store
+    global channel_store, memory_policy, memory_runtime, memory_service, memory_store
     memory_runtime = importlib.import_module("backend.memory_runtime")
     memory_runtime = importlib.reload(memory_runtime)
     channel_store = importlib.import_module("backend.channel_store")
     memory_policy = importlib.import_module("backend.memory_policy")
+    memory_service = importlib.import_module("backend.memory_service")
     memory_store = importlib.import_module("backend.memory_store")
     deployment = dataclasses.replace(
         deployment_config.load_deployment_config(
@@ -255,6 +259,51 @@ class MemoryAuthorityTests(NoNetworkMixin, unittest.TestCase):
                 memory_store.MemoryStoreError, "runtime_authority_invalid",
             ):
                 memory_store.MemoryStore(self.path, fake)
+        self.assert_zero_state()
+
+    def test_runtime_policy_keeps_candidate_and_explicit_authorities_independent(self):
+        candidate_only = memory_runtime._policy_from_config(config(
+            writes=False,
+            auto_candidate_persistence=True,
+        ))
+        explicit_only = memory_runtime._policy_from_config(config(
+            writes=True,
+            auto_candidate_persistence=False,
+        ))
+        self.assertTrue(candidate_only.auto_candidate_persistence_enabled)
+        self.assertFalse(candidate_only.explicit_writes_enabled)
+        self.assertFalse(explicit_only.auto_candidate_persistence_enabled)
+        self.assertTrue(explicit_only.explicit_writes_enabled)
+
+    def test_candidate_authority_cannot_borrow_explicit_action_write_path(self):
+        candidate_runtime = bootstrap(
+            self.path,
+            config(
+                writes=False,
+                auto_candidate_persistence=True,
+            ),
+        )
+        authority = candidate_runtime.privileged_actions._authority
+        policy = memory_runtime.require_runtime_authority(authority)
+        self.assertTrue(policy.auto_candidate_persistence_enabled)
+        self.assertFalse(policy.explicit_writes_enabled)
+        self.assertFalse(
+            any("candidate" in value for value in memory_runtime.ACTION_TYPES)
+        )
+
+        message_id = self.message()
+        with self.assertRaisesRegex(
+            memory_service.MemoryServiceError,
+            "^explicit_writes_disabled$",
+        ):
+            candidate_runtime.privileged_actions.remember_explicit_user_message(
+                kind="project",
+                scope_type="global_user",
+                scope_ref="",
+                content="Synthetic automatic candidate must not use explicit writes",
+                sensitivity="normal",
+                canonical_message_id=message_id,
+            )
         self.assert_zero_state()
 
     def test_environment_mutation_cannot_enable_frozen_disabled_runtime(self):

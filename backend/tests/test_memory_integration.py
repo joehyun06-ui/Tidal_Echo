@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import tempfile
 import unittest
@@ -27,6 +28,8 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
 
     def _assert_no_entry_writer(self, module):
         self.assertIsNone(module.MEMORY_EXPLICIT_ENTRY_SERVICES)
+        self.assertIsNone(module.MEMORY_PRIVILEGED_RUNTIME)
+        self.assertIsNone(module.MEMORY_CANDIDATE_PERSISTENCE)
         self.assertIsNone(module.memory_runtime._PROCESS_AUTHORITY)
         self.assertFalse(hasattr(module.app.state, "memory_runtime"))
         self.assertFalse(hasattr(module.app.state, "privileged_memory_actions"))
@@ -46,6 +49,10 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ready"])
         self.assertFalse(response.json()["checks"]["memory_core"])
+        self.assertNotIn(
+            "memory_auto_candidate_persistence",
+            response.json()["checks"],
+        )
         self.assertFalse(module.DEPLOYMENT.memory.enabled)
         self.assertFalse(module.DEPLOYMENT.heartbeat.enabled)
         self.assertNotIn("errors", response.json())
@@ -78,6 +85,11 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["checks"]["memory_core"])
         self.assertTrue(module.DEPLOYMENT.memory.configuration_valid)
+        self.assertNotIn(
+            "memory_auto_candidate_persistence",
+            response.json()["checks"],
+        )
+        self._assert_no_entry_writer(module)
 
     async def test_enabled_writes_with_valid_hmac_is_ready(self):
         with tempfile.TemporaryDirectory() as root:
@@ -228,6 +240,7 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["checks"]["memory_core"])
         self.assertTrue(payload["checks"]["memory_explicit_entry"])
+        self.assertNotIn("memory_auto_candidate_persistence", payload["checks"])
         services = module.MEMORY_EXPLICIT_ENTRY_SERVICES
         self.assertIsInstance(services, tuple)
         self.assertEqual(
@@ -239,11 +252,159 @@ class MemoryIntegrationTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             is module.memory_explicit_actions.ExplicitMemoryActionService
             for service in services
         ))
+        runtime = module.MEMORY_PRIVILEGED_RUNTIME
+        self.assertIsNotNone(runtime)
+        self.assertIsNone(module.MEMORY_CANDIDATE_PERSISTENCE)
+        policy = module.memory_runtime.require_runtime_authority(
+            runtime.privileged_actions._authority
+        )
+        self.assertTrue(policy.explicit_writes_enabled)
+        self.assertFalse(policy.auto_candidate_persistence_enabled)
         self.assertFalse(hasattr(module.app.state, "memory_runtime"))
         self.assertFalse(hasattr(module.app.state, "privileged_memory_actions"))
         self.assertFalse(any(
             "memory" in route.path.lower() for route in module.app.routes
         ))
+
+    async def test_candidate_only_bootstraps_shared_runtime_without_explicit_entry(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                kelivo=True,
+                memory=True,
+                memory_secret=TEST_HMAC_SECRET,
+                memory_auto_formation=True,
+                memory_candidate_persistence=True,
+            )
+            response = await self._ready(module)
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["checks"]["memory_core"])
+        self.assertTrue(
+            payload["checks"]["memory_auto_candidate_persistence"]
+        )
+        self.assertNotIn("memory_explicit_entry", payload["checks"])
+        runtime = module.MEMORY_PRIVILEGED_RUNTIME
+        persistence = module.MEMORY_CANDIDATE_PERSISTENCE
+        self.assertIsNotNone(runtime)
+        self.assertIs(persistence, runtime.candidate_persistence)
+        self.assertIsNone(module.MEMORY_EXPLICIT_ENTRY_SERVICES)
+        self.assertIs(persistence._store, runtime.privileged_actions._store)
+        self.assertIs(persistence._authority, runtime.privileged_actions._authority)
+        policy = module.memory_runtime.require_runtime_authority(
+            persistence._authority
+        )
+        self.assertFalse(policy.explicit_writes_enabled)
+        self.assertTrue(policy.auto_candidate_persistence_enabled)
+
+    async def test_explicit_and_candidate_share_one_runtime_and_bootstrap_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                kelivo=True,
+                memory=True,
+                memory_writes=True,
+                memory_secret=TEST_HMAC_SECRET,
+                memory_entry=True,
+                memory_auto_formation=True,
+                memory_candidate_persistence=True,
+            )
+            with mock.patch.object(
+                module.memory_runtime,
+                "bootstrap_memory_runtime_from_environment",
+                side_effect=AssertionError("runtime bootstrap repeated"),
+            ) as bootstrap:
+                module.init_db()
+            response = await self._ready(module)
+        bootstrap.assert_not_called()
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["checks"]["memory_explicit_entry"])
+        self.assertTrue(
+            payload["checks"]["memory_auto_candidate_persistence"]
+        )
+        runtime = module.MEMORY_PRIVILEGED_RUNTIME
+        persistence = module.MEMORY_CANDIDATE_PERSISTENCE
+        services = module.MEMORY_EXPLICIT_ENTRY_SERVICES
+        self.assertIs(persistence, runtime.candidate_persistence)
+        self.assertTrue(all(
+            service._backend._store is persistence._store
+            for service in services
+        ))
+        self.assertTrue(all(
+            service._backend._actions._authority is persistence._authority
+            for service in services
+        ))
+        policy = module.memory_runtime.require_runtime_authority(
+            persistence._authority
+        )
+        self.assertTrue(policy.explicit_writes_enabled)
+        self.assertTrue(policy.auto_candidate_persistence_enabled)
+
+    async def test_candidate_bootstrap_failure_is_fail_closed_and_readyz_gates(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                kelivo=True,
+                memory=True,
+                memory_secret=TEST_HMAC_SECRET,
+                memory_auto_formation=True,
+            )
+            module.DEPLOYMENT = dataclasses.replace(
+                module.DEPLOYMENT,
+                memory=dataclasses.replace(
+                    module.DEPLOYMENT.memory,
+                    auto_candidate_persistence_enabled=True,
+                ),
+            )
+            with mock.patch.object(
+                module.memory_runtime,
+                "bootstrap_memory_runtime_from_environment",
+                side_effect=module.memory_runtime.MemoryRuntimeError(
+                    "memory_schema_invalid"
+                ),
+            ):
+                module._compose_memory_privileged_runtime()
+            response = await self._ready(module)
+        payload = response.json()
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(payload["ready"])
+        self.assertTrue(payload["checks"]["memory_core"])
+        self.assertFalse(
+            payload["checks"]["memory_auto_candidate_persistence"]
+        )
+        self.assertEqual(
+            payload["errors"]["memory_auto_candidate_persistence"],
+            "memory_schema_invalid",
+        )
+        self.assertIsNone(module.MEMORY_PRIVILEGED_RUNTIME)
+        self.assertIsNone(module.MEMORY_CANDIDATE_PERSISTENCE)
+        self.assertIsNone(module.memory_runtime._PROCESS_AUTHORITY)
+
+    async def test_candidate_enabled_missing_handle_fails_readiness_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = load_app(
+                root,
+                kelivo=True,
+                memory=True,
+                memory_secret=TEST_HMAC_SECRET,
+                memory_auto_formation=True,
+                memory_candidate_persistence=True,
+            )
+            module.MEMORY_CANDIDATE_PERSISTENCE = None
+            module.MEMORY_CANDIDATE_PERSISTENCE_ERROR = (
+                "memory_auto_candidate_persistence_unavailable"
+            )
+            response = await self._ready(module)
+        payload = response.json()
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(
+            payload["checks"]["memory_auto_candidate_persistence"]
+        )
+        self.assertEqual(
+            payload["errors"]["memory_auto_candidate_persistence"],
+            "memory_auto_candidate_persistence_unavailable",
+        )
 
     async def test_enabled_writes_missing_hmac_fail_closed_in_readiness(self):
         with tempfile.TemporaryDirectory() as root:

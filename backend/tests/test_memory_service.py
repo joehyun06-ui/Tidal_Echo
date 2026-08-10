@@ -1111,6 +1111,67 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             [],
         )
 
+    def test_real_active_retrieval_excludes_candidate_plaintext_and_key(self):
+        stamp = channel_store.now_iso()
+        active_key = "R" * 32
+        candidate_key = "Q" * 32
+        active_plaintext = "Synthetic active retrieval control"
+        candidate_plaintext = "PRIVATE candidate retrieval exclusion sentinel"
+        with channel_store.connect(self.path) as conn:
+            for key, content, fingerprint, status, explicitness, confidence in (
+                (
+                    active_key,
+                    active_plaintext,
+                    b"r" * 32,
+                    "active",
+                    "explicit",
+                    1.0,
+                ),
+                (
+                    candidate_key,
+                    candidate_plaintext,
+                    b"q" * 32,
+                    "candidate",
+                    "inferred",
+                    0.0,
+                ),
+            ):
+                conn.execute(
+                    """INSERT INTO memory_items
+                       (memory_key,kind,scope_type,scope_ref,normalized_content,
+                        normalized_fingerprint,fingerprint_version,status,
+                        explicitness,confidence,sensitivity,first_observed_at,
+                        last_confirmed_at,superseded_by_id,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,1,?,?,?,'normal',?,?,NULL,?,?)""",
+                    (
+                        key,
+                        "project",
+                        "global_user",
+                        "",
+                        content,
+                        fingerprint,
+                        status,
+                        explicitness,
+                        confidence,
+                        stamp,
+                        stamp,
+                        stamp,
+                        stamp,
+                    ),
+                )
+
+        result = self.service.get_active_memories(
+            scope_type="global_user",
+            scope_ref="",
+            kinds=("project",),
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["memory_key"], active_key)
+        self.assertEqual(result[0]["normalized_content"], active_plaintext)
+        serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn(candidate_key, serialized)
+        self.assertNotIn(candidate_plaintext, serialized)
+
     def test_sensitive_items_are_never_returned_by_phase1_retrieval(self):
         service = self.service_for(memory_config(sensitive=True))
         message_id = self.message()
