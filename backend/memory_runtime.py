@@ -52,6 +52,7 @@ class MemoryRuntimeError(RuntimeError):
 class MemoryRuntimePolicy:
     enabled: bool
     explicit_writes_enabled: bool
+    auto_candidate_persistence_enabled: bool
     sensitive_storage_enabled: bool
     max_item_chars: int
     forget_retention_policy: str
@@ -120,6 +121,7 @@ class _RuntimeAuthority:
 class MemoryRuntime:
     read_service: object = field(repr=False)
     privileged_actions: object = field(repr=False)
+    candidate_persistence: object = field(repr=False)
 
 
 _AUTHORITY_CONSTRUCTOR_TOKEN = object()
@@ -133,6 +135,9 @@ def _policy_from_config(config: deployment_config.MemoryConfig) -> MemoryRuntime
     return MemoryRuntimePolicy(
         enabled=config.enabled,
         explicit_writes_enabled=config.explicit_writes_enabled,
+        auto_candidate_persistence_enabled=(
+            config.auto_candidate_persistence_enabled
+        ),
         sensitive_storage_enabled=config.sensitive_storage_enabled,
         max_item_chars=config.max_item_chars,
         forget_retention_policy=config.forget_retention_policy,
@@ -376,7 +381,10 @@ def _bootstrap_memory_read_service(deployment):
         sensitive_storage_enabled=config.sensitive_storage_enabled,
     )
     expected_profile = None
-    if config.explicit_writes_enabled and config.configuration_valid:
+    if (
+        config.explicit_writes_enabled
+        or config.auto_candidate_persistence_enabled
+    ) and config.configuration_valid:
         expected_profile = memory_fingerprint_profile_from_config(
             config
         )
@@ -395,6 +403,9 @@ def _bootstrap_memory_read_service(deployment):
         configuration_valid=config.configuration_valid,
         error_category=config.error_category,
         explicit_writes_enabled=config.explicit_writes_enabled,
+        auto_candidate_persistence_enabled=(
+            config.auto_candidate_persistence_enabled
+        ),
         policy=policy,
     )
 
@@ -440,7 +451,11 @@ def _bootstrap_memory_runtime_scope(deployment):
             store = memory_store.MemoryStore(path, authority)
             expected_profile = (
                 memory_fingerprint_profile_from_config(deployment.memory)
-                if policy.explicit_writes_enabled and policy.configuration_valid
+                if (
+                    policy.explicit_writes_enabled
+                    or policy.auto_candidate_persistence_enabled
+                )
+                and policy.configuration_valid
                 else None
             )
             reader = memory_store.MemoryReader(
@@ -453,12 +468,19 @@ def _bootstrap_memory_runtime_scope(deployment):
                 configuration_valid=policy.configuration_valid,
                 error_category=policy.error_category,
                 explicit_writes_enabled=policy.explicit_writes_enabled,
+                auto_candidate_persistence_enabled=(
+                    policy.auto_candidate_persistence_enabled
+                ),
                 policy=store.policy,
             )
             privileged_actions = memory_service.PrivilegedMemoryActions(store, authority)
+            candidate_persistence = (
+                memory_service.AutomaticCandidatePersistence(store, authority)
+            )
             runtime = MemoryRuntime(
                 read_service=read_service,
                 privileged_actions=privileged_actions,
+                candidate_persistence=candidate_persistence,
             )
             yield runtime
             if (

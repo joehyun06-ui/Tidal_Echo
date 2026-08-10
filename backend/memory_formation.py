@@ -22,6 +22,7 @@ MAX_PROPOSALS: Final = 3
 SOURCE_MAX_CHARS: Final = 8000
 DEFAULT_MAX_ITEM_CHARS: Final = 1000
 TOTAL_CANDIDATE_MAX_CHARS: Final = 2000
+FORMATION_CONTRACT_VERSION: Final = "memory-formation-v1"
 
 SCOPE_TYPE: Final = "global_user"
 SCOPE_REF: Final = ""

@@ -10,7 +10,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from backend import memory_formation_integration as integration
-from backend.memory_formation import AutoMemoryProposalV1
+from backend.memory_formation import (
+    FORMATION_CONTRACT_VERSION,
+    AutoMemoryProposalV1,
+)
 from backend.memory_formation_extractor import (
     EXTRACTOR_CONTRACT_VERSION,
     EXTRACTOR_SESSION_ID,
@@ -21,6 +24,7 @@ from backend.tests._support import NoNetworkMixin, load_app, request
 
 
 KELIVO_KEY = "test-kelivo-key-distinct-1234567890"
+MEMORY_SECRET = "Synthetic-App-Candidate-HMAC-Key-2026!Z9q7"
 
 
 def extractor_output(proposals):
@@ -31,6 +35,130 @@ def extractor_output(proposals):
 
 
 class ShadowCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_server_owned_contract_versions_are_fixed(self):
+        self.assertEqual(FORMATION_CONTRACT_VERSION, "memory-formation-v1")
+        self.assertEqual(
+            EXTRACTOR_CONTRACT_VERSION,
+            "memory-formation-extractor-v1",
+        )
+
+    async def test_accepted_callback_receives_only_canonical_source_and_proposals(self):
+        source = "I usually prefer tea."
+        proposal = AutoMemoryProposalV1("durable_preference", 0, len(source))
+        extraction = AutoMemoryExtractionV1((proposal,))
+        extractor_calls = []
+        callback_calls = []
+
+        async def extract(received_source):
+            extractor_calls.append(received_source)
+            return extraction
+
+        async def accepted(*args):
+            callback_calls.append(args)
+
+        result = await integration.run_memory_formation_shadow(
+            47,
+            source,
+            extract,
+            max_item_chars=777,
+            accepted_proposals_callable=accepted,
+        )
+        self.assertEqual(extractor_calls, [source])
+        self.assertEqual(callback_calls, [(47, source, extraction.proposals)])
+        self.assertIs(callback_calls[0][2], extraction.proposals)
+        self.assertEqual(
+            dataclasses.asdict(result),
+            {
+                "status": "completed",
+                "category": "completed",
+                "proposal_count": 1,
+                "candidate_count": 1,
+            },
+        )
+
+    async def test_empty_accepted_proposals_still_invokes_callback(self):
+        calls = []
+
+        async def extract(_source):
+            return AutoMemoryExtractionV1(())
+
+        async def accepted(*args):
+            calls.append(args)
+
+        result = await integration.run_memory_formation_shadow(
+            9,
+            "canonical source",
+            extract,
+            max_item_chars=1000,
+            accepted_proposals_callable=accepted,
+        )
+        self.assertEqual(calls, [(9, "canonical source", ())])
+        self.assertEqual(
+            (result.status, result.category, result.proposal_count),
+            ("completed", "no_proposals", 0),
+        )
+
+    async def test_callback_failure_does_not_change_shadow_semantics(self):
+        source = "Project Atlas uses Python."
+        proposal = AutoMemoryProposalV1("project_fact", 0, len(source))
+
+        async def extract(_source):
+            return AutoMemoryExtractionV1((proposal,))
+
+        async def fail(*_args):
+            raise RuntimeError("PRIVATE CALLBACK DETAIL")
+
+        result = await integration.run_memory_formation_shadow(
+            11,
+            source,
+            extract,
+            max_item_chars=1000,
+            accepted_proposals_callable=fail,
+        )
+        self.assertEqual(
+            (result.status, result.category, result.candidate_count),
+            ("completed", "completed", 1),
+        )
+        self.assertNotIn("PRIVATE CALLBACK DETAIL", repr(result))
+
+    async def test_callback_cancellation_propagates(self):
+        async def extract(_source):
+            return AutoMemoryExtractionV1(())
+
+        async def cancel(*_args):
+            raise asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            await integration.run_memory_formation_shadow(
+                12,
+                "canonical source",
+                extract,
+                max_item_chars=1000,
+                accepted_proposals_callable=cancel,
+            )
+
+    async def test_rejected_builder_output_never_invokes_callback(self):
+        source = "Do not remember that I usually prefer coffee."
+        proposal = AutoMemoryProposalV1(
+            "durable_preference",
+            source.index("I usually"),
+            len(source),
+        )
+        callback = mock.AsyncMock()
+
+        async def extract(_source):
+            return AutoMemoryExtractionV1((proposal,))
+
+        result = await integration.run_memory_formation_shadow(
+            13,
+            source,
+            extract,
+            max_item_chars=1000,
+            accepted_proposals_callable=callback,
+        )
+        self.assertEqual(result.status, "failed")
+        callback.assert_not_awaited()
+
     async def test_exact_canonical_source_and_max_chars_reach_phase4a(self):
         source = "I usually prefer tea."
         proposal = AutoMemoryProposalV1("durable_preference", 0, len(source))
@@ -316,16 +444,20 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
             schema_before = tuple(conn.execute(
                 "SELECT type,name,sql FROM sqlite_master ORDER BY type,name"
             ).fetchall())
-        response = await self.post("fresh-shadow-key-0001", text=source)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["choices"][0]["message"]["content"], "main reply")
-        await asyncio.wait_for(extractor_started.wait(), 2)
-        shadow_task = self.module.app.state.memory_formation_shadow_task
-        self.assertIsNotNone(shadow_task)
-        self.assertFalse(shadow_task.done())
-        release_extractor.set()
-        await shadow_task
-        await asyncio.sleep(0)
+        with mock.patch("builtins.print") as printed:
+            response = await self.post("fresh-shadow-key-0001", text=source)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["choices"][0]["message"]["content"],
+                "main reply",
+            )
+            await asyncio.wait_for(extractor_started.wait(), 2)
+            shadow_task = self.module.app.state.memory_formation_shadow_task
+            self.assertIsNotNone(shadow_task)
+            self.assertFalse(shadow_task.done())
+            release_extractor.set()
+            await shadow_task
+            await asyncio.sleep(0)
 
         self.assertEqual(len(calls), 2)
         main_call, extractor_call = calls
@@ -343,7 +475,14 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
         with self.module.db() as conn:
             counts = {
                 table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                for table in ("memory_items", "memory_sources", "kelivo_requests", "messages")
+                for table in (
+                    "memory_items",
+                    "memory_sources",
+                    "memory_candidate_sources",
+                    "memory_auto_formation_runs",
+                    "kelivo_requests",
+                    "messages",
+                )
             }
             row = conn.execute(
                 """SELECT status,provider_messages_json,context_bundle_json,response_json
@@ -355,9 +494,23 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
         self.assertEqual(counts, {
             "memory_items": 0,
             "memory_sources": 0,
+            "memory_candidate_sources": 0,
+            "memory_auto_formation_runs": 0,
             "kelivo_requests": 1,
             "messages": 2,
         })
+        self.assertIsNone(self.module.MEMORY_CANDIDATE_PERSISTENCE)
+        self.assertIsNone(self.module.MEMORY_PRIVILEGED_RUNTIME)
+        logs = " ".join(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertIn(
+            "[memory-formation-shadow] status=completed proposals=1 candidates=1",
+            logs,
+        )
+        self.assertNotIn("[memory-candidate-persistence]", logs)
         self.assertEqual(row["status"], "completed")
         persisted_messages = json.loads(row["provider_messages_json"])
         persisted_bundle = json.loads(row["context_bundle_json"])
@@ -532,6 +685,8 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
             operit_share=True,
             memory=True,
             memory_auto_formation=True,
+            memory_secret=MEMORY_SECRET,
+            memory_candidate_persistence=True,
         )
         calls = []
 
@@ -540,17 +695,23 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
             return {"text": "operit reply", "usage": {}}
 
         module.KELIVO_GENERATOR = generate
-        response = await request(
-            module,
-            "POST",
-            "/v1/operit/share",
-            headers={"Authorization": "Bearer test-operit-share-key-distinct-1234567890"},
-            json=self.payload("shared text"),
-        )
+        with mock.patch.object(
+            module.MEMORY_CANDIDATE_PERSISTENCE,
+            "persist",
+            wraps=module.MEMORY_CANDIDATE_PERSISTENCE.persist,
+        ) as persisted:
+            response = await request(
+                module,
+                "POST",
+                "/v1/operit/share",
+                headers={"Authorization": "Bearer test-operit-share-key-distinct-1234567890"},
+                json=self.payload("shared text"),
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(calls), 1)
         self.assertNotEqual(calls[0][1], EXTRACTOR_SESSION_ID)
         self.assertIsNone(getattr(module.app.state, "memory_formation_shadow_task", None))
+        persisted.assert_not_called()
 
     async def test_extractor_failure_cannot_change_response_or_completed_request(self):
         secret = "PRIVATE-EXTRACTOR-RAW-OUTPUT"
@@ -679,6 +840,8 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
             auto_idempotency=True,
             memory=True,
             memory_auto_formation=True,
+            memory_secret=MEMORY_SECRET,
+            memory_candidate_persistence=True,
         )
         source = "I usually prefer tea."
         calls = []
@@ -736,7 +899,12 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
                 fresh_counts = {
                     table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                     for table in (
-                        "kelivo_requests", "messages", "memory_items", "memory_sources",
+                        "kelivo_requests",
+                        "messages",
+                        "memory_items",
+                        "memory_sources",
+                        "memory_candidate_sources",
+                        "memory_auto_formation_runs",
                     )
                 }
                 row = conn.execute(
@@ -749,6 +917,8 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
                 "messages": 2,
                 "memory_items": 0,
                 "memory_sources": 0,
+                "memory_candidate_sources": 0,
+                "memory_auto_formation_runs": 1,
             })
             self.assertEqual(row["idempotency_key"], internal_key)
             self.assertEqual((row["status"], row["error_category"]), ("completed", None))
@@ -778,7 +948,12 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
                 replay_counts = {
                     table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                     for table in (
-                        "kelivo_requests", "messages", "memory_items", "memory_sources",
+                        "kelivo_requests",
+                        "messages",
+                        "memory_items",
+                        "memory_sources",
+                        "memory_candidate_sources",
+                        "memory_auto_formation_runs",
                     )
                 }
             self.assertEqual(replay_counts, fresh_counts)
@@ -841,6 +1016,456 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
                 await started.wait()
             self.assertTrue(cancelled.is_set())
             self.assertIsNone(self.module.app.state.memory_formation_shadow_task)
+
+
+class MemoryCandidatePersistenceAppIntegrationTests(
+    NoNetworkMixin,
+    unittest.IsolatedAsyncioTestCase,
+):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.module = load_app(
+            self.temp.name,
+            telegram=False,
+            kelivo=True,
+            memory=True,
+            memory_secret=MEMORY_SECRET,
+            memory_auto_formation=True,
+            memory_candidate_persistence=True,
+        )
+        self.headers = {
+            "Authorization": f"Bearer {KELIVO_KEY}",
+        }
+
+    async def asyncTearDown(self):
+        task = getattr(
+            self.module.app.state,
+            "memory_formation_shadow_task",
+            None,
+        )
+        if task is not None and not task.done():
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    @staticmethod
+    def payload(text="I usually prefer tea."):
+        return {
+            "model": "ouou-home",
+            "messages": [{"role": "user", "content": text}],
+            "stream": False,
+        }
+
+    async def post(self, key, *, text="I usually prefer tea.", headers=None):
+        return await request(
+            self.module,
+            "POST",
+            "/v1/chat/completions",
+            headers=(
+                {**self.headers, "Idempotency-Key": key}
+                if headers is None
+                else headers
+            ),
+            json=self.payload(text),
+        )
+
+    async def wait_for_idle(self):
+        for _ in range(300):
+            task = getattr(
+                self.module.app.state,
+                "memory_formation_shadow_task",
+                None,
+            )
+            if task is None:
+                return
+            await asyncio.sleep(0.005)
+        self.fail("candidate persistence formation task did not finish")
+
+    def memory_counts(self):
+        with self.module.db() as conn:
+            return {
+                table: int(conn.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()[0])
+                for table in (
+                    "memory_items",
+                    "memory_candidate_sources",
+                    "memory_auto_formation_runs",
+                    "memory_sources",
+                    "memory_evidence_events",
+                    "memory_action_requests",
+                )
+            }
+
+    async def test_fresh_durable_signal_persists_candidate_after_response(self):
+        source = "Project Atlas uses Python."
+        calls = []
+
+        async def generate(*args):
+            calls.append(args)
+            if args[1] == EXTRACTOR_SESSION_ID:
+                return {"text": extractor_output([{
+                    "signal_type": "project_fact",
+                    "start": 0,
+                    "end": len(source),
+                }])}
+            return {"text": "main reply", "usage": {"total_tokens": 3}}
+
+        self.module.KELIVO_GENERATOR = generate
+        headers = {
+            **self.headers,
+            "Idempotency-Key": "candidate-fresh-key-0001",
+            "X-Memory-Formation-Contract-Version": "attacker-v99",
+            "X-Memory-Extractor-Contract-Version": "attacker-v99",
+        }
+        with mock.patch.dict(
+            "os.environ",
+            {"MEMORY_FORMATION_CONTRACT_VERSION": "attacker-v99"},
+        ), mock.patch("builtins.print") as printed:
+            response = await self.post(
+                "candidate-fresh-key-0001",
+                text=source,
+                headers=headers,
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["choices"][0]["message"]["content"],
+                "main reply",
+            )
+            await self.wait_for_idle()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            sum(call[1] == EXTRACTOR_SESSION_ID for call in calls),
+            1,
+        )
+        self.assertEqual(self.memory_counts(), {
+            "memory_items": 1,
+            "memory_candidate_sources": 1,
+            "memory_auto_formation_runs": 1,
+            "memory_sources": 0,
+            "memory_evidence_events": 0,
+            "memory_action_requests": 0,
+        })
+        with self.module.db() as conn:
+            item = conn.execute("SELECT * FROM memory_items").fetchone()
+            run = conn.execute(
+                "SELECT * FROM memory_auto_formation_runs"
+            ).fetchone()
+            active_count = int(conn.execute(
+                "SELECT count(*) FROM memory_items WHERE status='active'"
+            ).fetchone()[0])
+        self.assertEqual(item["status"], "candidate")
+        self.assertEqual(item["normalized_content"], source)
+        self.assertEqual(active_count, 0)
+        self.assertEqual(
+            run["formation_contract_version"],
+            FORMATION_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            run["extractor_contract_version"],
+            EXTRACTOR_CONTRACT_VERSION,
+        )
+        logs = " ".join(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertIn(
+            "[memory-formation-shadow] status=completed proposals=1 candidates=1",
+            logs,
+        )
+        self.assertIn(
+            "[memory-candidate-persistence] status=completed "
+            "created=1 existing=0 active_duplicate=0 suppressed=0 replayed=0",
+            logs,
+        )
+        self.assertNotIn(source, logs)
+        self.assertNotIn("attacker-v99", logs)
+
+    async def test_valid_zero_proposal_output_writes_terminal_run_only(self):
+        calls = []
+
+        async def generate(*args):
+            calls.append(args)
+            if args[1] == EXTRACTOR_SESSION_ID:
+                return {"text": extractor_output([])}
+            return {"text": "main reply", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = generate
+        with mock.patch("builtins.print") as printed:
+            response = await self.post("candidate-zero-key-0001")
+            self.assertEqual(response.status_code, 200)
+            await self.wait_for_idle()
+        self.assertEqual(
+            sum(call[1] == EXTRACTOR_SESSION_ID for call in calls),
+            1,
+        )
+        self.assertEqual(self.memory_counts(), {
+            "memory_items": 0,
+            "memory_candidate_sources": 0,
+            "memory_auto_formation_runs": 1,
+            "memory_sources": 0,
+            "memory_evidence_events": 0,
+            "memory_action_requests": 0,
+        })
+        logs = " ".join(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertIn(
+            "status=completed created=0 existing=0 "
+            "active_duplicate=0 suppressed=0 replayed=0",
+            logs,
+        )
+        self.assertIn(
+            "[memory-formation-shadow] status=completed proposals=0 candidates=0",
+            logs,
+        )
+
+    async def test_rejected_and_invalid_extractor_outputs_write_no_memory(self):
+        source = "Do not remember that I usually prefer coffee."
+        selected = "I usually prefer coffee."
+        start = source.index(selected)
+
+        async def ineligible(*args):
+            if args[1] == EXTRACTOR_SESSION_ID:
+                return {"text": extractor_output([{
+                    "signal_type": "durable_preference",
+                    "start": start,
+                    "end": start + len(selected),
+                }])}
+            return {"text": "main reply", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = ineligible
+        response = await self.post("candidate-ineligible-key-0001", text=source)
+        self.assertEqual(response.status_code, 200)
+        await self.wait_for_idle()
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+
+        async def invalid(*args):
+            if args[1] == EXTRACTOR_SESSION_ID:
+                return {"text": "PRIVATE INVALID EXTRACTOR OUTPUT"}
+            return {"text": "main reply", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = invalid
+        response = await self.post("candidate-invalid-key-0001")
+        self.assertEqual(response.status_code, 200)
+        await self.wait_for_idle()
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+
+        async def unavailable(*args):
+            if args[1] == EXTRACTOR_SESSION_ID:
+                raise self.module.kelivo_service.GenerationError(
+                    "PRIVATE EXTRACTOR PROVIDER ERROR",
+                    False,
+                )
+            return {"text": "main reply", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = unavailable
+        response = await self.post("candidate-unavailable-key-0001")
+        self.assertEqual(response.status_code, 200)
+        await self.wait_for_idle()
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+
+    async def test_failed_and_uncertain_main_requests_never_persist(self):
+        with mock.patch.object(
+            self.module.MEMORY_CANDIDATE_PERSISTENCE,
+            "persist",
+            wraps=self.module.MEMORY_CANDIDATE_PERSISTENCE.persist,
+        ) as persisted:
+            for uncertain, expected_status in ((False, 502), (True, 504)):
+                async def fail(*_args, uncertain=uncertain):
+                    raise self.module.kelivo_service.GenerationError(
+                        "synthetic_generation_failure",
+                        uncertain,
+                    )
+
+                self.module.KELIVO_GENERATOR = fail
+                with self.subTest(uncertain=uncertain):
+                    response = await self.post(
+                        f"candidate-main-failure-{int(uncertain)}-0001"
+                    )
+                    self.assertEqual(response.status_code, expected_status)
+                    self.assertIsNone(getattr(
+                        self.module.app.state,
+                        "memory_formation_shadow_task",
+                        None,
+                    ))
+            persisted.assert_not_called()
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+
+    async def test_persistence_error_isolated_from_http_and_shadow_semantics(self):
+        source = "Project Atlas uses Python."
+
+        async def generate(*args):
+            if args[1] == EXTRACTOR_SESSION_ID:
+                return {"text": extractor_output([{
+                    "signal_type": "project_fact",
+                    "start": 0,
+                    "end": len(source),
+                }])}
+            return {"text": "authoritative reply", "usage": {}}
+
+        class StablePersistenceError(RuntimeError):
+            category = "storage_unavailable"
+
+        self.module.KELIVO_GENERATOR = generate
+        with mock.patch.object(
+            self.module.MEMORY_CANDIDATE_PERSISTENCE,
+            "persist",
+            side_effect=StablePersistenceError("PRIVATE SQLITE DETAIL"),
+        ) as persisted, mock.patch("builtins.print") as printed:
+            response = await self.post(
+                "candidate-persistence-failure-key-0001",
+                text=source,
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["choices"][0]["message"]["content"],
+                "authoritative reply",
+            )
+            await self.wait_for_idle()
+        persisted.assert_called_once()
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+        logs = " ".join(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertIn(
+            "[memory-formation-shadow] status=completed proposals=1 candidates=1",
+            logs,
+        )
+        self.assertIn(
+            "[memory-candidate-persistence] "
+            "status=failed category=storage_unavailable",
+            logs,
+        )
+        self.assertNotIn("PRIVATE SQLITE DETAIL", logs)
+        self.assertNotIn(source, logs)
+
+    async def test_explicit_replay_does_not_repeat_extractor_or_persistence(self):
+        calls = []
+
+        async def generate(*args):
+            calls.append(args)
+            if args[1] == EXTRACTOR_SESSION_ID:
+                return {"text": extractor_output([])}
+            return {"text": "main reply", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = generate
+        first = await self.post("candidate-replay-key-0001")
+        self.assertEqual(first.status_code, 200)
+        await self.wait_for_idle()
+        before = self.memory_counts()
+        replay = await self.post("candidate-replay-key-0001")
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.json(), first.json())
+        await asyncio.sleep(0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            sum(call[1] == EXTRACTOR_SESSION_ID for call in calls),
+            1,
+        )
+        self.assertEqual(self.memory_counts(), before)
+        self.assertIsNone(
+            getattr(self.module.app.state, "memory_formation_shadow_task", None)
+        )
+
+    async def test_source_load_failure_never_calls_persistence(self):
+        async def generate(*_args):
+            return {"text": "main reply", "usage": {}}
+
+        self.module.KELIVO_GENERATOR = generate
+        with mock.patch.object(
+            self.module.kelivo_service,
+            "load_completed_canonical_formation_source",
+            side_effect=self.module.kelivo_service.KelivoError(
+                503,
+                "canonical_source_unavailable",
+            ),
+        ), mock.patch.object(
+            self.module.MEMORY_CANDIDATE_PERSISTENCE,
+            "persist",
+            wraps=self.module.MEMORY_CANDIDATE_PERSISTENCE.persist,
+        ) as persisted, mock.patch("builtins.print") as printed:
+            response = await self.post("candidate-source-failure-key-0001")
+            self.assertEqual(response.status_code, 200)
+            await self.wait_for_idle()
+        persisted.assert_not_called()
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+        logs = " ".join(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertIn(
+            "[memory-formation-shadow] status=failed category=source_unavailable",
+            logs,
+        )
+        self.assertNotIn("[memory-candidate-persistence]", logs)
+
+    async def test_persistence_telemetry_is_bounded_and_data_free(self):
+        result = SimpleNamespace(
+            created_count=99,
+            existing_candidate_count=-5,
+            active_duplicate_count=2,
+            suppressed_count=7,
+            replayed=True,
+            source_text="PRIVATE SOURCE",
+            memory_key="PRIVATE KEY",
+        )
+        with mock.patch("builtins.print") as printed:
+            self.module._log_memory_candidate_persistence(
+                status="completed",
+                result=result,
+            )
+            self.module._log_memory_candidate_persistence(
+                status="failed",
+                category="PRIVATE RAW ERROR",
+            )
+        logs = tuple(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertEqual(logs, (
+            "[memory-candidate-persistence] status=completed "
+            "created=3 existing=0 active_duplicate=2 suppressed=3 replayed=1",
+            "[memory-candidate-persistence] "
+            "status=failed category=candidate_persistence_failed",
+        ))
+        self.assertNotIn("PRIVATE", " ".join(logs))
+
+    async def test_enabled_missing_handle_logs_fixed_failure_without_fallback(self):
+        self.module.MEMORY_CANDIDATE_PERSISTENCE = None
+        self.module.MEMORY_CANDIDATE_PERSISTENCE_ERROR = (
+            "memory_auto_candidate_persistence_unavailable"
+        )
+        proposal = AutoMemoryProposalV1(
+            "durable_preference",
+            0,
+            len("I prefer tea."),
+        )
+        with mock.patch("builtins.print") as printed:
+            await self.module._persist_accepted_memory_proposals(
+                47,
+                "I prefer tea.",
+                (proposal,),
+            )
+        logs = tuple(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertEqual(logs, (
+            "[memory-candidate-persistence] status=failed "
+            "category=memory_auto_candidate_persistence_unavailable",
+        ))
+        self.assertEqual(sum(self.memory_counts().values()), 0)
+        self.assertIsNone(self.module.MEMORY_EXPLICIT_ENTRY_SERVICES)
 
 
 if __name__ == "__main__":

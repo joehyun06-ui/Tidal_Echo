@@ -441,9 +441,21 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
                 "UPDATE schema_migrations SET status='pending' WHERE version=8",
             ),
             (
-                "extra-v9",
+                "missing-v9",
+                "DELETE FROM schema_migrations WHERE version=9",
+            ),
+            (
+                "wrong-v9-name",
+                "UPDATE schema_migrations SET name='wrong' WHERE version=9",
+            ),
+            (
+                "wrong-v9-status",
+                "UPDATE schema_migrations SET status='pending' WHERE version=9",
+            ),
+            (
+                "extra-v10",
                 """INSERT INTO schema_migrations
-                   VALUES(9,'unknown','applied','x','x')""",
+                   VALUES(10,'unknown','applied','x','x')""",
             ),
             ("core-table", "DROP TABLE channel_accounts"),
             ("relay-table", "DROP TABLE push_subscriptions"),
@@ -481,6 +493,26 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
             (
                 "v8-trigger",
                 "DROP TRIGGER memory_action_requests_immutable_update",
+            ),
+            ("v9-source-table", "DROP TABLE memory_candidate_sources"),
+            ("v9-run-table", "DROP TABLE memory_auto_formation_runs"),
+            (
+                "v9-index",
+                "DROP INDEX idx_memory_candidate_sources_canonical",
+            ),
+            (
+                "v9-fk",
+                """PRAGMA writable_schema=ON;
+                   UPDATE sqlite_master
+                   SET sql=replace(sql,
+                       'ON DELETE RESTRICT',
+                       'ON DELETE CASCADE')
+                   WHERE type='table' AND name='memory_auto_formation_runs';
+                   PRAGMA writable_schema=OFF""",
+            ),
+            (
+                "v9-trigger",
+                "DROP TRIGGER memory_auto_formation_runs_immutable_update",
             ),
         )
         for name, script in corruptions:
@@ -585,6 +617,20 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
                    AFTER INSERT ON memory_action_requests
                    BEGIN SELECT 1; END""",
                 "DROP TRIGGER operator_memory_action_trigger",
+            ),
+            (
+                "memory-candidate-third-trigger",
+                """CREATE TRIGGER operator_memory_candidate_trigger
+                   AFTER INSERT ON memory_candidate_sources
+                   BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_candidate_trigger",
+            ),
+            (
+                "memory-formation-run-trigger",
+                """CREATE TRIGGER operator_memory_formation_run_trigger
+                   AFTER INSERT ON memory_auto_formation_runs
+                   BEGIN SELECT 1; END""",
+                "DROP TRIGGER operator_memory_formation_run_trigger",
             ),
         )
         for name, create_sql, remove_sql in cases:

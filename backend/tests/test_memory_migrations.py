@@ -20,7 +20,7 @@ class MemoryMigrationTests(unittest.TestCase):
                 ts TEXT NOT NULL,direction TEXT NOT NULL,kind TEXT NOT NULL,
                 text TEXT NOT NULL,meta TEXT NOT NULL DEFAULT '{}')""")
 
-    def test_empty_database_upgrades_to_v8_and_is_repeatable(self):
+    def test_empty_database_upgrades_to_v9_and_is_repeatable(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
@@ -35,7 +35,7 @@ class MemoryMigrationTests(unittest.TestCase):
                 )
             }
             channel_store.validate_memory_schema(conn)
-        self.assertEqual(versions, list(range(1, 9)))
+        self.assertEqual(versions, list(range(1, 10)))
         self.assertTrue(
             {
                 "memory_items",
@@ -44,11 +44,13 @@ class MemoryMigrationTests(unittest.TestCase):
                 "memory_sources",
                 "memory_suppressions",
                 "memory_action_requests",
+                "memory_candidate_sources",
+                "memory_auto_formation_runs",
             }.issubset(tables)
         )
 
-    def test_every_synthetic_prior_version_upgrades_to_v8(self):
-        for version in range(1, 8):
+    def test_every_synthetic_prior_version_upgrades_to_v9(self):
+        for version in range(1, 9):
             with self.subTest(version=version):
                 path = str(Path(self.temp.name) / f"v{version}.sqlite3")
                 with channel_store.connect(path) as conn:
@@ -68,7 +70,7 @@ class MemoryMigrationTests(unittest.TestCase):
                 channel_store.run_migrations(path)
                 with channel_store.connect(path) as conn:
                     marker = conn.execute(
-                        "SELECT status FROM schema_migrations WHERE version=8"
+                        "SELECT status FROM schema_migrations WHERE version=9"
                     ).fetchone()
                     preserved = conn.execute(
                         "SELECT count(*) FROM channel_accounts"
@@ -77,9 +79,9 @@ class MemoryMigrationTests(unittest.TestCase):
                 self.assertEqual(marker[0], "applied")
                 self.assertEqual(preserved, 1)
 
-    def test_concurrent_optional_v8_migration_applies_exactly_once(self):
+    def test_concurrent_optional_v9_migration_applies_exactly_once(self):
         channel_store.run_migrations(
-            self.path, channel_store.MIGRATIONS[:7],
+            self.path, channel_store.MIGRATIONS[:8],
         )
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(
@@ -89,12 +91,467 @@ class MemoryMigrationTests(unittest.TestCase):
         with channel_store.connect(self.path) as conn:
             self.assertEqual(
                 conn.execute(
-                    "SELECT count(*) FROM schema_migrations WHERE version=8"
+                    "SELECT count(*) FROM schema_migrations WHERE version=9"
                 ).fetchone()[0],
                 1,
             )
             channel_store.validate_memory_schema(conn)
             channel_store.validate_memory_action_schema(conn)
+            channel_store.validate_memory_candidate_persistence_schema(conn)
+
+    def test_existing_v8_upgrades_additively_without_rebuilding_memory_schema(self):
+        channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:8])
+        stamp = channel_store.now_iso()
+        with channel_store.connect(self.path) as conn:
+            conn.execute(
+                """INSERT INTO memory_items
+                   (memory_key,kind,scope_type,scope_ref,normalized_content,
+                    normalized_fingerprint,fingerprint_version,status,explicitness,
+                    confidence,sensitivity,first_observed_at,last_confirmed_at,
+                    superseded_by_id,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,1,'candidate','inferred',0.0,'normal',
+                          ?,?,NULL,?,?)""",
+                (
+                    "V" * 32,
+                    "project",
+                    "global_user",
+                    "",
+                    "synthetic preserved candidate",
+                    b"v" * 32,
+                    stamp,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+            before = {
+                (row["type"], row["name"]): row["sql"]
+                for row in conn.execute(
+                    """SELECT type,name,sql FROM sqlite_master
+                       WHERE (name LIKE 'memory_%' OR name LIKE 'idx_memory_%')
+                         AND name NOT LIKE 'sqlite_autoindex_%'"""
+                )
+            }
+
+        channel_store.run_migrations(self.path)
+
+        with channel_store.connect(self.path) as conn:
+            after_old = {
+                key: conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+                    key,
+                ).fetchone()[0]
+                for key in before
+            }
+            marker = conn.execute(
+                "SELECT name,status FROM schema_migrations WHERE version=9"
+            ).fetchone()
+            preserved = conn.execute(
+                "SELECT status,explicitness,confidence FROM memory_items"
+            ).fetchone()
+            channel_store.validate_memory_candidate_persistence_schema(conn)
+        self.assertEqual(after_old, before)
+        self.assertEqual(
+            tuple(marker),
+            ("automatic_memory_candidate_persistence_foundation", "applied"),
+        )
+        self.assertEqual(tuple(preserved), ("candidate", "inferred", 0.0))
+
+    def test_v9_exact_columns_indexes_and_foreign_keys(self):
+        channel_store.run_migrations(self.path)
+        with channel_store.connect(self.path) as conn:
+            source_columns = tuple(
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_xinfo(memory_candidate_sources)"
+                )
+            )
+            run_columns = tuple(
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_xinfo(memory_auto_formation_runs)"
+                )
+            )
+            source_indexes = {
+                row["name"]: (
+                    bool(row["unique"]),
+                    row["origin"],
+                    bool(row["partial"]),
+                    channel_store._index_columns(conn, row["name"]),
+                )
+                for row in conn.execute(
+                    "PRAGMA index_list(memory_candidate_sources)"
+                )
+            }
+            run_indexes = conn.execute(
+                "PRAGMA index_list(memory_auto_formation_runs)"
+            ).fetchall()
+            source_fks = {
+                (
+                    row["from"], row["table"], row["to"],
+                    row["on_delete"],
+                )
+                for row in conn.execute(
+                    "PRAGMA foreign_key_list(memory_candidate_sources)"
+                )
+            }
+            run_fks = {
+                (
+                    row["from"], row["table"], row["to"],
+                    row["on_delete"],
+                )
+                for row in conn.execute(
+                    "PRAGMA foreign_key_list(memory_auto_formation_runs)"
+                )
+            }
+            triggers = {
+                row["name"]
+                for row in conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type='trigger'
+                         AND tbl_name IN (
+                             'memory_candidate_sources',
+                             'memory_auto_formation_runs'
+                         )"""
+                )
+            }
+        self.assertEqual(source_columns, (
+            "id",
+            "memory_id",
+            "canonical_message_id",
+            "signal_type",
+            "span_start",
+            "span_end",
+            "formation_contract_version",
+            "extractor_contract_version",
+            "created_at",
+        ))
+        self.assertEqual(run_columns, (
+            "canonical_message_id",
+            "proposal_digest",
+            "proposal_count",
+            "candidate_count",
+            "created_count",
+            "existing_candidate_count",
+            "active_duplicate_count",
+            "suppressed_count",
+            "formation_contract_version",
+            "extractor_contract_version",
+            "created_at",
+        ))
+        self.assertEqual(source_indexes, {
+            "sqlite_autoindex_memory_candidate_sources_1": (
+                True,
+                "u",
+                False,
+                (
+                    "memory_id",
+                    "canonical_message_id",
+                    "signal_type",
+                    "span_start",
+                    "span_end",
+                    "formation_contract_version",
+                    "extractor_contract_version",
+                ),
+            ),
+            "idx_memory_candidate_sources_memory": (
+                False, "c", False, ("memory_id", "id"),
+            ),
+            "idx_memory_candidate_sources_canonical": (
+                False, "c", False, ("canonical_message_id", "id"),
+            ),
+        })
+        self.assertEqual(run_indexes, [])
+        self.assertEqual(source_fks, {
+            ("memory_id", "memory_items", "id", "RESTRICT"),
+            ("canonical_message_id", "messages", "id", "RESTRICT"),
+        })
+        self.assertEqual(run_fks, {
+            ("canonical_message_id", "messages", "id", "RESTRICT"),
+        })
+        self.assertEqual(triggers, {
+            "memory_candidate_sources_immutable_update",
+            "memory_candidate_sources_immutable_delete",
+            "memory_auto_formation_runs_immutable_update",
+            "memory_auto_formation_runs_immutable_delete",
+        })
+
+    def test_v9_checks_unique_and_restrict_constraints_fail_closed(self):
+        channel_store.run_migrations(self.path)
+        stamp = channel_store.now_iso()
+        with channel_store.connect(self.path) as conn:
+            message_ids = []
+            for index in range(8):
+                message_ids.append(int(conn.execute(
+                    """INSERT INTO messages(ts,direction,kind,text,meta)
+                       VALUES(?,'in','user',?,'{}')""",
+                    (stamp, f"synthetic-{index}"),
+                ).lastrowid))
+            memory_id = int(conn.execute(
+                """INSERT INTO memory_items
+                   (memory_key,kind,scope_type,scope_ref,normalized_content,
+                    normalized_fingerprint,fingerprint_version,status,explicitness,
+                    confidence,sensitivity,first_observed_at,last_confirmed_at,
+                    superseded_by_id,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,1,'candidate','inferred',0.0,'normal',
+                          ?,?,NULL,?,?)""",
+                (
+                    "C" * 32,
+                    "project",
+                    "global_user",
+                    "",
+                    "synthetic candidate",
+                    b"c" * 32,
+                    stamp,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            ).lastrowid)
+            source_values = (
+                memory_id,
+                message_ids[0],
+                "project_fact",
+                0,
+                9,
+                "memory-formation-v1",
+                "memory-formation-extractor-v1",
+                stamp,
+            )
+            conn.execute(
+                """INSERT INTO memory_candidate_sources
+                   (memory_id,canonical_message_id,signal_type,span_start,span_end,
+                    formation_contract_version,extractor_contract_version,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                source_values,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO memory_candidate_sources
+                       (memory_id,canonical_message_id,signal_type,span_start,span_end,
+                        formation_contract_version,extractor_contract_version,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    source_values,
+                )
+            invalid_sources = (
+                ("project_fact", -1, 9, "memory-formation-v1"),
+                ("project_fact", 0.5, 9, "memory-formation-v1"),
+                ("project_fact", 9, 9, "memory-formation-v1"),
+                ("unknown", 0, 9, "memory-formation-v1"),
+                ("project_fact", 0, 9, "unsafe/version"),
+            )
+            for offset, (signal, start, end, formation_version) in enumerate(
+                invalid_sources,
+                start=1,
+            ):
+                with self.subTest(signal=signal, start=start, end=end), self.assertRaises(
+                    sqlite3.IntegrityError
+                ):
+                    conn.execute(
+                        """INSERT INTO memory_candidate_sources
+                           (memory_id,canonical_message_id,signal_type,span_start,span_end,
+                            formation_contract_version,extractor_contract_version,created_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (
+                            memory_id,
+                            message_ids[offset],
+                            signal,
+                            start,
+                            end,
+                            formation_version,
+                            "memory-formation-extractor-v1",
+                            stamp,
+                        ),
+                    )
+
+            valid_run = (
+                message_ids[0],
+                "a" * 64,
+                2,
+                1,
+                1,
+                0,
+                0,
+                0,
+                "memory-formation-v1",
+                "memory-formation-extractor-v1",
+                stamp,
+            )
+            conn.execute(
+                """INSERT INTO memory_auto_formation_runs
+                   (canonical_message_id,proposal_digest,proposal_count,candidate_count,
+                    created_count,existing_candidate_count,active_duplicate_count,
+                    suppressed_count,formation_contract_version,
+                    extractor_contract_version,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                valid_run,
+            )
+            immutable_operations = (
+                (
+                    "candidate-source-update",
+                    """UPDATE memory_candidate_sources
+                       SET span_end=8 WHERE memory_id=?""",
+                    (memory_id,),
+                    "memory_candidate_source_immutable",
+                ),
+                (
+                    "candidate-source-delete",
+                    "DELETE FROM memory_candidate_sources WHERE memory_id=?",
+                    (memory_id,),
+                    "memory_candidate_source_immutable",
+                ),
+                (
+                    "formation-run-update",
+                    """UPDATE memory_auto_formation_runs
+                       SET proposal_count=3 WHERE canonical_message_id=?""",
+                    (message_ids[0],),
+                    "memory_auto_formation_run_immutable",
+                ),
+                (
+                    "formation-run-delete",
+                    """DELETE FROM memory_auto_formation_runs
+                       WHERE canonical_message_id=?""",
+                    (message_ids[0],),
+                    "memory_auto_formation_run_immutable",
+                ),
+            )
+            for name, statement, parameters, category in immutable_operations:
+                with self.subTest(operation=name), self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    f"^{category}$",
+                ):
+                    conn.execute(statement, parameters)
+            invalid_runs = (
+                ("A" * 64, 0, 0, 0, 0, 0, 0),
+                ("b" * 64, 4, 0, 0, 0, 0, 0),
+                ("c" * 64, 0, 1, 1, 0, 0, 0),
+                ("d" * 64, 2, 2, 1, 0, 0, 0),
+                ("e" * 64, 1, 1, 0.5, 0, 0, 0.5),
+            )
+            for offset, values in enumerate(invalid_runs, start=1):
+                with self.subTest(run=offset), self.assertRaises(
+                    sqlite3.IntegrityError
+                ):
+                    conn.execute(
+                        """INSERT INTO memory_auto_formation_runs
+                           (canonical_message_id,proposal_digest,proposal_count,
+                            candidate_count,created_count,existing_candidate_count,
+                            active_duplicate_count,suppressed_count,
+                            formation_contract_version,extractor_contract_version,
+                            created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            message_ids[offset],
+                            *values,
+                            "memory-formation-v1",
+                            "memory-formation-extractor-v1",
+                            stamp,
+                        ),
+                    )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "DELETE FROM memory_items WHERE id=?",
+                    (memory_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "DELETE FROM messages WHERE id=?",
+                    (message_ids[0],),
+                )
+
+    def test_failed_v9_rolls_back_both_tables_indexes_and_marker(self):
+        channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:8])
+
+        def broken(conn):
+            channel_store._migration_009(conn)
+            raise RuntimeError("injected-v9")
+
+        migrations = (
+            *channel_store.MIGRATIONS[:8],
+            (
+                9,
+                "automatic_memory_candidate_persistence_foundation",
+                broken,
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "^injected-v9$"):
+            channel_store.run_migrations(self.path, migrations)
+        with channel_store.connect(self.path) as conn:
+            objects = conn.execute(
+                """SELECT name FROM sqlite_master
+                   WHERE name LIKE 'memory_candidate_%'
+                      OR name LIKE 'memory_auto_formation_%'
+                      OR name LIKE 'idx_memory_candidate_%'"""
+            ).fetchall()
+            marker = conn.execute(
+                "SELECT status FROM schema_migrations WHERE version=9"
+            ).fetchone()
+            v8 = conn.execute(
+                "SELECT status FROM schema_migrations WHERE version=8"
+            ).fetchone()
+        self.assertEqual(objects, [])
+        self.assertIsNone(marker)
+        self.assertEqual(v8[0], "applied")
+
+    def test_v9_validator_rejects_check_index_fk_and_object_tampering(self):
+        corruptions = (
+            (
+                "index",
+                "DROP INDEX idx_memory_candidate_sources_memory",
+            ),
+            (
+                "check",
+                """PRAGMA writable_schema=ON;
+                   UPDATE sqlite_master
+                   SET sql=replace(sql,'span_start>=0','span_start>=-1')
+                   WHERE type='table' AND name='memory_candidate_sources';
+                   PRAGMA writable_schema=OFF""",
+            ),
+            (
+                "foreign-key",
+                """PRAGMA writable_schema=ON;
+                   UPDATE sqlite_master
+                   SET sql=replace(sql,'ON DELETE RESTRICT','ON DELETE CASCADE')
+                   WHERE type='table' AND name='memory_auto_formation_runs';
+                   PRAGMA writable_schema=OFF""",
+            ),
+            (
+                "missing-trigger",
+                "DROP TRIGGER memory_candidate_sources_immutable_update",
+            ),
+            (
+                "tampered-trigger",
+                """DROP TRIGGER memory_auto_formation_runs_immutable_delete;
+                   CREATE TRIGGER memory_auto_formation_runs_immutable_delete
+                   BEFORE DELETE ON memory_auto_formation_runs
+                   BEGIN
+                     SELECT RAISE(ABORT,'wrong_category');
+                   END""",
+            ),
+            (
+                "extra-trigger",
+                """CREATE TRIGGER unreviewed_candidate_trigger
+                   AFTER INSERT ON memory_candidate_sources
+                   BEGIN SELECT 1; END""",
+            ),
+        )
+        for name, script in corruptions:
+            with self.subTest(name=name):
+                path = str(Path(self.temp.name) / f"tamper-{name}.sqlite3")
+                with channel_store.connect(path) as conn:
+                    conn.execute("""CREATE TABLE messages(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,direction TEXT NOT NULL,kind TEXT NOT NULL,
+                        text TEXT NOT NULL,meta TEXT NOT NULL DEFAULT '{}')""")
+                channel_store.run_migrations(path)
+                with channel_store.connect(path) as conn:
+                    conn.executescript(script)
+                with channel_store.connect(path) as conn, self.assertRaises(
+                    sqlite3.DatabaseError
+                ):
+                    channel_store.validate_memory_candidate_persistence_schema(
+                        conn
+                    )
 
     def test_v6_relational_rows_are_preserved(self):
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:6])
@@ -237,20 +694,21 @@ class MemoryMigrationTests(unittest.TestCase):
                     "UPDATE memory_items SET status='forgotten' WHERE id=?", (memory_id,)
                 )
 
-    def test_v8_database_remains_compatible_with_old_migration_paths(self):
+    def test_v9_database_remains_compatible_with_old_migration_paths(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:6])
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:7])
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
             self.assertEqual(
-                conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 8
+                conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 9
             )
             channel_store.validate_kelivo_schema(conn)
             channel_store.validate_heartbeat_schema(conn)
             channel_store.validate_heartbeat_hardening_schema(conn)
             channel_store.validate_memory_schema(conn)
             channel_store.validate_memory_action_schema(conn)
+            channel_store.validate_memory_candidate_persistence_schema(conn)
 
     def test_v1_through_v6_migration_identity_is_unchanged(self):
         self.assertEqual(

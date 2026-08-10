@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import re
@@ -16,12 +17,14 @@ try:
     from . import (
         channel_store,
         memory_action_ledger,
+        memory_formation,
         memory_policy,
         memory_runtime,
     )
 except ImportError:  # support direct module execution in local tooling
     import channel_store
     import memory_action_ledger
+    import memory_formation
     import memory_policy
     import memory_runtime
 
@@ -39,6 +42,23 @@ class StoreResult:
     outcome: str
     item: dict | None = field(default=None, repr=False)
     _memory_id: int | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AutoCandidatePersistenceResult:
+    """Immutable, data-free terminal outcome for one formation batch."""
+
+    outcome: str
+    proposal_count: int
+    candidate_count: int
+    created_count: int
+    existing_candidate_count: int
+    active_duplicate_count: int
+    suppressed_count: int
+    replayed: bool
+
+    def __repr__(self) -> str:
+        return "<AutoCandidatePersistenceResult>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -188,7 +208,40 @@ _PROFILE_STATE_TABLES = (
     "memory_suppressions",
     "memory_evidence_events",
     "memory_action_requests",
+    "memory_candidate_sources",
+    "memory_auto_formation_runs",
 )
+_CONTRACT_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_AUTO_PERSISTENCE_ERROR_CATEGORIES = frozenset({
+    "auto_candidate_persistence_disabled",
+    "candidate_budget_exceeded",
+    "candidate_persistence_conflict",
+    "candidate_persistence_failed",
+    "candidate_policy_rejected",
+    "candidate_state_conflict",
+    "duplicate_proposal",
+    "feature_disabled",
+    "formation_replay_conflict",
+    "ineligible_proposal",
+    "invalid_canonical_source",
+    "invalid_contract_version",
+    "invalid_max_item_chars",
+    "invalid_proposal",
+    "invalid_proposals",
+    "invalid_signal_type",
+    "invalid_source_message_id",
+    "invalid_source_text",
+    "invalid_span",
+    "memory_configuration_invalid",
+    "memory_fingerprint_profile_mismatch",
+    "memory_formation_error",
+    "memory_schema_invalid",
+    "overlapping_proposals",
+    "runtime_authority_invalid",
+    "source_text_too_long",
+    "storage_unavailable",
+    "too_many_proposals",
+})
 
 
 def _load_bounded_meta(raw: object) -> dict:
@@ -420,7 +473,9 @@ class MemoryStore:
     def validate_schema(self) -> bool:
         try:
             with channel_store.connect(self.path) as conn:
-                channel_store.validate_memory_action_schema(conn)
+                channel_store.validate_memory_candidate_persistence_schema(
+                    conn
+                )
             return True
         except (OSError, sqlite3.Error, ValueError):
             return False
@@ -604,6 +659,34 @@ class MemoryStore:
         except memory_policy.MemoryPolicyError:
             raise MemoryStoreError("memory_configuration_invalid") from None
 
+    def _require_candidate_persistence_runtime(self) -> None:
+        """Enforce the automatic write bit without consulting explicit authority."""
+
+        try:
+            policy = memory_runtime.require_runtime_authority(self._authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+        if policy is not self._runtime_policy:
+            raise MemoryStoreError("runtime_authority_invalid")
+        if not policy.enabled:
+            raise MemoryStoreError("feature_disabled")
+        if not policy.configuration_valid:
+            raise MemoryStoreError("memory_configuration_invalid")
+        if not policy.auto_candidate_persistence_enabled:
+            raise MemoryStoreError("auto_candidate_persistence_disabled")
+        if (
+            policy.normalization_version != memory_policy.NORMALIZATION_VERSION
+            or policy.fingerprint_version != memory_policy.FINGERPRINT_VERSION
+            or policy.fingerprint_domain != memory_policy.FINGERPRINT_DOMAIN
+        ):
+            raise MemoryStoreError("memory_configuration_invalid")
+        try:
+            memory_policy.fingerprint_profile_check(
+                policy.fingerprint_hmac_secret
+            )
+        except memory_policy.MemoryPolicyError:
+            raise MemoryStoreError("memory_configuration_invalid") from None
+
     def _profile_parameters(self) -> tuple[str, bytes, int, int]:
         try:
             return (
@@ -712,6 +795,433 @@ class MemoryStore:
             raise
         except (OSError, sqlite3.Error, ValueError):
             raise MemoryStoreError("storage_unavailable") from None
+
+    @staticmethod
+    def _validate_contract_version(value: object) -> str:
+        if (
+            type(value) is not str
+            or _CONTRACT_VERSION_PATTERN.fullmatch(value) is None
+        ):
+            raise MemoryStoreError("invalid_contract_version")
+        return value
+
+    @staticmethod
+    def _proposal_digest(
+        proposals: tuple[memory_formation.AutoMemoryProposalV1, ...],
+    ) -> str:
+        payload = [
+            {
+                "end": proposal.end,
+                "signal_type": proposal.signal_type,
+                "start": proposal.start,
+            }
+            for proposal in proposals
+        ]
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _candidate_result_from_run(
+        row: sqlite3.Row,
+        *,
+        replayed: bool,
+    ) -> AutoCandidatePersistenceResult:
+        field_names = (
+            "proposal_count",
+            "candidate_count",
+            "created_count",
+            "existing_candidate_count",
+            "active_duplicate_count",
+            "suppressed_count",
+        )
+        try:
+            values = tuple(row[name] for name in field_names)
+        except (IndexError, KeyError):
+            raise MemoryStoreError("candidate_state_conflict") from None
+        if any(type(value) is not int or not 0 <= value <= 3 for value in values):
+            raise MemoryStoreError("candidate_state_conflict")
+        (
+            proposal_count,
+            candidate_count,
+            created_count,
+            existing_candidate_count,
+            active_duplicate_count,
+            suppressed_count,
+        ) = values
+        if (
+            candidate_count > proposal_count
+            or created_count + existing_candidate_count
+            + active_duplicate_count + suppressed_count != candidate_count
+        ):
+            raise MemoryStoreError("candidate_state_conflict")
+        return AutoCandidatePersistenceResult(
+            outcome="completed",
+            proposal_count=proposal_count,
+            candidate_count=candidate_count,
+            created_count=created_count,
+            existing_candidate_count=existing_candidate_count,
+            active_duplicate_count=active_duplicate_count,
+            suppressed_count=suppressed_count,
+            replayed=replayed,
+        )
+
+    @staticmethod
+    def _validate_canonical_candidate_source(
+        conn: sqlite3.Connection,
+        *,
+        canonical_message_id: object,
+        source_text: object,
+    ) -> None:
+        if (
+            type(canonical_message_id) is not int
+            or canonical_message_id <= 0
+            or type(source_text) is not str
+        ):
+            raise MemoryStoreError("invalid_canonical_source")
+        row = conn.execute(
+            "SELECT id,direction,kind,text FROM messages WHERE id=?",
+            (canonical_message_id,),
+        ).fetchone()
+        if (
+            row is None
+            or type(row["id"]) is not int
+            or row["id"] != canonical_message_id
+            or row["direction"] != "in"
+            or row["kind"] != "user"
+            or type(row["text"]) is not str
+            or row["text"] != source_text
+        ):
+            raise MemoryStoreError("invalid_canonical_source")
+
+    @staticmethod
+    def _validate_candidate_provenance_binding(
+        *,
+        canonical_message_id: int,
+        proposals: tuple[memory_formation.AutoMemoryProposalV1, ...],
+        candidates: tuple[memory_formation.AutoMemoryCandidateV1, ...],
+    ) -> None:
+        if len(proposals) != len(candidates):
+            raise MemoryStoreError("candidate_state_conflict")
+        for proposal, candidate in zip(proposals, candidates):
+            if (
+                type(proposal) is not memory_formation.AutoMemoryProposalV1
+                or type(candidate) is not memory_formation.AutoMemoryCandidateV1
+                or candidate.source_message_id != canonical_message_id
+                or candidate.signal_type != proposal.signal_type
+                or candidate.kind
+                != memory_formation.SIGNAL_KIND_MAPPING.get(proposal.signal_type)
+                or candidate.scope_type != memory_formation.SCOPE_TYPE
+                or candidate.scope_ref != memory_formation.SCOPE_REF
+                or candidate.sensitivity != memory_formation.SENSITIVITY
+                or type(candidate.normalized_content) is not str
+                or not candidate.normalized_content
+            ):
+                raise MemoryStoreError("candidate_state_conflict")
+
+    @staticmethod
+    def _insert_candidate_source(
+        conn: sqlite3.Connection,
+        *,
+        memory_id: int,
+        canonical_message_id: int,
+        proposal: memory_formation.AutoMemoryProposalV1,
+        formation_contract_version: str,
+        extractor_contract_version: str,
+        stamp: str,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO memory_candidate_sources
+               (memory_id,canonical_message_id,signal_type,span_start,span_end,
+                formation_contract_version,extractor_contract_version,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                memory_id,
+                canonical_message_id,
+                proposal.signal_type,
+                proposal.start,
+                proposal.end,
+                formation_contract_version,
+                extractor_contract_version,
+                stamp,
+            ),
+        )
+
+    def _before_auto_formation_run_insert(
+        self,
+        _conn: sqlite3.Connection,
+    ) -> None:
+        """Private test seam immediately before the terminal run record."""
+
+    def persist_auto_memory_candidates(
+        self,
+        *,
+        canonical_message_id: object,
+        source_text: object,
+        proposals: object,
+        formation_contract_version: object,
+        extractor_contract_version: object,
+    ) -> AutoCandidatePersistenceResult:
+        """Persist one candidate-only batch without using explicit envelopes."""
+
+        self._require_candidate_persistence_runtime()
+        formation_version = self._validate_contract_version(
+            formation_contract_version
+        )
+        extractor_version = self._validate_contract_version(
+            extractor_contract_version
+        )
+        frozen_proposals = (
+            tuple(proposals) if type(proposals) is list else proposals
+        )
+        try:
+            with channel_store.connect(self.path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._require_candidate_persistence_runtime()
+                    try:
+                        channel_store.validate_memory_candidate_persistence_schema(
+                            conn
+                        )
+                    except (sqlite3.Error, ValueError):
+                        raise MemoryStoreError("memory_schema_invalid") from None
+                    self._validate_canonical_candidate_source(
+                        conn,
+                        canonical_message_id=canonical_message_id,
+                        source_text=source_text,
+                    )
+                    try:
+                        candidates = memory_formation.build_auto_memory_candidates(
+                            canonical_message_id,
+                            source_text,
+                            frozen_proposals,
+                            max_item_chars=self._runtime_policy.max_item_chars,
+                        )
+                    except memory_formation.MemoryFormationError as error:
+                        raise MemoryStoreError(error.category) from None
+                    sorted_proposals = tuple(sorted(
+                        frozen_proposals,
+                        key=lambda proposal: (
+                            proposal.start,
+                            proposal.end,
+                            proposal.signal_type,
+                        ),
+                    ))
+                    self._validate_candidate_provenance_binding(
+                        canonical_message_id=canonical_message_id,
+                        proposals=sorted_proposals,
+                        candidates=candidates,
+                    )
+                    proposal_digest = self._proposal_digest(sorted_proposals)
+                    proposal_count = len(sorted_proposals)
+                    candidate_count = len(candidates)
+
+                    self._validate_or_initialize_profile(conn, initialize=True)
+                    existing_run = conn.execute(
+                        """SELECT * FROM memory_auto_formation_runs
+                           WHERE canonical_message_id=?""",
+                        (canonical_message_id,),
+                    ).fetchone()
+                    if existing_run is not None:
+                        if (
+                            existing_run["proposal_digest"] != proposal_digest
+                            or existing_run["formation_contract_version"]
+                            != formation_version
+                            or existing_run["extractor_contract_version"]
+                            != extractor_version
+                        ):
+                            raise MemoryStoreError("formation_replay_conflict")
+                        result = self._candidate_result_from_run(
+                            existing_run,
+                            replayed=True,
+                        )
+                        if (
+                            result.proposal_count != proposal_count
+                            or result.candidate_count != candidate_count
+                        ):
+                            raise MemoryStoreError("candidate_state_conflict")
+                        conn.execute("COMMIT")
+                        return result
+
+                    stamp = channel_store.now_iso()
+                    created_count = 0
+                    existing_candidate_count = 0
+                    active_duplicate_count = 0
+                    suppressed_count = 0
+                    for proposal, candidate in zip(sorted_proposals, candidates):
+                        fingerprint = memory_policy.fingerprint_content(
+                            self._runtime_policy.fingerprint_hmac_secret,
+                            scope_type=candidate.scope_type,
+                            scope_ref=candidate.scope_ref,
+                            kind=candidate.kind,
+                            normalized_content=candidate.normalized_content,
+                        )
+                        suppression_ids = self._matching_suppression_ids(
+                            conn,
+                            scope_type=candidate.scope_type,
+                            scope_ref=candidate.scope_ref,
+                            kind=candidate.kind,
+                            fingerprint_version=(
+                                self._runtime_policy.fingerprint_version
+                            ),
+                            fingerprint=fingerprint,
+                        )
+                        if suppression_ids:
+                            suppressed_count += 1
+                            continue
+
+                        existing = self._find_live_by_fingerprint(
+                            conn,
+                            scope_type=candidate.scope_type,
+                            scope_ref=candidate.scope_ref,
+                            kind=candidate.kind,
+                            fingerprint_version=(
+                                self._runtime_policy.fingerprint_version
+                            ),
+                            fingerprint=fingerprint,
+                        )
+                        if existing is not None:
+                            if (
+                                existing["normalized_content"]
+                                != candidate.normalized_content
+                            ):
+                                raise MemoryStoreError("candidate_state_conflict")
+                            if existing["status"] == "active":
+                                active_duplicate_count += 1
+                                continue
+                            if existing["status"] != "candidate":
+                                raise MemoryStoreError("candidate_state_conflict")
+                            existing_candidate_count += 1
+                            self._insert_candidate_source(
+                                conn,
+                                memory_id=int(existing["id"]),
+                                canonical_message_id=canonical_message_id,
+                                proposal=proposal,
+                                formation_contract_version=formation_version,
+                                extractor_contract_version=extractor_version,
+                                stamp=stamp,
+                            )
+                            continue
+
+                        memory_key = secrets.token_urlsafe(24)
+                        cursor = conn.execute(
+                            """INSERT INTO memory_items
+                               (memory_key,kind,scope_type,scope_ref,
+                                normalized_content,normalized_fingerprint,
+                                fingerprint_version,status,explicitness,confidence,
+                                sensitivity,first_observed_at,last_confirmed_at,
+                                superseded_by_id,created_at,updated_at)
+                               VALUES(?,?,?,?,?,?,?,'candidate','inferred',0.0,
+                                      ?,?,?,NULL,?,?)""",
+                            (
+                                memory_key,
+                                candidate.kind,
+                                candidate.scope_type,
+                                candidate.scope_ref,
+                                candidate.normalized_content,
+                                fingerprint,
+                                self._runtime_policy.fingerprint_version,
+                                candidate.sensitivity,
+                                stamp,
+                                stamp,
+                                stamp,
+                                stamp,
+                            ),
+                        )
+                        memory_id = int(cursor.lastrowid)
+                        persisted = conn.execute(
+                            """SELECT status,explicitness,confidence,scope_type,
+                                      scope_ref,sensitivity,kind,normalized_content,
+                                      normalized_fingerprint,fingerprint_version
+                               FROM memory_items WHERE id=?""",
+                            (memory_id,),
+                        ).fetchone()
+                        if (
+                            persisted is None
+                            or persisted["status"] != "candidate"
+                            or persisted["explicitness"] != "inferred"
+                            or persisted["confidence"] != 0.0
+                            or persisted["scope_type"] != candidate.scope_type
+                            or persisted["scope_ref"] != candidate.scope_ref
+                            or persisted["sensitivity"] != candidate.sensitivity
+                            or persisted["kind"] != candidate.kind
+                            or persisted["normalized_content"]
+                            != candidate.normalized_content
+                            or persisted["fingerprint_version"]
+                            != self._runtime_policy.fingerprint_version
+                            or not memory_policy.secure_digest_equal(
+                                persisted["normalized_fingerprint"], fingerprint
+                            )
+                        ):
+                            raise MemoryStoreError("candidate_state_conflict")
+                        self._insert_candidate_source(
+                            conn,
+                            memory_id=memory_id,
+                            canonical_message_id=canonical_message_id,
+                            proposal=proposal,
+                            formation_contract_version=formation_version,
+                            extractor_contract_version=extractor_version,
+                            stamp=stamp,
+                        )
+                        created_count += 1
+
+                    self._before_auto_formation_run_insert(conn)
+                    conn.execute(
+                        """INSERT INTO memory_auto_formation_runs
+                           (canonical_message_id,proposal_digest,proposal_count,
+                            candidate_count,created_count,existing_candidate_count,
+                            active_duplicate_count,suppressed_count,
+                            formation_contract_version,extractor_contract_version,
+                            created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            canonical_message_id,
+                            proposal_digest,
+                            proposal_count,
+                            candidate_count,
+                            created_count,
+                            existing_candidate_count,
+                            active_duplicate_count,
+                            suppressed_count,
+                            formation_version,
+                            extractor_version,
+                            stamp,
+                        ),
+                    )
+                    run = conn.execute(
+                        """SELECT * FROM memory_auto_formation_runs
+                           WHERE canonical_message_id=?""",
+                        (canonical_message_id,),
+                    ).fetchone()
+                    if run is None:
+                        raise MemoryStoreError("candidate_state_conflict")
+                    result = self._candidate_result_from_run(
+                        run,
+                        replayed=False,
+                    )
+                    conn.execute("COMMIT")
+                    return result
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except MemoryStoreError as error:
+            category = (
+                error.category
+                if error.category in _AUTO_PERSISTENCE_ERROR_CATEGORIES
+                else "candidate_persistence_failed"
+            )
+            raise MemoryStoreError(category) from None
+        except sqlite3.IntegrityError:
+            raise MemoryStoreError("candidate_persistence_conflict") from None
+        except (OSError, sqlite3.Error):
+            raise MemoryStoreError("storage_unavailable") from None
+        except Exception:
+            raise MemoryStoreError("candidate_persistence_failed") from None
 
     @staticmethod
     def _derive_evidence_role(direction: object, kind: object) -> str:

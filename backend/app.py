@@ -47,6 +47,7 @@ try:
         kelivo_service,
         memory_context_integration,
         memory_explicit_actions,
+        memory_formation,
         memory_formation_extractor,
         memory_formation_integration,
         memory_runtime,
@@ -58,6 +59,7 @@ except ImportError:  # support `python backend/app.py`
     import kelivo_service
     import memory_context_integration
     import memory_explicit_actions
+    import memory_formation
     import memory_formation_extractor
     import memory_formation_integration
     import memory_runtime
@@ -147,6 +149,9 @@ KELIVO_PERSONA, KELIVO_PERSONA_SOURCE = deployment_config.load_server_persona()
 MEMORY_SERVICE = memory_runtime.bootstrap_memory_read_service_from_environment(
     TELEGRAM
 )
+MEMORY_PRIVILEGED_RUNTIME = None
+MEMORY_CANDIDATE_PERSISTENCE = None
+MEMORY_CANDIDATE_PERSISTENCE_ERROR = ""
 MEMORY_EXPLICIT_ENTRY_SERVICES = None
 MEMORY_EXPLICIT_ENTRY_ERROR = ""
 MEMORY_STARTUP_ERROR = ""
@@ -175,54 +180,122 @@ def db() -> sqlite3.Connection:
     return conn
 
 
-def _compose_explicit_memory_entry() -> None:
-    global MEMORY_SERVICE
+_MEMORY_PRIVILEGED_STARTUP_CATEGORIES = frozenset({
+    "feature_disabled",
+    "memory_configuration_invalid",
+    "memory_explicit_entry_invalid",
+    "memory_fingerprint_hmac_secret_invalid",
+    "memory_fingerprint_hmac_secret_missing",
+    "memory_fingerprint_hmac_secret_must_be_distinct",
+    "memory_fingerprint_key_id_invalid",
+    "memory_fingerprint_key_id_missing",
+    "memory_fingerprint_profile_mismatch",
+    "memory_runtime_already_initialized",
+    "memory_schema_invalid",
+    "runtime_authority_invalid",
+})
+
+
+def _safe_memory_startup_category(error: object, fallback: str) -> str:
+    category = error if type(error) is str else getattr(error, "category", "")
+    return (
+        category
+        if type(category) is str
+        and category in _MEMORY_PRIVILEGED_STARTUP_CATEGORIES
+        else fallback
+    )
+
+
+def _compose_memory_privileged_runtime() -> None:
+    global MEMORY_SERVICE, MEMORY_PRIVILEGED_RUNTIME
+    global MEMORY_CANDIDATE_PERSISTENCE
+    global MEMORY_CANDIDATE_PERSISTENCE_ERROR
     global MEMORY_EXPLICIT_ENTRY_ERROR, MEMORY_EXPLICIT_ENTRY_SERVICES
     config = DEPLOYMENT.memory
-    if not config.explicit_entry_enabled:
+    explicit_required = config.explicit_entry_enabled
+    candidate_required = config.auto_candidate_persistence_enabled
+    if not explicit_required and not candidate_required:
         return
-    if MEMORY_EXPLICIT_ENTRY_SERVICES is not None:
-        return
-    if not config.entry_configuration_valid:
+    explicit_valid = explicit_required and config.entry_configuration_valid
+    candidate_valid = candidate_required and config.configuration_valid
+    if explicit_required and not config.entry_configuration_valid:
         MEMORY_EXPLICIT_ENTRY_ERROR = (
             config.entry_error_category or "memory_explicit_entry_invalid"
         )
-        return
-    if CORE_STARTUP_ERROR or MEMORY_STARTUP_ERROR:
-        MEMORY_EXPLICIT_ENTRY_ERROR = (
-            MEMORY_STARTUP_ERROR or "memory_schema_invalid"
+    if candidate_required and not config.configuration_valid:
+        MEMORY_CANDIDATE_PERSISTENCE_ERROR = (
+            config.error_category or "memory_configuration_invalid"
         )
+    if CORE_STARTUP_ERROR or MEMORY_STARTUP_ERROR:
+        category = MEMORY_STARTUP_ERROR or "memory_schema_invalid"
+        if explicit_valid:
+            MEMORY_EXPLICIT_ENTRY_ERROR = category
+        if candidate_valid:
+            MEMORY_CANDIDATE_PERSISTENCE_ERROR = category
         return
     memory_ready, memory_error = MEMORY_SERVICE.readiness()
     if not memory_ready:
-        MEMORY_EXPLICIT_ENTRY_ERROR = (
-            memory_error or "memory_explicit_entry_invalid"
-        )
+        if explicit_valid:
+            MEMORY_EXPLICIT_ENTRY_ERROR = _safe_memory_startup_category(
+                memory_error,
+                "memory_explicit_entry_invalid",
+            )
+        if candidate_valid:
+            MEMORY_CANDIDATE_PERSISTENCE_ERROR = _safe_memory_startup_category(
+                memory_error,
+                "memory_auto_candidate_persistence_unavailable",
+            )
         return
-    try:
-        runtime = memory_runtime.bootstrap_memory_runtime_from_environment(
-            TELEGRAM
-        )
-        backend = memory_explicit_actions.create_entry_backend(
-            runtime.privileged_actions
-        )
-        services = (
-            memory_explicit_actions.bind_operator_cli(backend),
-            memory_explicit_actions.bind_mcp(backend),
-            memory_explicit_actions.bind_telegram(backend),
-            memory_explicit_actions.bind_operit(backend),
-        )
-    except (
-        memory_explicit_actions.ExplicitMemoryActionError,
-        memory_runtime.MemoryRuntimeError,
-    ) as error:
-        MEMORY_EXPLICIT_ENTRY_ERROR = str(
-            getattr(error, "category", "memory_explicit_entry_invalid")
-        )
+    if not explicit_valid and not candidate_valid:
         return
+    runtime = MEMORY_PRIVILEGED_RUNTIME
+    if runtime is None:
+        try:
+            runtime = memory_runtime.bootstrap_memory_runtime_from_environment(
+                TELEGRAM
+            )
+        except Exception as error:
+            if explicit_valid:
+                MEMORY_EXPLICIT_ENTRY_ERROR = _safe_memory_startup_category(
+                    error,
+                    "memory_explicit_entry_invalid",
+                )
+            if candidate_valid:
+                MEMORY_CANDIDATE_PERSISTENCE_ERROR = (
+                    _safe_memory_startup_category(
+                        error,
+                        "memory_auto_candidate_persistence_unavailable",
+                    )
+                )
+            return
+        MEMORY_PRIVILEGED_RUNTIME = runtime
     MEMORY_SERVICE = runtime.read_service
-    MEMORY_EXPLICIT_ENTRY_SERVICES = services
-    MEMORY_EXPLICIT_ENTRY_ERROR = ""
+    if candidate_valid:
+        candidate_persistence = getattr(runtime, "candidate_persistence", None)
+        if candidate_persistence is None:
+            MEMORY_CANDIDATE_PERSISTENCE_ERROR = (
+                "memory_auto_candidate_persistence_unavailable"
+            )
+        else:
+            MEMORY_CANDIDATE_PERSISTENCE = candidate_persistence
+            MEMORY_CANDIDATE_PERSISTENCE_ERROR = ""
+    if explicit_valid and MEMORY_EXPLICIT_ENTRY_SERVICES is None:
+        try:
+            backend = memory_explicit_actions.create_entry_backend(
+                runtime.privileged_actions
+            )
+            MEMORY_EXPLICIT_ENTRY_SERVICES = (
+                memory_explicit_actions.bind_operator_cli(backend),
+                memory_explicit_actions.bind_mcp(backend),
+                memory_explicit_actions.bind_telegram(backend),
+                memory_explicit_actions.bind_operit(backend),
+            )
+            MEMORY_EXPLICIT_ENTRY_ERROR = ""
+        except Exception as error:
+            MEMORY_EXPLICIT_ENTRY_ERROR = _safe_memory_startup_category(
+                error,
+                "memory_explicit_entry_invalid",
+            )
 
 
 def init_db() -> None:
@@ -271,7 +344,7 @@ def init_db() -> None:
             channel_store.run_migrations(DB_PATH)
         except (OSError, sqlite3.Error, ValueError):
             MEMORY_STARTUP_ERROR = "memory_schema_invalid"
-    _compose_explicit_memory_entry()
+    _compose_memory_privileged_runtime()
     channel_store.recover_inflight_generations(DB_PATH)
     channel_store.recover_inflight_deliveries(DB_PATH)
     # A process restart makes every prior in-flight dispatch uncertain; never
@@ -1028,6 +1101,119 @@ def _log_memory_formation_shadow(
         pass
 
 
+_MEMORY_CANDIDATE_PERSISTENCE_CATEGORIES = frozenset({
+    "auto_candidate_persistence_disabled",
+    "candidate_budget_exceeded",
+    "candidate_persistence_conflict",
+    "candidate_persistence_failed",
+    "candidate_policy_rejected",
+    "candidate_state_conflict",
+    "duplicate_proposal",
+    "feature_disabled",
+    "formation_replay_conflict",
+    "ineligible_proposal",
+    "invalid_canonical_source",
+    "invalid_contract_version",
+    "invalid_max_item_chars",
+    "invalid_proposal",
+    "invalid_proposals",
+    "invalid_signal_type",
+    "invalid_source_message_id",
+    "invalid_source_text",
+    "invalid_span",
+    "memory_auto_candidate_persistence_unavailable",
+    "memory_configuration_invalid",
+    "memory_fingerprint_profile_mismatch",
+    "memory_formation_error",
+    "memory_schema_invalid",
+    "overlapping_proposals",
+    "runtime_authority_invalid",
+    "source_text_too_long",
+    "storage_unavailable",
+    "too_many_proposals",
+})
+
+
+def _log_memory_candidate_persistence(
+    *,
+    status: str,
+    result: object | None = None,
+    category: object = "",
+) -> None:
+    """Emit bounded candidate persistence telemetry without data identifiers."""
+
+    try:
+        if status == "completed" and result is not None:
+            def bounded_count(name: str) -> int:
+                return max(0, min(int(getattr(result, name, 0)), 3))
+
+            replayed = 1 if getattr(result, "replayed", False) is True else 0
+            print(
+                "[memory-candidate-persistence] status=completed "
+                f"created={bounded_count('created_count')} "
+                f"existing={bounded_count('existing_candidate_count')} "
+                f"active_duplicate={bounded_count('active_duplicate_count')} "
+                f"suppressed={bounded_count('suppressed_count')} "
+                f"replayed={replayed}",
+                flush=True,
+            )
+        elif status == "failed":
+            safe_category = (
+                category
+                if type(category) is str
+                and category in _MEMORY_CANDIDATE_PERSISTENCE_CATEGORIES
+                else "candidate_persistence_failed"
+            )
+            print(
+                "[memory-candidate-persistence] "
+                f"status=failed category={safe_category}",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
+async def _persist_accepted_memory_proposals(
+    canonical_message_id: int,
+    source_text: str,
+    proposals: tuple,
+) -> None:
+    if not DEPLOYMENT.memory.auto_candidate_persistence_enabled:
+        return
+    persistence = MEMORY_CANDIDATE_PERSISTENCE
+    if persistence is None:
+        _log_memory_candidate_persistence(
+            status="failed",
+            category=(
+                MEMORY_CANDIDATE_PERSISTENCE_ERROR
+                or "memory_auto_candidate_persistence_unavailable"
+            ),
+        )
+        return
+    try:
+        result = await asyncio.to_thread(
+            persistence.persist,
+            canonical_message_id=canonical_message_id,
+            source_text=source_text,
+            proposals=proposals,
+            formation_contract_version=(
+                memory_formation.FORMATION_CONTRACT_VERSION
+            ),
+            extractor_contract_version=(
+                memory_formation_extractor.EXTRACTOR_CONTRACT_VERSION
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        _log_memory_candidate_persistence(
+            status="failed",
+            category=getattr(error, "category", ""),
+        )
+        return
+    _log_memory_candidate_persistence(status="completed", result=result)
+
+
 def _memory_formation_shadow_done(task: asyncio.Task) -> None:
     if getattr(app.state, "memory_formation_shadow_task", None) is task:
         app.state.memory_formation_shadow_task = None
@@ -1067,11 +1253,18 @@ async def _run_memory_formation_shadow_task(
                 provider_prompt_contract_version=kelivo_service.PROMPT_CONTRACT_VERSION,
             )
 
+        formation_kwargs = {
+            "max_item_chars": DEPLOYMENT.memory.max_item_chars,
+        }
+        if DEPLOYMENT.memory.auto_candidate_persistence_enabled:
+            formation_kwargs["accepted_proposals_callable"] = (
+                _persist_accepted_memory_proposals
+            )
         result = await memory_formation_integration.run_memory_formation_shadow(
             canonical.canonical_message_id,
             canonical.text,
             extractor,
-            max_item_chars=DEPLOYMENT.memory.max_item_chars,
+            **formation_kwargs,
         )
     except asyncio.CancelledError:
         raise
@@ -1296,6 +1489,13 @@ async def readyz():
             MEMORY_EXPLICIT_ENTRY_SERVICES is not None
             and not MEMORY_EXPLICIT_ENTRY_ERROR
         )
+    if DEPLOYMENT.memory.auto_candidate_persistence_enabled:
+        checks["memory_auto_candidate_persistence"] = bool(
+            memory_ready
+            and MEMORY_PRIVILEGED_RUNTIME is not None
+            and MEMORY_CANDIDATE_PERSISTENCE is not None
+            and not MEMORY_CANDIDATE_PERSISTENCE_ERROR
+        )
     if DEPLOYMENT.kelivo.enabled:
         checks["kelivo"] = await asyncio.to_thread(
             kelivo_service.client_mapping_ready,
@@ -1327,6 +1527,17 @@ async def readyz():
     ):
         errors["memory_explicit_entry"] = (
             MEMORY_EXPLICIT_ENTRY_ERROR or "memory_explicit_entry_invalid"
+        )
+    if (
+        DEPLOYMENT.memory.auto_candidate_persistence_enabled
+        and not checks["memory_auto_candidate_persistence"]
+    ):
+        errors["memory_auto_candidate_persistence"] = (
+            MEMORY_CANDIDATE_PERSISTENCE_ERROR
+            or _safe_memory_startup_category(
+                memory_error,
+                "memory_auto_candidate_persistence_unavailable",
+            )
         )
     if errors:
         payload["errors"] = errors

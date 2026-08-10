@@ -1142,13 +1142,20 @@ class MemoryContextDispatchIntegrationTests(
                           context_bundle_hash,request_identity_hash,prompt_contract_version
                    FROM kelivo_requests"""
             ).fetchone()
-            database_dump = "\n".join(conn.iterdump())
+            persisted_rows_dump = "\n".join(
+                statement
+                for statement in conn.iterdump()
+                if statement.startswith("INSERT INTO")
+            )
         self.assertEqual(row["prompt_contract_version"], "kelivo-provider-prompt-v1")
         self.assertNotIn(plaintext, row["provider_messages_json"])
         self.assertNotIn(plaintext, row["context_bundle_json"])
         self.assertNotIn("transient_memory_dispatch", row["context_bundle_json"])
-        self.assertNotIn(plaintext, database_dump)
-        self.assertNotIn("kelivo-transient-memory-dispatch-v1", database_dump)
+        self.assertNotIn(plaintext, persisted_rows_dump)
+        self.assertNotIn(
+            "kelivo-transient-memory-dispatch-v1",
+            persisted_rows_dump,
+        )
         self.assertNotIn(plaintext, stdout.getvalue())
         self.assertNotIn(plaintext, stderr.getvalue())
 
@@ -1207,19 +1214,23 @@ class MemoryContextDispatchIntegrationTests(
             snapshot_count = conn.execute(
                 "SELECT count(*) FROM companion_context_snapshots"
             ).fetchone()[0]
-            database_dump = "\n".join(conn.iterdump())
+            persisted_rows_dump = "\n".join(
+                statement
+                for statement in conn.iterdump()
+                if statement.startswith("INSERT INTO")
+            )
         self.assertEqual(snapshot_count, 0)
         for plaintext in (relevant_text, early_only_text):
             self.assertNotIn(plaintext, row["provider_messages_json"])
             self.assertNotIn(plaintext, row["context_bundle_json"])
-            self.assertNotIn(plaintext, database_dump)
+            self.assertNotIn(plaintext, persisted_rows_dump)
         for metadata in (
             "candidate_count",
             "selected_count",
             "query_signal_count",
             "transient_memory_dispatch",
         ):
-            self.assertNotIn(metadata, database_dump)
+            self.assertNotIn(metadata, persisted_rows_dump)
 
     async def test_smart_no_match_dispatches_base_without_marker_or_fallback(self):
         self.enable_smart_retrieval()
