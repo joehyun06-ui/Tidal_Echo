@@ -20,6 +20,10 @@ HMAC_DIGEST_BYTES = 32
 CREDENTIAL_DETECTION_MAX_CHARS = 4096
 CREDENTIAL_PERCENT_DECODE_ROUNDS = 2
 
+# Neutral canonical validator for server-generated Memory identifiers.  Keep
+# boundary-specific error mapping in the calling service/ledger.
+MEMORY_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,96}\Z")
+
 KINDS = frozenset({
     "user_preference", "user_profile", "relationship", "shared_episode",
     "project", "decision", "task_or_progress", "assistant_experience",

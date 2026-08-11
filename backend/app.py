@@ -45,6 +45,8 @@ try:
         channel_store,
         deployment_config,
         kelivo_service,
+        memory_candidate_review,
+        memory_candidate_review_composition,
         memory_context_integration,
         memory_explicit_actions,
         memory_formation,
@@ -57,6 +59,8 @@ except ImportError:  # support `python backend/app.py`
     import channel_store
     import deployment_config
     import kelivo_service
+    import memory_candidate_review
+    import memory_candidate_review_composition
     import memory_context_integration
     import memory_explicit_actions
     import memory_formation
@@ -152,6 +156,10 @@ MEMORY_SERVICE = memory_runtime.bootstrap_memory_read_service_from_environment(
 MEMORY_PRIVILEGED_RUNTIME = None
 MEMORY_CANDIDATE_PERSISTENCE = None
 MEMORY_CANDIDATE_PERSISTENCE_ERROR = ""
+MEMORY_CANDIDATE_REVIEW_SERVICE = None
+MEMORY_CANDIDATE_REVIEW_OPERATOR = None
+MEMORY_CANDIDATE_REVIEW_MCP = None
+MEMORY_CANDIDATE_REVIEW_ERROR = ""
 MEMORY_EXPLICIT_ENTRY_SERVICES = None
 MEMORY_EXPLICIT_ENTRY_ERROR = ""
 MEMORY_STARTUP_ERROR = ""
@@ -204,6 +212,69 @@ def _safe_memory_startup_category(error: object, fallback: str) -> str:
         and category in _MEMORY_PRIVILEGED_STARTUP_CATEGORIES
         else fallback
     )
+
+
+_MEMORY_CANDIDATE_REVIEW_CATEGORIES = frozenset({
+    "candidate_review_disabled",
+    "candidate_review_configuration_invalid",
+    "candidate_review_schema_invalid",
+    "candidate_review_profile_mismatch",
+    "candidate_review_state_invalid",
+    "candidate_unreviewable",
+    "candidate_not_found",
+    "invalid_candidate_key",
+    "invalid_candidate_kind",
+    "invalid_candidate_limit",
+    "invalid_candidate_cursor",
+    "storage_unavailable",
+    "candidate_review_unavailable",
+})
+
+
+def _safe_candidate_review_category(
+    error: object,
+    fallback: str = "candidate_review_unavailable",
+) -> str:
+    category = error if type(error) is str else getattr(error, "category", "")
+    return (
+        category
+        if type(category) is str
+        and category in _MEMORY_CANDIDATE_REVIEW_CATEGORIES
+        else fallback
+    )
+
+
+def _compose_memory_candidate_review() -> None:
+    global MEMORY_CANDIDATE_REVIEW_SERVICE
+    global MEMORY_CANDIDATE_REVIEW_OPERATOR, MEMORY_CANDIDATE_REVIEW_MCP
+    global MEMORY_CANDIDATE_REVIEW_ERROR
+    MEMORY_CANDIDATE_REVIEW_SERVICE = None
+    MEMORY_CANDIDATE_REVIEW_OPERATOR = None
+    MEMORY_CANDIDATE_REVIEW_MCP = None
+    MEMORY_CANDIDATE_REVIEW_ERROR = ""
+    config = DEPLOYMENT.memory
+    if not config.candidate_review_enabled:
+        return
+    if not config.configuration_valid:
+        MEMORY_CANDIDATE_REVIEW_ERROR = (
+            "candidate_review_configuration_invalid"
+        )
+        return
+    if CORE_STARTUP_ERROR or MEMORY_STARTUP_ERROR:
+        MEMORY_CANDIDATE_REVIEW_ERROR = "candidate_review_schema_invalid"
+        return
+    try:
+        capabilities = (
+            memory_candidate_review_composition
+            .compose_candidate_review_capabilities(DEPLOYMENT)
+        )
+        MEMORY_CANDIDATE_REVIEW_SERVICE = capabilities.service
+        MEMORY_CANDIDATE_REVIEW_OPERATOR = capabilities.operator_cli
+        MEMORY_CANDIDATE_REVIEW_MCP = capabilities.mcp
+    except memory_candidate_review.MemoryCandidateReviewError as error:
+        MEMORY_CANDIDATE_REVIEW_ERROR = _safe_candidate_review_category(error)
+    except Exception:
+        MEMORY_CANDIDATE_REVIEW_ERROR = "candidate_review_unavailable"
 
 
 def _compose_memory_privileged_runtime() -> None:
@@ -338,12 +409,14 @@ def init_db() -> None:
             )
     except (OSError, sqlite3.Error, ValueError):
         CORE_STARTUP_ERROR = "core_schema_invalid"
+        _compose_memory_candidate_review()
         return
     if DEPLOYMENT.memory.enabled:
         try:
             channel_store.run_migrations(DB_PATH)
         except (OSError, sqlite3.Error, ValueError):
             MEMORY_STARTUP_ERROR = "memory_schema_invalid"
+    _compose_memory_candidate_review()
     _compose_memory_privileged_runtime()
     channel_store.recover_inflight_generations(DB_PATH)
     channel_store.recover_inflight_deliveries(DB_PATH)
@@ -1496,6 +1569,37 @@ async def readyz():
             and MEMORY_CANDIDATE_PERSISTENCE is not None
             and not MEMORY_CANDIDATE_PERSISTENCE_ERROR
         )
+    candidate_review_error = ""
+    if DEPLOYMENT.memory.candidate_review_enabled:
+        if not checks["database"]:
+            candidate_review_ready = False
+            candidate_review_error = "candidate_review_schema_invalid"
+        elif MEMORY_CANDIDATE_REVIEW_ERROR:
+            candidate_review_ready = False
+            candidate_review_error = _safe_candidate_review_category(
+                MEMORY_CANDIDATE_REVIEW_ERROR
+            )
+        elif not memory_ready:
+            candidate_review_ready = False
+            candidate_review_error = (
+                "candidate_review_schema_invalid"
+                if MEMORY_STARTUP_ERROR
+                else "candidate_review_unavailable"
+            )
+        elif MEMORY_CANDIDATE_REVIEW_SERVICE is None:
+            candidate_review_ready = False
+            candidate_review_error = "candidate_review_unavailable"
+        else:
+            candidate_review_ready, candidate_review_error = (
+                await asyncio.to_thread(
+                    MEMORY_CANDIDATE_REVIEW_SERVICE.readiness
+                )
+            )
+            candidate_review_error = _safe_candidate_review_category(
+                candidate_review_error,
+                "candidate_review_unavailable",
+            ) if not candidate_review_ready else ""
+        checks["memory_candidate_review"] = bool(candidate_review_ready)
     if DEPLOYMENT.kelivo.enabled:
         checks["kelivo"] = await asyncio.to_thread(
             kelivo_service.client_mapping_ready,
@@ -1538,6 +1642,13 @@ async def readyz():
                 memory_error,
                 "memory_auto_candidate_persistence_unavailable",
             )
+        )
+    if (
+        DEPLOYMENT.memory.candidate_review_enabled
+        and not checks["memory_candidate_review"]
+    ):
+        errors["memory_candidate_review"] = (
+            candidate_review_error or "candidate_review_unavailable"
         )
     if errors:
         payload["errors"] = errors

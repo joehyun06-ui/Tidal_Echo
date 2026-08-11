@@ -22,6 +22,9 @@ def clear_backend_app_modules():
         "backend.kelivo_service", "backend.heartbeat_service",
         "backend.memory_policy", "backend.memory_runtime",
         "backend.memory_store", "backend.memory_service",
+        "backend.memory_candidate_review",
+        "backend.memory_candidate_review_adapters",
+        "backend.memory_candidate_review_composition",
         "backend.memory_explicit_actions", "backend.memory_context",
         "backend.memory_context_integration", "backend.memory_retrieval",
         "backend.memory_formation_extractor",
@@ -83,7 +86,8 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
              memory_sensitive: bool = False, memory_secret: str = "",
              memory_entry: bool = False, memory_context: bool = False,
              memory_smart: bool = False, memory_auto_formation: bool = False,
-             memory_candidate_persistence: bool = False):
+             memory_candidate_persistence: bool = False,
+             memory_candidate_review: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -125,6 +129,9 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "MEMORY_AUTO_FORMATION_ENABLED": "true" if memory_auto_formation else "false",
         "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": (
             "true" if memory_candidate_persistence else "false"
+        ),
+        "MEMORY_CANDIDATE_REVIEW_ENABLED": (
+            "true" if memory_candidate_review else "false"
         ),
         "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
         "MEMORY_MAX_ITEM_CHARS": "1000",
