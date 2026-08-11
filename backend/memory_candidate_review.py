@@ -563,6 +563,13 @@ class MemoryCandidateReviewReader:
                 evidence=evidence,
             )
 
+    def _readiness(self) -> tuple[bool, str]:
+        """Probe only schema/profile state without reading candidate data."""
+
+        with self._connect_read_only() as conn:
+            self._prepare_connection(conn)
+        return True, ""
+
 
 class MemoryCandidateReviewService:
     """Capability gate for the isolated read-only review reader."""
@@ -604,6 +611,17 @@ class MemoryCandidateReviewService:
             _raise("candidate_review_configuration_invalid")
         if not self._configuration_valid:
             _raise("candidate_review_configuration_invalid")
+
+    def readiness(self) -> tuple[bool, str]:
+        """Return a bounded health result without inspecting candidate rows."""
+
+        try:
+            self._require_enabled()
+            return self._reader._readiness()
+        except MemoryCandidateReviewError as error:
+            return False, error.category
+        except Exception:
+            return False, "candidate_review_state_invalid"
 
     def list_candidates(
         self,

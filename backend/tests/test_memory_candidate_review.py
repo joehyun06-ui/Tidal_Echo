@@ -247,6 +247,14 @@ class MemoryCandidateReviewTests(NoNetworkMixin, unittest.TestCase):
                     ) as ctx:
                         service.list_candidates()
                     self.assertEqual(ctx.exception.category, category)
+            self.assertEqual(
+                disabled.readiness(),
+                (False, "candidate_review_disabled"),
+            )
+            self.assertEqual(
+                invalid.readiness(),
+                (False, "candidate_review_configuration_invalid"),
+            )
 
     def test_list_and_detail_have_fixed_immutable_repr_safe_shapes(self):
         content = "Project Atlas uses Python."
