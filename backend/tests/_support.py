@@ -126,6 +126,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": (
             "true" if memory_candidate_persistence else "false"
         ),
+        "MEMORY_CANDIDATE_REVIEW_ENABLED": "false",
         "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
         "MEMORY_MAX_ITEM_CHARS": "1000",
         "MEMORY_FORGET_RETENTION_POLICY": "tombstone_without_content",
