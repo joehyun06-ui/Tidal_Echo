@@ -6,8 +6,15 @@ import re
 from typing import Sequence
 
 try:
-    from . import memory_formation, memory_policy, memory_runtime, memory_store
+    from . import (
+        memory_candidate_decision_ledger,
+        memory_formation,
+        memory_policy,
+        memory_runtime,
+        memory_store,
+    )
 except ImportError:  # support direct module execution in local tooling
+    import memory_candidate_decision_ledger
     import memory_formation
     import memory_policy
     import memory_runtime
@@ -228,6 +235,61 @@ class AutomaticCandidatePersistence(_PrivilegedServiceBase):
             memory_store.MemoryStoreError,
         ) as error:
             raise self._translate_error(error) from None
+
+
+class CandidateDecisionWriter(_PrivilegedServiceBase):
+    """Narrow internal terminal-decision capability retained by the runtime."""
+
+    def readiness(self) -> tuple[bool, str]:
+        """Return bounded dynamic health without inspecting candidate rows."""
+
+        try:
+            self._store.candidate_decision_readiness()
+            return True, ""
+        except memory_store.MemoryStoreError as error:
+            category = getattr(
+                error,
+                "category",
+                "candidate_decision_state_invalid",
+            )
+            safe_categories = {
+                "candidate_decisions_disabled",
+                "candidate_decision_configuration_invalid",
+                "candidate_decision_schema_invalid",
+                "candidate_decision_profile_mismatch",
+                "candidate_decision_state_invalid",
+                "runtime_authority_invalid",
+                "storage_unavailable",
+            }
+            return False, (
+                category
+                if type(category) is str and category in safe_categories
+                else "candidate_decision_state_invalid"
+            )
+        except Exception:
+            return False, "candidate_decision_state_invalid"
+
+    def decide(
+        self,
+        *,
+        binding: (
+            memory_candidate_decision_ledger.CandidateDecisionLedgerBindingV1
+        ),
+    ) -> memory_candidate_decision_ledger.CandidateDecisionResultV1:
+        try:
+            memory_runtime.require_runtime_authority(self._authority)
+            return self._store.decide_memory_candidate_atomic(
+                binding=binding
+            )
+        except (
+            memory_runtime.MemoryRuntimeError,
+            memory_store.MemoryStoreError,
+        ) as error:
+            raise (
+                memory_candidate_decision_ledger.MemoryCandidateDecisionLedgerError(
+                    getattr(error, "category", "candidate_decision_state_invalid")
+                )
+            ) from None
 
 
 class PrivilegedMemoryActions(_PrivilegedServiceBase):

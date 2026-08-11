@@ -30,6 +30,7 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.auto_formation_enabled)
         self.assertFalse(config.auto_candidate_persistence_enabled)
         self.assertFalse(config.candidate_review_enabled)
+        self.assertFalse(config.candidate_decisions_enabled)
         self.assertTrue(config.entry_configuration_valid)
         self.assertEqual(config.max_item_chars, 1000)
         self.assertEqual(config.forget_retention_policy, "tombstone_without_content")
@@ -93,6 +94,59 @@ class MemoryConfigTests(unittest.TestCase):
                 self.assertTrue(config.candidate_review_enabled)
                 self.assertFalse(config.configuration_valid)
                 self.assertEqual(config.error_category, category)
+
+    def test_candidate_decisions_are_strict_default_off(self):
+        for value in ("", "maybe", " true ", "enabled"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                r"^invalid_memory_candidate_decisions_enabled$",
+            ):
+                self.load({"MEMORY_CANDIDATE_DECISIONS_ENABLED": value})
+
+    def test_candidate_decisions_require_only_core_review_and_profile(self):
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_candidate_decisions_requires_core$",
+        ):
+            self.load({"MEMORY_CANDIDATE_DECISIONS_ENABLED": "true"})
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_candidate_decisions_requires_candidate_review$",
+        ):
+            self.load({
+                "MEMORY_CORE_ENABLED": "true",
+                "MEMORY_CANDIDATE_DECISIONS_ENABLED": "true",
+            })
+
+        config = self.load({
+            "MEMORY_CORE_ENABLED": "true",
+            "MEMORY_CANDIDATE_REVIEW_ENABLED": "true",
+            "MEMORY_CANDIDATE_DECISIONS_ENABLED": "true",
+            "MEMORY_FINGERPRINT_KEY_ID": TEST_KEY_ID,
+            "MEMORY_FINGERPRINT_HMAC_SECRET": TEST_HMAC_SECRET,
+        })
+        self.assertTrue(config.candidate_decisions_enabled)
+        self.assertTrue(config.candidate_review_enabled)
+        self.assertTrue(config.configuration_valid)
+        self.assertFalse(config.context_injection_enabled)
+        self.assertFalse(config.auto_formation_enabled)
+        self.assertFalse(config.auto_candidate_persistence_enabled)
+        self.assertFalse(config.explicit_writes_enabled)
+        self.assertFalse(config.explicit_entry_enabled)
+        self.assertFalse(config.sensitive_storage_enabled)
+
+    def test_candidate_decisions_require_valid_fingerprint_configuration(self):
+        config = self.load({
+            "MEMORY_CORE_ENABLED": "true",
+            "MEMORY_CANDIDATE_REVIEW_ENABLED": "true",
+            "MEMORY_CANDIDATE_DECISIONS_ENABLED": "true",
+        })
+        self.assertTrue(config.candidate_decisions_enabled)
+        self.assertFalse(config.configuration_valid)
+        self.assertEqual(
+            config.error_category,
+            "memory_fingerprint_key_id_missing",
+        )
 
     def test_auto_formation_is_strict_default_off_and_has_only_core_kelivo_dependencies(self):
         with self.assertRaisesRegex(

@@ -25,6 +25,8 @@ def clear_backend_app_modules():
         "backend.memory_candidate_review",
         "backend.memory_candidate_review_adapters",
         "backend.memory_candidate_review_composition",
+        "backend.memory_candidate_decision_adapters",
+        "backend.memory_candidate_decision_composition",
         "backend.memory_explicit_actions", "backend.memory_context",
         "backend.memory_context_integration", "backend.memory_retrieval",
         "backend.memory_formation_extractor",
@@ -87,7 +89,8 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
              memory_entry: bool = False, memory_context: bool = False,
              memory_smart: bool = False, memory_auto_formation: bool = False,
              memory_candidate_persistence: bool = False,
-             memory_candidate_review: bool = False):
+             memory_candidate_review: bool = False,
+             memory_candidate_decisions: bool = False):
     root_path = Path(root)
     brain_path = root_path / "brain_target"
     brain_path.write_text(brain, encoding="utf-8")
@@ -132,6 +135,9 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         ),
         "MEMORY_CANDIDATE_REVIEW_ENABLED": (
             "true" if memory_candidate_review else "false"
+        ),
+        "MEMORY_CANDIDATE_DECISIONS_ENABLED": (
+            "true" if memory_candidate_decisions else "false"
         ),
         "MEMORY_SENSITIVE_STORAGE_ENABLED": "true" if memory_sensitive else "false",
         "MEMORY_MAX_ITEM_CHARS": "1000",

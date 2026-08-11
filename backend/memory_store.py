@@ -17,6 +17,8 @@ try:
     from . import (
         channel_store,
         memory_action_ledger,
+        memory_candidate_decision_ledger,
+        memory_candidate_integrity,
         memory_formation,
         memory_policy,
         memory_runtime,
@@ -24,6 +26,8 @@ try:
 except ImportError:  # support direct module execution in local tooling
     import channel_store
     import memory_action_ledger
+    import memory_candidate_decision_ledger
+    import memory_candidate_integrity
     import memory_formation
     import memory_policy
     import memory_runtime
@@ -210,6 +214,7 @@ _PROFILE_STATE_TABLES = (
     "memory_action_requests",
     "memory_candidate_sources",
     "memory_auto_formation_runs",
+    "memory_candidate_decisions",
 )
 _CONTRACT_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _AUTO_PERSISTENCE_ERROR_CATEGORIES = frozenset({
@@ -241,6 +246,20 @@ _AUTO_PERSISTENCE_ERROR_CATEGORIES = frozenset({
     "source_text_too_long",
     "storage_unavailable",
     "too_many_proposals",
+})
+_CANDIDATE_DECISION_ERROR_CATEGORIES = frozenset({
+    "candidate_decisions_disabled",
+    "candidate_decision_configuration_invalid",
+    "candidate_decision_schema_invalid",
+    "candidate_decision_profile_mismatch",
+    "candidate_decision_state_invalid",
+    "candidate_not_pending",
+    "invalid_candidate_decision_request",
+    "invalid_candidate_key",
+    "candidate_decision_request_conflict",
+    "candidate_decision_conflict",
+    "runtime_authority_invalid",
+    "storage_unavailable",
 })
 
 
@@ -480,6 +499,43 @@ class MemoryStore:
         except (OSError, sqlite3.Error, ValueError):
             return False
 
+    def candidate_decision_readiness(self) -> None:
+        """Validate decision authority, schema, and profile without writes."""
+
+        try:
+            self._require_candidate_decision_runtime()
+        except MemoryStoreError as error:
+            category = {
+                "feature_disabled": "candidate_decision_configuration_invalid",
+                "memory_configuration_invalid": (
+                    "candidate_decision_configuration_invalid"
+                ),
+            }.get(error.category, error.category)
+            raise MemoryStoreError(category) from None
+        verifier = self._candidate_integrity_verifier()
+        try:
+            connection = channel_store.connect_read_only(
+                self.path,
+                timeout_seconds=30.0,
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            raise MemoryStoreError("storage_unavailable") from None
+        with connection as conn:
+            try:
+                channel_store.validate_memory_candidate_decision_schema_v1_v10(
+                    conn
+                )
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                raise MemoryStoreError(
+                    "candidate_decision_schema_invalid"
+                ) from None
+            try:
+                verifier.verify_profile(conn)
+            except (
+                memory_candidate_integrity.AutomaticCandidateIntegrityError
+            ) as error:
+                self._raise_candidate_integrity_error(error)
+
     def _action_unit_of_work(self):
         """Create the internal root transaction for a reviewed composition path."""
         self._require_write_runtime()
@@ -674,6 +730,34 @@ class MemoryStore:
             raise MemoryStoreError("memory_configuration_invalid")
         if not policy.auto_candidate_persistence_enabled:
             raise MemoryStoreError("auto_candidate_persistence_disabled")
+        if (
+            policy.normalization_version != memory_policy.NORMALIZATION_VERSION
+            or policy.fingerprint_version != memory_policy.FINGERPRINT_VERSION
+            or policy.fingerprint_domain != memory_policy.FINGERPRINT_DOMAIN
+        ):
+            raise MemoryStoreError("memory_configuration_invalid")
+        try:
+            memory_policy.fingerprint_profile_check(
+                policy.fingerprint_hmac_secret
+            )
+        except memory_policy.MemoryPolicyError:
+            raise MemoryStoreError("memory_configuration_invalid") from None
+
+    def _require_candidate_decision_runtime(self) -> None:
+        """Enforce decision authority without borrowing other write bits."""
+
+        try:
+            policy = memory_runtime.require_runtime_authority(self._authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+        if policy is not self._runtime_policy:
+            raise MemoryStoreError("runtime_authority_invalid")
+        if not policy.enabled:
+            raise MemoryStoreError("feature_disabled")
+        if not policy.configuration_valid:
+            raise MemoryStoreError("memory_configuration_invalid")
+        if not policy.candidate_decisions_enabled:
+            raise MemoryStoreError("candidate_decisions_disabled")
         if (
             policy.normalization_version != memory_policy.NORMALIZATION_VERSION
             or policy.fingerprint_version != memory_policy.FINGERPRINT_VERSION
@@ -1222,6 +1306,402 @@ class MemoryStore:
             raise MemoryStoreError("storage_unavailable") from None
         except Exception:
             raise MemoryStoreError("candidate_persistence_failed") from None
+
+    def _candidate_integrity_verifier(
+        self,
+    ) -> memory_candidate_integrity.AutomaticCandidateIntegrityVerifier:
+        try:
+            return (
+                memory_candidate_integrity.AutomaticCandidateIntegrityVerifier(
+                    fingerprint_key_id=(
+                        self._runtime_policy.fingerprint_key_id
+                    ),
+                    fingerprint_hmac_secret=(
+                        self._runtime_policy.fingerprint_hmac_secret
+                    ),
+                    max_item_chars=self._runtime_policy.max_item_chars,
+                )
+            )
+        except memory_candidate_integrity.AutomaticCandidateIntegrityError:
+            raise MemoryStoreError(
+                "candidate_decision_configuration_invalid"
+            ) from None
+
+    @staticmethod
+    def _raise_candidate_integrity_error(
+        error: memory_candidate_integrity.AutomaticCandidateIntegrityError,
+    ) -> None:
+        categories = {
+            "candidate_integrity_profile_mismatch": (
+                "candidate_decision_profile_mismatch"
+            ),
+            "candidate_integrity_schema_invalid": (
+                "candidate_decision_schema_invalid"
+            ),
+            "storage_unavailable": "storage_unavailable",
+        }
+        raise MemoryStoreError(categories.get(
+            error.category,
+            "candidate_decision_state_invalid",
+        )) from None
+
+    @staticmethod
+    def _same_verified_automatic_identity(
+        before: memory_candidate_integrity.VerifiedAutomaticMemoryV1,
+        after: memory_candidate_integrity.VerifiedAutomaticMemoryV1,
+    ) -> bool:
+        return (
+            type(before)
+            is memory_candidate_integrity.VerifiedAutomaticMemoryV1
+            and type(after)
+            is memory_candidate_integrity.VerifiedAutomaticMemoryV1
+            and before.memory_id == after.memory_id
+            and before.candidate_key == after.candidate_key
+            and before.kind == after.kind
+            and before.content == after.content
+            and memory_policy.secure_digest_equal(
+                before.fingerprint,
+                after.fingerprint,
+            )
+            and before.fingerprint_version == after.fingerprint_version
+            and before.scope_type == after.scope_type
+            and before.scope_ref == after.scope_ref
+            and before.sensitivity == after.sensitivity
+            and before.explicitness == after.explicitness
+            and before.first_observed_at == after.first_observed_at
+            and before.created_at == after.created_at
+            and before.evidence == after.evidence
+        )
+
+    @staticmethod
+    def _validate_rejection_suppression(
+        conn: sqlite3.Connection,
+        *,
+        suppression_id: int,
+        memory: memory_candidate_integrity.VerifiedAutomaticMemoryV1,
+        expected_created_at: str,
+    ) -> None:
+        row = conn.execute(
+            """SELECT id,scope_type,scope_ref,kind,normalized_fingerprint,
+                      fingerprint_version,reason_category,created_at
+                 FROM memory_suppressions WHERE id=?""",
+            (suppression_id,),
+        ).fetchone()
+        if (
+            row is None
+            or type(row["id"]) is not int
+            or row["id"] != suppression_id
+            or row["scope_type"] != memory.scope_type
+            or row["scope_ref"] != memory.scope_ref
+            or row["kind"] != memory.kind
+            or type(row["normalized_fingerprint"]) is not bytes
+            or not memory_policy.secure_digest_equal(
+                row["normalized_fingerprint"],
+                memory.fingerprint,
+            )
+            or type(row["fingerprint_version"]) is not int
+            or row["fingerprint_version"] != memory.fingerprint_version
+            or row["reason_category"] != "user_reject"
+            or row["created_at"] != expected_created_at
+        ):
+            raise MemoryStoreError("candidate_decision_state_invalid")
+
+    @staticmethod
+    def _insert_candidate_rejection_suppression(
+        conn: sqlite3.Connection,
+        *,
+        memory: memory_candidate_integrity.VerifiedAutomaticMemoryV1,
+        stamp: str,
+    ) -> int:
+        cursor = conn.execute(
+            """INSERT INTO memory_suppressions
+               (scope_type,scope_ref,kind,normalized_fingerprint,
+                fingerprint_version,reason_category,created_at)
+               VALUES(?,?,?,?,?,'user_reject',?)""",
+            (
+                memory.scope_type,
+                memory.scope_ref,
+                memory.kind,
+                memory.fingerprint,
+                memory.fingerprint_version,
+                stamp,
+            ),
+        )
+        suppression_id = cursor.lastrowid
+        if (
+            cursor.rowcount != 1
+            or type(suppression_id) is not int
+            or suppression_id <= 0
+        ):
+            raise MemoryStoreError("candidate_decision_conflict")
+        return suppression_id
+
+    def _before_candidate_decision_ledger_insert(
+        self,
+        _conn: sqlite3.Connection,
+        _binding: (
+            memory_candidate_decision_ledger.CandidateDecisionLedgerBindingV1
+        ),
+        _memory: memory_candidate_integrity.VerifiedAutomaticMemoryV1,
+        _suppression_id: int | None,
+    ) -> None:
+        """Private rollback seam after mutation and before terminal ledger."""
+
+    def _verify_terminal_decision_replay(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        binding: (
+            memory_candidate_decision_ledger.CandidateDecisionLedgerBindingV1
+        ),
+        ledger: memory_candidate_decision_ledger.CandidateDecisionLedgerRowV1,
+        verifier: (
+            memory_candidate_integrity.AutomaticCandidateIntegrityVerifier
+        ),
+    ) -> memory_candidate_integrity.VerifiedAutomaticMemoryV1:
+        row = conn.execute(
+            f"""SELECT {memory_candidate_integrity.AUTOMATIC_MEMORY_COLUMNS}
+                  FROM memory_items WHERE id=?""",
+            (ledger.memory_id,),
+        ).fetchone()
+        if row is None or row["memory_key"] != binding.candidate_key:
+            raise MemoryStoreError("candidate_decision_state_invalid")
+        try:
+            if binding.decision == "approve":
+                memory = verifier.verify_approved_memory(conn, row)
+                if (
+                    ledger.suppression_id is not None
+                    or memory.last_confirmed_at != ledger.created_at
+                    or memory.updated_at != ledger.created_at
+                ):
+                    raise MemoryStoreError(
+                        "candidate_decision_state_invalid"
+                    )
+            else:
+                memory = verifier.verify_rejected_memory(conn, row)
+                if (
+                    type(ledger.suppression_id) is not int
+                    or memory.updated_at != ledger.created_at
+                ):
+                    raise MemoryStoreError(
+                        "candidate_decision_state_invalid"
+                    )
+                self._validate_rejection_suppression(
+                    conn,
+                    suppression_id=ledger.suppression_id,
+                    memory=memory,
+                    expected_created_at=ledger.created_at,
+                )
+            return memory
+        except memory_candidate_integrity.AutomaticCandidateIntegrityError as error:
+            self._raise_candidate_integrity_error(error)
+
+    def decide_memory_candidate_atomic(
+        self,
+        *,
+        binding: (
+            memory_candidate_decision_ledger.CandidateDecisionLedgerBindingV1
+        ),
+    ) -> memory_candidate_decision_ledger.CandidateDecisionResultV1:
+        """Apply or replay one review-authorized terminal candidate decision."""
+
+        try:
+            with channel_store.connect(self.path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._require_candidate_decision_runtime()
+                    verifier = self._candidate_integrity_verifier()
+                    try:
+                        channel_store.validate_memory_candidate_decision_schema_v1_v10(
+                            conn
+                        )
+                    except (sqlite3.Error, TypeError, ValueError):
+                        raise MemoryStoreError(
+                            "candidate_decision_schema_invalid"
+                        ) from None
+                    valid_binding = (
+                        memory_candidate_decision_ledger.validate_binding(
+                            binding
+                        )
+                    )
+                    existing = memory_candidate_decision_ledger.lookup_request(
+                        conn,
+                        valid_binding.request_id,
+                    )
+                    replay_ledger = (
+                        memory_candidate_decision_ledger.validate_replay_binding(
+                            existing,
+                            valid_binding,
+                        )
+                        if existing is not None
+                        else None
+                    )
+                    try:
+                        verifier.verify_profile(conn)
+                    except (
+                        memory_candidate_integrity.AutomaticCandidateIntegrityError
+                    ) as error:
+                        self._raise_candidate_integrity_error(error)
+
+                    if replay_ledger is not None:
+                        self._verify_terminal_decision_replay(
+                            conn,
+                            binding=valid_binding,
+                            ledger=replay_ledger,
+                            verifier=verifier,
+                        )
+                        result = (
+                            memory_candidate_decision_ledger.CandidateDecisionResultV1(
+                                valid_binding,
+                                replayed=True,
+                            )
+                        )
+                        conn.execute("COMMIT")
+                        return result
+
+                    row = conn.execute(
+                        f"""SELECT {
+                            memory_candidate_integrity.AUTOMATIC_MEMORY_COLUMNS
+                        } FROM memory_items WHERE memory_key=?""",
+                        (valid_binding.candidate_key,),
+                    ).fetchone()
+                    if row is None or row["status"] != "candidate":
+                        raise MemoryStoreError("candidate_not_pending")
+                    try:
+                        pending = verifier.verify_pending_candidate(conn, row)
+                    except (
+                        memory_candidate_integrity.AutomaticCandidateIntegrityError
+                    ) as error:
+                        self._raise_candidate_integrity_error(error)
+                    if self._matching_suppression_ids(
+                        conn,
+                        scope_type=pending.scope_type,
+                        scope_ref=pending.scope_ref,
+                        kind=pending.kind,
+                        fingerprint_version=pending.fingerprint_version,
+                        fingerprint=pending.fingerprint,
+                    ):
+                        raise MemoryStoreError(
+                            "candidate_decision_state_invalid"
+                        )
+
+                    stamp = channel_store.now_iso()
+                    suppression_id = None
+                    if valid_binding.decision == "approve":
+                        cursor = conn.execute(
+                            """UPDATE memory_items
+                                  SET status='active',confidence=1.0,
+                                      last_confirmed_at=?,updated_at=?
+                                WHERE id=? AND status='candidate'""",
+                            (stamp, stamp, pending.memory_id),
+                        )
+                    else:
+                        suppression_id = (
+                            self._insert_candidate_rejection_suppression(
+                                conn,
+                                memory=pending,
+                                stamp=stamp,
+                            )
+                        )
+                        cursor = conn.execute(
+                            """UPDATE memory_items
+                                  SET status='rejected',updated_at=?
+                                WHERE id=? AND status='candidate'""",
+                            (stamp, pending.memory_id),
+                        )
+                    if cursor.rowcount != 1:
+                        raise MemoryStoreError(
+                            "candidate_decision_conflict"
+                        )
+
+                    self._before_candidate_decision_ledger_insert(
+                        conn,
+                        valid_binding,
+                        pending,
+                        suppression_id,
+                    )
+                    ledger = (
+                        memory_candidate_decision_ledger._insert_terminal_decision(
+                            conn,
+                            binding=valid_binding,
+                            memory_id=pending.memory_id,
+                            suppression_id=suppression_id,
+                            created_at=stamp,
+                        )
+                    )
+                    terminal = self._verify_terminal_decision_replay(
+                        conn,
+                        binding=valid_binding,
+                        ledger=ledger,
+                        verifier=verifier,
+                    )
+                    if not self._same_verified_automatic_identity(
+                        pending,
+                        terminal,
+                    ):
+                        raise MemoryStoreError(
+                            "candidate_decision_state_invalid"
+                        )
+                    if valid_binding.decision == "approve":
+                        if (
+                            terminal.confidence != 1.0
+                            or terminal.last_confirmed_at != stamp
+                            or terminal.updated_at != stamp
+                        ):
+                            raise MemoryStoreError(
+                                "candidate_decision_state_invalid"
+                            )
+                    elif (
+                        terminal.confidence != 0.0
+                        or terminal.last_confirmed_at
+                        != pending.last_confirmed_at
+                        or terminal.updated_at != stamp
+                    ):
+                        raise MemoryStoreError(
+                            "candidate_decision_state_invalid"
+                        )
+
+                    result = (
+                        memory_candidate_decision_ledger.CandidateDecisionResultV1(
+                            valid_binding,
+                            replayed=False,
+                        )
+                    )
+                    conn.execute("COMMIT")
+                    return result
+                except BaseException:
+                    if conn.in_transaction:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    raise
+        except MemoryStoreError as error:
+            aliases = {
+                "feature_disabled": "candidate_decisions_disabled",
+                "memory_configuration_invalid": (
+                    "candidate_decision_configuration_invalid"
+                ),
+            }
+            category = aliases.get(error.category, error.category)
+            if category not in _CANDIDATE_DECISION_ERROR_CATEGORIES:
+                category = "candidate_decision_state_invalid"
+            raise MemoryStoreError(category) from None
+        except (
+            memory_candidate_decision_ledger.MemoryCandidateDecisionLedgerError
+        ) as error:
+            category = (
+                error.category
+                if error.category in _CANDIDATE_DECISION_ERROR_CATEGORIES
+                else "candidate_decision_state_invalid"
+            )
+            raise MemoryStoreError(category) from None
+        except sqlite3.IntegrityError:
+            raise MemoryStoreError("candidate_decision_conflict") from None
+        except (OSError, sqlite3.Error):
+            raise MemoryStoreError("storage_unavailable") from None
+        except Exception:
+            raise MemoryStoreError("candidate_decision_state_invalid") from None
 
     @staticmethod
     def _derive_evidence_role(direction: object, kind: object) -> str:

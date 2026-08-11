@@ -941,6 +941,72 @@ def _migration_009(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+MEMORY_CANDIDATE_DECISION_TABLE_DDL = """CREATE TABLE memory_candidate_decisions (
+        request_id TEXT PRIMARY KEY NOT NULL
+            CHECK(length(request_id) BETWEEN 32 AND 96
+                  AND request_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        memory_id INTEGER NOT NULL UNIQUE,
+        origin TEXT NOT NULL
+            CHECK(origin IN ('operator_cli','mcp')),
+        decision TEXT NOT NULL
+            CHECK(decision IN ('approve','reject')),
+        request_binding_digest BLOB NOT NULL
+            CHECK(typeof(request_binding_digest)='blob'
+                  AND length(request_binding_digest)=32),
+        suppression_id INTEGER,
+        review_contract_version TEXT NOT NULL
+            CHECK(length(review_contract_version) BETWEEN 1 AND 128
+                  AND review_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
+                  AND substr(review_contract_version,1,1) GLOB '[A-Za-z0-9]'),
+        decision_contract_version TEXT NOT NULL
+            CHECK(length(decision_contract_version) BETWEEN 1 AND 128
+                  AND decision_contract_version NOT GLOB '*[^A-Za-z0-9._:-]*'
+                  AND substr(decision_contract_version,1,1) GLOB '[A-Za-z0-9]'),
+        created_at TEXT NOT NULL,
+        CHECK(
+            (decision='approve' AND suppression_id IS NULL)
+            OR
+            (decision='reject' AND suppression_id IS NOT NULL)
+        ),
+        CHECK(
+            length(created_at) BETWEEN 25 AND 40
+            AND created_at NOT GLOB '*[^0-9T:+.-]*'
+            AND substr(created_at,5,1)='-'
+            AND substr(created_at,8,1)='-'
+            AND substr(created_at,11,1)='T'
+            AND substr(created_at,14,1)=':'
+            AND substr(created_at,17,1)=':'
+            AND substr(created_at,-6)='+00:00'
+        ),
+        FOREIGN KEY(memory_id)
+            REFERENCES memory_items(id) ON DELETE RESTRICT,
+        FOREIGN KEY(suppression_id)
+            REFERENCES memory_suppressions(id) ON DELETE RESTRICT)"""
+
+MEMORY_CANDIDATE_DECISION_TRIGGER_DDL: dict[str, str] = {
+    "memory_candidate_decisions_immutable_update":
+        """CREATE TRIGGER memory_candidate_decisions_immutable_update
+           BEFORE UPDATE ON memory_candidate_decisions
+           BEGIN
+             SELECT RAISE(ABORT,'memory_candidate_decision_immutable');
+           END""",
+    "memory_candidate_decisions_immutable_delete":
+        """CREATE TRIGGER memory_candidate_decisions_immutable_delete
+           BEFORE DELETE ON memory_candidate_decisions
+           BEGIN
+             SELECT RAISE(ABORT,'memory_candidate_decision_immutable');
+           END""",
+}
+
+
+def _migration_010(conn: sqlite3.Connection) -> None:
+    """Add the terminal candidate decision ledger without decision actions."""
+    validate_memory_candidate_persistence_schema(conn)
+    conn.execute(MEMORY_CANDIDATE_DECISION_TABLE_DDL)
+    for statement in MEMORY_CANDIDATE_DECISION_TRIGGER_DDL.values():
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -2355,6 +2421,11 @@ def validate_memory_candidate_persistence_schema(
                  AND name NOT LIKE 'sqlite_autoindex_%'"""
         )
     }
+    actual_objects -= {
+        ("table", "memory_candidate_decisions"),
+        ("trigger", "memory_candidate_decisions_immutable_update"),
+        ("trigger", "memory_candidate_decisions_immutable_delete"),
+    }
     expected_objects = {
         ("table", "memory_candidate_sources"),
         ("table", "memory_auto_formation_runs"),
@@ -2368,6 +2439,165 @@ def validate_memory_candidate_persistence_schema(
     if actual_objects != expected_objects:
         raise sqlite3.DatabaseError(
             "invalid memory candidate persistence object set"
+        )
+
+
+def validate_memory_candidate_decision_schema_v1_v10(
+    conn: sqlite3.Connection,
+) -> None:
+    """Validate the exact v1-v10 markers and terminal decision ledger."""
+    validate_memory_candidate_persistence_schema(conn)
+
+    actual_markers = [
+        tuple(row)
+        for row in conn.execute(
+            """SELECT version,name,status FROM schema_migrations
+               ORDER BY version"""
+        ).fetchall()
+    ]
+    expected_markers = [
+        (version, name, "applied")
+        for version, name, _apply in MIGRATIONS[:10]
+    ]
+    if actual_markers != expected_markers:
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision migration markers"
+        )
+
+    rows = conn.execute(
+        "PRAGMA table_xinfo(memory_candidate_decisions)"
+    ).fetchall()
+    if any(int(row["hidden"]) != 0 for row in rows):
+        raise sqlite3.DatabaseError(
+            "invalid hidden memory candidate decision column"
+        )
+    actual_columns = tuple(
+        (
+            row["name"], str(row["type"]).upper(), int(row["notnull"]),
+            row["dflt_value"], int(row["pk"]),
+        )
+        for row in rows
+    )
+    expected_columns = (
+        ("request_id", "TEXT", 1, None, 1),
+        ("memory_id", "INTEGER", 1, None, 0),
+        ("origin", "TEXT", 1, None, 0),
+        ("decision", "TEXT", 1, None, 0),
+        ("request_binding_digest", "BLOB", 1, None, 0),
+        ("suppression_id", "INTEGER", 0, None, 0),
+        ("review_contract_version", "TEXT", 1, None, 0),
+        ("decision_contract_version", "TEXT", 1, None, 0),
+        ("created_at", "TEXT", 1, None, 0),
+    )
+    if actual_columns != expected_columns:
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision columns"
+        )
+
+    actual_indexes = {
+        row["name"]: row
+        for row in conn.execute(
+            "PRAGMA index_list(memory_candidate_decisions)"
+        )
+    }
+    expected_indexes = {
+        "sqlite_autoindex_memory_candidate_decisions_1": (
+            True, "pk", False, ("request_id",),
+        ),
+        "sqlite_autoindex_memory_candidate_decisions_2": (
+            True, "u", False, ("memory_id",),
+        ),
+    }
+    if set(actual_indexes) != set(expected_indexes):
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision index set"
+        )
+    for name, (unique, origin, partial, columns) in expected_indexes.items():
+        row = actual_indexes[name]
+        if (
+            bool(row["unique"]), row["origin"], bool(row["partial"]),
+        ) != (unique, origin, partial):
+            raise sqlite3.DatabaseError(
+                "invalid memory candidate decision index attributes"
+            )
+        _validate_index_xinfo(conn, name, columns)
+
+    actual_fks = {
+        (
+            row["from"], row["table"], row["to"], row["on_update"],
+            row["on_delete"], row["match"],
+        )
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(memory_candidate_decisions)"
+        )
+    }
+    expected_fks = {
+        (
+            "memory_id", "memory_items", "id",
+            "NO ACTION", "RESTRICT", "NONE",
+        ),
+        (
+            "suppression_id", "memory_suppressions", "id",
+            "NO ACTION", "RESTRICT", "NONE",
+        ),
+    }
+    if actual_fks != expected_fks:
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision foreign keys"
+        )
+
+    table = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type='table' AND name='memory_candidate_decisions'"""
+    ).fetchone()
+    if (
+        table is None
+        or _sql_fingerprint(str(table["sql"]))
+        != _sql_fingerprint(MEMORY_CANDIDATE_DECISION_TABLE_DDL)
+    ):
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision table fingerprint"
+        )
+
+    actual_triggers = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            """SELECT name,sql FROM sqlite_master
+               WHERE type='trigger'
+                 AND tbl_name='memory_candidate_decisions'"""
+        )
+    }
+    if set(actual_triggers) != set(MEMORY_CANDIDATE_DECISION_TRIGGER_DDL):
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision trigger set"
+        )
+    for name, expected_sql in MEMORY_CANDIDATE_DECISION_TRIGGER_DDL.items():
+        if (
+            _sql_fingerprint(str(actual_triggers[name]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError(
+                "invalid memory candidate decision trigger fingerprint"
+            )
+
+    actual_objects = {
+        (row["type"], row["name"])
+        for row in conn.execute(
+            """SELECT type,name FROM sqlite_master
+               WHERE (name LIKE 'memory_candidate_decision%'
+                      OR name LIKE 'idx_memory_candidate_decision%'
+                      OR tbl_name='memory_candidate_decisions')
+                 AND name NOT LIKE 'sqlite_autoindex_%'"""
+        )
+    }
+    expected_objects = {
+        ("table", "memory_candidate_decisions"),
+        ("trigger", "memory_candidate_decisions_immutable_update"),
+        ("trigger", "memory_candidate_decisions_immutable_delete"),
+    }
+    if actual_objects != expected_objects:
+        raise sqlite3.DatabaseError(
+            "invalid memory candidate decision object set"
         )
 
 
@@ -2406,6 +2636,7 @@ def _validate_memory_operator_main_schema_objects(
         *MEMORY_TABLE_DDL,
         _ddl_object_name(MEMORY_ACTION_REQUEST_TABLE_DDL, "table"),
         *MEMORY_CANDIDATE_PERSISTENCE_TABLE_DDL,
+        _ddl_object_name(MEMORY_CANDIDATE_DECISION_TABLE_DDL, "table"),
     }
     index_names = {
         *CORE_V1_INDEX_DDL,
@@ -2421,6 +2652,7 @@ def _validate_memory_operator_main_schema_objects(
         *MEMORY_TRIGGER_DDL,
         *MEMORY_ACTION_REQUEST_TRIGGER_DDL,
         *MEMORY_CANDIDATE_PERSISTENCE_TRIGGER_DDL,
+        *MEMORY_CANDIDATE_DECISION_TRIGGER_DDL,
     }
     expected = {
         *(("table", name) for name in table_names),
@@ -2439,58 +2671,25 @@ def _validate_memory_operator_main_schema_objects(
         raise sqlite3.DatabaseError("memory_operator_schema_invalid")
 
 
-def validate_memory_operator_schema_v1_v9(
+def validate_memory_operator_schema_v1_v10(
     conn: sqlite3.Connection,
 ) -> None:
     """Validate the exact supported operator schema using data-free failures."""
     try:
-        validate_core_schema_v1_v6(
-            conn,
-            require_relay_tables=True,
-        )
-        marker_rows = conn.execute(
-            """SELECT version,name,status FROM schema_migrations
-               ORDER BY version"""
-        ).fetchall()
-        actual_markers = [tuple(row) for row in marker_rows]
-        expected_markers = [
-            (version, name, "applied")
-            for version, name, _apply in MIGRATIONS
-        ]
-        if actual_markers[:6] != expected_markers[:6]:
-            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
-        if (
-            len(actual_markers) < 7
-            or actual_markers[6]
-            != (7, "explicit_memory_core_foundation", "applied")
-        ):
-            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
-        validate_memory_schema(conn)
-        if (
-            len(actual_markers) < 8
-            or actual_markers[7]
-            != (8, "explicit_memory_action_request_ledger", "applied")
-        ):
-            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
-        validate_memory_action_schema(conn)
-        if (
-            len(actual_markers) < 9
-            or actual_markers[8]
-            != (
-                9,
-                "automatic_memory_candidate_persistence_foundation",
-                "applied",
-            )
-        ):
-            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
-        validate_memory_candidate_persistence_schema(conn)
-        if actual_markers != expected_markers:
-            raise sqlite3.DatabaseError("memory_operator_schema_invalid")
+        validate_core_schema_v1_v6(conn, require_relay_tables=True)
+        validate_memory_candidate_decision_schema_v1_v10(conn)
         _validate_memory_operator_main_schema_objects(conn)
     except (sqlite3.Error, TypeError, ValueError):
         raise sqlite3.DatabaseError(
             "memory_operator_schema_invalid"
         ) from None
+
+
+def validate_memory_operator_schema_v1_v9(
+    conn: sqlite3.Connection,
+) -> None:
+    """Compatibility name; the operator contract now requires exact v1-v10."""
+    validate_memory_operator_schema_v1_v10(conn)
 
 
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
@@ -2506,6 +2705,11 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
         9,
         "automatic_memory_candidate_persistence_foundation",
         _migration_009,
+    ),
+    (
+        10,
+        "memory_candidate_decision_ledger_foundation",
+        _migration_010,
     ),
 )
 CORE_MIGRATIONS = MIGRATIONS[:6]
@@ -2545,6 +2749,8 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 validate_memory_action_schema(conn)
             if requested_latest >= 9:
                 validate_memory_candidate_persistence_schema(conn)
+            if requested_latest >= 10:
+                validate_memory_candidate_decision_schema_v1_v10(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

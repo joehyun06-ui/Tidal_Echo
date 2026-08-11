@@ -40,6 +40,8 @@ def config(
     enabled: bool = True,
     writes: bool = True,
     auto_candidate_persistence: bool = False,
+    candidate_decisions: bool = False,
+    candidate_review: bool = False,
     sensitive: bool = False,
     secret: str = TEST_SECRET,
     key_id: str = "authority-test-key",
@@ -50,6 +52,8 @@ def config(
         smart_retrieval_enabled=False,
         explicit_writes_enabled=writes,
         auto_candidate_persistence_enabled=auto_candidate_persistence,
+        candidate_decisions_enabled=candidate_decisions,
+        candidate_review_enabled=candidate_review,
         sensitive_storage_enabled=sensitive,
         max_item_chars=1000,
         forget_retention_policy="tombstone_without_content",
@@ -274,6 +278,161 @@ class MemoryAuthorityTests(NoNetworkMixin, unittest.TestCase):
         self.assertFalse(candidate_only.explicit_writes_enabled)
         self.assertFalse(explicit_only.auto_candidate_persistence_enabled)
         self.assertTrue(explicit_only.explicit_writes_enabled)
+
+    def test_runtime_policy_keeps_decision_authority_independent(self):
+        decision_only = memory_runtime._policy_from_config(config(
+            writes=False,
+            auto_candidate_persistence=False,
+            candidate_decisions=True,
+            candidate_review=True,
+        ))
+        explicit_only = memory_runtime._policy_from_config(config(
+            writes=True,
+            candidate_decisions=False,
+        ))
+        persistence_only = memory_runtime._policy_from_config(config(
+            writes=False,
+            auto_candidate_persistence=True,
+            candidate_decisions=False,
+        ))
+        self.assertTrue(decision_only.candidate_decisions_enabled)
+        self.assertFalse(decision_only.explicit_writes_enabled)
+        self.assertFalse(decision_only.auto_candidate_persistence_enabled)
+        self.assertFalse(explicit_only.candidate_decisions_enabled)
+        self.assertFalse(persistence_only.candidate_decisions_enabled)
+
+    def test_candidate_decision_guard_requires_only_its_authority_bit(self):
+        decision_runtime = bootstrap(
+            self.path,
+            config(
+                writes=False,
+                auto_candidate_persistence=False,
+                candidate_decisions=True,
+                candidate_review=True,
+            ),
+        )
+        decision_store = decision_runtime.privileged_actions._store
+        decision_store._require_candidate_decision_runtime()
+
+        for runtime_config in (
+            config(writes=True, candidate_decisions=False),
+            config(
+                writes=False,
+                auto_candidate_persistence=True,
+                candidate_decisions=False,
+            ),
+        ):
+            with self.subTest(runtime_config=runtime_config):
+                unrelated_runtime = bootstrap(self.path, runtime_config)
+                unrelated_store = unrelated_runtime.privileged_actions._store
+                with self.assertRaisesRegex(
+                    memory_store.MemoryStoreError,
+                    "^candidate_decisions_disabled$",
+                ):
+                    unrelated_store._require_candidate_decision_runtime()
+
+    def test_candidate_decision_guard_maps_disabled_and_invalid_configuration(self):
+        cases = (
+            (
+                "feature_disabled",
+                config(
+                    enabled=False,
+                    writes=False,
+                    candidate_decisions=True,
+                    candidate_review=True,
+                ),
+            ),
+            (
+                "memory_configuration_invalid",
+                config(
+                    writes=False,
+                    candidate_decisions=True,
+                    candidate_review=True,
+                    secret="",
+                ),
+            ),
+        )
+        for category, runtime_config in cases:
+            with self.subTest(category=category):
+                runtime = bootstrap(self.path, runtime_config)
+                store = runtime.privileged_actions._store
+                with self.assertRaisesRegex(
+                    memory_store.MemoryStoreError,
+                    f"^{category}$",
+                ):
+                    store._require_candidate_decision_runtime()
+
+        runtime = bootstrap(
+            self.path,
+            config(
+                writes=False,
+                candidate_decisions=True,
+                candidate_review=True,
+            ),
+        )
+        store = runtime.privileged_actions._store
+        policy = memory_runtime.require_runtime_authority(
+            runtime.privileged_actions._authority
+        )
+        object.__setattr__(policy, "fingerprint_hmac_secret", "weak")
+        with self.assertRaisesRegex(
+            memory_store.MemoryStoreError,
+            "^memory_configuration_invalid$",
+        ):
+            store._require_candidate_decision_runtime()
+
+    def test_candidate_decision_guard_fails_closed_on_runtime_and_contract_drift(self):
+        decision_runtime = bootstrap(
+            self.path,
+            config(
+                writes=False,
+                candidate_decisions=True,
+                candidate_review=True,
+            ),
+        )
+        decision_store = decision_runtime.privileged_actions._store
+        policy = memory_runtime.require_runtime_authority(
+            decision_runtime.privileged_actions._authority
+        )
+        object.__setattr__(policy, "fingerprint_domain", "wrong-domain")
+        with self.assertRaisesRegex(
+            memory_store.MemoryStoreError,
+            "^memory_configuration_invalid$",
+        ):
+            decision_store._require_candidate_decision_runtime()
+
+        importlib.reload(memory_runtime)
+        with self.assertRaisesRegex(
+            memory_store.MemoryStoreError,
+            "^runtime_authority_invalid$",
+        ):
+            decision_store._require_candidate_decision_runtime()
+
+    def test_candidate_decisions_require_runtime_profile_but_review_alone_does_not(self):
+        decision_deployment = SimpleNamespace(
+            memory=config(
+                writes=False,
+                candidate_decisions=True,
+                candidate_review=True,
+            ),
+            db_path=self.path,
+        )
+        review_deployment = SimpleNamespace(
+            memory=config(
+                writes=False,
+                candidate_decisions=False,
+                candidate_review=True,
+            ),
+            db_path=self.path,
+        )
+        decision_read = memory_runtime._bootstrap_memory_read_service(
+            decision_deployment
+        )
+        review_read = memory_runtime._bootstrap_memory_read_service(
+            review_deployment
+        )
+        self.assertIsNotNone(decision_read._reader._expected_profile)
+        self.assertIsNone(review_read._reader._expected_profile)
 
     def test_candidate_authority_cannot_borrow_explicit_action_write_path(self):
         candidate_runtime = bootstrap(

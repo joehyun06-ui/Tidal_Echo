@@ -9,18 +9,23 @@ Phase 4A evidence.
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
 
 try:
-    from . import channel_store, deployment_config, memory_formation, memory_policy
+    from . import (
+        channel_store,
+        deployment_config,
+        memory_candidate_integrity,
+        memory_formation,
+        memory_policy,
+    )
 except ImportError:  # support direct module execution in local tooling
     import channel_store
     import deployment_config
+    import memory_candidate_integrity
     import memory_formation
     import memory_policy
 
@@ -28,13 +33,17 @@ except ImportError:  # support direct module execution in local tooling
 DEFAULT_CANDIDATE_LIMIT: Final = 20
 MAX_CANDIDATE_LIMIT: Final = 50
 MAX_CONTENT_PREVIEW_CHARS: Final = 240
-EVIDENCE_CONTEXT_CHARS: Final = 160
-MAX_SOURCE_EXCERPT_CHARS: Final = 2320
+EVIDENCE_CONTEXT_CHARS: Final = (
+    memory_candidate_integrity.EVIDENCE_CONTEXT_CHARS
+)
+MAX_SOURCE_EXCERPT_CHARS: Final = (
+    memory_candidate_integrity.MAX_SOURCE_EXCERPT_CHARS
+)
+CANDIDATE_REVIEW_CONTRACT_VERSION: Final = (
+    memory_candidate_integrity.CANDIDATE_REVIEW_CONTRACT_VERSION
+)
 
-_PROFILE_KEY_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
-_CONTRACT_VERSION: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _AUTOMATIC_KINDS: Final = frozenset(memory_formation.SIGNAL_KIND_MAPPING.values())
-_AUTOMATIC_SIGNALS: Final = frozenset(memory_formation.SIGNAL_KIND_MAPPING)
 
 _ERROR_CATEGORIES: Final = frozenset({
     "candidate_review_disabled",
@@ -51,9 +60,9 @@ _ERROR_CATEGORIES: Final = frozenset({
     "storage_unavailable",
 })
 
-_CANDIDATE_COLUMNS: Final = """id,memory_key,kind,scope_type,scope_ref,
-    normalized_content,normalized_fingerprint,fingerprint_version,status,
-    explicitness,confidence,sensitivity,created_at"""
+_CANDIDATE_COLUMNS: Final = (
+    memory_candidate_integrity.AUTOMATIC_MEMORY_COLUMNS
+)
 
 
 class MemoryCandidateReviewError(RuntimeError):
@@ -127,28 +136,8 @@ class CandidateReviewDetailV1:
         return "<CandidateReviewDetailV1>"
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class _ValidatedCandidate:
-    memory_id: int
-    candidate_key: str
-    kind: str
-    content: str
-    fingerprint: bytes
-    created_at: str
-
-
 def _raise(category: str) -> None:
     raise MemoryCandidateReviewError(category)
-
-
-def _is_valid_timestamp(value: object) -> bool:
-    if type(value) is not str or not value or len(value) > 64:
-        return False
-    try:
-        parsed = datetime.fromisoformat(value)
-        return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
-    except (TypeError, ValueError, OverflowError):
-        return False
 
 
 def _preview(content: str) -> str:
@@ -162,11 +151,7 @@ class MemoryCandidateReviewReader:
 
     __slots__ = (
         "_database_path",
-        "_fingerprint_key_id",
-        "_fingerprint_key_check",
-        "_fingerprint_hmac_secret",
-        "_max_item_chars",
-        "_policy",
+        "_verifier",
     )
 
     def __init__(
@@ -183,7 +168,6 @@ class MemoryCandidateReviewReader:
                 raise ValueError
             if (
                 type(fingerprint_key_id) is not str
-                or _PROFILE_KEY_ID.fullmatch(fingerprint_key_id) is None
                 or type(fingerprint_hmac_secret) is not str
                 or not deployment_config.memory_fingerprint_secret_is_strong(
                     fingerprint_hmac_secret
@@ -192,10 +176,14 @@ class MemoryCandidateReviewReader:
                 or not 64 <= max_item_chars <= 4096
             ):
                 raise ValueError
-            key_check = memory_policy.fingerprint_profile_check(
-                fingerprint_hmac_secret
+            verifier = (
+                memory_candidate_integrity.AutomaticCandidateIntegrityVerifier(
+                    fingerprint_key_id=fingerprint_key_id,
+                    fingerprint_hmac_secret=fingerprint_hmac_secret,
+                    max_item_chars=max_item_chars,
+                )
             )
-            policy = memory_policy.MemoryPolicy(
+            memory_policy.MemoryPolicy(
                 max_item_chars=max_item_chars,
                 sensitive_storage_enabled=False,
             )
@@ -204,11 +192,7 @@ class MemoryCandidateReviewReader:
         except Exception:
             _raise("candidate_review_configuration_invalid")
         self._database_path = str(database)
-        self._fingerprint_key_id = fingerprint_key_id
-        self._fingerprint_key_check = key_check
-        self._fingerprint_hmac_secret = fingerprint_hmac_secret
-        self._max_item_chars = max_item_chars
-        self._policy = policy
+        self._verifier = verifier
 
     def __repr__(self) -> str:
         return "<MemoryCandidateReviewReader>"
@@ -232,223 +216,49 @@ class MemoryCandidateReviewReader:
 
     def _validate_profile(self, conn: sqlite3.Connection) -> None:
         try:
-            rows = conn.execute(
-                """SELECT singleton,key_id,key_check,normalization_version,
-                          fingerprint_version
-                   FROM memory_fingerprint_profile ORDER BY singleton"""
-            ).fetchall()
-            if len(rows) != 1:
-                _raise("candidate_review_profile_mismatch")
-            row = rows[0]
-            if (
-                type(row["singleton"]) is not int
-                or row["singleton"] != 1
-                or type(row["key_id"]) is not str
-                or row["key_id"] != self._fingerprint_key_id
-                or type(row["key_check"]) is not bytes
-                or not memory_policy.secure_digest_equal(
-                    row["key_check"], self._fingerprint_key_check
-                )
-                or type(row["normalization_version"]) is not int
-                or row["normalization_version"]
-                != memory_policy.NORMALIZATION_VERSION
-                or type(row["fingerprint_version"]) is not int
-                or row["fingerprint_version"]
-                != memory_policy.FINGERPRINT_VERSION
-            ):
-                _raise("candidate_review_profile_mismatch")
-        except MemoryCandidateReviewError:
-            raise
-        except (OSError, sqlite3.Error, KeyError, TypeError, ValueError):
+            self._verifier.verify_profile(conn)
+        except memory_candidate_integrity.AutomaticCandidateIntegrityError:
             _raise("candidate_review_profile_mismatch")
 
     def _prepare_connection(self, conn: sqlite3.Connection) -> None:
         self._validate_schema(conn)
         self._validate_profile(conn)
 
-    def _validate_candidate_row(self, row: sqlite3.Row) -> _ValidatedCandidate:
-        try:
-            memory_id = row["id"]
-            candidate_key = row["memory_key"]
-            kind = row["kind"]
-            content = row["normalized_content"]
-            fingerprint = row["normalized_fingerprint"]
-            confidence = row["confidence"]
-            created_at = row["created_at"]
-            if (
-                type(memory_id) is not int
-                or memory_id <= 0
-                or type(candidate_key) is not str
-                or (
-                    memory_policy.MEMORY_KEY_PATTERN.fullmatch(candidate_key)
-                    is None
-                )
-                or type(kind) is not str
-                or kind not in _AUTOMATIC_KINDS
-                or row["status"] != "candidate"
-                or row["explicitness"] != "inferred"
-                or type(confidence) is not float
-                or confidence != 0.0
-                or row["scope_type"] != memory_formation.SCOPE_TYPE
-                or row["scope_ref"] != memory_formation.SCOPE_REF
-                or row["sensitivity"] != memory_formation.SENSITIVITY
-                or type(content) is not str
-                or not content
-                or type(row["fingerprint_version"]) is not int
-                or row["fingerprint_version"] != memory_policy.FINGERPRINT_VERSION
-                or type(fingerprint) is not bytes
-                or len(fingerprint) != memory_policy.HMAC_DIGEST_BYTES
-                or not _is_valid_timestamp(created_at)
-            ):
-                _raise("candidate_review_state_invalid")
-            canonical = self._policy.validate_content(
-                content,
-                memory_formation.SENSITIVITY,
+    @staticmethod
+    def _map_verified_evidence(
+        evidence: tuple[
+            memory_candidate_integrity.VerifiedAutomaticEvidenceV1, ...
+        ],
+    ) -> tuple[CandidateReviewEvidenceV1, ...]:
+        return tuple(
+            CandidateReviewEvidenceV1(
+                signal_type=item.signal_type,
+                observed_at=item.observed_at,
+                formation_contract_version=item.formation_contract_version,
+                extractor_contract_version=item.extractor_contract_version,
+                source_excerpt=item.source_excerpt,
             )
-            if canonical != content:
-                _raise("candidate_review_state_invalid")
-            expected = memory_policy.fingerprint_content(
-                self._fingerprint_hmac_secret,
-                scope_type=memory_formation.SCOPE_TYPE,
-                scope_ref=memory_formation.SCOPE_REF,
-                kind=kind,
-                normalized_content=content,
-            )
-            if not memory_policy.secure_digest_equal(fingerprint, expected):
-                _raise("candidate_review_state_invalid")
-        except MemoryCandidateReviewError:
-            raise
-        except (memory_policy.MemoryPolicyError, KeyError, TypeError, ValueError):
-            _raise("candidate_review_state_invalid")
-        return _ValidatedCandidate(
-            memory_id=memory_id,
-            candidate_key=candidate_key,
-            kind=kind,
-            content=content,
-            fingerprint=fingerprint,
-            created_at=created_at,
+            for item in evidence
         )
 
-    def _validate_evidence(
+    def _verify_candidate(
         self,
         conn: sqlite3.Connection,
-        candidate: _ValidatedCandidate,
+        row: sqlite3.Row,
         *,
         missing_category: str,
-    ) -> tuple[CandidateReviewEvidenceV1, ...]:
+    ) -> memory_candidate_integrity.VerifiedAutomaticMemoryV1:
         try:
-            rows = conn.execute(
-                """SELECT id,canonical_message_id,signal_type,span_start,span_end,
-                          formation_contract_version,extractor_contract_version,
-                          created_at
-                   FROM memory_candidate_sources
-                   WHERE memory_id=? ORDER BY created_at ASC,id ASC""",
-                (candidate.memory_id,),
-            ).fetchall()
-            if not rows:
+            return self._verifier.verify_pending_candidate(conn, row)
+        except memory_candidate_integrity.AutomaticCandidateIntegrityError as error:
+            if error.category == "candidate_provenance_missing":
                 _raise(missing_category)
-            evidence: list[CandidateReviewEvidenceV1] = []
-            for row in rows:
-                source_id = row["id"]
-                canonical_message_id = row["canonical_message_id"]
-                signal_type = row["signal_type"]
-                start = row["span_start"]
-                end = row["span_end"]
-                formation_version = row["formation_contract_version"]
-                extractor_version = row["extractor_contract_version"]
-                observed_at = row["created_at"]
-                if (
-                    type(source_id) is not int
-                    or source_id <= 0
-                    or type(canonical_message_id) is not int
-                    or canonical_message_id <= 0
-                    or type(signal_type) is not str
-                    or signal_type not in _AUTOMATIC_SIGNALS
-                    or type(start) is not int
-                    or type(end) is not int
-                    or not 0 <= start < end
-                    or type(formation_version) is not str
-                    or _CONTRACT_VERSION.fullmatch(formation_version) is None
-                    or type(extractor_version) is not str
-                    or _CONTRACT_VERSION.fullmatch(extractor_version) is None
-                    or not _is_valid_timestamp(observed_at)
-                ):
-                    _raise("candidate_review_state_invalid")
-
-                message = conn.execute(
-                    """SELECT id,direction,kind,text FROM messages WHERE id=?""",
-                    (canonical_message_id,),
-                ).fetchone()
-                if (
-                    message is None
-                    or type(message["id"]) is not int
-                    or message["id"] != canonical_message_id
-                    or message["direction"] != "in"
-                    or message["kind"] != "user"
-                    or type(message["text"]) is not str
-                    or end > len(message["text"])
-                    or end - start > memory_formation.TOTAL_CANDIDATE_MAX_CHARS
-                ):
-                    _raise("candidate_review_state_invalid")
-                source_text = message["text"]
-                proposal = memory_formation.AutoMemoryProposalV1(
-                    signal_type=signal_type,
-                    start=start,
-                    end=end,
-                )
-                try:
-                    rebuilt = memory_formation.build_auto_memory_candidates(
-                        canonical_message_id,
-                        source_text,
-                        (proposal,),
-                        max_item_chars=self._max_item_chars,
-                    )
-                except memory_formation.MemoryFormationError:
-                    _raise("candidate_review_state_invalid")
-                if len(rebuilt) != 1:
-                    _raise("candidate_review_state_invalid")
-                proof = rebuilt[0]
-                if (
-                    type(proof) is not memory_formation.AutoMemoryCandidateV1
-                    or proof.source_message_id != canonical_message_id
-                    or proof.signal_type != signal_type
-                    or proof.kind != candidate.kind
-                    or proof.scope_type != memory_formation.SCOPE_TYPE
-                    or proof.scope_ref != memory_formation.SCOPE_REF
-                    or proof.sensitivity != memory_formation.SENSITIVITY
-                    or proof.normalized_content != candidate.content
-                ):
-                    _raise("candidate_review_state_invalid")
-                proof_fingerprint = memory_policy.fingerprint_content(
-                    self._fingerprint_hmac_secret,
-                    scope_type=proof.scope_type,
-                    scope_ref=proof.scope_ref,
-                    kind=proof.kind,
-                    normalized_content=proof.normalized_content,
-                )
-                if not memory_policy.secure_digest_equal(
-                    candidate.fingerprint, proof_fingerprint
-                ):
-                    _raise("candidate_review_state_invalid")
-                excerpt = source_text[
-                    max(0, start - EVIDENCE_CONTEXT_CHARS):
-                    min(len(source_text), end + EVIDENCE_CONTEXT_CHARS)
-                ]
-                if len(excerpt) > MAX_SOURCE_EXCERPT_CHARS:
-                    _raise("candidate_review_state_invalid")
-                evidence.append(CandidateReviewEvidenceV1(
-                    signal_type=signal_type,
-                    observed_at=observed_at,
-                    formation_contract_version=formation_version,
-                    extractor_contract_version=extractor_version,
-                    source_excerpt=excerpt,
-                ))
-            return tuple(evidence)
-        except MemoryCandidateReviewError:
-            raise
-        except (OSError, sqlite3.Error):
-            _raise("storage_unavailable")
-        except (KeyError, TypeError, ValueError):
+            if error.category == "candidate_integrity_profile_mismatch":
+                _raise("candidate_review_profile_mismatch")
+            if error.category == "candidate_integrity_schema_invalid":
+                _raise("candidate_review_schema_invalid")
+            if error.category == "storage_unavailable":
+                _raise("storage_unavailable")
             _raise("candidate_review_state_invalid")
 
     def _resolve_cursor(
@@ -458,6 +268,8 @@ class MemoryCandidateReviewReader:
         kind: str | None,
     ) -> tuple[str, int]:
         try:
+            if memory_policy.MEMORY_KEY_PATTERN.fullmatch(candidate_key) is None:
+                _raise("invalid_candidate_cursor")
             row = conn.execute(
                 f"""SELECT {_CANDIDATE_COLUMNS} FROM memory_items
                    WHERE memory_key=?""",
@@ -469,11 +281,10 @@ class MemoryCandidateReviewReader:
                 or (kind is not None and row["kind"] != kind)
             ):
                 _raise("invalid_candidate_cursor")
-            candidate = self._validate_candidate_row(row)
-            self._validate_evidence(
+            candidate = self._verify_candidate(
                 conn,
-                candidate,
                 missing_category="candidate_review_state_invalid",
+                row=row,
             )
             return candidate.created_at, candidate.memory_id
         except MemoryCandidateReviewError:
@@ -515,10 +326,9 @@ class MemoryCandidateReviewReader:
                 _raise("storage_unavailable")
             result: list[CandidateReviewSummaryV1] = []
             for row in rows:
-                candidate = self._validate_candidate_row(row)
-                evidence = self._validate_evidence(
+                candidate = self._verify_candidate(
                     conn,
-                    candidate,
+                    row,
                     missing_category="candidate_review_state_invalid",
                 )
                 result.append(CandidateReviewSummaryV1(
@@ -526,7 +336,7 @@ class MemoryCandidateReviewReader:
                     kind=candidate.kind,
                     content_preview=_preview(candidate.content),
                     created_at=candidate.created_at,
-                    provenance_count=len(evidence),
+                    provenance_count=len(candidate.evidence),
                 ))
             return tuple(result)
 
@@ -543,21 +353,21 @@ class MemoryCandidateReviewReader:
                 _raise("storage_unavailable")
             if row is None:
                 _raise("candidate_not_found")
-            candidate = self._validate_candidate_row(row)
-            evidence = self._validate_evidence(
+            candidate = self._verify_candidate(
                 conn,
-                candidate,
+                row,
                 missing_category="candidate_unreviewable",
             )
+            evidence = self._map_verified_evidence(candidate.evidence)
             return CandidateReviewDetailV1(
                 candidate_key=candidate.candidate_key,
                 kind=candidate.kind,
                 content=candidate.content,
-                scope_type=memory_formation.SCOPE_TYPE,
-                scope_ref=memory_formation.SCOPE_REF,
-                sensitivity=memory_formation.SENSITIVITY,
-                explicitness="inferred",
-                confidence=0.0,
+                scope_type=candidate.scope_type,
+                scope_ref=candidate.scope_ref,
+                sensitivity=candidate.sensitivity,
+                explicitness=candidate.explicitness,
+                confidence=candidate.confidence,
                 created_at=candidate.created_at,
                 provenance_count=len(evidence),
                 evidence=evidence,
