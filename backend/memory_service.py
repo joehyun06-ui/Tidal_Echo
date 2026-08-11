@@ -6,8 +6,15 @@ import re
 from typing import Sequence
 
 try:
-    from . import memory_formation, memory_policy, memory_runtime, memory_store
+    from . import (
+        memory_candidate_decision_ledger,
+        memory_formation,
+        memory_policy,
+        memory_runtime,
+        memory_store,
+    )
 except ImportError:  # support direct module execution in local tooling
+    import memory_candidate_decision_ledger
     import memory_formation
     import memory_policy
     import memory_runtime
@@ -228,6 +235,32 @@ class AutomaticCandidatePersistence(_PrivilegedServiceBase):
             memory_store.MemoryStoreError,
         ) as error:
             raise self._translate_error(error) from None
+
+
+class CandidateDecisionWriter(_PrivilegedServiceBase):
+    """Narrow internal terminal-decision capability retained by the runtime."""
+
+    def decide(
+        self,
+        *,
+        binding: (
+            memory_candidate_decision_ledger.CandidateDecisionLedgerBindingV1
+        ),
+    ) -> memory_candidate_decision_ledger.CandidateDecisionResultV1:
+        try:
+            memory_runtime.require_runtime_authority(self._authority)
+            return self._store.decide_memory_candidate_atomic(
+                binding=binding
+            )
+        except (
+            memory_runtime.MemoryRuntimeError,
+            memory_store.MemoryStoreError,
+        ) as error:
+            raise (
+                memory_candidate_decision_ledger.MemoryCandidateDecisionLedgerError(
+                    getattr(error, "category", "candidate_decision_state_invalid")
+                )
+            ) from None
 
 
 class PrivilegedMemoryActions(_PrivilegedServiceBase):

@@ -1,7 +1,7 @@
-"""Pure binding and replay semantics for the candidate decision ledger.
+"""Pure binding, terminal-row, and replay semantics for candidate decisions.
 
-This Slice 1 module exposes no approve/reject service, opens no database, owns
-no transaction, and has no Memory runtime or write authority.
+This module opens no database and owns no transaction or runtime authority.
+Its internal insert helper only accepts a caller-owned active transaction.
 """
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ from datetime import datetime, timezone
 from typing import Final
 
 try:
-    from . import memory_candidate_review, memory_policy
+    from . import memory_candidate_integrity, memory_policy
 except ImportError:  # support direct module execution in local tooling
-    import memory_candidate_review
+    import memory_candidate_integrity
     import memory_policy
 
 
@@ -83,7 +83,7 @@ class CandidateDecisionLedgerBindingV1:
     decision: str
     candidate_key: str = field(repr=False)
     review_contract_version: str = field(
-        default=memory_candidate_review.CANDIDATE_REVIEW_CONTRACT_VERSION,
+        default=memory_candidate_integrity.CANDIDATE_REVIEW_CONTRACT_VERSION,
         init=False,
     )
     decision_contract_version: str = field(
@@ -109,6 +109,48 @@ class CandidateDecisionLedgerRowV1:
 
     def __repr__(self) -> str:
         return "<CandidateDecisionLedgerRowV1>"
+
+
+@dataclass(frozen=True, slots=True, repr=False, init=False)
+class CandidateDecisionResultV1:
+    request_id: str = field(repr=False)
+    candidate_key: str = field(repr=False)
+    decision: str
+    status: str
+    result_category: str
+    resulting_status: str
+    replayed: bool
+
+    def __init__(
+        self,
+        binding: CandidateDecisionLedgerBindingV1,
+        *,
+        replayed: bool,
+    ):
+        valid = validate_binding(binding)
+        if type(replayed) is not bool:
+            raise MemoryCandidateDecisionLedgerError(
+                "candidate_decision_state_invalid"
+            )
+        approved = valid.decision == "approve"
+        object.__setattr__(self, "request_id", valid.request_id)
+        object.__setattr__(self, "candidate_key", valid.candidate_key)
+        object.__setattr__(self, "decision", valid.decision)
+        object.__setattr__(self, "status", "completed")
+        object.__setattr__(
+            self,
+            "result_category",
+            "approved" if approved else "rejected",
+        )
+        object.__setattr__(
+            self,
+            "resulting_status",
+            "active" if approved else "rejected",
+        )
+        object.__setattr__(self, "replayed", replayed)
+
+    def __repr__(self) -> str:
+        return "<CandidateDecisionResultV1>"
 
 
 def issue_candidate_decision_request_id() -> str:
@@ -140,7 +182,7 @@ def validate_binding(
         or type(binding.decision) is not str
         or binding.decision not in _DECISIONS
         or binding.review_contract_version
-        != memory_candidate_review.CANDIDATE_REVIEW_CONTRACT_VERSION
+        != memory_candidate_integrity.CANDIDATE_REVIEW_CONTRACT_VERSION
         or binding.decision_contract_version
         != CANDIDATE_DECISION_CONTRACT_VERSION
     ):
@@ -218,7 +260,7 @@ def _row_from_sqlite(row: sqlite3.Row) -> CandidateDecisionLedgerRowV1:
         or (decision == "approve" and suppression_id is not None)
         or (decision == "reject" and suppression_id is None)
         or review_version
-        != memory_candidate_review.CANDIDATE_REVIEW_CONTRACT_VERSION
+        != memory_candidate_integrity.CANDIDATE_REVIEW_CONTRACT_VERSION
         or decision_version != CANDIDATE_DECISION_CONTRACT_VERSION
         or not _valid_terminal_timestamp(created_at)
     ):
@@ -288,5 +330,77 @@ def validate_replay_binding(
     ):
         raise MemoryCandidateDecisionLedgerError(
             "candidate_decision_request_conflict"
+        )
+    return row
+
+
+def _insert_terminal_decision(
+    conn: sqlite3.Connection,
+    *,
+    binding: CandidateDecisionLedgerBindingV1,
+    memory_id: int,
+    suppression_id: int | None,
+    created_at: str,
+) -> CandidateDecisionLedgerRowV1:
+    """Insert one immutable terminal row on a caller-owned transaction."""
+
+    valid = validate_binding(binding)
+    if (
+        not isinstance(conn, sqlite3.Connection)
+        or not conn.in_transaction
+        or type(memory_id) is not int
+        or memory_id <= 0
+        or not _valid_terminal_timestamp(created_at)
+        or (
+            suppression_id is not None
+            and (type(suppression_id) is not int or suppression_id <= 0)
+        )
+        or (valid.decision == "approve" and suppression_id is not None)
+        or (valid.decision == "reject" and suppression_id is None)
+    ):
+        raise MemoryCandidateDecisionLedgerError(
+            "candidate_decision_state_invalid"
+        )
+    digest = binding_digest(valid)
+    try:
+        conn.execute(
+            """INSERT INTO memory_candidate_decisions
+               (request_id,memory_id,origin,decision,request_binding_digest,
+                suppression_id,review_contract_version,
+                decision_contract_version,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                valid.request_id,
+                memory_id,
+                valid.origin,
+                valid.decision,
+                digest,
+                suppression_id,
+                valid.review_contract_version,
+                valid.decision_contract_version,
+                created_at,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        raise MemoryCandidateDecisionLedgerError(
+            "candidate_decision_conflict"
+        ) from None
+    except sqlite3.Error:
+        raise MemoryCandidateDecisionLedgerError(
+            "candidate_decision_schema_invalid"
+        ) from None
+    row = lookup_request(conn, valid.request_id)
+    if row is None:
+        raise MemoryCandidateDecisionLedgerError(
+            "candidate_decision_state_invalid"
+        )
+    validate_replay_binding(row, valid)
+    if (
+        row.memory_id != memory_id
+        or row.suppression_id != suppression_id
+        or row.created_at != created_at
+    ):
+        raise MemoryCandidateDecisionLedgerError(
+            "candidate_decision_state_invalid"
         )
     return row

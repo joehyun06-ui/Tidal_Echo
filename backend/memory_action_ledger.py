@@ -1192,7 +1192,7 @@ class _MemoryActionUnitOfWork:
                 or type(row["fingerprint_version"]) is not int
                 or row["fingerprint_version"]
                 != memory_policy.FINGERPRINT_VERSION
-                or row["explicitness"] != "explicit"
+                or row["explicitness"] not in {"explicit", "inferred"}
                 or isinstance(confidence, bool)
                 or not isinstance(confidence, (int, float))
                 or float(confidence) != 1.0
@@ -1705,8 +1705,7 @@ class _MemoryActionUnitOfWork:
             raise self._semantic_error()
         for item in snapshot.items:
             if (
-                item.explicitness != "explicit"
-                or item.confidence != 1.0
+                item.confidence != 1.0
                 or item.fingerprint_version
                 != memory_policy.FINGERPRINT_VERSION
             ):
@@ -1735,6 +1734,21 @@ class _MemoryActionUnitOfWork:
             "sensitive": 1,
             "restricted": 2,
         }
+
+        def require_explicit_result(
+            item: TerminalMemoryItemSemanticV1,
+        ) -> None:
+            if item.explicitness != "explicit" or item.confidence != 1.0:
+                raise self._semantic_error()
+
+        def require_confirmed_target(
+            item: TerminalMemoryItemSemanticV1,
+        ) -> None:
+            if (
+                item.explicitness not in {"explicit", "inferred"}
+                or item.confidence != 1.0
+            ):
+                raise self._semantic_error()
 
         def require_binding_fields(
             item: TerminalMemoryItemSemanticV1,
@@ -1795,6 +1809,7 @@ class _MemoryActionUnitOfWork:
                         else "at_least"
                     ),
                 )
+                require_explicit_result(result_item)
                 action_item = result_item
         elif binding.action_kind == "correct":
             target_key = binding.target_memory_key
@@ -1820,11 +1835,13 @@ class _MemoryActionUnitOfWork:
                     require_content=False,
                     sensitivity_mode="at_most",
                 )
+                require_confirmed_target(target)
                 require_binding_fields(
                     result_item,
                     require_content=True,
                     sensitivity_mode="exact",
                 )
+                require_explicit_result(result_item)
                 if target.normalized_content == binding.normalized_content:
                     raise self._semantic_error()
                 action_item = result_item
@@ -1844,6 +1861,7 @@ class _MemoryActionUnitOfWork:
                     require_content=True,
                     sensitivity_mode="exact",
                 )
+                require_confirmed_target(target)
                 action_item = target
             else:
                 target = items_by_relation.get("target")
@@ -1861,6 +1879,7 @@ class _MemoryActionUnitOfWork:
                     require_content=False,
                     sensitivity_mode="at_most",
                 )
+                require_confirmed_target(target)
                 if target.normalized_content == binding.normalized_content:
                     raise self._semantic_error()
         else:
@@ -1880,6 +1899,7 @@ class _MemoryActionUnitOfWork:
                 require_content=False,
                 sensitivity_mode="exact",
             )
+            require_confirmed_target(target)
             action_item = target
 
         expected_action_type, expected_evidence_type, reality, subject, component = (

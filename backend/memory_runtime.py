@@ -123,6 +123,7 @@ class MemoryRuntime:
     read_service: object = field(repr=False)
     privileged_actions: object = field(repr=False)
     candidate_persistence: object = field(repr=False)
+    candidate_decisions: object = field(repr=False)
 
 
 _AUTHORITY_CONSTRUCTOR_TOKEN = object()
@@ -481,10 +482,15 @@ def _bootstrap_memory_runtime_scope(deployment):
             candidate_persistence = (
                 memory_service.AutomaticCandidatePersistence(store, authority)
             )
+            candidate_decisions = memory_service.CandidateDecisionWriter(
+                store,
+                authority,
+            )
             runtime = MemoryRuntime(
                 read_service=read_service,
                 privileged_actions=privileged_actions,
                 candidate_persistence=candidate_persistence,
+                candidate_decisions=candidate_decisions,
             )
             yield runtime
             if (
