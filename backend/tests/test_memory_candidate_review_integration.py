@@ -39,6 +39,8 @@ class MemoryCandidateReviewIntegrationTests(
             "backend.memory_candidate_review",
             "backend.memory_candidate_review_adapters",
             "backend.memory_candidate_review_composition",
+            "backend.memory_candidate_decision_adapters",
+            "backend.memory_candidate_decision_composition",
             "backend.memory_context", "backend.memory_context_integration",
             "backend.memory_retrieval", "backend.memory_formation_extractor",
             "backend.memory_formation_integration",

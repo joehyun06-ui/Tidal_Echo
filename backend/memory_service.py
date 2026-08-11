@@ -240,6 +240,35 @@ class AutomaticCandidatePersistence(_PrivilegedServiceBase):
 class CandidateDecisionWriter(_PrivilegedServiceBase):
     """Narrow internal terminal-decision capability retained by the runtime."""
 
+    def readiness(self) -> tuple[bool, str]:
+        """Return bounded dynamic health without inspecting candidate rows."""
+
+        try:
+            self._store.candidate_decision_readiness()
+            return True, ""
+        except memory_store.MemoryStoreError as error:
+            category = getattr(
+                error,
+                "category",
+                "candidate_decision_state_invalid",
+            )
+            safe_categories = {
+                "candidate_decisions_disabled",
+                "candidate_decision_configuration_invalid",
+                "candidate_decision_schema_invalid",
+                "candidate_decision_profile_mismatch",
+                "candidate_decision_state_invalid",
+                "runtime_authority_invalid",
+                "storage_unavailable",
+            }
+            return False, (
+                category
+                if type(category) is str and category in safe_categories
+                else "candidate_decision_state_invalid"
+            )
+        except Exception:
+            return False, "candidate_decision_state_invalid"
+
     def decide(
         self,
         *,

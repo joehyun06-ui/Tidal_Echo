@@ -499,6 +499,43 @@ class MemoryStore:
         except (OSError, sqlite3.Error, ValueError):
             return False
 
+    def candidate_decision_readiness(self) -> None:
+        """Validate decision authority, schema, and profile without writes."""
+
+        try:
+            self._require_candidate_decision_runtime()
+        except MemoryStoreError as error:
+            category = {
+                "feature_disabled": "candidate_decision_configuration_invalid",
+                "memory_configuration_invalid": (
+                    "candidate_decision_configuration_invalid"
+                ),
+            }.get(error.category, error.category)
+            raise MemoryStoreError(category) from None
+        verifier = self._candidate_integrity_verifier()
+        try:
+            connection = channel_store.connect_read_only(
+                self.path,
+                timeout_seconds=30.0,
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            raise MemoryStoreError("storage_unavailable") from None
+        with connection as conn:
+            try:
+                channel_store.validate_memory_candidate_decision_schema_v1_v10(
+                    conn
+                )
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                raise MemoryStoreError(
+                    "candidate_decision_schema_invalid"
+                ) from None
+            try:
+                verifier.verify_profile(conn)
+            except (
+                memory_candidate_integrity.AutomaticCandidateIntegrityError
+            ) as error:
+                self._raise_candidate_integrity_error(error)
+
     def _action_unit_of_work(self):
         """Create the internal root transaction for a reviewed composition path."""
         self._require_write_runtime()

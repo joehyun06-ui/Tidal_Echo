@@ -45,6 +45,8 @@ try:
         channel_store,
         deployment_config,
         kelivo_service,
+        memory_candidate_decision_composition,
+        memory_candidate_decision_ledger,
         memory_candidate_review,
         memory_candidate_review_composition,
         memory_context_integration,
@@ -59,6 +61,8 @@ except ImportError:  # support `python backend/app.py`
     import channel_store
     import deployment_config
     import kelivo_service
+    import memory_candidate_decision_composition
+    import memory_candidate_decision_ledger
     import memory_candidate_review
     import memory_candidate_review_composition
     import memory_context_integration
@@ -160,6 +164,10 @@ MEMORY_CANDIDATE_REVIEW_SERVICE = None
 MEMORY_CANDIDATE_REVIEW_OPERATOR = None
 MEMORY_CANDIDATE_REVIEW_MCP = None
 MEMORY_CANDIDATE_REVIEW_ERROR = ""
+MEMORY_CANDIDATE_DECISION_SERVICE = None
+MEMORY_CANDIDATE_DECISION_OPERATOR = None
+MEMORY_CANDIDATE_DECISION_MCP = None
+MEMORY_CANDIDATE_DECISION_ERROR = None
 MEMORY_EXPLICIT_ENTRY_SERVICES = None
 MEMORY_EXPLICIT_ENTRY_ERROR = ""
 MEMORY_STARTUP_ERROR = ""
@@ -244,6 +252,30 @@ def _safe_candidate_review_category(
     )
 
 
+_MEMORY_CANDIDATE_DECISION_CATEGORIES = frozenset({
+    "candidate_decisions_disabled",
+    "candidate_decision_configuration_invalid",
+    "candidate_decision_schema_invalid",
+    "candidate_decision_profile_mismatch",
+    "candidate_decision_state_invalid",
+    "runtime_authority_invalid",
+    "storage_unavailable",
+})
+
+
+def _safe_candidate_decision_category(
+    error: object,
+    fallback: str = "candidate_decision_state_invalid",
+) -> str:
+    category = error if type(error) is str else getattr(error, "category", "")
+    return (
+        category
+        if type(category) is str
+        and category in _MEMORY_CANDIDATE_DECISION_CATEGORIES
+        else fallback
+    )
+
+
 def _compose_memory_candidate_review() -> None:
     global MEMORY_CANDIDATE_REVIEW_SERVICE
     global MEMORY_CANDIDATE_REVIEW_OPERATOR, MEMORY_CANDIDATE_REVIEW_MCP
@@ -285,10 +317,12 @@ def _compose_memory_privileged_runtime() -> None:
     config = DEPLOYMENT.memory
     explicit_required = config.explicit_entry_enabled
     candidate_required = config.auto_candidate_persistence_enabled
-    if not explicit_required and not candidate_required:
+    decision_required = config.candidate_decisions_enabled
+    if not explicit_required and not candidate_required and not decision_required:
         return
     explicit_valid = explicit_required and config.entry_configuration_valid
     candidate_valid = candidate_required and config.configuration_valid
+    decision_valid = decision_required and config.configuration_valid
     if explicit_required and not config.entry_configuration_valid:
         MEMORY_EXPLICIT_ENTRY_ERROR = (
             config.entry_error_category or "memory_explicit_entry_invalid"
@@ -317,7 +351,7 @@ def _compose_memory_privileged_runtime() -> None:
                 "memory_auto_candidate_persistence_unavailable",
             )
         return
-    if not explicit_valid and not candidate_valid:
+    if not explicit_valid and not candidate_valid and not decision_valid:
         return
     runtime = MEMORY_PRIVILEGED_RUNTIME
     if runtime is None:
@@ -369,6 +403,60 @@ def _compose_memory_privileged_runtime() -> None:
             )
 
 
+def _compose_memory_candidate_decisions() -> None:
+    global MEMORY_CANDIDATE_DECISION_SERVICE
+    global MEMORY_CANDIDATE_DECISION_OPERATOR, MEMORY_CANDIDATE_DECISION_MCP
+    global MEMORY_CANDIDATE_DECISION_ERROR
+    MEMORY_CANDIDATE_DECISION_SERVICE = None
+    MEMORY_CANDIDATE_DECISION_OPERATOR = None
+    MEMORY_CANDIDATE_DECISION_MCP = None
+    MEMORY_CANDIDATE_DECISION_ERROR = None
+    config = DEPLOYMENT.memory
+    if not config.candidate_decisions_enabled:
+        return
+    if not config.configuration_valid:
+        MEMORY_CANDIDATE_DECISION_ERROR = (
+            "candidate_decision_configuration_invalid"
+        )
+        return
+    if CORE_STARTUP_ERROR or MEMORY_STARTUP_ERROR:
+        MEMORY_CANDIDATE_DECISION_ERROR = "candidate_decision_schema_invalid"
+        return
+    if (
+        MEMORY_CANDIDATE_REVIEW_SERVICE is None
+        or MEMORY_CANDIDATE_REVIEW_ERROR
+    ):
+        MEMORY_CANDIDATE_DECISION_ERROR = "candidate_decision_state_invalid"
+        return
+    runtime = MEMORY_PRIVILEGED_RUNTIME
+    if runtime is None:
+        MEMORY_CANDIDATE_DECISION_ERROR = "runtime_authority_invalid"
+        return
+    writer = getattr(runtime, "candidate_decisions", None)
+    if writer is None:
+        MEMORY_CANDIDATE_DECISION_ERROR = "runtime_authority_invalid"
+        return
+    try:
+        ready, category = writer.readiness()
+        if not ready:
+            MEMORY_CANDIDATE_DECISION_ERROR = (
+                _safe_candidate_decision_category(category)
+            )
+            return
+        composition = (
+            memory_candidate_decision_composition.compose_candidate_decisions(
+                writer
+            )
+        )
+        MEMORY_CANDIDATE_DECISION_SERVICE = composition.writer
+        MEMORY_CANDIDATE_DECISION_OPERATOR = composition.operator
+        MEMORY_CANDIDATE_DECISION_MCP = composition.mcp
+    except memory_candidate_decision_ledger.MemoryCandidateDecisionLedgerError as error:
+        MEMORY_CANDIDATE_DECISION_ERROR = _safe_candidate_decision_category(error)
+    except Exception:
+        MEMORY_CANDIDATE_DECISION_ERROR = "candidate_decision_state_invalid"
+
+
 def init_db() -> None:
     global CORE_STARTUP_ERROR, MEMORY_STARTUP_ERROR
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -410,6 +498,7 @@ def init_db() -> None:
     except (OSError, sqlite3.Error, ValueError):
         CORE_STARTUP_ERROR = "core_schema_invalid"
         _compose_memory_candidate_review()
+        _compose_memory_candidate_decisions()
         return
     if DEPLOYMENT.memory.enabled:
         try:
@@ -418,6 +507,7 @@ def init_db() -> None:
             MEMORY_STARTUP_ERROR = "memory_schema_invalid"
     _compose_memory_candidate_review()
     _compose_memory_privileged_runtime()
+    _compose_memory_candidate_decisions()
     channel_store.recover_inflight_generations(DB_PATH)
     channel_store.recover_inflight_deliveries(DB_PATH)
     # A process restart makes every prior in-flight dispatch uncertain; never
@@ -1569,6 +1659,7 @@ async def readyz():
             and MEMORY_CANDIDATE_PERSISTENCE is not None
             and not MEMORY_CANDIDATE_PERSISTENCE_ERROR
         )
+    candidate_review_ready = False
     candidate_review_error = ""
     if DEPLOYMENT.memory.candidate_review_enabled:
         if not checks["database"]:
@@ -1600,6 +1691,62 @@ async def readyz():
                 "candidate_review_unavailable",
             ) if not candidate_review_ready else ""
         checks["memory_candidate_review"] = bool(candidate_review_ready)
+    candidate_decision_error = ""
+    if DEPLOYMENT.memory.candidate_decisions_enabled:
+        if not checks["database"] or MEMORY_STARTUP_ERROR:
+            candidate_decision_ready = False
+            candidate_decision_error = "candidate_decision_schema_invalid"
+        elif MEMORY_CANDIDATE_DECISION_ERROR:
+            candidate_decision_ready = False
+            candidate_decision_error = _safe_candidate_decision_category(
+                MEMORY_CANDIDATE_DECISION_ERROR
+            )
+        elif not memory_ready:
+            candidate_decision_ready = False
+            candidate_decision_error = (
+                "candidate_decision_profile_mismatch"
+                if memory_error == "memory_fingerprint_profile_mismatch"
+                else "candidate_decision_configuration_invalid"
+            )
+        elif (
+            MEMORY_PRIVILEGED_RUNTIME is None
+            or MEMORY_CANDIDATE_DECISION_SERVICE is None
+            or MEMORY_CANDIDATE_DECISION_OPERATOR is None
+            or MEMORY_CANDIDATE_DECISION_MCP is None
+        ):
+            candidate_decision_ready = False
+            candidate_decision_error = "runtime_authority_invalid"
+        else:
+            writer_ready, writer_error = (
+                await asyncio.to_thread(
+                    MEMORY_CANDIDATE_DECISION_SERVICE.readiness
+                )
+            )
+            if not writer_ready:
+                candidate_decision_ready = False
+                candidate_decision_error = _safe_candidate_decision_category(
+                    writer_error
+                )
+            elif (
+                not candidate_review_ready
+                or MEMORY_CANDIDATE_REVIEW_SERVICE is None
+            ):
+                candidate_decision_ready = False
+                candidate_decision_error = {
+                    "candidate_review_schema_invalid": (
+                        "candidate_decision_schema_invalid"
+                    ),
+                    "candidate_review_profile_mismatch": (
+                        "candidate_decision_profile_mismatch"
+                    ),
+                }.get(
+                    candidate_review_error,
+                    "candidate_decision_state_invalid",
+                )
+            else:
+                candidate_decision_ready = True
+                candidate_decision_error = ""
+        checks["memory_candidate_decisions"] = bool(candidate_decision_ready)
     if DEPLOYMENT.kelivo.enabled:
         checks["kelivo"] = await asyncio.to_thread(
             kelivo_service.client_mapping_ready,
@@ -1649,6 +1796,13 @@ async def readyz():
     ):
         errors["memory_candidate_review"] = (
             candidate_review_error or "candidate_review_unavailable"
+        )
+    if (
+        DEPLOYMENT.memory.candidate_decisions_enabled
+        and not checks["memory_candidate_decisions"]
+    ):
+        errors["memory_candidate_decisions"] = (
+            candidate_decision_error or "candidate_decision_state_invalid"
         )
     if errors:
         payload["errors"] = errors
