@@ -30,6 +30,7 @@ MAX_CANDIDATE_LIMIT: Final = 50
 MAX_CONTENT_PREVIEW_CHARS: Final = 240
 EVIDENCE_CONTEXT_CHARS: Final = 160
 MAX_SOURCE_EXCERPT_CHARS: Final = 2320
+CANDIDATE_REVIEW_CONTRACT_VERSION: Final = "memory-candidate-review-v1"
 
 _PROFILE_KEY_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _CONTRACT_VERSION: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")

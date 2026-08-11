@@ -26,7 +26,7 @@ class HeartbeatMigrationTests(unittest.TestCase):
             )}
             channel_store.validate_heartbeat_schema(conn)
             channel_store.validate_heartbeat_hardening_schema(conn)
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         self.assertTrue({
             "heartbeat_state", "heartbeat_runs", "journal_entries", "timeline_events",
             "heartbeat_schedule_revisions", "heartbeat_run_inputs",

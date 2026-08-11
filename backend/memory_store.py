@@ -210,6 +210,7 @@ _PROFILE_STATE_TABLES = (
     "memory_action_requests",
     "memory_candidate_sources",
     "memory_auto_formation_runs",
+    "memory_candidate_decisions",
 )
 _CONTRACT_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _AUTO_PERSISTENCE_ERROR_CATEGORIES = frozenset({
@@ -674,6 +675,34 @@ class MemoryStore:
             raise MemoryStoreError("memory_configuration_invalid")
         if not policy.auto_candidate_persistence_enabled:
             raise MemoryStoreError("auto_candidate_persistence_disabled")
+        if (
+            policy.normalization_version != memory_policy.NORMALIZATION_VERSION
+            or policy.fingerprint_version != memory_policy.FINGERPRINT_VERSION
+            or policy.fingerprint_domain != memory_policy.FINGERPRINT_DOMAIN
+        ):
+            raise MemoryStoreError("memory_configuration_invalid")
+        try:
+            memory_policy.fingerprint_profile_check(
+                policy.fingerprint_hmac_secret
+            )
+        except memory_policy.MemoryPolicyError:
+            raise MemoryStoreError("memory_configuration_invalid") from None
+
+    def _require_candidate_decision_runtime(self) -> None:
+        """Enforce decision authority without borrowing other write bits."""
+
+        try:
+            policy = memory_runtime.require_runtime_authority(self._authority)
+        except memory_runtime.MemoryRuntimeError as error:
+            raise MemoryStoreError(error.category) from None
+        if policy is not self._runtime_policy:
+            raise MemoryStoreError("runtime_authority_invalid")
+        if not policy.enabled:
+            raise MemoryStoreError("feature_disabled")
+        if not policy.configuration_valid:
+            raise MemoryStoreError("memory_configuration_invalid")
+        if not policy.candidate_decisions_enabled:
+            raise MemoryStoreError("candidate_decisions_disabled")
         if (
             policy.normalization_version != memory_policy.NORMALIZATION_VERSION
             or policy.fingerprint_version != memory_policy.FINGERPRINT_VERSION

@@ -53,6 +53,7 @@ class MemoryRuntimePolicy:
     enabled: bool
     explicit_writes_enabled: bool
     auto_candidate_persistence_enabled: bool
+    candidate_decisions_enabled: bool
     sensitive_storage_enabled: bool
     max_item_chars: int
     forget_retention_policy: str
@@ -138,6 +139,7 @@ def _policy_from_config(config: deployment_config.MemoryConfig) -> MemoryRuntime
         auto_candidate_persistence_enabled=(
             config.auto_candidate_persistence_enabled
         ),
+        candidate_decisions_enabled=config.candidate_decisions_enabled,
         sensitive_storage_enabled=config.sensitive_storage_enabled,
         max_item_chars=config.max_item_chars,
         forget_retention_policy=config.forget_retention_policy,
@@ -384,6 +386,7 @@ def _bootstrap_memory_read_service(deployment):
     if (
         config.explicit_writes_enabled
         or config.auto_candidate_persistence_enabled
+        or config.candidate_decisions_enabled
     ) and config.configuration_valid:
         expected_profile = memory_fingerprint_profile_from_config(
             config
@@ -454,6 +457,7 @@ def _bootstrap_memory_runtime_scope(deployment):
                 if (
                     policy.explicit_writes_enabled
                     or policy.auto_candidate_persistence_enabled
+                    or policy.candidate_decisions_enabled
                 )
                 and policy.configuration_valid
                 else None

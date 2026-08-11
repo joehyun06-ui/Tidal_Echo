@@ -200,6 +200,7 @@ class MemoryConfig:
     auto_formation_enabled: bool = False
     auto_candidate_persistence_enabled: bool = False
     candidate_review_enabled: bool = False
+    candidate_decisions_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -427,6 +428,10 @@ def load_deployment_config(
         env.get("MEMORY_CANDIDATE_REVIEW_ENABLED", "false"),
         "invalid_memory_candidate_review_enabled",
     )
+    memory_candidate_decisions = parse_strict_bool(
+        env.get("MEMORY_CANDIDATE_DECISIONS_ENABLED", "false"),
+        "invalid_memory_candidate_decisions_enabled",
+    )
     memory_sensitive_storage = parse_strict_bool(
         env.get("MEMORY_SENSITIVE_STORAGE_ENABLED", "false"),
         "invalid_memory_sensitive_storage_enabled",
@@ -466,6 +471,12 @@ def load_deployment_config(
         )
     if memory_candidate_review and not memory_enabled:
         raise DeploymentConfigError("memory_candidate_review_requires_core")
+    if memory_candidate_decisions and not memory_enabled:
+        raise DeploymentConfigError("memory_candidate_decisions_requires_core")
+    if memory_candidate_decisions and not memory_candidate_review:
+        raise DeploymentConfigError(
+            "memory_candidate_decisions_requires_candidate_review"
+        )
     if memory_auto_formation and not memory_enabled:
         raise DeploymentConfigError("memory_auto_formation_requires_core")
     if memory_auto_formation and not kelivo_enabled:
@@ -618,6 +629,7 @@ def load_deployment_config(
         memory_explicit_writes
         or memory_auto_candidate_persistence
         or memory_candidate_review
+        or memory_candidate_decisions
     ):
         if not memory_key_id:
             memory_configuration_valid = False
@@ -799,6 +811,7 @@ def load_deployment_config(
                 memory_auto_candidate_persistence
             ),
             candidate_review_enabled=memory_candidate_review,
+            candidate_decisions_enabled=memory_candidate_decisions,
         ),
     )
 
