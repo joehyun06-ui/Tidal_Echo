@@ -27,6 +27,7 @@ _CATEGORIES: Final = frozenset({
     "candidate_rejected",
     "completed",
     "extractor_invalid_output",
+    "extractor_timeout",
     "extractor_unavailable",
     "no_proposals",
     "source_ineligible",
@@ -87,11 +88,12 @@ async def run_memory_formation_shadow(
     except asyncio.CancelledError:
         raise
     except MemoryFormationExtractorError as error:
-        category = (
-            "extractor_invalid_output"
-            if error.category == "extractor_invalid_output"
-            else "extractor_unavailable"
-        )
+        if error.category == "extractor_timeout":
+            category = "extractor_timeout"
+        elif error.category == "extractor_invalid_output":
+            category = "extractor_invalid_output"
+        else:
+            category = "extractor_unavailable"
         return _result("failed", category)
     except Exception:
         return _result("failed", "extractor_unavailable")

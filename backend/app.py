@@ -1240,6 +1240,7 @@ def _log_memory_formation_shadow(
         "busy",
         "candidate_rejected",
         "extractor_invalid_output",
+        "extractor_timeout",
         "extractor_unavailable",
         "scheduler_unavailable",
         "shutdown",

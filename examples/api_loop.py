@@ -82,7 +82,6 @@ LOOP_ASSISTANT_MAX_CHARS = deployment_config.parse_bounded_int(
     os.environ.get("LOOP_ASSISTANT_MAX_CHARS", "64000"), 1, 1_000_000,
     "invalid_loop_assistant_max_chars",
 )
-MEMORY_FORMATION_EXTRACTOR_TIMEOUT_SECONDS = 20.0
 LOOP_MODEL_TOTAL_TIMEOUT_SECONDS = deployment_config.parse_positive_finite_float(
     os.environ.get("LOOP_MODEL_TOTAL_TIMEOUT_SECONDS", "120"), "invalid_loop_timeout"
 )
@@ -802,7 +801,9 @@ async def loop_chat(request: Request):
         raise HTTPException(status_code=400, detail="invalid_extractor_contract")
     try:
         if extractor_marker_present:
-            async with asyncio.timeout(MEMORY_FORMATION_EXTRACTOR_TIMEOUT_SECONDS):
+            async with asyncio.timeout(
+    memory_formation_extractor.EXTRACTOR_TIMEOUT_SECONDS
+):
                 out = await run_kelivo_provider_contract(
                     provider_model, provider_messages,
                     temperature=float(temperature), max_tokens=max_tokens,

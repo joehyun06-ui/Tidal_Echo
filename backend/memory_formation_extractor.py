@@ -26,12 +26,13 @@ MAX_PROPOSALS: Final = FORMATION_MAX_PROPOSALS
 EXTRACTOR_RESPONSE_MAX_CHARS: Final = 4096
 EXTRACTOR_MAX_TOKENS: Final = 256
 EXTRACTOR_TEMPERATURE: Final = 0.0
-EXTRACTOR_TIMEOUT_SECONDS: Final = 20.0
+EXTRACTOR_TIMEOUT_SECONDS: Final = 45.0
 EXTRACTOR_SESSION_ID: Final = "memory-formation-extractor-v1"
 
 _SAFE_CONTRACT_VALUE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _ERROR_CATEGORIES: Final = frozenset({
     "extractor_invalid_output",
+    "extractor_timeout",
     "extractor_unavailable",
     "invalid_generation_callable",
     "invalid_provider_model",
@@ -211,6 +212,8 @@ async def extract_auto_memory_proposals(
             )
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        _raise("extractor_timeout")
     except Exception:
         _raise("extractor_unavailable")
     if type(response) is not dict:
