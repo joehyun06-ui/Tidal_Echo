@@ -802,9 +802,9 @@ async def loop_chat(request: Request):
     try:
         if extractor_marker_present:
             async with asyncio.timeout(
-                 memory_formation_extractor.EXTRACTOR_TIMEOUT_SECONDS
+                memory_formation_extractor.EXTRACTOR_TIMEOUT_SECONDS
             ):
-                 out = await run_kelivo_provider_contract(
+                out = await run_kelivo_provider_contract(
                     provider_model, provider_messages,
                     temperature=float(temperature), max_tokens=max_tokens,
                 )
