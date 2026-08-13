@@ -267,7 +267,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         began = loop.time()
         with mock.patch.object(
-            self.module, "MEMORY_FORMATION_EXTRACTOR_TIMEOUT_SECONDS", 0.005,
+            self.module.memory_formation_extractor, "EXTRACTOR_TIMEOUT_SECONDS", 0.005,
         ), mock.patch.object(
             self.module, "run_kelivo_provider_contract", new=blocked,
         ):

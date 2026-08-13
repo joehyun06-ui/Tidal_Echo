@@ -281,6 +281,35 @@ class ShadowCompositionTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_extractor_timeout_produces_no_candidates_or_callback(self):
+        callback = mock.AsyncMock()
+
+        async def extract(_source):
+            raise MemoryFormationExtractorError("extractor_timeout")
+
+        with mock.patch.object(
+            integration,
+            "build_auto_memory_candidates",
+            side_effect=AssertionError("builder must not run"),
+        ):
+            result = await integration.run_memory_formation_shadow(
+                1,
+                "source",
+                extract,
+                max_item_chars=1000,
+                accepted_proposals_callable=callback,
+            )
+
+        self.assertEqual(
+            (
+                result.status,
+                result.category,
+                result.proposal_count,
+                result.candidate_count,
+            ),
+            ("failed", "extractor_timeout", 0, 0),
+        )
+        callback.assert_not_awaited()
 class CanonicalFormationSourceTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -520,6 +549,25 @@ class MemoryFormationAppIntegrationTests(NoNetworkMixin, unittest.IsolatedAsynci
         self.assertNotIn(EXTRACTOR_CONTRACT_VERSION, persisted)
         self.assertEqual(schema_after, schema_before)
 
+    async def test_extractor_timeout_telemetry_is_bounded_and_data_free(self):
+        secret = "PRIVATE-TIMEOUT-SOURCE-AND-ID"
+
+        with mock.patch("builtins.print") as printed:
+            self.module._log_memory_formation_shadow(
+                status="failed",
+                category="extractor_timeout",
+            )
+
+        logs = " ".join(
+            str(call.args[0])
+            for call in printed.call_args_list
+            if call.args
+        )
+        self.assertEqual(
+            logs,
+            "[memory-formation-shadow] status=failed category=extractor_timeout",
+        )
+        self.assertNotIn(secret, logs)
     async def test_default_off_performs_no_shadow_lookup_call_or_log_and_preserves_contract(self):
         other_temp = tempfile.TemporaryDirectory()
         self.addCleanup(other_temp.cleanup)

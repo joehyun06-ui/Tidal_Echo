@@ -19,6 +19,8 @@ def output(proposals, *, version=extractor.EXTRACTOR_CONTRACT_VERSION, **extra):
 
 
 class MemoryFormationExtractorTests(unittest.IsolatedAsyncioTestCase):
+    def test_timeout_constant_is_45_seconds(self):
+        self.assertEqual(extractor.EXTRACTOR_TIMEOUT_SECONDS, 45.0)
     async def invoke(self, raw_output, *, source="abcdefghij", capture=None):
         calls = [] if capture is None else capture
 
@@ -207,6 +209,20 @@ class MemoryFormationExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("message_id", serialized)
         self.assertNotIn("idempotency", serialized)
 
+    async def test_latency_above_old_boundary_but_below_new_boundary_succeeds(self):
+        async def generation(*_args):
+            await asyncio.sleep(0.30)
+            return {"text": output([])}
+
+        with mock.patch.object(extractor, "EXTRACTOR_TIMEOUT_SECONDS", 0.45):
+            result = await extractor.extract_auto_memory_proposals(
+                generation,
+                "source",
+                provider_model="provider-model",
+                provider_prompt_contract_version="kelivo-provider-prompt-v1",
+            )
+
+        self.assertEqual(result.proposals, ())
     async def test_timeout_is_bounded_and_generation_is_never_retried(self):
         calls = 0
 
@@ -224,7 +240,7 @@ class MemoryFormationExtractorTests(unittest.IsolatedAsyncioTestCase):
                     provider_model="provider-model",
                     provider_prompt_contract_version="kelivo-provider-prompt-v1",
                 )
-        self.assertEqual(raised.exception.category, "extractor_unavailable")
+        self.assertEqual(raised.exception.category, "extractor_timeout")
         self.assertEqual(calls, 1)
 
     async def test_generation_failures_and_model_output_never_enter_errors(self):
