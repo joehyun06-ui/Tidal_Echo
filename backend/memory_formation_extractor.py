@@ -24,7 +24,7 @@ from backend.memory_formation import (
 EXTRACTOR_CONTRACT_VERSION: Final = "memory-formation-extractor-v1"
 MAX_PROPOSALS: Final = FORMATION_MAX_PROPOSALS
 EXTRACTOR_RESPONSE_MAX_CHARS: Final = 4096
-EXTRACTOR_MAX_TOKENS: Final = 256
+EXTRACTOR_MAX_TOKENS: Final = 128
 EXTRACTOR_TEMPERATURE: Final = 0.0
 EXTRACTOR_TIMEOUT_SECONDS: Final = 45.0
 EXTRACTOR_SESSION_ID: Final = "memory-formation-extractor-v1"

@@ -199,7 +199,7 @@ class MemoryFormationExtractorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session, extractor.EXTRACTOR_SESSION_ID)
         self.assertEqual(model, "provider-model")
         self.assertEqual(temperature, 0.0)
-        self.assertLessEqual(max_tokens, 256)
+        self.assertEqual(extractor.EXTRACTOR_MAX_TOKENS, 128)
         self.assertEqual(max_tokens, extractor.EXTRACTOR_MAX_TOKENS)
         self.assertEqual(context, {
             "prompt_contract_version": "kelivo-provider-prompt-v1",
