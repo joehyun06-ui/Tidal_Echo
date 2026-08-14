@@ -206,7 +206,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                     "use_default_persona": False,
                     "single_route": True,
                     "temperature": 0.0,
-                    "max_tokens": 256,
+                    "max_tokens": 128,
                     "memory_formation_extractor": "memory-formation-extractor-v1",
                 },
             )
@@ -214,7 +214,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generated.await_args.args[1], provider_messages)
         self.assertEqual(generated.await_args.kwargs, {
             "temperature": 0.0,
-            "max_tokens": 256,
+            "max_tokens": 128,
         })
         with closing(sqlite3.connect(self.module.RELAY_DB)) as conn:
             after_messages = conn.execute(
@@ -244,7 +244,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             "use_default_persona": False,
             "single_route": True,
             "temperature": 0.0,
-            "max_tokens": 256,
+            "max_tokens": 128,
             "memory_formation_extractor": "memory-formation-extractor-v1",
         }
         with closing(sqlite3.connect(self.module.RELAY_DB)) as conn:
@@ -328,7 +328,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             "use_default_persona": False,
             "single_route": True,
             "temperature": 0.0,
-            "max_tokens": 256,
+            "max_tokens": 128,
             "memory_formation_extractor": "memory-formation-extractor-v1",
         }
         invalid_bodies = [
@@ -348,7 +348,7 @@ class ApiLoopReliabilityTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
                 ],
             },
             {**body, "temperature": 0.1},
-            {**body, "max_tokens": 257},
+            {**body, "max_tokens": 129},
         ]
         generated = mock.AsyncMock()
         with mock.patch.object(
