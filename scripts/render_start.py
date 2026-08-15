@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise the private api_loop and public relay in one Render instance."""
+"""Supervise api_loop, public relay, and optional autonomous wake in one Render instance."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ class SupervisorConfig:
     shutdown_grace: float
     instance_nonce: str
     internal_token: str
+    autonomous_wake_enabled: bool = False
 
 
 def preflight(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
@@ -52,11 +53,21 @@ def preflight(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
     shutdown_grace = deployment_config.parse_positive_finite_float(
         env.get("SUPERVISOR_SHUTDOWN_GRACE_SECONDS", "10"), "invalid_shutdown_grace"
     )
+    autonomous_wake_enabled = deployment_config.parse_strict_bool(
+        env.get("AUTONOMOUS_WAKE_ENABLED", "false"), "invalid_autonomous_wake_enabled"
+    )
+    if autonomous_wake_enabled:
+        bridge_url = str(env.get("AUTONOMOUS_WAKE_BRIDGE_URL", "")).strip()
+        token = str(env.get("AUTONOMOUS_WAKE_TOKEN", "")).strip()
+        if not bridge_url.startswith("https://") or len(bridge_url) > 512:
+            raise DeploymentConfigError("invalid_autonomous_wake_bridge_url")
+        if len(token) < 32 or len(token) > 256 or any(char.isspace() for char in token):
+            raise DeploymentConfigError("invalid_autonomous_wake_token")
     deployment_config.prepare_persistent_paths(deployment)
     initialize_brain_target(deployment)
     return SupervisorConfig(
         deployment, relay_port, loop_ready_timeout, shutdown_grace,
-        secrets.token_urlsafe(32), secrets.token_urlsafe(48),
+        secrets.token_urlsafe(32), secrets.token_urlsafe(48), autonomous_wake_enabled,
     )
 
 
@@ -73,7 +84,7 @@ def child_environment(config: SupervisorConfig, environ: Mapping[str, str] | Non
 
 def child_commands(config: SupervisorConfig, executable: str | None = None) -> dict[str, list[str]]:
     python = executable or sys.executable
-    return {
+    commands = {
         "api_loop": [
             python, "-m", "uvicorn", "examples.api_loop:app", "--host", "127.0.0.1",
             "--port", str(config.deployment.loop_port), "--workers", "1",
@@ -85,6 +96,9 @@ def child_commands(config: SupervisorConfig, executable: str | None = None) -> d
             "--no-access-log",
         ],
     }
+    if config.autonomous_wake_enabled:
+        commands["autonomous_wake"] = [python, "scripts/autonomous_wake_worker.py"]
+    return commands
 
 
 def safe_log(process: str, pid: int | None, state: str, category: str = "") -> None:
@@ -223,9 +237,14 @@ class RenderSupervisor:
             relay_env = dict(env)
             relay_env["API_LOOP_EXPECTED_NONCE"] = config.instance_nonce
             relay_env["API_LOOP_INTERNAL_TOKEN"] = config.internal_token
+            wake_env = dict(env)
+            wake_env["API_LOOP_INSTANCE_NONCE"] = config.instance_nonce
+            wake_env["API_LOOP_INTERNAL_TOKEN"] = config.internal_token
             loop_process = self._start("api_loop", commands["api_loop"], api_env)
             self._wait_for_loop(loop_process, config.deployment.loop_port, config.instance_nonce, config.loop_ready_timeout)
             self._start("relay", commands["relay"], relay_env)
+            if "autonomous_wake" in commands:
+                self._start("autonomous_wake", commands["autonomous_wake"], wake_env)
             while self.stop_signal is None:
                 failed = next(
                     ((name, process) for name, process in self.processes.items() if process.poll() is not None),
