@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,8 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
 
 DEFAULT_DID = "No previous autonomous wake has run."
 MAX_DID_CHARS = 240
+_STATUS_LOG_LOCK = threading.Lock()
+_STATUS_LOG_LAST_MONOTONIC = 0.0
 
 
 def utc_now() -> datetime:
@@ -97,6 +100,33 @@ class WakeState:
             raise ValueError("invalid_wake_state")
 
 
+def _status_logging_enabled() -> bool:
+    return os.environ.get("AUTONOMOUS_WAKE_STATUS_LOG_ENABLED", "false").strip().lower() == "true"
+
+
+def _maybe_log_status(state: WakeState, *, interval_seconds: float = 60.0) -> None:
+    """Emit bounded scheduler telemetry without exposing the causal ``did``."""
+    if not _status_logging_enabled():
+        return
+    global _STATUS_LOG_LAST_MONOTONIC
+    now_mono = time.monotonic()
+    with _STATUS_LOG_LOCK:
+        if _STATUS_LOG_LAST_MONOTONIC and now_mono - _STATUS_LOG_LAST_MONOTONIC < interval_seconds:
+            return
+        _STATUS_LOG_LAST_MONOTONIC = now_mono
+    next_wakeup = state.next_wakeup_at or "none"
+    last_heartbeat = state.last_heartbeat_at or "none"
+    print(
+        "[sinus-status] "
+        f"next_wakeup_at={next_wakeup} "
+        f"last_heartbeat_at={last_heartbeat} "
+        f"wakeup_reason={state.wakeup_reason} "
+        f"consecutive_fallbacks={state.consecutive_fallbacks} "
+        f"schedule_generation={state.schedule_generation}",
+        flush=True,
+    )
+
+
 class WakeStateStore:
     """Atomically persist one scheduler state with a separate lock file."""
 
@@ -151,7 +181,9 @@ class WakeStateStore:
 
     def load(self) -> WakeState:
         with self._exclusive():
-            return self._load()
+            state = self._load()
+        _maybe_log_status(state)
+        return state
 
     def save(self, state: WakeState) -> None:
         with self._exclusive():
