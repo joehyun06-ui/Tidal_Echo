@@ -1658,7 +1658,7 @@ class MemoryServiceTests(NoNetworkMixin, unittest.TestCase):
             (
                 "telegram",
                 int(telegram["canonical_message_id"]),
-                "",
+                "telegram",
                 "Synthetic Telegram provenance",
             ),
         ]

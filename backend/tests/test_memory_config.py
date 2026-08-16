@@ -28,6 +28,7 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.sensitive_storage_enabled)
         self.assertFalse(config.explicit_entry_enabled)
         self.assertFalse(config.auto_formation_enabled)
+        self.assertFalse(config.natural_ingress_formation_enabled)
         self.assertFalse(config.auto_candidate_persistence_enabled)
         self.assertFalse(config.candidate_review_enabled)
         self.assertFalse(config.candidate_decisions_enabled)
@@ -187,6 +188,45 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(config.explicit_writes_enabled)
         self.assertFalse(config.explicit_entry_enabled)
         self.assertFalse(config.sensitive_storage_enabled)
+
+    def test_natural_ingress_formation_is_strict_default_off_and_requires_auto_formation(self):
+        for value in ("", "maybe", " true ", "enabled", "?"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                r"^invalid_memory_natural_ingress_formation_enabled$",
+            ):
+                self.load({
+                    "MEMORY_NATURAL_INGRESS_FORMATION_ENABLED": value,
+                })
+
+        disabled = self.load({
+            "MEMORY_NATURAL_INGRESS_FORMATION_ENABLED": "false",
+        })
+        self.assertFalse(disabled.natural_ingress_formation_enabled)
+
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            r"^memory_natural_ingress_formation_requires_auto_formation$",
+        ):
+            self.load({
+                "MEMORY_NATURAL_INGRESS_FORMATION_ENABLED": "true",
+            })
+
+        config = self.load({
+            "MEMORY_NATURAL_INGRESS_FORMATION_ENABLED": "true",
+            "MEMORY_AUTO_FORMATION_ENABLED": "true",
+            "MEMORY_CORE_ENABLED": "true",
+            "KELIVO_ENABLED": "true",
+            "KELIVO_API_KEY": "test-kelivo-key-distinct-1234567890",
+            "KELIVO_CLIENT_ID": "primary-kelivo",
+            "KELIVO_API_SESSION": "shared-test-session",
+            "KELIVO_MODEL_ALIAS": "ouou-home",
+            "LLM_MODEL": "test-provider-model",
+        })
+        self.assertTrue(config.natural_ingress_formation_enabled)
+        self.assertTrue(config.auto_formation_enabled)
+        self.assertFalse(config.auto_candidate_persistence_enabled)
+        self.assertFalse(config.explicit_writes_enabled)
 
     def test_auto_candidate_persistence_is_strict_and_default_off(self):
         for value in ("", "maybe", " true ", "enabled", "真"):

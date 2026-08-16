@@ -1449,6 +1449,174 @@ async def _run_memory_formation_shadow_task(
         )
 
 
+def _load_natural_ingress_formation_source(
+    canonical_message_id: int,
+    *,
+    channel: str,
+    source: str,
+) -> tuple[int, str]:
+    if type(canonical_message_id) is not int or canonical_message_id <= 0:
+        raise ValueError("invalid_natural_ingress_source")
+    if (channel, source) not in {
+        ("web", "relay"),
+        ("telegram", "telegram"),
+    }:
+        raise ValueError("invalid_natural_ingress_source")
+
+    with db() as conn:
+        row = conn.execute(
+            """SELECT id,direction,kind,text,meta
+               FROM messages WHERE id=?""",
+            (canonical_message_id,),
+        ).fetchone()
+
+    if (
+        row is None
+        or row["direction"] != "in"
+        or row["kind"] != "user"
+        or type(row["text"]) is not str
+        or not row["text"].strip()
+    ):
+        raise ValueError("invalid_natural_ingress_source")
+
+    try:
+        meta = json.loads(row["meta"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("invalid_natural_ingress_source") from None
+
+    if (
+        not isinstance(meta, dict)
+        or meta.get("channel") != channel
+        or meta.get("source") != source
+    ):
+        raise ValueError("invalid_natural_ingress_source")
+
+    return int(row["id"]), row["text"]
+
+
+async def _run_natural_ingress_memory_formation_shadow_task(
+    *,
+    canonical_message_id: int,
+    channel: str,
+    source: str,
+    generation_callable,
+) -> None:
+    try:
+        canonical_id, source_text = await asyncio.to_thread(
+            _load_natural_ingress_formation_source,
+            canonical_message_id,
+            channel=channel,
+            source=source,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log_memory_formation_shadow(
+            status="failed", category="source_unavailable",
+        )
+        return
+
+    try:
+        provider_defaults = await asyncio.to_thread(
+            deployment_config.resolve_kelivo_provider_contract_defaults,
+            os.environ,
+            DEPLOYMENT.loop_config,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log_memory_formation_shadow(
+            status="failed", category="extractor_unavailable",
+        )
+        return
+
+    async def extractor(text: str):
+        return await memory_formation_extractor.extract_auto_memory_proposals(
+            generation_callable,
+            text,
+            provider_model=provider_defaults.provider_model,
+            provider_prompt_contract_version=(
+                kelivo_service.PROMPT_CONTRACT_VERSION
+            ),
+        )
+
+    formation_kwargs = {
+        "max_item_chars": DEPLOYMENT.memory.max_item_chars,
+    }
+    if DEPLOYMENT.memory.auto_candidate_persistence_enabled:
+        formation_kwargs["accepted_proposals_callable"] = (
+            _persist_accepted_memory_proposals
+        )
+
+    result = await memory_formation_integration.run_memory_formation_shadow(
+        canonical_id,
+        source_text,
+        extractor,
+        **formation_kwargs,
+    )
+
+    if result.status == "completed":
+        _log_memory_formation_shadow(
+            status="completed",
+            proposal_count=result.proposal_count,
+            candidate_count=result.candidate_count,
+        )
+    else:
+        _log_memory_formation_shadow(
+            status="failed", category=result.category,
+        )
+
+
+def _schedule_natural_ingress_memory_formation_shadow(
+    *,
+    canonical_message_id: int,
+    channel: str,
+    source: str,
+    generation_callable,
+) -> bool:
+    if (
+        not DEPLOYMENT.memory.auto_formation_enabled
+        or not DEPLOYMENT.memory.natural_ingress_formation_enabled
+    ):
+        return False
+    if (channel, source) not in {
+        ("web", "relay"),
+        ("telegram", "telegram"),
+    }:
+        return False
+    if generation_callable is None:
+        _log_memory_formation_shadow(
+            status="failed", category="extractor_unavailable",
+        )
+        return False
+    if getattr(app.state, "shutting_down", False):
+        _log_memory_formation_shadow(status="skipped", category="shutdown")
+        return False
+
+    existing = getattr(app.state, "memory_formation_shadow_task", None)
+    if existing is not None and not existing.done():
+        _log_memory_formation_shadow(status="skipped", category="busy")
+        return False
+
+    try:
+        task = asyncio.create_task(
+            _run_natural_ingress_memory_formation_shadow_task(
+                canonical_message_id=canonical_message_id,
+                channel=channel,
+                source=source,
+                generation_callable=generation_callable,
+            )
+        )
+    except Exception:
+        _log_memory_formation_shadow(
+            status="failed", category="scheduler_unavailable",
+        )
+        return False
+
+    app.state.memory_formation_shadow_task = task
+    task.add_done_callback(_memory_formation_shadow_done)
+    return True
+
 def _schedule_memory_formation_shadow(
     *,
     client_id: str,
@@ -2333,7 +2501,24 @@ async def app_send(request: Request):
     api_session = str(body.get("api_session") or body.get("session_id") or "").strip()
     if not text and not attachments:
         raise HTTPException(status_code=400, detail="empty text")
-    msg = await dispatch_human_message(text, attachments=attachments, api_session=api_session)
+    msg = await dispatch_human_message(
+        text,
+        attachments=attachments,
+        api_session=api_session,
+        extra_meta={"channel": "web", "source": "relay"},
+    )
+    if text and DEPLOYMENT.memory.natural_ingress_formation_enabled:
+        try:
+            _schedule_natural_ingress_memory_formation_shadow(
+                canonical_message_id=msg["id"],
+                channel="web",
+                source="relay",
+                generation_callable=KELIVO_GENERATOR,
+            )
+        except Exception:
+            _log_memory_formation_shadow(
+                status="failed", category="scheduler_unavailable",
+            )
     return {"id": msg["id"]}
 
 
@@ -2390,6 +2575,18 @@ async def telegram_webhook(request: Request):
                                      existing_message=result["message"], route=False)
     except Exception:
         print("[telegram] sse_broadcast_failed")
+    if DEPLOYMENT.memory.natural_ingress_formation_enabled:
+        try:
+            _schedule_natural_ingress_memory_formation_shadow(
+                canonical_message_id=result["message"]["id"],
+                channel="telegram",
+                source="telegram",
+                generation_callable=KELIVO_GENERATOR,
+            )
+        except Exception:
+            _log_memory_formation_shadow(
+                status="failed", category="scheduler_unavailable",
+            )
     return {"ok": True, "queued": True}
 
 
