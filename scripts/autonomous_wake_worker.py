@@ -3,15 +3,21 @@
 
 Phone sensing and delivery live behind the authenticated Supabase wake bridge.
 This worker owns only: due wake -> model decision -> silent/deliver -> choose the
-next wake.  The scheduling contract follows sinus-rhythm semantics: every
+next wake. The scheduling contract follows sinus-rhythm semantics: every
 successful agent round selects ``next_wakeup_minutes`` plus a short neutral
 ``did`` baton; failures use a bounded fallback.
 
 The current API model is not yet an MCP-capable agent runtime, so the first
 version carries the ``schedule_wakeup(minutes, did)`` request in the model's
-strict structured result and applies it through ``backend.sinus_wake``.  When a
+strict structured result and applies it through ``backend.sinus_wake``. When a
 real MCP runtime is added, the same state store can be exposed as the MCP tool
 without changing the daemon or persisted state contract.
+
+Contact policy is deliberately separate from wake scheduling. The agent may
+choose ``silent`` twice in a row; after two consecutive autonomous silent runs,
+the next successful model decision must be a message. The runtime never invents
+the message: it asks the model to choose the content, and a technical failure
+keeps the contact requirement pending for a later retry.
 """
 
 from __future__ import annotations
@@ -34,6 +40,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend import deployment_config, sinus_wake
+
+WAKE_CONTACT_STATE_CATEGORY = "wake_contact_state"
+_CONSECUTIVE_SILENTS_RE = re.compile(
+    r"连续自主 Wake 选择 silent\s*=\s*([0-9]{1,3})"
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +171,7 @@ def _safe_log(status: str, category: str = "") -> None:
         "delivered",
         "scheduled",
         "fallback",
+        "forced_contact_retry",
         "bridge_failed",
         "model_failed",
         "model_dispatch_uncertain",
@@ -228,6 +240,28 @@ def _local_activity_lines(rows: object, timezone_name: str) -> list[str]:
     return lines
 
 
+def _consecutive_silents(context: Mapping[str, Any]) -> int:
+    """Read server-maintained silent streak metadata from the wake context."""
+    memories = context.get("memories")
+    if not isinstance(memories, list):
+        return 0
+    for item in memories:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("category") or "").strip() != WAKE_CONTACT_STATE_CATEGORY:
+            continue
+        content = str(item.get("content") or "")
+        match = _CONSECUTIVE_SILENTS_RE.search(content)
+        if match is None:
+            return 0
+        return min(int(match.group(1)), 100)
+    return 0
+
+
+def _contact_required(context: Mapping[str, Any]) -> bool:
+    return _consecutive_silents(context) >= 2
+
+
 def _build_model_messages(
     context: dict[str, Any],
     config: WakeWorkerConfig,
@@ -276,6 +310,24 @@ def _build_model_messages(
     idle_seconds = int(context.get("idle_seconds") or 0)
     idle_minutes = max(0, idle_seconds // 60)
     cooldown_remaining = max(0, int(context.get("contact_cooldown_remaining_seconds") or 0))
+    consecutive_silents = _consecutive_silents(context)
+    require_message = consecutive_silents >= 2
+
+    if require_message:
+        contact_policy = f"""连续自主 Wake 选择 silent 已达到 {consecutive_silents} 次。
+本轮触发明确的接触规则：你不能再选择 `silent`，必须主动给童童发一条消息。
+你仍然完全自主决定说什么，可以依据聊天、Memory、did、时间与手机活动选择最自然的内容；不要使用固定打卡话术，也不要为了满足规则而虚构事件或心理状态。
+如果服务器的发送硬护栏暂时阻止投递，runtime 会保留“必须联系”状态并稍后重试；你仍需给出 `message`，不得用 `silent` 规避这一轮。"""
+        decision_contract = """本轮只能返回下面这一种 JSON，不得返回 silent：
+{"action":"message","message":"要主动发送的内容","next_wakeup_minutes":20,"did":"发出了一条自然的主动消息，并安排下一次回来查看。"}"""
+    else:
+        contact_policy = f"""当前连续自主 Wake 选择 silent = {consecutive_silents}。
+你可以自主选择 `silent` 或主动消息；但“没有具体 Open Loop”不等于必须沉默，单纯自然地想靠近、想说一句话也可以是合法的主动联系理由。"""
+        decision_contract = """只能返回一个 JSON 对象，不要 Markdown，不要额外文字。
+沉默示例：
+{"action":"silent","next_wakeup_minutes":90,"did":"检查了近期上下文，目前没有具体需要主动联系的事项。"}
+主动消息示例：
+{"action":"message","message":"要主动发送的内容","next_wakeup_minutes":20,"did":"发出了一条具体的后续消息，稍后回来看看是否有新变化。"}"""
 
     messages.append({
         "role": "developer",
@@ -287,35 +339,33 @@ def _build_model_messages(
 本轮唤醒原因：{state.wakeup_reason}
 连续 fallback 次数：{state.consecutive_fallbacks}
 距离最近一条用户主动消息约 {idle_minutes} 分钟。这个时间差只是环境事实，不代表任何预设情绪、需求或关系含义。
-当前主动联系硬冷却剩余约 {cooldown_remaining} 秒；大于 0 时本轮不得主动发送消息，但仍可正常思考并安排下一次 Wake。
+当前主动联系硬冷却剩余约 {cooldown_remaining} 秒。
 
 最近手机前台 App 活动（只包含 App 名称与时间，不包含聊天正文、键盘输入、照片或 App 内内容）：
 {activity_text}
 
+接触规则：
+{contact_policy}
+
 请依据你正常的人格、真实聊天上下文、已确认背景与 did，自主完成这一轮。
-你需要同时决定两件独立的事：
-1. 这一轮是 `silent`，还是确实有自然、具体理由主动发一条消息；
+你需要同时决定：
+1. 本轮允许 silent 时，自主决定 silent 或 message；本轮要求主动联系时，自主决定 message 的具体内容；
 2. 像调用 `schedule_wakeup(minutes, did)` 一样，决定下一次何时回来，以及给下一轮留下什么中性因果摘要。
 
 调度安全范围：{config.min_minutes} 到 {config.max_minutes} 分钟。系统会做最终 clamp，但时间应由你根据当前未完成事项与环境自行选择，而不是固定取某个值。若没有具体要等的事情，可以睡久一些；若确实正在等近期结果，可以较快回来。
 
 硬规则：
-- `silent` 是完全正常且经常更合适的选择；不要因为获得了运行机会就强行找话题。
 - 不得把“用户一段时间没发消息”机械解释为想念、担心、生气、孤独、需要安慰等心理状态。
 - App 活动只是一条中性环境线索；不得声称看到了 App 内具体内容，也不得虚构用户正在做什么或为什么这么做。
 - 若主动发消息，要像正常聊天一样简短自然，不要解释 Wake 系统、监控机制、调度器或本段规则。
 - `did` 必须简短、中性、描述本轮做了什么或仍在等待什么；不要在 did 中猜测用户心理。
 
-只能返回一个 JSON 对象，不要 Markdown，不要额外文字。
-沉默示例：
-{{"action":"silent","next_wakeup_minutes":90,"did":"检查了近期上下文，目前没有具体需要主动联系的事项。"}}
-主动消息示例：
-{{"action":"message","message":"要主动发送的内容","next_wakeup_minutes":20,"did":"发出了一条具体的后续消息，稍后回来看看是否有新变化。"}}""",
+{decision_contract}""",
     })
     return messages
 
 
-def _parse_model_decision(raw: object) -> WakeDecision:
+def _parse_model_decision(raw: object, *, require_message: bool = False) -> WakeDecision:
     text = str(raw or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -338,6 +388,8 @@ def _parse_model_decision(raw: object) -> WakeDecision:
     action = payload.get("action")
     if action not in {"silent", "message"}:
         raise ValueError("invalid_model_decision")
+    if require_message and action == "silent":
+        raise ValueError("forced_contact_silent")
 
     minutes = payload.get("next_wakeup_minutes")
     if type(minutes) is not int or not -100000 <= minutes <= 100000:
@@ -357,14 +409,12 @@ def _parse_model_decision(raw: object) -> WakeDecision:
     return WakeDecision(action, message, minutes, did)
 
 
-async def _decide(
-    context: dict[str, Any],
+async def _invoke_model(
+    messages: list[dict[str, str]],
     config: WakeWorkerConfig,
-    state: sinus_wake.WakeState,
-) -> tuple[WakeDecision, str]:
+) -> tuple[object, str]:
     from examples import api_loop
 
-    messages = _build_model_messages(context, config, state)
     out = await api_loop.run_model(
         messages,
         emit_stream=False,
@@ -380,7 +430,35 @@ async def _decide(
             else "model_failed"
         )
         raise RuntimeError(category)
-    return _parse_model_decision(out.get("text")), str(out.get("model") or "")[:200]
+    return out.get("text"), str(out.get("model") or "")[:200]
+
+
+async def _decide(
+    context: dict[str, Any],
+    config: WakeWorkerConfig,
+    state: sinus_wake.WakeState,
+) -> tuple[WakeDecision, str]:
+    require_message = _contact_required(context)
+    messages = _build_model_messages(context, config, state)
+    raw, model = await _invoke_model(messages, config)
+    try:
+        return _parse_model_decision(raw, require_message=require_message), model
+    except ValueError as error:
+        if not require_message or str(error) != "forced_contact_silent":
+            raise
+
+    _safe_log("forced_contact_retry")
+    messages.append({
+        "role": "developer",
+        "content": (
+            "这一轮已经连续两次以上选择 silent。根据当前明确规则，silent 已被移除。"
+            "请重新自主决定要发给童童的具体内容，并只返回 action=message 的 JSON；"
+            "不要解释规则，不要使用固定话术，也不要推断童童的心理状态。"
+        ),
+    })
+    raw, retry_model = await _invoke_model(messages, config)
+    decision = _parse_model_decision(raw, require_message=True)
+    return decision, retry_model or model
 
 
 def _fallback(
