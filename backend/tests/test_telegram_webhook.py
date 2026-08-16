@@ -43,6 +43,9 @@ class TelegramWebhookTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM generation_jobs").fetchone()[0], 1)
             row = conn.execute("SELECT * FROM messages").fetchone()
             self.assertEqual(row["text"], "hello")
+            meta = self.module.json.loads(row["meta"])
+            self.assertEqual(meta["channel"], "telegram")
+            self.assertEqual(meta["source"], "telegram")
 
 
 if __name__ == "__main__":

@@ -198,6 +198,7 @@ class MemoryConfig:
     entry_configuration_valid: bool = True
     entry_error_category: str = ""
     auto_formation_enabled: bool = False
+    natural_ingress_formation_enabled: bool = False
     auto_candidate_persistence_enabled: bool = False
     candidate_review_enabled: bool = False
     candidate_decisions_enabled: bool = False
@@ -420,6 +421,10 @@ def load_deployment_config(
         env.get("MEMORY_AUTO_FORMATION_ENABLED", "false"),
         "invalid_memory_auto_formation_enabled",
     )
+    memory_natural_ingress_formation = parse_strict_bool(
+        env.get("MEMORY_NATURAL_INGRESS_FORMATION_ENABLED", "false"),
+        "invalid_memory_natural_ingress_formation_enabled",
+    )
     memory_auto_candidate_persistence = parse_strict_bool(
         env.get("MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED", "false"),
         "invalid_memory_auto_candidate_persistence_enabled",
@@ -457,6 +462,10 @@ def load_deployment_config(
         raise DeploymentConfigError("memory_context_injection_requires_core")
     if memory_context_injection and not kelivo_enabled:
         raise DeploymentConfigError("memory_context_injection_requires_kelivo")
+    if memory_natural_ingress_formation and not memory_auto_formation:
+        raise DeploymentConfigError(
+            "memory_natural_ingress_formation_requires_auto_formation"
+        )
     if memory_auto_candidate_persistence and not memory_enabled:
         raise DeploymentConfigError(
             "memory_auto_candidate_persistence_requires_core"
@@ -807,6 +816,9 @@ def load_deployment_config(
             entry_configuration_valid=memory_entry_configuration_valid,
             entry_error_category=memory_entry_error_category,
             auto_formation_enabled=memory_auto_formation,
+            natural_ingress_formation_enabled=(
+                memory_natural_ingress_formation
+            ),
             auto_candidate_persistence_enabled=(
                 memory_auto_candidate_persistence
             ),

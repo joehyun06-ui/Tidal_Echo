@@ -2855,7 +2855,8 @@ def enqueue_telegram_update(path: str, *, account_id: str, update_id: str, chat_
                 return {"duplicate": False, "rejected": "rate_limited", "event_id": event_id}
             conversation = get_or_create_conversation(conn, "telegram", account_id, chat_id, "private", user_id)
             meta = {"user": "human", "attachments": [], "api_session": conversation["api_session"],
-                    "channel": "telegram", "external_event_id": str(event_id)}
+                    "channel": "telegram", "source": "telegram",
+                    "external_event_id": str(event_id)}
             cur = conn.execute("INSERT INTO messages(ts,direction,kind,text,meta) VALUES(?,?,?,?,?)",
                                (stamp, "in", "user", text, json.dumps(meta, ensure_ascii=False)))
             canonical_id = cur.lastrowid

@@ -88,6 +88,7 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
              memory_sensitive: bool = False, memory_secret: str = "",
              memory_entry: bool = False, memory_context: bool = False,
              memory_smart: bool = False, memory_auto_formation: bool = False,
+             memory_natural_ingress_formation: bool = False,
              memory_candidate_persistence: bool = False,
              memory_candidate_review: bool = False,
              memory_candidate_decisions: bool = False):
@@ -130,6 +131,9 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
         "MEMORY_EXPLICIT_WRITES_ENABLED": "true" if memory_writes else "false",
         "MEMORY_EXPLICIT_ENTRY_ENABLED": "true" if memory_entry else "false",
         "MEMORY_AUTO_FORMATION_ENABLED": "true" if memory_auto_formation else "false",
+        "MEMORY_NATURAL_INGRESS_FORMATION_ENABLED": (
+            "true" if memory_natural_ingress_formation else "false"
+        ),
         "MEMORY_AUTO_CANDIDATE_PERSISTENCE_ENABLED": (
             "true" if memory_candidate_persistence else "false"
         ),
