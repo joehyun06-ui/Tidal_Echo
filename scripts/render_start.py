@@ -91,7 +91,7 @@ def child_commands(config: SupervisorConfig, executable: str | None = None) -> d
             "--no-access-log",
         ],
         "relay": [
-            python, "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0",
+            python, "-m", "uvicorn", "backend.legacy_chat_bridge_app:app", "--host", "0.0.0.0",
             "--port", str(config.relay_port), "--workers", "1",
             "--no-access-log",
         ],
