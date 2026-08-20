@@ -371,7 +371,7 @@ def _persist_message_meta(message_id: object, meta: dict[str, Any]) -> None:
 
 def _visual_route_text(text: str, description: str, digest: str) -> str:
     user_text = str(text or "").strip()
-    if not user_text or user_text == "[图片]":
+    if not user_text or user_text == telegram_integration.TELEGRAM_IMAGE_PLACEHOLDER:
         user_text = "[用户发送了一张图片]"
     return (
         user_text
@@ -519,7 +519,7 @@ def _validate_update_multimodal(
         "chat_id": str(chat_id),
         "user_id": str(user_id),
         "external_message_id": str(message_id),
-        "text": text or "[图片]",
+        "text": text or telegram_integration.TELEGRAM_IMAGE_PLACEHOLDER,
     }, None
 
 

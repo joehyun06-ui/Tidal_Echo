@@ -429,7 +429,7 @@ class SupervisorTests(NoNetworkMixin, unittest.TestCase):
             result = supervisor.run(self.config(Path(root)), render_env(Path(root)))
         self.assertEqual(result, 1)
         self.assertIn("examples.api_loop:app", calls[0])
-        self.assertIn("backend.app:app", calls[1])
+        self.assertIn("backend.legacy_chat_bridge_app:app", calls[1])
         self.assertEqual(calls[0][calls[0].index("--host") + 1], "127.0.0.1")
         self.assertEqual(calls[1][calls[1].index("--host") + 1], "0.0.0.0")
         self.assertEqual(calls[0][calls[0].index("--workers") + 1], "1")

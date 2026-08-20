@@ -43,7 +43,8 @@ def _is_image_only(message: dict) -> bool:
         return (
             isinstance(meta, dict)
             and isinstance(meta.get("telegram_photo"), dict)
-            and str(message.get("text") or "").strip() == "[图片]"
+            and str(message.get("text") or "").strip()
+            == telegram_integration.TELEGRAM_IMAGE_PLACEHOLDER
         )
     except Exception:
         return False
@@ -86,7 +87,7 @@ def _coalesce_followup(db_path: str, current_job: dict) -> str:
                 if age < 0 or age > MAX_FOLLOWUP_AGE_SECONDS:
                     continue
                 text = str(row["text"] or "").strip()
-                if not text or text == "[图片]":
+                if not text or text == telegram_integration.TELEGRAM_IMAGE_PLACEHOLDER:
                     continue
                 try:
                     meta = json.loads(row["meta"] or "{}")
