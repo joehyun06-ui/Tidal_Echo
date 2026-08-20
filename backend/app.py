@@ -1449,6 +1449,43 @@ async def _run_memory_formation_shadow_task(
         )
 
 
+def _telegram_attachment_only_formation_source(
+    text: object,
+    meta: object,
+    *,
+    channel: str,
+    source: str,
+) -> bool:
+    """Identify server-proven Telegram image-only canonical sources."""
+
+    if (
+        (channel, source) != ("telegram", "telegram")
+        or type(text) is not str
+        or text != telegram_integration.TELEGRAM_IMAGE_PLACEHOLDER
+        or not isinstance(meta, dict)
+    ):
+        return False
+
+    telegram_photo = meta.get("telegram_photo")
+    if isinstance(telegram_photo, dict) and bool(telegram_photo):
+        return True
+
+    attachments = meta.get("attachments")
+    if not isinstance(attachments, list):
+        return False
+    return any(
+        isinstance(attachment, dict)
+        and attachment.get("kind") == "image"
+        and isinstance(attachment.get("mime"), str)
+        and attachment["mime"].lower().startswith("image/")
+        for attachment in attachments
+    )
+
+
+class _TelegramAttachmentOnlyFormationSource(ValueError):
+    """Signal a confirmed server-proven Telegram attachment-only source."""
+
+
 def _load_natural_ingress_formation_source(
     canonical_message_id: int,
     *,
@@ -1490,6 +1527,15 @@ def _load_natural_ingress_formation_source(
         or meta.get("source") != source
     ):
         raise ValueError("invalid_natural_ingress_source")
+    if _telegram_attachment_only_formation_source(
+        row["text"],
+        meta,
+        channel=channel,
+        source=source,
+    ):
+        raise _TelegramAttachmentOnlyFormationSource(
+            "telegram_attachment_only_formation_source"
+        )
 
     return int(row["id"]), row["text"]
 
@@ -1510,6 +1556,11 @@ async def _run_natural_ingress_memory_formation_shadow_task(
         )
     except asyncio.CancelledError:
         raise
+    except _TelegramAttachmentOnlyFormationSource:
+        _log_memory_formation_shadow(
+            status="skipped", category="source_ineligible",
+        )
+        return
     except Exception:
         _log_memory_formation_shadow(
             status="failed", category="source_unavailable",
@@ -1584,6 +1635,20 @@ def _schedule_natural_ingress_memory_formation_shadow(
         ("telegram", "telegram"),
     }:
         return False
+    if (channel, source) == ("telegram", "telegram"):
+        try:
+            _load_natural_ingress_formation_source(
+                canonical_message_id,
+                channel=channel,
+                source=source,
+            )
+        except _TelegramAttachmentOnlyFormationSource:
+            return False
+        except Exception:
+            _log_memory_formation_shadow(
+                status="failed", category="source_unavailable",
+            )
+            return False
     if generation_callable is None:
         _log_memory_formation_shadow(
             status="failed", category="extractor_unavailable",
@@ -2575,7 +2640,15 @@ async def telegram_webhook(request: Request):
                                      existing_message=result["message"], route=False)
     except Exception:
         print("[telegram] sse_broadcast_failed")
-    if DEPLOYMENT.memory.natural_ingress_formation_enabled:
+    if (
+        DEPLOYMENT.memory.natural_ingress_formation_enabled
+        and not _telegram_attachment_only_formation_source(
+            result["message"].get("text"),
+            result["message"].get("meta"),
+            channel="telegram",
+            source="telegram",
+        )
+    ):
         try:
             _schedule_natural_ingress_memory_formation_shadow(
                 canonical_message_id=result["message"]["id"],

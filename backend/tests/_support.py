@@ -31,6 +31,8 @@ def clear_backend_app_modules():
         "backend.memory_context_integration", "backend.memory_retrieval",
         "backend.memory_formation_extractor",
         "backend.memory_formation_integration",
+        "backend.multimodal_patch",
+        "backend.telegram_image_followup_coalesce",
     )
     for name in module_names:
         sys.modules.pop(name, None)

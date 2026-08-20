@@ -21,6 +21,7 @@ except ImportError:
 
 
 MAX_TELEGRAM_ID = 2**63 - 1
+TELEGRAM_IMAGE_PLACEHOLDER = "\u005b\u56fe\u7247\u005d"
 
 
 def _strict_positive_id(value: object) -> int:
