@@ -758,7 +758,7 @@ class TelegramImageNaturalIngressExclusionTests(
                     self.module.MEMORY_CANDIDATE_PERSISTENCE,
                     "persist",
                     wraps=self.module.MEMORY_CANDIDATE_PERSISTENCE.persist,
-                ) as persisted, mock.patch("builtins.print"):
+                ) as persisted, mock.patch("builtins.print") as printed:
                     admitted = (
                         self.module
                         ._schedule_natural_ingress_memory_formation_shadow(
@@ -784,6 +784,62 @@ class TelegramImageNaturalIngressExclusionTests(
                 generate.assert_not_awaited()
                 formation.assert_not_awaited()
                 persisted.assert_not_called()
+                self.assertEqual(
+                    [call.args for call in printed.call_args_list],
+                    [(
+                        "[memory-formation-shadow] "
+                        "status=skipped category=source_ineligible",
+                    )],
+                )
+
+    async def test_telegram_preflight_source_unavailable_logs_once_without_work(
+        self,
+    ):
+        canonical = self.module.save_message(
+            "in",
+            "user",
+            "ordinary Telegram text",
+            {"channel": "telegram", "source": "telegram"},
+        )
+        generate = mock.AsyncMock()
+        with mock.patch.object(
+            self.module,
+            "_load_natural_ingress_formation_source",
+            side_effect=RuntimeError("injected canonical reload failure"),
+        ), mock.patch.object(
+            self.module.memory_formation_integration,
+            "run_memory_formation_shadow",
+            new_callable=mock.AsyncMock,
+        ) as formation, mock.patch.object(
+            self.module.MEMORY_CANDIDATE_PERSISTENCE,
+            "persist",
+            wraps=self.module.MEMORY_CANDIDATE_PERSISTENCE.persist,
+        ) as persisted, mock.patch("builtins.print") as printed:
+            admitted = (
+                self.module._schedule_natural_ingress_memory_formation_shadow(
+                    canonical_message_id=canonical["id"],
+                    channel="telegram",
+                    source="telegram",
+                    generation_callable=generate,
+                )
+            )
+
+        self.assertFalse(admitted)
+        self.assertIsNone(getattr(
+            self.module.app.state,
+            "memory_formation_shadow_task",
+            None,
+        ))
+        generate.assert_not_awaited()
+        formation.assert_not_awaited()
+        persisted.assert_not_called()
+        self.assertEqual(
+            [call.args for call in printed.call_args_list],
+            [(
+                "[memory-formation-shadow] "
+                "status=failed category=source_unavailable",
+            )],
+        )
 
     async def test_captioned_photo_formation_receives_caption_only(self):
         caption = "I prefer tea with breakfast."

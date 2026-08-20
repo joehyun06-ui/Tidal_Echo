@@ -1482,6 +1482,10 @@ def _telegram_attachment_only_formation_source(
     )
 
 
+class _TelegramAttachmentOnlyFormationSource(ValueError):
+    """Signal a confirmed server-proven Telegram attachment-only source."""
+
+
 def _load_natural_ingress_formation_source(
     canonical_message_id: int,
     *,
@@ -1529,7 +1533,9 @@ def _load_natural_ingress_formation_source(
         channel=channel,
         source=source,
     ):
-        raise ValueError("invalid_natural_ingress_source")
+        raise _TelegramAttachmentOnlyFormationSource(
+            "telegram_attachment_only_formation_source"
+        )
 
     return int(row["id"]), row["text"]
 
@@ -1550,6 +1556,11 @@ async def _run_natural_ingress_memory_formation_shadow_task(
         )
     except asyncio.CancelledError:
         raise
+    except _TelegramAttachmentOnlyFormationSource:
+        _log_memory_formation_shadow(
+            status="skipped", category="source_ineligible",
+        )
+        return
     except Exception:
         _log_memory_formation_shadow(
             status="failed", category="source_unavailable",
@@ -1631,7 +1642,12 @@ def _schedule_natural_ingress_memory_formation_shadow(
                 channel=channel,
                 source=source,
             )
+        except _TelegramAttachmentOnlyFormationSource:
+            return False
         except Exception:
+            _log_memory_formation_shadow(
+                status="failed", category="source_unavailable",
+            )
             return False
     if generation_callable is None:
         _log_memory_formation_shadow(
