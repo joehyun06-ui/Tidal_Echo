@@ -161,6 +161,54 @@ from backend import kelivo_current_turn_vision as _kelivo_turn_vision  # noqa: E
 _kelivo_turn_vision.install(app)
 
 
+@app.post("/internal/legacy-chat/vision-context")
+async def legacy_vision_context(request: Request):
+    """Return a transient visual description for the authenticated legacy VPS.
+
+    The caller supplies inline data:image/* URLs only. Nothing is persisted by
+    this endpoint and image-derived text is never written into Memory here.
+    """
+    if not _check_bridge_auth(request):
+        return _error(401, "unauthorized")
+
+    raw = await request.body()
+    if len(raw) > _multimodal_patch.MAX_KELIVO_MULTIMODAL_BODY:
+        return _error(413, "request_body_too_large")
+
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) - {"images", "prompt"}:
+            return _error(400, "invalid_request_body")
+        raw_images = payload.get("images")
+        prompt = payload.get("prompt", "")
+        if not isinstance(raw_images, list) or not 1 <= len(raw_images) <= _multimodal_patch.MAX_IMAGES:
+            return _error(422, "invalid_images")
+        if not isinstance(prompt, str) or len(prompt) > 8000:
+            return _error(422, "invalid_prompt")
+
+        images = []
+        total = 0
+        for raw_image in raw_images:
+            mime, image = _multimodal_patch._decode_data_url(raw_image)
+            total += len(image)
+            if total > _multimodal_patch.MAX_TOTAL_IMAGE_BYTES:
+                return _error(413, "images_too_large")
+            images.append((mime, image))
+
+        description = await _multimodal_patch._vision_async(
+            images,
+            prompt or "请读取用户这次发送的图片，并忠实描述与当前对话相关的内容。",
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+        return _error(400, "malformed_json")
+    except _multimodal_patch.VisionError as error:
+        return _error(504 if error.uncertain else 422, error.category)
+    except Exception:
+        return _error(500, "vision_context_failed")
+
+    return {"ok": True, "description": description}
+
+
 @app.post("/internal/legacy-chat/vision-smoke")
 async def legacy_vision_smoke(request: Request):
     if not _check_bridge_auth(request):
