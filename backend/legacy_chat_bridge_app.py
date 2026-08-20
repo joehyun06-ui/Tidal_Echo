@@ -1,10 +1,9 @@
 """Private compatibility bridge for the legacy OUO Home synchronous /chat backend.
 
 The legacy VPS remains the canonical writer for its Supabase conversation. This
-module only exposes a server-to-server OpenAI-compatible generation endpoint so
-that the old Android shell can use the same healthy api_loop provider path as the
-current Render service. The bridge never persists chat content in the Render
-relay database and never exposes its credential to browsers.
+module only exposes server-to-server compatibility endpoints so the old Android
+shell can use the same provider path as the current Render service. Credentials
+never need to be exposed to browsers.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import json
 import os
 import time
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from backend import deployment_config, kelivo_service
@@ -154,6 +153,27 @@ async def legacy_chat_completion(request: Request):
     }
 
 
-# Optional compatibility patches are imported only by this Render entrypoint.
-# The core backend modules keep their reviewed text-only contracts unchanged.
-from backend import multimodal_patch as _multimodal_patch  # noqa: E402,F401
+# Imported only by this Render entrypoint. Core modules retain their reviewed
+# text-only contracts; the patch performs bounded image->text compatibility.
+from backend import multimodal_patch as _multimodal_patch  # noqa: E402
+
+
+@app.post("/internal/legacy-chat/vision-smoke")
+async def legacy_vision_smoke(request: Request):
+    if not _check_bridge_auth(request):
+        return _error(401, "unauthorized")
+    raw = await request.body()
+    if len(raw) > 1024 * 1024:
+        return _error(413, "request_body_too_large")
+    try:
+        payload = json.loads(raw)
+        mime, image = _multimodal_patch._decode_data_url(payload.get("image"))
+        description = await _multimodal_patch._vision_async(
+            [(mime, image)],
+            "请只确认你能读取这张测试图片，并简短描述它。",
+        )
+    except _multimodal_patch.VisionError as error:
+        return _error(504 if error.uncertain else 502, error.category)
+    except Exception:
+        return _error(500, "vision_smoke_failed")
+    return {"ok": True, "has_description": bool(description.strip())}
