@@ -157,8 +157,10 @@ async def legacy_chat_completion(request: Request):
 # text-only contracts; the patch performs bounded image->text compatibility.
 from backend import multimodal_patch as _multimodal_patch  # noqa: E402
 from backend import kelivo_current_turn_vision as _kelivo_turn_vision  # noqa: E402
+from backend import telegram_image_followup_coalesce as _telegram_image_turn  # noqa: E402
 
 _kelivo_turn_vision.install(app)
+_telegram_image_turn.install()
 
 
 @app.post("/internal/legacy-chat/vision-context")
