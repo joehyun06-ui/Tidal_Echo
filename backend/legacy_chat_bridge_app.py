@@ -156,6 +156,9 @@ async def legacy_chat_completion(request: Request):
 # Imported only by this Render entrypoint. Core modules retain their reviewed
 # text-only contracts; the patch performs bounded image->text compatibility.
 from backend import multimodal_patch as _multimodal_patch  # noqa: E402
+from backend import kelivo_current_turn_vision as _kelivo_turn_vision  # noqa: E402
+
+_kelivo_turn_vision.install(app)
 
 
 @app.post("/internal/legacy-chat/vision-smoke")
