@@ -152,3 +152,8 @@ async def legacy_chat_completion(request: Request):
         ],
         "usage": usage,
     }
+
+
+# Optional compatibility patches are imported only by this Render entrypoint.
+# The core backend modules keep their reviewed text-only contracts unchanged.
+from backend import multimodal_patch as _multimodal_patch  # noqa: E402,F401
