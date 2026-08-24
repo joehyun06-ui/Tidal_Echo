@@ -36,7 +36,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from backend import deployment_config, memory_formation_extractor
+from backend import continuity_context, deployment_config, memory_formation_extractor
 
 
 def load_dotenv(path: Path) -> None:
@@ -67,6 +67,9 @@ TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 STREAM_OUTPUT = deployment_config.parse_strict_bool(os.environ.get("LOOP_STREAM", "1"), "invalid_loop_stream")
 RENDER_TELEGRAM_MVP = deployment_config.parse_strict_bool(
     os.environ.get("RENDER_TELEGRAM_MVP", "false"), "invalid_render_telegram_mvp"
+)
+TRANSIENT_CONTINUITY_ENABLED = (
+    continuity_context.continuity_enabled_from_environment(os.environ)
 )
 API_LOOP_INSTANCE_NONCE = os.environ.get("API_LOOP_INSTANCE_NONCE", "")
 API_LOOP_INTERNAL_TOKEN = os.environ.get("API_LOOP_INTERNAL_TOKEN", "")
@@ -295,6 +298,84 @@ def build_messages(text: str, *, before_id: int | None = None, session_id: str =
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": text})
     return messages
+
+
+def _log_continuity_context(
+    status: str,
+    *,
+    current_channel: str = "",
+    item_count: int = 0,
+    total_chars: int = 0,
+) -> None:
+    if (
+        status == "applied"
+        and current_channel in {"web", "telegram"}
+        and type(item_count) is int
+        and 1 <= item_count <= continuity_context.CONTINUITY_MAX_HANDOFF_ITEMS
+        and type(total_chars) is int
+        and 0 <= total_chars <= (
+            continuity_context.CONTINUITY_TOTAL_SOURCE_TEXT_BUDGET
+        )
+    ):
+        print(
+            "[continuity-context] "
+            f"status=applied current_channel={current_channel} "
+            f"item_count={item_count} total_chars={total_chars}",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif status == "empty" and current_channel in {"web", "telegram"}:
+        print(
+            "[continuity-context] "
+            f"status=empty current_channel={current_channel}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "[continuity-context] "
+            "status=failed category=continuity_context_unavailable",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def build_ingest_messages(
+    text: str,
+    *,
+    msg_id: int | None,
+    session_id: str,
+) -> list[dict[str, str]]:
+    messages = build_messages(
+        text,
+        before_id=msg_id,
+        session_id=session_id,
+        use_context=True,
+    )
+    if not TRANSIENT_CONTINUITY_ENABLED:
+        return messages
+    try:
+        derived = continuity_context.derive_continuity_context(
+            RELAY_DB,
+            msg_id,
+            text,
+        )
+    except Exception:
+        _log_continuity_context("unavailable")
+        return messages
+    if derived.developer_message is None:
+        _log_continuity_context(
+            "empty",
+            current_channel=derived.current_channel,
+        )
+        return messages
+    _log_continuity_context(
+        "applied",
+        current_channel=derived.current_channel,
+        item_count=len(derived.items),
+        total_chars=derived.total_chars,
+    )
+    return [*messages[:-1], derived.developer_message, messages[-1]]
 
 
 def public_config() -> dict[str, Any]:
@@ -601,7 +682,7 @@ async def handle_ingest(
     channel_conversation: str = "",
 ) -> dict[str, Any]:
     stream_id = stream_id or ("api-" + uuid.uuid4().hex[:16])
-    messages = build_messages(text, before_id=msg_id, session_id=session_id, use_context=True)
+    messages = build_ingest_messages(text, msg_id=msg_id, session_id=session_id)
     out = await run_model(messages, stream_id=stream_id, session_id=session_id, emit_stream=not dry)
     if out.get("outcome") != "success":
         uncertain = out.get("outcome") == "dispatch_uncertain"
