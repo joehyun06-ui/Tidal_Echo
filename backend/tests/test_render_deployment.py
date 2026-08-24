@@ -666,7 +666,7 @@ class BlueprintTests(unittest.TestCase):
         self.assertEqual(env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"]["value"], "300")
         self.assertEqual(env["KELIVO_CLIENT_ID"]["value"], "primary-kelivo")
         self.assertEqual(env["KELIVO_MODEL_ALIAS"]["value"], "ouou-home")
-        self.assertEqual(env["TRANSIENT_CONTINUITY_ENABLED"]["value"], "false")
+        self.assertEqual(env["TRANSIENT_CONTINUITY_ENABLED"]["value"], "true")
         self.assertEqual(env["SQLITE_BUSY_TIMEOUT_SECONDS"]["value"], "30")
         self.assertEqual(env["KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS"]["value"], "15")
         for key in (
