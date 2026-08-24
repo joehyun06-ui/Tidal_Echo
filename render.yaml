@@ -39,7 +39,7 @@
         {"key": "LOOP_DISPATCH_TIMEOUT_SECONDS", "value": "180"},
         {"key": "SUPERVISOR_LOOP_READY_TIMEOUT_SECONDS", "value": "15"},
         {"key": "SUPERVISOR_SHUTDOWN_GRACE_SECONDS", "value": "10"},
-        {"key": "KELIVO_ENABLED", "value": "false"},
+        {"key": "KELIVO_ENABLED", "value": "true"},
         {"key": "KELIVO_CLIENT_ID", "value": "primary-kelivo"},
         {"key": "KELIVO_API_SESSION", "sync": false},
         {"key": "KELIVO_MODEL_ALIAS", "value": "ouou-home"},
