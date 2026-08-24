@@ -661,7 +661,7 @@ class BlueprintTests(unittest.TestCase):
         shutdown_grace = env["SUPERVISOR_SHUTDOWN_GRACE_SECONDS"]["value"]
         self.assertEqual(shutdown_grace, "10")
         self.assertGreater(float(shutdown_grace), 0)
-        self.assertEqual(env["KELIVO_ENABLED"]["value"], "false")
+        self.assertEqual(env["KELIVO_ENABLED"]["value"], "true")
         self.assertEqual(env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"]["value"], "false")
         self.assertEqual(env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"]["value"], "300")
         self.assertEqual(env["KELIVO_CLIENT_ID"]["value"], "primary-kelivo")
