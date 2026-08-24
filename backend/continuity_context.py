@@ -52,19 +52,54 @@ class ContinuityContextUnavailable(RuntimeError):
         super().__init__(CONTINUITY_UNAVAILABLE_CATEGORY)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ContinuityItem:
     source_channel: str
     observed_at: str
     user_text: str
 
+    def __repr__(self) -> str:
+        return "<ContinuityItem>"
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, repr=False)
 class ContinuityContextResult:
     current_channel: str
     items: tuple[ContinuityItem, ...]
     total_chars: int
     developer_message: dict[str, str] | None
+
+    def __repr__(self) -> str:
+        try:
+            current_channel = object.__getattribute__(self, "current_channel")
+            items = object.__getattribute__(self, "items")
+            total_chars = object.__getattribute__(self, "total_chars")
+            developer_message = object.__getattribute__(self, "developer_message")
+            if (
+                type(current_channel) is not str
+                or current_channel not in {"web", "telegram"}
+                or type(items) is not tuple
+                or len(items) > CONTINUITY_MAX_HANDOFF_ITEMS
+                or any(type(item) is not ContinuityItem for item in items)
+                or type(total_chars) is not int
+                or not 0 <= total_chars <= CONTINUITY_TOTAL_SOURCE_TEXT_BUDGET
+                or (
+                    developer_message is not None
+                    and type(developer_message) is not dict
+                )
+                or bool(items) != (developer_message is not None)
+            ):
+                raise ValueError
+            return (
+                "<ContinuityContextResult "
+                f"current_channel={current_channel} "
+                f"item_count={len(items)} "
+                f"total_chars={total_chars} "
+                "developer_message="
+                f"{'true' if developer_message is not None else 'false'}>"
+            )
+        except BaseException:
+            return "<ContinuityContextResult>"
 
 
 def continuity_enabled_from_environment(environment: Mapping[str, str]) -> bool:
