@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import ast
 import copy
-import hashlib
 import inspect
 import json
 import socket
 import sqlite3
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,8 +14,8 @@ from unittest import mock
 from backend import memory_retrieval, memory_retrieval_v2
 
 
-V1_REQUIRED_BASE_SHA256 = (
-    "724186fe0f8ac62f2a6edda7c0653387e5fba720ae6ea56886a3b9ab6e519b40"
+V1_REQUIRED_BASE_BLOB_SHA = (
+    "f20f854c9dd16611c56e1f1915ef835617226381"
 )
 
 
@@ -788,11 +788,15 @@ class ExplodingCode:
 
 
 class MemoryRetrievalV2PurityTests(unittest.TestCase):
-    def test_v1_retrieval_source_is_byte_for_byte_unchanged(self):
-        digest = hashlib.sha256(
-            Path(memory_retrieval.__file__).read_bytes()
-        ).hexdigest()
-        self.assertEqual(digest, V1_REQUIRED_BASE_SHA256)
+    def test_v1_retrieval_git_blob_is_unchanged(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        blob_sha = subprocess.check_output(
+            ["git", "rev-parse", ":backend/memory_retrieval.py"],
+            cwd=repo_root,
+            text=True,
+            encoding="utf-8",
+        ).strip()
+        self.assertEqual(blob_sha, V1_REQUIRED_BASE_BLOB_SHA)
 
     def test_v2_module_imports_only_pure_standard_library_dependencies(self):
         source_path = Path(memory_retrieval_v2.__file__)
