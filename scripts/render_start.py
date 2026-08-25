@@ -97,7 +97,10 @@ def child_commands(config: SupervisorConfig, executable: str | None = None) -> d
         ],
     }
     if config.autonomous_wake_enabled:
-        commands["autonomous_wake"] = [python, "scripts/autonomous_wake_worker.py"]
+        commands["autonomous_wake"] = [
+            python,
+            "scripts/autonomous_wake_worker_notification_compat.py",
+        ]
     return commands
 
 
