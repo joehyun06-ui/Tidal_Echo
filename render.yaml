@@ -59,6 +59,7 @@
         {"key": "LOOP_PROVIDER_RESPONSE_MAX_BYTES", "value": "1048576"},
         {"key": "LOOP_ASSISTANT_MAX_CHARS", "value": "64000"},
         {"key": "TRANSIENT_CONTINUITY_ENABLED", "value": "true"},
+        {"key": "MEMORY_RETRIEVAL_V2_SHADOW_ENABLED", "value": "false"},
         {"key": "RELAY_SECRET", "sync": false},
         {"key": "KELIVO_API_KEY", "sync": false},
         {"key": "TELEGRAM_BOT_TOKEN", "sync": false},

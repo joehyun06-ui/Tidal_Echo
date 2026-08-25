@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
 try:
-    from . import memory_context, memory_retrieval
+    from . import memory_context, memory_retrieval, memory_retrieval_v2_shadow
 except ImportError:  # support direct module execution in local tooling
     import memory_context
     import memory_retrieval
+    import memory_retrieval_v2_shadow
 
 
 LEGACY_RETRIEVAL_MAX_ITEMS = 10
@@ -59,6 +60,9 @@ class MemoryContextIntegrationError(RuntimeError):
 class TransientMemoryDispatch:
     provider_messages: tuple[dict[str, str], ...] = field(repr=False)
     memory_applied: bool
+    retrieval_v2_shadow_report: (
+        memory_retrieval_v2_shadow.MemoryRetrievalV2ShadowReport | None
+    ) = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -160,10 +164,17 @@ def prepare_transient_memory_dispatch(
     *,
     enabled: bool,
     smart_retrieval_enabled: bool,
+    retrieval_v2_shadow_enabled: bool = False,
 ) -> TransientMemoryDispatch:
     """Read once, validate, and insert transient global-user Memory context."""
 
-    if type(enabled) is not bool or type(smart_retrieval_enabled) is not bool:
+    if (
+        type(enabled) is not bool
+        or type(smart_retrieval_enabled) is not bool
+        or type(retrieval_v2_shadow_enabled) is not bool
+    ):
+        raise MemoryContextIntegrationError()
+    if retrieval_v2_shadow_enabled and not smart_retrieval_enabled:
         raise MemoryContextIntegrationError()
     if smart_retrieval_enabled and not enabled:
         raise MemoryContextIntegrationError()
@@ -172,6 +183,7 @@ def prepare_transient_memory_dispatch(
 
     messages = _validate_base_messages(base_messages)
     try:
+        shadow_report = None
         if smart_retrieval_enabled:
             safe_items = read_service.get_active_memories(
                 scope_type="global_user",
@@ -197,6 +209,21 @@ def prepare_transient_memory_dispatch(
                 selection,
                 candidates=candidate_snapshot,
             )
+            if retrieval_v2_shadow_enabled:
+                try:
+                    shadow_report = (
+                        memory_retrieval_v2_shadow
+                        .compare_memory_retrieval_v2_shadow(
+                            candidate_snapshot,
+                            render_items,
+                            query_text=messages[-1]["content"],
+                        )
+                    )
+                except BaseException:
+                    shadow_report = (
+                        memory_retrieval_v2_shadow
+                        .MemoryRetrievalV2ShadowReport.failed()
+                    )
         else:
             render_items = read_service.get_active_memories(
                 scope_type="global_user",
@@ -212,7 +239,7 @@ def prepare_transient_memory_dispatch(
             character_budget=SMART_FINAL_CHARACTER_BUDGET,
         )
         if developer_message is None:
-            return TransientMemoryDispatch(messages, False)
+            return TransientMemoryDispatch(messages, False, shadow_report)
         if (
             type(developer_message) is not dict
             or set(developer_message) != {"role", "content"}
@@ -233,7 +260,7 @@ def prepare_transient_memory_dispatch(
             or provider_messages[-1]["role"] != "user"
         ):
             raise MemoryContextIntegrationError()
-        return TransientMemoryDispatch(provider_messages, True)
+        return TransientMemoryDispatch(provider_messages, True, shadow_report)
     except MemoryContextIntegrationError:
         raise
     except Exception:

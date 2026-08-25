@@ -1265,6 +1265,20 @@ def _log_memory_formation_shadow(
         pass
 
 
+def _log_memory_retrieval_v2_shadow(report: object) -> None:
+    """Emit only independently bounded structural shadow telemetry."""
+
+    try:
+        line = (
+            memory_context_integration.memory_retrieval_v2_shadow
+            .render_memory_retrieval_v2_shadow_telemetry(report)
+        )
+        if line is not None:
+            print(line, flush=True)
+    except BaseException:
+        pass
+
+
 _MEMORY_CANDIDATE_PERSISTENCE_CATEGORIES = frozenset({
     "auto_candidate_persistence_disabled",
     "candidate_budget_exceeded",
@@ -2208,7 +2222,17 @@ async def _run_completion_state_machine(
                 smart_retrieval_enabled=(
                     DEPLOYMENT.memory.smart_retrieval_enabled
                 ),
+                retrieval_v2_shadow_enabled=(
+                    DEPLOYMENT.memory.retrieval_v2_shadow_enabled
+                ),
             )
+            if transient_dispatch.retrieval_v2_shadow_report is not None:
+                try:
+                    _log_memory_retrieval_v2_shadow(
+                        transient_dispatch.retrieval_v2_shadow_report
+                    )
+                except BaseException:
+                    pass
             provider_messages = transient_dispatch.provider_messages
             if transient_dispatch.memory_applied:
                 dispatch_context = dict(dispatch_context)

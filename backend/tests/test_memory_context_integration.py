@@ -954,6 +954,7 @@ class MemoryContextIntegrationTests(unittest.TestCase):
                 "typing",
                 "memory_context",
                 "memory_retrieval",
+                "memory_retrieval_v2_shadow",
             },
         )
         for forbidden in (
