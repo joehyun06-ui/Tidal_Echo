@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from scripts import autonomous_wake_worker as worker
+import autonomous_wake_worker as worker
 
 
 _original_bridge = worker._bridge
