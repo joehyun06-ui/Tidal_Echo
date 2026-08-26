@@ -11,6 +11,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import time
 
 from fastapi import Request
@@ -26,6 +27,7 @@ _BRIDGE_TOKEN = os.environ.get("LEGACY_CHAT_BRIDGE_TOKEN", "").strip()
 _BRIDGE_SESSION = os.environ.get(
     "LEGACY_CHAT_BRIDGE_SESSION", "legacy-ouo-home-api"
 ).strip()
+_WAKE_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 if (
     len(_BRIDGE_TOKEN) < 32
@@ -63,6 +65,96 @@ def _check_bridge_auth(request: Request) -> bool:
     if not supplied:
         return False
     return hmac.compare_digest(supplied, _BRIDGE_TOKEN)
+
+
+def _check_internal_auth(request: Request) -> bool:
+    expected = str(relay_app.API_LOOP_INTERNAL_TOKEN or "").strip()
+    supplied = str(request.headers.get("x-internal-token") or "").strip()
+    if len(expected) < 32 or not supplied:
+        return False
+    return hmac.compare_digest(supplied, expected)
+
+
+def _existing_autonomous_message(run_id: str) -> dict | None:
+    """Return an already persisted canonical wake message for this run.
+
+    The relay schema intentionally keeps arbitrary metadata as JSON text. Read a
+    bounded tail and decode in Python instead of depending on SQLite JSON1.
+    """
+    with relay_app.db() as conn:
+        rows = conn.execute(
+            """SELECT id,ts,direction,kind,text,meta
+               FROM messages
+               WHERE direction='out' AND kind='reply'
+               ORDER BY id DESC LIMIT 2000"""
+        ).fetchall()
+    for row in rows:
+        try:
+            meta = json.loads(row["meta"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("autonomous_wake_run_id") != run_id:
+            continue
+        return {
+            "id": row["id"],
+            "ts": row["ts"],
+            "direction": row["direction"],
+            "kind": row["kind"],
+            "text": row["text"],
+            "meta": meta,
+        }
+    return None
+
+
+@app.post("/internal/autonomous-wake/out")
+async def autonomous_wake_out(request: Request):
+    """Persist a wake message in the canonical relay exactly once per run."""
+    if not _check_internal_auth(request):
+        return _error(401, "unauthorized")
+
+    raw = await request.body()
+    if len(raw) > 8 * 1024:
+        return _error(413, "request_body_too_large")
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error(400, "malformed_json")
+    if not isinstance(body, dict):
+        return _error(400, "invalid_request_body")
+
+    run_id = str(body.get("run_id") or "").strip()
+    message = str(body.get("message") or "").strip()
+    model = str(body.get("model") or "").strip()
+    if _WAKE_RUN_ID_RE.fullmatch(run_id) is None:
+        return _error(422, "invalid_run_id")
+    if not message or len(message) > 1000:
+        return _error(422, "invalid_message")
+    if len(model) > 200:
+        return _error(422, "invalid_model")
+
+    existing = _existing_autonomous_message(run_id)
+    if existing is not None:
+        return {"ok": True, "status": "delivered", "id": existing["id"], "duplicate": True}
+
+    meta = {
+        "autonomous": True,
+        "autonomous_wake_run_id": run_id,
+        "source": "autonomous_wake",
+    }
+    if model:
+        meta["model"] = model
+    msg = relay_app.save_message("out", "reply", message, meta)
+
+    await relay_app.broadcast(relay_app.app_subs, {"type": "typing", "active": False})
+    await relay_app.broadcast(relay_app.app_subs, relay_app.app_payload(msg))
+    if not relay_app.app_subs:
+        try:
+            await relay_app.push_to_all(relay_app.notification_from_message(msg))
+        except Exception:
+            pass
+    return {"ok": True, "status": "delivered", "id": msg["id"], "duplicate": False}
 
 
 @app.post("/internal/legacy-chat/v1/chat/completions")
