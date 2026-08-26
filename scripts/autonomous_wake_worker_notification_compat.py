@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 import autonomous_wake_worker as worker
 
 
@@ -201,6 +203,22 @@ async def _deliver_canonical_relay(
     raise RuntimeError("canonical_relay_unavailable") from last_error
 
 
+async def _original_delivery_bridge(config, body: dict[str, Any]) -> dict[str, Any]:
+    """Let the Supabase delivery bridge finish even when ntfy retries are slow.
+
+    The worker's normal 20-second client timeout is appropriate for prepare and
+    local relay traffic, but the historical Supabase deliver operation can spend
+    substantially longer retrying the optional ntfy side channel after the
+    durable message write. If that client times out first, the wrapper never
+    reaches the canonical relay write even though Supabase later marks the run
+    delivered. Use a delivery-only client with a wider read timeout so canonical
+    delivery can follow the bridge's final accepted result.
+    """
+    timeout = httpx.Timeout(120.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as delivery_client:
+        return await _original_bridge(delivery_client, config, body)
+
+
 async def _mark_bridge_failed(client, config, run_id: str, category: str) -> None:
     try:
         await _original_bridge(
@@ -265,7 +283,7 @@ async def _canonical_delivery_bridge(client, config, body: dict[str, Any]):
 
         notification_failed = False
         try:
-            result = await _original_bridge(client, config, body)
+            result = await _original_delivery_bridge(config, body)
         except RuntimeError as error:
             if str(error) != "notification_failed":
                 raise
