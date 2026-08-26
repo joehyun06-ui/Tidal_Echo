@@ -4,10 +4,11 @@
 The Supabase wake bridge remains responsible for phone-activity input, durable
 wake-run bookkeeping, policy values, and the historical ntfy side channel.
 GuiTing's real chat moved to the Render relay SQLite, so this launcher replaces
-the stale Supabase recent-chat/idle fields with a read-only snapshot of that
-canonical database before each agent run. Accepted wake messages are then
-written into the relay through an authenticated localhost endpoint, which fans
-them out to GuiTing and deduplicates by wake run id.
+the stale Supabase recent-chat/idle fields with a read-only snapshot of the
+currently active canonical relay session before each agent run. Accepted wake
+messages are then written into that same relay session through an authenticated
+localhost endpoint, which fans them out to GuiTing and deduplicates by wake run
+id.
 
 ntfy failure stays non-fatal: the canonical relay is the user-visible source of
 truth, not the ntfy side channel.
@@ -28,6 +29,7 @@ import autonomous_wake_worker as worker
 
 _original_bridge = worker._bridge
 _run_min_idle_seconds: dict[str, int] = {}
+_run_api_session: dict[str, str] = {}
 
 
 def _relay_database_path() -> Path:
@@ -54,8 +56,21 @@ def _parse_utc(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _active_api_session() -> str:
+    try:
+        from examples import api_loop
+        active = str(api_loop.active_session_id() or "").strip()
+    except Exception:
+        raise RuntimeError("canonical_relay_unavailable") from None
+    if len(active) > 128:
+        raise RuntimeError("canonical_relay_unavailable")
+    return active
+
+
 def _canonical_context() -> dict[str, Any]:
     path = _relay_database_path()
+    active_session = _active_api_session()
+    conn = None
     try:
         conn = sqlite3.connect(
             f"{path.as_uri()}?mode=ro",
@@ -66,19 +81,32 @@ def _canonical_context() -> dict[str, Any]:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
-        rows = conn.execute(
-            """SELECT id,ts,direction,kind,text
-               FROM messages
-               WHERE direction IN ('in','out')
-               ORDER BY id DESC LIMIT 120"""
-        ).fetchall()
+        if active_session:
+            rows = conn.execute(
+                """SELECT id,ts,direction,kind,text
+                   FROM messages
+                   WHERE direction IN ('in','out')
+                     AND json_extract(meta, '$.api_session') = ?
+                   ORDER BY id DESC LIMIT 120""",
+                (active_session,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id,ts,direction,kind,text
+                   FROM messages
+                   WHERE direction IN ('in','out')
+                     AND (json_extract(meta, '$.api_session') IS NULL
+                          OR json_extract(meta, '$.api_session') = '')
+                   ORDER BY id DESC LIMIT 120"""
+            ).fetchall()
     except (OSError, sqlite3.Error):
         raise RuntimeError("canonical_relay_unavailable") from None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     recent: list[dict[str, str]] = []
     latest_user_at: datetime | None = None
@@ -107,6 +135,7 @@ def _canonical_context() -> dict[str, Any]:
             int((datetime.now(timezone.utc) - latest_user_at).total_seconds()),
         )
     return {
+        "api_session": active_session,
         "has_user_context": latest_user_at is not None,
         "idle_seconds": idle_seconds,
         "recent_messages": recent,
@@ -133,12 +162,14 @@ async def _deliver_canonical_relay(
     run_id: str,
     message: str,
     model: str,
+    api_session: str,
 ) -> dict[str, Any]:
     url, token = _relay_endpoint()
     payload = {
         "run_id": run_id,
         "message": message,
         "model": model,
+        "api_session": api_session,
     }
     last_error: Exception | None = None
     for attempt in range(3):
@@ -181,6 +212,11 @@ async def _mark_bridge_failed(client, config, run_id: str, category: str) -> Non
         pass
 
 
+def _clear_run(run_id: str) -> None:
+    _run_min_idle_seconds.pop(run_id, None)
+    _run_api_session.pop(run_id, None)
+
+
 async def _canonical_delivery_bridge(client, config, body: dict[str, Any]):
     op = body.get("op")
     run_id = str(body.get("run_id") or "")
@@ -200,13 +236,14 @@ async def _canonical_delivery_bridge(client, config, body: dict[str, Any]):
         except (TypeError, ValueError):
             min_idle = 0
         _run_min_idle_seconds[run_id] = max(0, min(min_idle, 86400))
+        _run_api_session[run_id] = str(context["api_session"] or "")
         return result
 
     if op in {"silent", "fail"}:
         try:
             return await _original_bridge(client, config, body)
         finally:
-            _run_min_idle_seconds.pop(run_id, None)
+            _clear_run(run_id)
 
     if op != "deliver":
         return await _original_bridge(client, config, body)
@@ -214,6 +251,11 @@ async def _canonical_delivery_bridge(client, config, body: dict[str, Any]):
     try:
         context = _canonical_context()
         min_idle = _run_min_idle_seconds.get(run_id, 0)
+        prepared_session = _run_api_session.get(run_id, "")
+        current_session = str(context["api_session"] or "")
+        if current_session != prepared_session:
+            await _mark_bridge_failed(client, config, run_id, "active_session_changed")
+            raise RuntimeError("active_session_changed")
         if (
             not context["has_user_context"]
             or int(context["idle_seconds"]) < min_idle
@@ -243,13 +285,14 @@ async def _canonical_delivery_bridge(client, config, body: dict[str, Any]):
             run_id=run_id,
             message=str(body.get("message") or ""),
             model=str(body.get("model") or ""),
+            api_session=prepared_session,
         )
         if notification_failed:
             result["notification_failed"] = True
         result["canonical_relay"] = "delivered"
         return result
     finally:
-        _run_min_idle_seconds.pop(run_id, None)
+        _clear_run(run_id)
 
 
 worker._bridge = _canonical_delivery_bridge
