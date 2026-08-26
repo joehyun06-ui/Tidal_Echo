@@ -158,7 +158,6 @@ def load_app(root: str, *, telegram: bool = True, brain: str = "loop", kelivo: b
     os.environ.update(values)
     clear_backend_app_modules()
     module = importlib.import_module("backend.app")
-    module.telegram_integration = importlib.import_module("backend.telegram_integration")
     module.init_db()
     return module
 

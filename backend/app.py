@@ -55,6 +55,7 @@ try:
         memory_formation_extractor,
         memory_formation_integration,
         memory_runtime,
+        telegram_integration,
     )
     from .telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 except ImportError:  # support `python backend/app.py`
@@ -71,6 +72,7 @@ except ImportError:  # support `python backend/app.py`
     import memory_formation_extractor
     import memory_formation_integration
     import memory_runtime
+    import telegram_integration
     from telegram_integration import LoopDispatchError, TelegramConfig, TelegramWorker, validate_update
 
 try:
