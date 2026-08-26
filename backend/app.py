@@ -1281,6 +1281,20 @@ def _log_memory_retrieval_v2_shadow(report: object) -> None:
         pass
 
 
+def _log_memory_retrieval_v2_active(report: object) -> None:
+    """Emit only independently bounded active-retrieval telemetry."""
+
+    try:
+        line = (
+            memory_context_integration.memory_retrieval_v2_active
+            .render_memory_retrieval_v2_active_telemetry(report)
+        )
+        if line is not None:
+            print(line, flush=True)
+    except BaseException:
+        pass
+
+
 _MEMORY_CANDIDATE_PERSISTENCE_CATEGORIES = frozenset({
     "auto_candidate_persistence_disabled",
     "candidate_budget_exceeded",
@@ -2227,11 +2241,21 @@ async def _run_completion_state_machine(
                 retrieval_v2_shadow_enabled=(
                     DEPLOYMENT.memory.retrieval_v2_shadow_enabled
                 ),
+                retrieval_v2_active_enabled=(
+                    DEPLOYMENT.memory.retrieval_v2_active_enabled
+                ),
             )
             if transient_dispatch.retrieval_v2_shadow_report is not None:
                 try:
                     _log_memory_retrieval_v2_shadow(
                         transient_dispatch.retrieval_v2_shadow_report
+                    )
+                except BaseException:
+                    pass
+            if transient_dispatch.retrieval_v2_active_report is not None:
+                try:
+                    _log_memory_retrieval_v2_active(
+                        transient_dispatch.retrieval_v2_active_report
                     )
                 except BaseException:
                     pass
