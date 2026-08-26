@@ -203,6 +203,7 @@ class MemoryConfig:
     candidate_review_enabled: bool = False
     candidate_decisions_enabled: bool = False
     retrieval_v2_shadow_enabled: bool = False
+    retrieval_v2_active_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -414,6 +415,10 @@ def load_deployment_config(
         env.get("MEMORY_RETRIEVAL_V2_SHADOW_ENABLED", "false"),
         "invalid_memory_retrieval_v2_shadow_enabled",
     )
+    memory_retrieval_v2_active = parse_strict_bool(
+        env.get("MEMORY_RETRIEVAL_V2_ACTIVE_ENABLED", "false"),
+        "invalid_memory_retrieval_v2_active_enabled",
+    )
     memory_explicit_writes = parse_strict_bool(
         env.get("MEMORY_EXPLICIT_WRITES_ENABLED", "false"),
         "invalid_memory_explicit_writes_enabled",
@@ -457,6 +462,14 @@ def load_deployment_config(
         raise DeploymentConfigError("invalid_memory_forget_retention_policy")
     if not memory_enabled and (memory_explicit_writes or memory_sensitive_storage):
         raise DeploymentConfigError("invalid_memory_feature_relationship")
+    if memory_retrieval_v2_active and not memory_smart_retrieval:
+        raise DeploymentConfigError(
+            "memory_retrieval_v2_active_requires_smart_retrieval"
+        )
+    if memory_retrieval_v2_active and memory_retrieval_v2_shadow:
+        raise DeploymentConfigError(
+            "memory_retrieval_v2_active_conflicts_with_shadow"
+        )
     if memory_retrieval_v2_shadow and not memory_smart_retrieval:
         raise DeploymentConfigError(
             "memory_retrieval_v2_shadow_requires_smart_retrieval"
@@ -834,6 +847,7 @@ def load_deployment_config(
             candidate_review_enabled=memory_candidate_review,
             candidate_decisions_enabled=memory_candidate_decisions,
             retrieval_v2_shadow_enabled=memory_retrieval_v2_shadow,
+            retrieval_v2_active_enabled=memory_retrieval_v2_active,
         ),
     )
 

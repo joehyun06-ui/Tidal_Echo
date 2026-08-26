@@ -104,6 +104,19 @@ class MemoryContextIntegrationTests(unittest.TestCase):
                     smart_retrieval_enabled=smart,
                 )
 
+        for active in (1, "true", None):
+            with self.subTest(active=active), self.assertRaisesRegex(
+                memory_context_integration.MemoryContextIntegrationError,
+                r"^memory_context_unavailable$",
+            ):
+                memory_context_integration.prepare_transient_memory_dispatch(
+                    service,
+                    self.base,
+                    enabled=True,
+                    smart_retrieval_enabled=True,
+                    retrieval_v2_active_enabled=active,
+                )
+
         with (
             mock.patch.object(
                 memory_context_integration.memory_retrieval,
@@ -953,7 +966,9 @@ class MemoryContextIntegrationTests(unittest.TestCase):
                 "dataclasses",
                 "typing",
                 "memory_context",
+                "memory_context_v2",
                 "memory_retrieval",
+                "memory_retrieval_v2_active",
                 "memory_retrieval_v2_shadow",
             },
         )

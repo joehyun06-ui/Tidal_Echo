@@ -671,6 +671,10 @@ class BlueprintTests(unittest.TestCase):
             env["MEMORY_RETRIEVAL_V2_SHADOW_ENABLED"]["value"],
             "false",
         )
+        self.assertEqual(
+            env["MEMORY_RETRIEVAL_V2_ACTIVE_ENABLED"]["value"],
+            "false",
+        )
         self.assertEqual(env["SQLITE_BUSY_TIMEOUT_SECONDS"]["value"], "30")
         self.assertEqual(env["KELIVO_COMPLETION_COMMIT_MARGIN_SECONDS"]["value"], "15")
         for key in (
