@@ -28,6 +28,7 @@ _BRIDGE_SESSION = os.environ.get(
     "LEGACY_CHAT_BRIDGE_SESSION", "legacy-ouo-home-api"
 ).strip()
 _WAKE_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_API_SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 if (
     len(_BRIDGE_TOKEN) < 32
@@ -127,12 +128,15 @@ async def autonomous_wake_out(request: Request):
     run_id = str(body.get("run_id") or "").strip()
     message = str(body.get("message") or "").strip()
     model = str(body.get("model") or "").strip()
+    api_session = str(body.get("api_session") or "").strip()
     if _WAKE_RUN_ID_RE.fullmatch(run_id) is None:
         return _error(422, "invalid_run_id")
     if not message or len(message) > 1000:
         return _error(422, "invalid_message")
     if len(model) > 200:
         return _error(422, "invalid_model")
+    if api_session and _API_SESSION_RE.fullmatch(api_session) is None:
+        return _error(422, "invalid_api_session")
 
     existing = _existing_autonomous_message(run_id)
     if existing is not None:
@@ -145,6 +149,8 @@ async def autonomous_wake_out(request: Request):
     }
     if model:
         meta["model"] = model
+    if api_session:
+        meta["api_session"] = api_session
     msg = relay_app.save_message("out", "reply", message, meta)
 
     await relay_app.broadcast(relay_app.app_subs, {"type": "typing", "active": False})
