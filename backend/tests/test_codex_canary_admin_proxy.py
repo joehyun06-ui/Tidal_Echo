@@ -85,8 +85,10 @@ class CodexCanaryAdminProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         big = json.dumps({"title": "x" * proxy.MAX_ADMIN_BODY_BYTES})
         response = await self.request(
-            "POST", "/provider/canary/create", headers=headers,
-            content=big, headers={**headers, "Content-Type": "application/json"},
+            "POST",
+            "/provider/canary/create",
+            content=big,
+            headers={**headers, "Content-Type": "application/json"},
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.calls, [])
