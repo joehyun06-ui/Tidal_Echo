@@ -24,7 +24,7 @@ class CodexCanaryEntrypointImportTest(unittest.TestCase):
             "RELAY_DB": str(root / "relay.db"),
             "RELAY_UPLOAD_DIR": str(root / "uploads"),
             "RELAY_BRAIN_FILE": str(brain),
-            "RELAY_BRAIN_TARGET": "desktop",
+            "RELAY_BRAIN_TARGET": "",
             "LOOP_CONFIG": str(root / "api_loop.config.json"),
             "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
             "CODEX_CONTROL_ENABLED": "false",
