@@ -46,16 +46,18 @@ def load_generation_runtime_config(
     store_path = Path(raw_store)
     if not store_path.is_absolute() or ".." in store_path.parts:
         raise CodexGenerationError("invalid_codex_generation_store_path")
-    if not deployment_config.path_within_root(store_path, persistent_root):
-        raise CodexGenerationError("invalid_codex_generation_store_path")
-    if not deployment_config.path_within_root(generation.workspace_root, persistent_root):
-        raise CodexGenerationError("invalid_codex_generation_workspace")
     if relay_db is not None:
         try:
             if store_path.resolve(strict=False) == relay_db.resolve(strict=False):
                 raise CodexGenerationError("codex_generation_store_must_be_separate")
+        except CodexGenerationError:
+            raise
         except (OSError, RuntimeError, ValueError):
             raise CodexGenerationError("invalid_codex_generation_store_path") from None
+    if not deployment_config.path_within_root(store_path, persistent_root):
+        raise CodexGenerationError("invalid_codex_generation_store_path")
+    if not deployment_config.path_within_root(generation.workspace_root, persistent_root):
+        raise CodexGenerationError("invalid_codex_generation_workspace")
     raw_poll = str(env.get("CODEX_GENERATION_POLL_SECONDS", "0.25"))
     try:
         poll = float(raw_poll)
