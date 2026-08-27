@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from pathlib import Path
 
 from .codex_app_server_shared_transport import CodexScopedTransport, CodexTransportError
 
@@ -43,7 +44,34 @@ OFFICIAL_0147_DENY_CONFIG: Mapping[str, object] = {
     "web_search": "disabled",
 }
 
+_MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _MCP_DOTTED = re.compile(r"^mcp_servers\.([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\.enabled$")
+_MAX_MCP_SERVERS = 128
+
+
+def _effective_mcp_server_names(result: object) -> set[str]:
+    """Project only MCP names from the pinned ConfigReadResponse wire shape."""
+    if not isinstance(result, dict):
+        raise CodexTransportError("codex_app_server_protocol_error")
+    config = result.get("config")
+    if not isinstance(config, dict):
+        raise CodexTransportError("codex_app_server_protocol_error")
+    additional = config.get("additional")
+    if additional is None:
+        additional = {}
+    if not isinstance(additional, dict):
+        raise CodexTransportError("codex_app_server_protocol_error")
+    raw_mcp = additional.get("mcp_servers", {})
+    if raw_mcp is None:
+        raw_mcp = {}
+    if not isinstance(raw_mcp, dict) or len(raw_mcp) > _MAX_MCP_SERVERS:
+        raise CodexTransportError("codex_app_server_protocol_error")
+    names: set[str] = set()
+    for name in raw_mcp:
+        if not isinstance(name, str) or _MCP_NAME.fullmatch(name) is None:
+            raise CodexTransportError("codex_app_server_protocol_error")
+        names.add(name)
+    return names
 
 
 class CodexGenerationHardeningTransport:
@@ -56,20 +84,37 @@ class CodexGenerationHardeningTransport:
         if method not in {"thread/start", "thread/resume"}:
             return await self._transport.request(method, params)
         rewritten = dict(params)
+        cwd = rewritten.get("cwd")
+        if (
+            not isinstance(cwd, str)
+            or not cwd
+            or "\x00" in cwd
+            or not Path(cwd).is_absolute()
+        ):
+            raise CodexTransportError("codex_app_server_protocol_error")
         supplied_config = rewritten.get("config")
         if supplied_config is not None and not isinstance(supplied_config, dict):
             raise CodexTransportError("codex_app_server_protocol_error")
-        mcp_names: set[str] = set()
+        mcp_names = _effective_mcp_server_names(
+            await self._transport.request(
+                "config/read",
+                {"includeLayers": False, "cwd": cwd},
+            )
+        )
         if isinstance(supplied_config, dict):
             raw_mcp = supplied_config.get("mcp_servers")
             if isinstance(raw_mcp, dict):
-                mcp_names.update(name for name in raw_mcp if isinstance(name, str))
+                for name in raw_mcp:
+                    if isinstance(name, str) and _MCP_NAME.fullmatch(name) is not None:
+                        mcp_names.add(name)
             for key, value in supplied_config.items():
                 if value is not False or not isinstance(key, str):
                     continue
                 match = _MCP_DOTTED.fullmatch(key)
                 if match is not None:
                     mcp_names.add(match.group(1))
+        if len(mcp_names) > _MAX_MCP_SERVERS:
+            raise CodexTransportError("codex_app_server_protocol_error")
         hardened = dict(OFFICIAL_0147_DENY_CONFIG)
         hardened["mcp_servers"] = {
             name: {"enabled": False} for name in sorted(mcp_names)
