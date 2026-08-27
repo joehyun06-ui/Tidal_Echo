@@ -32,6 +32,14 @@ JOB_STATUSES = frozenset({
     "dispatch_uncertain",
 })
 ACTIVE_JOB_STATUSES = frozenset(JOB_STATUSES - {"completed", "failed"})
+RUNNING_JOB_STATUSES = frozenset({
+    "processing",
+    "thread_dispatching",
+    "turn_dispatching",
+    "in_progress",
+    "callback_pending",
+    "dispatch_uncertain",
+})
 RECOVERY_JOB_STATUSES = frozenset({
     "thread_dispatching",
     "turn_dispatching",
@@ -392,10 +400,11 @@ def enqueue_job(
                     canonical_message_id,input_digest,status,lease_until,attempt_count,recovery_count,
                     thread_attempt_id,thread_id,cwd,turn_id,assistant_message_id,error_category,
                     created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,'queued',NULL,0,0,NULL,?,?,NULL,NULL,NULL,?,?)""",
+                   VALUES(?,?,?,?,?,?,'queued',NULL,0,0,?,?,?,NULL,NULL,NULL,?,?)""",
                 (
                     generation_id, callback_identity, client_message_id, api_session,
-                    canonical_message_id, input_digest, session["thread_id"], session["cwd"],
+                    canonical_message_id, input_digest,
+                    session["thread_attempt_id"], session["thread_id"], session["cwd"],
                     stamp, stamp,
                 ),
             )
@@ -441,6 +450,8 @@ def claim_next_job(
     now = datetime.now(timezone.utc)
     stamp = now.isoformat()
     lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+    running = tuple(sorted(RUNNING_JOB_STATUSES))
+    placeholders = ",".join("?" for _ in running)
     with closing(connect(path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
@@ -450,26 +461,37 @@ def claim_next_job(
             (stamp, max_attempts),
         )
         row = conn.execute(
-            """SELECT * FROM codex_generation_jobs
-               WHERE attempt_count < ? AND (
-                    status='queued'
-                    OR (status='processing' AND (lease_until IS NULL OR lease_until < ?))
-               )
-               ORDER BY id LIMIT 1""",
-            (max_attempts, stamp),
+            f"""SELECT j.* FROM codex_generation_jobs AS j
+                WHERE j.attempt_count < ? AND (
+                    j.status='queued'
+                    OR (j.status='processing' AND (j.lease_until IS NULL OR j.lease_until < ?))
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM codex_generation_jobs AS active
+                    WHERE active.api_session=j.api_session AND active.id!=j.id
+                      AND active.status IN ({placeholders})
+                )
+                ORDER BY j.id LIMIT 1""",
+            (max_attempts, stamp, *running),
         ).fetchone()
         if row is None:
             conn.execute("COMMIT")
             return None
         updated = conn.execute(
-            """UPDATE codex_generation_jobs
-               SET status='processing',lease_until=?,attempt_count=attempt_count+1,
-                   error_category=NULL,updated_at=?
-               WHERE id=? AND attempt_count < ? AND (
+            f"""UPDATE codex_generation_jobs
+                SET status='processing',lease_until=?,attempt_count=attempt_count+1,
+                    error_category=NULL,updated_at=?
+                WHERE id=? AND attempt_count < ? AND (
                     status='queued'
                     OR (status='processing' AND (lease_until IS NULL OR lease_until < ?))
-               )""",
-            (lease_until, stamp, row["id"], max_attempts, stamp),
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM codex_generation_jobs AS active
+                    WHERE active.api_session=codex_generation_jobs.api_session
+                      AND active.id!=codex_generation_jobs.id
+                      AND active.status IN ({placeholders})
+                )""",
+            (lease_until, stamp, row["id"], max_attempts, stamp, *running),
         )
         if updated.rowcount != 1:
             conn.execute("ROLLBACK")
