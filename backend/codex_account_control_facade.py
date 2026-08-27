@@ -1,8 +1,4 @@
-"""P1-compatible account-control facade over the P2-A shared App Server runtime.
-
-This is a migration target only; production continues to use the existing
-``CodexAppServerControl`` until an explicit integration change is reviewed.
-"""
+"""P1-compatible account-control facade over the shared App Server runtime."""
 
 from __future__ import annotations
 
@@ -55,16 +51,19 @@ class CodexAccountControlFacade:
         self,
         transport: CodexScopedTransport,
         activity_gate: CodexProcessActivityGate,
+        *,
+        enabled: bool = True,
     ) -> None:
         self._transport = transport
         self._activity_gate = activity_gate
+        self._enabled = bool(enabled)
         self._login_lock = asyncio.Lock()
         self._login_id = ""
         self._login_starting = False
         self._completed_login_id = ""
 
     async def on_notification(self, method: str, params: Mapping[str, object]) -> None:
-        if method != "account/login/completed":
+        if not self._enabled or method != "account/login/completed":
             return
         completed_id = _bounded_text(params.get("loginId"), 256)
         if not completed_id:
@@ -77,6 +76,8 @@ class CodexAccountControlFacade:
                 self._completed_login_id = completed_id
 
     async def _request(self, method: str, params: Mapping[str, object] | None = None) -> object:
+        if not self._enabled:
+            raise CodexAccountFacadeError("codex_control_disabled")
         try:
             async with self._activity_gate.control():
                 return await self._transport.request(method, params or {})
@@ -122,6 +123,8 @@ class CodexAccountControlFacade:
             raise CodexAccountFacadeError("codex_usage_unavailable") from None
 
     async def login_start(self) -> dict[str, str]:
+        if not self._enabled:
+            raise CodexAccountFacadeError("codex_control_disabled")
         async with self._login_lock:
             if self._login_starting or self._login_id:
                 raise CodexAccountFacadeError("codex_login_in_progress")
@@ -163,6 +166,8 @@ class CodexAccountControlFacade:
             raise CodexAccountFacadeError("codex_login_unavailable") from None
 
     async def login_cancel(self) -> dict[str, bool]:
+        if not self._enabled:
+            raise CodexAccountFacadeError("codex_control_disabled")
         async with self._login_lock:
             login_id = self._login_id
         if not login_id:
@@ -172,7 +177,7 @@ class CodexAccountControlFacade:
             if type(result) is not dict or result.get("status") not in {"canceled", "notFound"}:
                 raise ValueError
         except CodexAccountFacadeError as exc:
-            if exc.category == "codex_generation_busy":
+            if exc.category in {"codex_control_disabled", "codex_generation_busy"}:
                 raise
             raise CodexAccountFacadeError("codex_login_unavailable") from None
         except Exception:
