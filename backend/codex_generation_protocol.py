@@ -8,8 +8,8 @@ Safety properties:
 - generation is disabled by default;
 - only an explicit generation RPC allow-list may cross the transport;
 - companion threads must be durable paginated threads;
-- environment/tool surfaces are denied by construction;
-- raw upstream error text/config values never leave this module;
+- transport-level hardening owns environment/tool isolation;
+- raw upstream error text never leaves this module;
 - no API<->Codex fallback decision lives here.
 """
 
@@ -28,9 +28,6 @@ from typing import Protocol
 
 MAX_USER_TEXT_CHARS = 1_048_576
 MAX_ASSISTANT_TEXT_CHARS = 64_000
-MAX_ID_CHARS = 160
-MAX_MODEL_CHARS = 128
-MAX_MCP_SERVERS = 128
 MAX_TURN_PAGE = 16
 DEFAULT_RECOVERY_TURN_PAGE = 8
 
@@ -64,30 +61,6 @@ KNOWN_CODEX_ERROR_INFO = frozenset({
     "internalServerError",
     "other",
 })
-
-# Mirrors the deny-by-default profile used by Codex isolated/structured threads.
-# P2-A intentionally keeps this explicit rather than relying on current defaults.
-HARDENED_FEATURE_OVERRIDES: Mapping[str, bool] = {
-    "features.shell_tool": False,
-    "features.unified_exec": False,
-    "features.apps": False,
-    "features.plugins": False,
-    "features.multi_agent": False,
-    "features.multi_agent_v2": False,
-    "features.image_generation": False,
-    "features.memories": False,
-    "features.hooks": False,
-    "features.skills": False,
-    "features.tool_suggest": False,
-    "features.update_plan": False,
-    "features.request_user_input": False,
-    "features.standalone_web_search": False,
-    "features.web_search_request": False,
-    "include_permissions_instructions": False,
-    "include_apps_instructions": False,
-    "include_collaboration_mode_instructions": False,
-    "include_environment_context": False,
-}
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -282,38 +255,6 @@ def deterministic_workspace(root: Path, api_session: str, attempt_id: str) -> Pa
     return resolved
 
 
-def extract_mcp_server_names(config_result: object) -> tuple[str, ...]:
-    """Extract names only; never project MCP config values or secrets."""
-    payload = _mapping(config_result, "codex_generation_config_invalid")
-    candidate: object = payload
-    for wrapper in ("config", "effectiveConfig", "effective_config"):
-        nested = payload.get(wrapper)
-        if isinstance(nested, dict):
-            candidate = nested
-            break
-    candidate_map = _mapping(candidate, "codex_generation_config_invalid")
-    raw = candidate_map.get("mcp_servers", candidate_map.get("mcpServers", {}))
-    if raw is None:
-        return ()
-    if not isinstance(raw, dict) or len(raw) > MAX_MCP_SERVERS:
-        raise CodexGenerationError("codex_generation_config_invalid")
-    output: list[str] = []
-    for name in raw:
-        if not isinstance(name, str) or not _SAFE_ID.fullmatch(name):
-            raise CodexGenerationError("codex_generation_config_invalid")
-        output.append(name)
-    return tuple(sorted(output))
-
-
-def build_hardened_config(mcp_server_names: tuple[str, ...] = ()) -> dict[str, object]:
-    config: dict[str, object] = dict(HARDENED_FEATURE_OVERRIDES)
-    config["web_search"] = "disabled"
-    for name in mcp_server_names:
-        _safe_id(name, "codex_generation_config_invalid")
-        config[f"mcp_servers.{name}.enabled"] = False
-    return config
-
-
 def resolve_model(model_list_result: object, policy: str = "default") -> ModelSelection:
     payload = _mapping(model_list_result, "codex_generation_model_unavailable")
     raw_models = payload.get("data", payload.get("models"))
@@ -491,21 +432,13 @@ class CodexGenerationProtocol:
         if not isinstance(persona, str) or not persona.strip() or len(persona) > 131_072:
             raise CodexGenerationError("codex_generation_persona_invalid")
         selection = await self.qualify()
-        mcp_names = extract_mcp_server_names(await self._request("config/read", {}))
         cwd = deterministic_workspace(self.config.workspace_root, api_session, attempt_id)
         params: dict[str, object] = {
             "model": selection.model,
             "cwd": str(cwd),
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
             "baseInstructions": persona,
             "ephemeral": False,
             "historyMode": "paginated",
-            "environments": [],
-            "dynamicTools": [],
-            "selectedCapabilityRoots": [],
-            "experimentalRawEvents": False,
-            "config": build_hardened_config(mcp_names),
         }
         raw = _mapping(
             await self._request("thread/start", params),
@@ -545,18 +478,13 @@ class CodexGenerationProtocol:
         model_provider = _safe_provider(model_provider)
         if not isinstance(cwd, Path) or not cwd.is_absolute():
             raise CodexGenerationError("codex_generation_workspace_invalid")
-        mcp_names = extract_mcp_server_names(await self._request("config/read", {}))
         params: dict[str, object] = {
             "threadId": thread_id,
             "model": model,
             "modelProvider": model_provider,
             "cwd": str(cwd),
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
             "baseInstructions": persona,
             "excludeTurns": True,
-            "environments": [],
-            "config": build_hardened_config(mcp_names),
             "initialTurnsPage": {
                 "limit": self.config.recovery_turn_page,
                 "sortDirection": "desc",
