@@ -67,6 +67,27 @@ def _message_dict(row: sqlite3.Row) -> dict:
     }
 
 
+def _validate_source_message(conn: sqlite3.Connection, reply_to: str, api_session: str) -> None:
+    row = conn.execute(
+        "SELECT id,direction,kind,text,meta FROM messages WHERE id=?",
+        (int(reply_to),),
+    ).fetchone()
+    if row is None:
+        raise CodexWebCompletionError("codex_web_source_message_missing")
+    if row["direction"] != "in" or row["kind"] != "user":
+        raise CodexWebCompletionError("codex_web_source_message_mismatch")
+    try:
+        meta = json.loads(row["meta"])
+    except Exception:
+        raise CodexWebCompletionError("codex_web_source_message_mismatch") from None
+    if not isinstance(meta, dict) or (
+        meta.get("channel") != "web"
+        or meta.get("source") != "relay"
+        or meta.get("api_session") != api_session
+    ):
+        raise CodexWebCompletionError("codex_web_source_message_mismatch")
+
+
 def complete_codex_web_generation(
     path: str | Path,
     *,
@@ -116,6 +137,7 @@ def complete_codex_web_generation(
     try:
         with closing(_connect(path, timeout_seconds)) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            _validate_source_message(conn, reply_to, api_session)
             rows = conn.execute(
                 """SELECT id,ts,direction,kind,text,meta FROM messages
                    WHERE direction='out' AND kind='reply'
