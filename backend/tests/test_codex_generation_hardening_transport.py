@@ -73,7 +73,7 @@ class HardeningTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["approvalPolicy"], "never")
         self.assertEqual(params["sandbox"], "read-only")
 
-    async def test_resume_rechecks_effective_cwd_and_is_hardened(self):
+    async def test_resume_rechecks_effective_cwd_and_reasserts_read_only_contract(self):
         inner = CaptureTransport({"project_mcp": {"command": "PRIVATE"}})
         transport = CodexGenerationHardeningTransport(inner)
         await transport.request("thread/resume", {
@@ -81,11 +81,15 @@ class HardeningTransportTest(unittest.IsolatedAsyncioTestCase):
             "cwd": "/var/data/codex-workspace/sessions/api-1/attempt-1",
             "config": {"mcp_servers.a.enabled": False},
             "environments": ["unsafe"],
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
         })
         self.assertEqual(inner.calls[0][0], "config/read")
         _, params = inner.calls[-1]
         self.assertEqual(params["environments"], [])
         self.assertEqual(params["runtimeWorkspaceRoots"], [])
+        self.assertEqual(params["approvalPolicy"], "never")
+        self.assertEqual(params["sandbox"], "read-only")
         self.assertEqual(params["config"]["mcp_servers"], {
             "a": {"enabled": False},
             "project_mcp": {"enabled": False},
