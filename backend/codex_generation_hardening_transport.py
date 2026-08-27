@@ -122,10 +122,10 @@ class CodexGenerationHardeningTransport:
         rewritten["config"] = hardened
         rewritten["environments"] = []
         rewritten["runtimeWorkspaceRoots"] = []
+        rewritten["approvalPolicy"] = "never"
+        rewritten["sandbox"] = "read-only"
         if method == "thread/start":
             rewritten["dynamicTools"] = []
             rewritten["selectedCapabilityRoots"] = []
             rewritten["experimentalRawEvents"] = False
-            rewritten["approvalPolicy"] = "never"
-            rewritten["sandbox"] = "read-only"
         return await self._transport.request(method, rewritten)
