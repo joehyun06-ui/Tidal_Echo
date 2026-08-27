@@ -79,15 +79,21 @@ def _queued_ack(payload: object, *, msg: Mapping[str, object]) -> dict | None:
         raise CodexCanaryRelayIntegrationError("loop_queued_ack_invalid")
     meta = msg.get("meta") or {}
     expected_session = str(meta.get("api_session") or "") if isinstance(meta, dict) else ""
+    canonical_id = msg.get("id")
+    expected_generation_id = (
+        f"codex-gen-{canonical_id}"
+        if isinstance(canonical_id, int) and not isinstance(canonical_id, bool) and canonical_id > 0
+        else ""
+    )
     if (
-        payload.get("ok") is not True
+        not expected_generation_id
+        or payload.get("ok") is not True
         or payload.get("provider") != "codex"
         or payload.get("generation_provider") != "codex"
         or payload.get("status") != "queued"
         or str(payload.get("api_session") or "") != expected_session
-        or payload.get("canonical_message_id") != msg.get("id")
-        or not isinstance(payload.get("generation_id"), str)
-        or not payload["generation_id"]
+        or payload.get("canonical_message_id") != canonical_id
+        or payload.get("generation_id") != expected_generation_id
     ):
         raise CodexCanaryRelayIntegrationError("loop_queued_ack_correlation_mismatch")
     return payload
