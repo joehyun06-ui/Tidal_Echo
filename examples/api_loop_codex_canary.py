@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from backend import codex_generation_store
 from backend.codex_canary_loop_integration import (
     CodexCanaryLoopIntegration,
     CodexCanaryLoopIntegrationError,
@@ -107,6 +108,39 @@ async def create_canary(request: Request):
     except CodexCanaryLoopIntegrationError as exc:
         return _error(exc)
     return {"ok": True, "provider": "codex", "created": row}
+
+
+@app.get("/loop/provider/canary/{session_id}/status")
+async def canary_status(session_id: str, request: Request):
+    legacy.check_internal_auth(request)
+    if not RUNTIME.generation_enabled:
+        return _error(CodexCanaryLoopIntegrationError(
+            "codex_generation_disabled", status_code=503
+        ))
+    try:
+        row = codex_generation_store.get_session(
+            GENERATION_CONFIG.store_path,
+            session_id,
+        )
+    except codex_generation_store.CodexGenerationStoreError as exc:
+        status = 400 if exc.category == "codex_generation_session_invalid" else 503
+        return _error(CodexCanaryLoopIntegrationError(exc.category, status_code=status))
+    if row is None:
+        return _error(CodexCanaryLoopIntegrationError(
+            "codex_canary_session_not_found", status_code=404
+        ))
+    return {
+        "ok": True,
+        "provider": "codex",
+        "session": {
+            "api_session": row["api_session"],
+            "status": row["status"],
+            "model": row["model"],
+            "model_provider": row["model_provider"],
+            "reasoning_effort": row["reasoning_effort"],
+            "thread_bound": row["thread_id"] is not None,
+        },
+    }
 
 
 @app.post("/loop/provider/canary/{session_id}/retire")
