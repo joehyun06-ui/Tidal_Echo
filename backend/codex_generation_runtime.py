@@ -117,4 +117,8 @@ class CodexGenerationRuntime:
                 await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                # Worker health is exposed separately through worker_exception().
+                # Shutdown must still close the one shared App Server runtime.
+                pass
         await self.foundation.close()
