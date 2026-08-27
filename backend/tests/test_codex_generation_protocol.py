@@ -10,10 +10,8 @@ from backend.codex_generation_protocol import (
     CodexGenerationError,
     CodexGenerationProtocol,
     CodexProcessActivityGate,
-    build_hardened_config,
     correlated_turn_from_page,
     deterministic_workspace,
-    extract_mcp_server_names,
     final_answer_from_turn,
     input_digest,
     project_notification,
@@ -59,14 +57,6 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
                     {"model": "gpt-5.4", "isDefault": False, "defaultReasoningEffort": "medium"},
                 ]
             },
-            "config/read": {
-                "config": {
-                    "mcp_servers": {
-                        "local_tools": {"command": "PRIVATE"},
-                        "browser": {"url": "PRIVATE"},
-                    }
-                }
-            },
             "thread/start": lambda params: {
                 "thread": {
                     "id": "thr-123",
@@ -107,41 +97,6 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CodexGenerationError):
             deterministic_workspace(self.root, "../escape", "attempt-1")
 
-    def test_hardening_disables_tools_environment_adjacent_surfaces_and_mcp(self):
-        config = build_hardened_config(("browser", "local_tools"))
-        for key in (
-            "features.shell_tool",
-            "features.unified_exec",
-            "features.apps",
-            "features.plugins",
-            "features.multi_agent",
-            "features.multi_agent_v2",
-            "features.image_generation",
-            "features.memories",
-            "features.hooks",
-            "features.skills",
-            "features.tool_suggest",
-            "features.update_plan",
-            "features.request_user_input",
-            "features.standalone_web_search",
-            "features.web_search_request",
-            "include_permissions_instructions",
-            "include_apps_instructions",
-            "include_collaboration_mode_instructions",
-            "include_environment_context",
-            "mcp_servers.browser.enabled",
-            "mcp_servers.local_tools.enabled",
-        ):
-            self.assertIs(config[key], False)
-        self.assertEqual(config["web_search"], "disabled")
-
-    def test_config_read_extracts_names_only(self):
-        names = extract_mcp_server_names({
-            "config": {"mcp_servers": {"z": {"token": "SECRET"}, "a": {"url": "SECRET"}}}
-        })
-        self.assertEqual(names, ("a", "z"))
-        self.assertNotIn("SECRET", repr(names))
-
     def test_model_selection_requires_one_default_and_pins_effort(self):
         selected = resolve_model({
             "data": [{"model": "gpt-5.6-sol", "isDefault": True, "defaultReasoningEffort": "high"}]
@@ -153,7 +108,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
                 {"model": "b", "isDefault": True},
             ]})
 
-    async def test_start_thread_is_paginated_durable_no_environment_no_dynamic_tools(self):
+    async def test_start_thread_pins_paginated_model_provider_and_persona_contract(self):
         transport = self.happy_transport()
         protocol = CodexGenerationProtocol(self.config(), transport)
         result = await protocol.start_thread(
@@ -162,18 +117,14 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.thread_id, "thr-123")
         self.assertEqual(result.model_provider, "openai")
         methods = [method for method, _ in transport.calls]
-        self.assertEqual(methods, ["account/read", "model/list", "config/read", "thread/start"])
+        self.assertEqual(methods, ["account/read", "model/list", "thread/start"])
         params = transport.calls[-1][1]
         self.assertEqual(params["historyMode"], "paginated")
         self.assertIs(params["ephemeral"], False)
-        self.assertEqual(params["approvalPolicy"], "never")
-        self.assertEqual(params["sandbox"], "read-only")
-        self.assertEqual(params["environments"], [])
-        self.assertEqual(params["dynamicTools"], [])
-        self.assertEqual(params["selectedCapabilityRoots"], [])
         self.assertEqual(params["baseInstructions"], "companion persona")
-        self.assertFalse(params["experimentalRawEvents"])
-        self.assertFalse(params["config"]["mcp_servers.browser.enabled"])
+        self.assertEqual(params["model"], "gpt-5.6-sol")
+        self.assertNotIn("config", params)
+        self.assertNotIn("environments", params)
 
     async def test_start_thread_rejects_non_paginated_response(self):
         transport = self.happy_transport()
@@ -185,7 +136,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(CodexGenerationError, "thread_contract_mismatch"):
             await protocol.start_thread(api_session="api-abc", attempt_id="attempt-1", persona="x")
 
-    async def test_resume_requests_bounded_summary_page_and_reapplies_hardening(self):
+    async def test_resume_requests_bounded_summary_page_and_pinned_provider(self):
         transport = self.happy_transport()
         protocol = CodexGenerationProtocol(self.config(), transport)
         page = await protocol.resume_thread(
@@ -206,8 +157,8 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
             "sortDirection": "desc",
             "itemsView": "summary",
         })
-        self.assertEqual(params["environments"], [])
         self.assertEqual(params["baseInstructions"], "current persona")
+        self.assertNotIn("config", params)
 
     async def test_turn_start_carries_stable_client_id_and_no_environment(self):
         transport = self.happy_transport()
