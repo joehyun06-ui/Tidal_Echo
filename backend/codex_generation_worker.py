@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Protocol
 
+from . import codex_generation_provider_binding as provider_binding
 from . import codex_generation_store as store
 from .codex_generation_protocol import (
     CodexGenerationError,
@@ -195,6 +196,13 @@ class CodexGenerationWorker:
                 if not ok:
                     return
                 session = store.get_session(self.store_path, str(job["api_session"])) or session
+            if session.get("model_provider") == provider_binding.UNRESOLVED_MODEL_PROVIDER:
+                store.mark_failed(
+                    self.store_path,
+                    job_id=job_id,
+                    category="codex_generation_provider_contract_changed",
+                )
+                return
             await self._dispatch_turn(job_id, session, text, persona)
 
     async def _create_thread(
@@ -234,7 +242,10 @@ class CodexGenerationWorker:
             )
             return False
         pinned_provider = session.get("model_provider")
-        if pinned_provider and result.model_provider != pinned_provider:
+        if (
+            pinned_provider not in (None, provider_binding.UNRESOLVED_MODEL_PROVIDER)
+            and result.model_provider != pinned_provider
+        ):
             store.mark_failed(
                 self.store_path, job_id=job_id, category="codex_generation_provider_contract_changed"
             )
@@ -244,12 +255,13 @@ class CodexGenerationWorker:
                 self.store_path, job_id=job_id, category="codex_generation_effort_contract_changed"
             )
             return False
-        store.bind_session_thread(
+        provider_binding.bind_first_thread_and_provider(
             self.store_path,
             job_id=job_id,
             thread_attempt_id=attempt_id,
             thread_id=result.thread_id,
             cwd=str(result.cwd),
+            model_provider=result.model_provider,
         )
         return True
 
@@ -305,6 +317,13 @@ class CodexGenerationWorker:
             return
         session = store.get_session(self.store_path, str(job["api_session"]))
         if session is None or not session.get("thread_id"):
+            return
+        if session.get("model_provider") == provider_binding.UNRESOLVED_MODEL_PROVIDER:
+            store.mark_failed(
+                self.store_path,
+                job_id=job_id,
+                category="codex_generation_provider_contract_changed",
+            )
             return
         try:
             persona = self._load_persona(session)
