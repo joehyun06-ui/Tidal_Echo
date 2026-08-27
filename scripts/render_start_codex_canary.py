@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from backend import deployment_config
 from scripts import render_start
@@ -50,14 +50,15 @@ def _replace_target(command: list[str], expected: str, replacement: str) -> list
     return [replacement if item == expected else item for item in command]
 
 
-def child_commands(
+def _select_child_commands(
+    base_selector: Callable[..., dict[str, list[str]]],
     config: render_start.SupervisorConfig,
     executable: str | None = None,
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
-    """Return legacy commands by default, or swap only the two reviewed entrypoints."""
-    commands = render_start.child_commands(config, executable=executable)
+    """Select entrypoints from an explicit immutable base selector."""
+    commands = base_selector(config, executable=executable)
     if not canary_entrypoints_enabled(environ):
         return commands
     commands = dict(commands)
@@ -70,6 +71,21 @@ def child_commands(
     return commands
 
 
+def child_commands(
+    config: render_start.SupervisorConfig,
+    executable: str | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Return legacy commands by default, or swap only the two reviewed entrypoints."""
+    return _select_child_commands(
+        render_start.child_commands,
+        config,
+        executable=executable,
+        environ=environ,
+    )
+
+
 def main() -> int:
     """Run the existing supervisor with a scoped entrypoint selector override."""
     # Validate before any child process can be started.
@@ -77,7 +93,12 @@ def main() -> int:
     original = render_start.child_commands
 
     def selected(config, executable=None):
-        return child_commands(config, executable=executable, environ=os.environ)
+        return _select_child_commands(
+            original,
+            config,
+            executable=executable,
+            environ=os.environ,
+        )
 
     render_start.child_commands = selected
     try:
