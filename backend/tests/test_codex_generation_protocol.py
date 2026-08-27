@@ -233,17 +233,20 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(input_digest("hello"), input_digest("hello"))
         self.assertNotEqual(input_digest("hello"), input_digest("hello!"))
 
-    def test_final_answer_prefers_final_phase_then_none_fallback(self):
+    def test_final_answer_matches_pinned_0147_agent_message_wire_shape(self):
         turn = {
             "items": [
-                {"type": "agentMessage", "content": [{"type": "text", "text": "draft"}]},
-                {"type": "agentMessage", "phase": "final_answer", "content": [{"type": "text", "text": "final"}]},
+                {"type": "agentMessage", "id": "a1", "text": "draft"},
+                {"type": "agentMessage", "id": "a2", "phase": "finalAnswer", "text": "final"},
             ]
         }
         self.assertEqual(final_answer_from_turn(turn), "final")
         self.assertEqual(final_answer_from_turn({
-            "items": [{"type": "agentMessage", "content": [{"type": "text", "text": "fallback"}]}]
+            "items": [{"type": "agentMessage", "id": "a3", "text": "fallback"}]
         }), "fallback")
+        self.assertIsNone(final_answer_from_turn({
+            "items": [{"type": "agentMessage", "id": "legacy-shape", "content": [{"type": "text", "text": "must-not-match"}]}]
+        }))
 
     def test_recovery_page_correlates_by_client_id_and_projects_final_answer(self):
         page = {
@@ -253,7 +256,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
                     "status": "completed",
                     "items": [
                         {"type": "userMessage", "id": "u2", "clientId": "gen-2", "content": []},
-                        {"type": "agentMessage", "id": "a2", "phase": "final_answer", "content": [{"type": "text", "text": "answer"}]},
+                        {"type": "agentMessage", "id": "a2", "phase": "finalAnswer", "text": "answer"},
                     ],
                 },
                 {
