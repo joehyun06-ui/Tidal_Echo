@@ -91,6 +91,7 @@ HARDENED_FEATURE_OVERRIDES: Mapping[str, bool] = {
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_SAFE_PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
 class CodexGenerationError(RuntimeError):
@@ -155,6 +156,7 @@ class ModelSelection:
 class ThreadStartResult:
     thread_id: str
     model: str
+    model_provider: str
     reasoning_effort: str | None
     cwd: Path
 
@@ -245,6 +247,12 @@ def _safe_id(value: object, category: str) -> str:
 def _safe_model(value: object) -> str:
     if not isinstance(value, str) or not _SAFE_MODEL.fullmatch(value):
         raise CodexGenerationError("codex_generation_model_unavailable")
+    return value
+
+
+def _safe_provider(value: object) -> str:
+    if not isinstance(value, str) or not _SAFE_PROVIDER.fullmatch(value):
+        raise CodexGenerationError("codex_generation_provider_unavailable")
     return value
 
 
@@ -510,28 +518,38 @@ class CodexGenerationProtocol:
         response_model = _safe_model(raw.get("model"))
         if response_model != selection.model:
             raise CodexGenerationError("codex_generation_thread_contract_mismatch")
+        response_provider = _safe_provider(raw.get("modelProvider"))
         response_cwd = raw.get("cwd")
         if not isinstance(response_cwd, str) or Path(response_cwd) != cwd:
             raise CodexGenerationError("codex_generation_thread_contract_mismatch")
-        return ThreadStartResult(thread_id, response_model, selection.reasoning_effort, cwd)
+        return ThreadStartResult(
+            thread_id=thread_id,
+            model=response_model,
+            model_provider=response_provider,
+            reasoning_effort=selection.reasoning_effort,
+            cwd=cwd,
+        )
 
     async def resume_thread(
         self,
         *,
         thread_id: str,
         model: str,
+        model_provider: str,
         reasoning_effort: str | None,
         cwd: Path,
         persona: str,
     ) -> Mapping[str, object]:
         thread_id = _safe_id(thread_id, "codex_generation_thread_invalid")
         model = _safe_model(model)
+        model_provider = _safe_provider(model_provider)
         if not isinstance(cwd, Path) or not cwd.is_absolute():
             raise CodexGenerationError("codex_generation_workspace_invalid")
         mcp_names = extract_mcp_server_names(await self._request("config/read", {}))
         params: dict[str, object] = {
             "threadId": thread_id,
             "model": model,
+            "modelProvider": model_provider,
             "cwd": str(cwd),
             "approvalPolicy": "never",
             "sandbox": "read-only",
