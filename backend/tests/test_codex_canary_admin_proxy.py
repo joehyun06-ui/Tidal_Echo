@@ -145,6 +145,16 @@ class CodexCanaryAdminProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error.category, "codex_generation_disabled")
         self.assertEqual(error.status_code, 503)
 
+    def test_malformed_created_session_is_server_unavailable_not_user_error(self):
+        with self.assertRaises(proxy.CodexCanaryAdminProxyError) as raised:
+            proxy._project_created({
+                "ok": True,
+                "provider": "codex",
+                "created": {"id": "bad session", "title": "trial"},
+            })
+        self.assertEqual(raised.exception.category, "codex_canary_unavailable")
+        self.assertEqual(raised.exception.status_code, 503)
+
     def test_install_is_idempotent(self):
         before = [(getattr(route, "path", None), tuple(sorted(getattr(route, "methods", set())))) for route in self.relay.app.routes]
         proxy.install(self.relay)
