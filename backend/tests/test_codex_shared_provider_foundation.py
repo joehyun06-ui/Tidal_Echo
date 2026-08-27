@@ -57,10 +57,17 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
             "account/login/cancel": {"status": "canceled"},
             "account/logout": {},
             "model/list": {"data": [{"model": "gpt-5.6-sol", "isDefault": True, "defaultReasoningEffort": "high"}]},
-            "config/read": {"config": {"mcp_servers": {"browser": {"url": "PRIVATE"}}}},
+            "config/read": {
+                "config": {
+                    "additional": {
+                        "mcp_servers": {"browser": {"url": "PRIVATE"}}
+                    }
+                }
+            },
             "thread/start": lambda params: {
                 "thread": {"id": "thr-1", "ephemeral": False, "historyMode": "paginated"},
                 "model": params["model"],
+                "modelProvider": "openai",
                 "cwd": params["cwd"],
             },
         }
@@ -124,9 +131,10 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.scopes[1].calls, [])
 
     async def test_composed_generation_uses_pinned_0147_hardening_profile(self):
-        await self.foundation.generation.start_thread(
+        result = await self.foundation.generation.start_thread(
             api_session="api-canary", attempt_id="attempt-1", persona="persona"
         )
+        self.assertEqual(result.model_provider, "openai")
         method, params = self.runtime.scopes[1].calls[-1]
         self.assertEqual(method, "thread/start")
         for key, value in OFFICIAL_0147_DENY_CONFIG.items():
