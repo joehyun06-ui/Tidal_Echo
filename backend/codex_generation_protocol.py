@@ -347,6 +347,7 @@ def require_chatgpt_account(account_result: object) -> None:
 
 
 def final_answer_from_turn(turn: Mapping[str, object]) -> str | None:
+    """Project the pinned Codex 0.147 AgentMessageThreadItem wire shape."""
     items = turn.get("items")
     if not isinstance(items, list):
         return None
@@ -355,20 +356,11 @@ def final_answer_from_turn(turn: Mapping[str, object]) -> str | None:
     for item in items:
         if not isinstance(item, dict) or item.get("type") != "agentMessage":
             continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        text = "".join(parts)
-        if not text or len(text) > MAX_ASSISTANT_TEXT_CHARS:
+        text = item.get("text")
+        if not isinstance(text, str) or not text or len(text) > MAX_ASSISTANT_TEXT_CHARS:
             continue
         phase = item.get("phase")
-        if phase in {"finalAnswer", "final_answer"}:
+        if phase == "finalAnswer":
             final = text
         elif phase is None:
             fallback = text
