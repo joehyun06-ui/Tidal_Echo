@@ -98,20 +98,26 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
         ]
         self.assertEqual(normalized, legacy)
 
-    def test_wrapper_main_restores_original_supervisor_selector(self):
+    def test_wrapper_main_selector_executes_without_recursion_and_restores_original(self):
         original = render_start.child_commands
         observed = {}
 
         def fake_main():
-            observed["selector"] = render_start.child_commands
+            selector = render_start.child_commands
+            observed["selector"] = selector
+            commands = selector(supervisor_config(), executable="python-test")
+            observed["commands"] = commands
             return 17
 
         with mock.patch.dict(os.environ, {
-            canary_start.CANARY_FLAG: "false",
+            canary_start.CANARY_FLAG: "true",
             canary_start.GENERATION_FLAG: "false",
         }, clear=False), mock.patch.object(render_start, "main", side_effect=fake_main):
             self.assertEqual(canary_start.main(), 17)
+
         self.assertIsNot(observed["selector"], original)
+        self.assertIn(canary_start.CANARY_API_LOOP, observed["commands"]["api_loop"])
+        self.assertIn(canary_start.CANARY_RELAY, observed["commands"]["relay"])
         self.assertIs(render_start.child_commands, original)
 
     def test_current_render_blueprint_still_uses_legacy_supervisor_and_has_no_activation_flags(self):
