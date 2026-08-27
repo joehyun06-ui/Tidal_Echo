@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 
 MAX_ADMIN_BODY_BYTES = 4096
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MODEL_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 _SAFE_LOOP_ERRORS = frozenset({
     "invalid_canary_request",
@@ -52,6 +53,26 @@ def _session_id(value: object) -> str:
 
 def _response_session_id(value: object) -> str:
     if not isinstance(value, str) or _SESSION_ID.fullmatch(value) is None:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    return value
+
+
+def _safe_model_value(value: object) -> str:
+    if not isinstance(value, str) or _MODEL_VALUE.fullmatch(value) is None:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    return value
+
+
+def _safe_effort(value: object) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or not value.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in value)
+    ):
         raise CodexCanaryAdminProxyError("codex_canary_unavailable")
     return value
 
@@ -138,20 +159,12 @@ def _project_status(result: Mapping[str, object], expected_session: str) -> dict
     if not isinstance(session, dict) or session.get("api_session") != expected_session:
         raise CodexCanaryAdminProxyError("codex_canary_unavailable")
     status = session.get("status")
-    model = session.get("model")
-    model_provider = session.get("model_provider")
-    effort = session.get("reasoning_effort")
     thread_bound = session.get("thread_bound")
-    if (
-        status not in {"active", "retired"}
-        or not isinstance(model, str)
-        or not model
-        or not isinstance(model_provider, str)
-        or not model_provider
-        or (effort is not None and not isinstance(effort, str))
-        or not isinstance(thread_bound, bool)
-    ):
+    if status not in {"active", "retired"} or not isinstance(thread_bound, bool):
         raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    model = _safe_model_value(session.get("model"))
+    model_provider = _safe_model_value(session.get("model_provider"))
+    effort = _safe_effort(session.get("reasoning_effort"))
     return {
         "ok": True,
         "provider": "codex",
