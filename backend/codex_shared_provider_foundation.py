@@ -1,9 +1,4 @@
-"""Composition root for P2-A shared Codex provider foundations.
-
-No public routes instantiate this object in P2-A. It exists to prove that the P1
-account facade and P2 generation facade can share one private App Server runtime
-without sharing RPC authority.
-"""
+"""Composition root for shared Codex provider foundations."""
 
 from __future__ import annotations
 
@@ -36,13 +31,14 @@ GenerationEventHandler = Callable[[GenerationNotification], Awaitable[None] | No
 
 
 class SharedCodexProviderFoundation:
-    """One runtime, two scoped facades, zero chat routing."""
+    """One runtime, two independently gated scoped facades."""
 
     def __init__(
         self,
         transport_config: CodexSharedTransportConfig,
         generation_config: CodexGenerationConfig,
         *,
+        control_enabled: bool = True,
         generation_event_handler: GenerationEventHandler | None = None,
         _runtime: CodexSharedAppServerRuntime | None = None,
     ) -> None:
@@ -55,7 +51,11 @@ class SharedCodexProviderFoundation:
             notifications=P1_ACCOUNT_NOTIFICATIONS,
             handler=self._on_account_notification,
         )
-        self.control = CodexAccountControlFacade(control_scope, self.activity_gate)
+        self.control = CodexAccountControlFacade(
+            control_scope,
+            self.activity_gate,
+            enabled=control_enabled,
+        )
 
         generation_scope = self.runtime.scope(
             methods=GENERATION_RPC_METHODS,
