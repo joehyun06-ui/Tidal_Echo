@@ -74,6 +74,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
                     "historyMode": "paginated",
                 },
                 "model": params["model"],
+                "modelProvider": "openai",
                 "cwd": params["cwd"],
             },
             "thread/resume": lambda params: {
@@ -159,6 +160,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
             api_session="api-abc", attempt_id="attempt-1", persona="companion persona"
         )
         self.assertEqual(result.thread_id, "thr-123")
+        self.assertEqual(result.model_provider, "openai")
         methods = [method for method, _ in transport.calls]
         self.assertEqual(methods, ["account/read", "model/list", "config/read", "thread/start"])
         params = transport.calls[-1][1]
@@ -177,7 +179,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         transport = self.happy_transport()
         transport.responses["thread/start"] = lambda params: {
             "thread": {"id": "thr-123", "ephemeral": False, "historyMode": "legacy"},
-            "model": params["model"], "cwd": params["cwd"],
+            "model": params["model"], "modelProvider": "openai", "cwd": params["cwd"],
         }
         protocol = CodexGenerationProtocol(self.config(), transport)
         with self.assertRaisesRegex(CodexGenerationError, "thread_contract_mismatch"):
@@ -189,6 +191,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         page = await protocol.resume_thread(
             thread_id="thr-123",
             model="gpt-5.6-sol",
+            model_provider="openai",
             reasoning_effort="high",
             cwd=self.root / "sessions" / "api-abc" / "attempt-1",
             persona="current persona",
@@ -197,6 +200,7 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         method, params = transport.calls[-1]
         self.assertEqual(method, "thread/resume")
         self.assertTrue(params["excludeTurns"])
+        self.assertEqual(params["modelProvider"], "openai")
         self.assertEqual(params["initialTurnsPage"], {
             "limit": 8,
             "sortDirection": "desc",
