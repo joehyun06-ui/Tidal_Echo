@@ -50,6 +50,12 @@ def _session_id(value: object) -> str:
     return value
 
 
+def _response_session_id(value: object) -> str:
+    if not isinstance(value, str) or _SESSION_ID.fullmatch(value) is None:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    return value
+
+
 def _loop_error(exc: HTTPException) -> CodexCanaryAdminProxyError:
     detail = exc.detail if isinstance(exc.detail, str) else ""
     parsed = None
@@ -114,7 +120,7 @@ def _project_created(result: Mapping[str, object]) -> dict[str, object]:
     created = result.get("created")
     if not isinstance(created, dict):
         raise CodexCanaryAdminProxyError("codex_canary_unavailable")
-    sid = _session_id(created.get("id"))
+    sid = _response_session_id(created.get("id"))
     title = created.get("title")
     if not isinstance(title, str) or not title or len(title) > 120:
         raise CodexCanaryAdminProxyError("codex_canary_unavailable")
