@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
 from backend.codex_account_control_facade import CodexAccountFacadeError
 from backend.codex_app_server_shared_transport import CodexSharedTransportConfig
+from backend.codex_generation_hardening_transport import OFFICIAL_0147_DENY_CONFIG
 from backend.codex_generation_protocol import CodexGenerationConfig, CodexGenerationError
 from backend.codex_shared_provider_foundation import SharedCodexProviderFoundation
 
@@ -55,7 +57,12 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
             "account/login/cancel": {"status": "canceled"},
             "account/logout": {},
             "model/list": {"data": [{"model": "gpt-5.6-sol", "isDefault": True, "defaultReasoningEffort": "high"}]},
-            "config/read": {"config": {"mcp_servers": {}}},
+            "config/read": {"config": {"mcp_servers": {"browser": {"url": "PRIVATE"}}}},
+            "thread/start": lambda params: {
+                "thread": {"id": "thr-1", "ephemeral": False, "historyMode": "paginated"},
+                "model": params["model"],
+                "cwd": params["cwd"],
+            },
         }
         self.runtime = FakeRuntime(self.responses)
         transport_config = CodexSharedTransportConfig(True, self.root / "home", self.root / "workspace", 1)
@@ -116,6 +123,22 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
             await foundation.generation.qualify()
         self.assertEqual(runtime.scopes[1].calls, [])
 
+    async def test_composed_generation_uses_pinned_0147_hardening_profile(self):
+        await self.foundation.generation.start_thread(
+            api_session="api-canary", attempt_id="attempt-1", persona="persona"
+        )
+        method, params = self.runtime.scopes[1].calls[-1]
+        self.assertEqual(method, "thread/start")
+        for key, value in OFFICIAL_0147_DENY_CONFIG.items():
+            self.assertEqual(params["config"][key], value)
+        self.assertEqual(params["config"]["mcp_servers"], {
+            "browser": {"enabled": False}
+        })
+        self.assertEqual(params["environments"], [])
+        self.assertEqual(params["runtimeWorkspaceRoots"], [])
+        self.assertEqual(params["dynamicTools"], [])
+        self.assertEqual(params["selectedCapabilityRoots"], [])
+
     async def test_generation_notifications_are_sanitized_before_callback(self):
         seen = []
         runtime = FakeRuntime(self.responses)
@@ -134,6 +157,31 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(seen[0].error_info, "serverOverloaded")
         self.assertNotIn("PRIVATE", repr(seen[0]))
+
+    async def test_async_generation_callback_does_not_block_reader_handler(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_callback(_event):
+            started.set()
+            await release.wait()
+
+        runtime = FakeRuntime(self.responses)
+        foundation = SharedCodexProviderFoundation(
+            CodexSharedTransportConfig(True, self.root / "home", self.root / "workspace", 1),
+            CodexGenerationConfig(True, self.root / "workspace"),
+            generation_event_handler=slow_callback,
+            _runtime=runtime,
+        )
+        handler = runtime.scopes[1].handler
+        await asyncio.wait_for(handler("turn/started", {
+            "threadId": "thr-1",
+            "turn": {"id": "turn-1", "status": "inProgress"},
+        }), timeout=0.1)
+        await asyncio.sleep(0)
+        self.assertTrue(started.is_set())
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_close_closes_only_shared_runtime_once(self):
         await self.foundation.close()
