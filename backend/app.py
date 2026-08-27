@@ -978,6 +978,43 @@ def loop_json(path: str, method: str = "GET", body=None):
         raise HTTPException(status_code=502, detail=f"loop proxy error: {exc}")
 
 
+_PROVIDER_CONTROL_ERROR_CATEGORIES = frozenset({
+    "codex_control_disabled",
+    "codex_app_server_unavailable",
+    "codex_app_server_protocol_error",
+    "codex_app_server_timeout",
+    "codex_not_authenticated",
+    "codex_login_in_progress",
+    "codex_login_unavailable",
+    "codex_usage_unavailable",
+})
+
+
+def provider_loop_json(path: str, method: str = "GET") -> dict:
+    """Proxy one bounded provider-control request without reflecting raw errors."""
+    try:
+        result = loop_json(path, method=method)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else ""
+        if detail not in _PROVIDER_CONTROL_ERROR_CATEGORIES and len(detail) <= 512:
+            try:
+                parsed = json.loads(detail)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and set(parsed) == {"detail"}:
+                nested = parsed.get("detail")
+                detail = nested if isinstance(nested, str) else ""
+        category = (
+            detail if detail in _PROVIDER_CONTROL_ERROR_CATEGORIES
+            else "codex_app_server_unavailable"
+        )
+        status = exc.status_code if exc.status_code in {401, 409, 503} else 503
+        raise HTTPException(status_code=status, detail=category) from None
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=503, detail="codex_app_server_protocol_error")
+    return result
+
+
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -2947,6 +2984,37 @@ async def app_push_test(request: Request):
 
 
 # ---- optional API loop control --------------------------------------------
+
+@app.get("/provider/status")
+async def provider_status(request: Request):
+    check_auth(request)
+    result = provider_loop_json("/loop/provider/status")
+    return {**result, "generation_provider": "api"}
+
+
+@app.get("/provider/usage")
+async def provider_usage(request: Request):
+    check_auth(request)
+    return provider_loop_json("/loop/provider/usage")
+
+
+@app.post("/provider/login/start")
+async def provider_login_start(request: Request):
+    check_auth(request)
+    return provider_loop_json("/loop/provider/login/start", method="POST")
+
+
+@app.post("/provider/login/cancel")
+async def provider_login_cancel(request: Request):
+    check_auth(request)
+    return provider_loop_json("/loop/provider/login/cancel", method="POST")
+
+
+@app.post("/provider/logout")
+async def provider_logout(request: Request):
+    check_auth(request)
+    return provider_loop_json("/loop/provider/logout", method="POST")
+
 
 @app.get("/app/brain")
 async def get_brain(request: Request):

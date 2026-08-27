@@ -27,7 +27,7 @@ import re
 import sqlite3
 import sys
 import uuid
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,12 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from backend import continuity_context, deployment_config, memory_formation_extractor
+from backend import (
+    codex_app_server_control,
+    continuity_context,
+    deployment_config,
+    memory_formation_extractor,
+)
 
 
 def load_dotenv(path: Path) -> None:
@@ -71,6 +76,8 @@ RENDER_TELEGRAM_MVP = deployment_config.parse_strict_bool(
 TRANSIENT_CONTINUITY_ENABLED = (
     continuity_context.continuity_enabled_from_environment(os.environ)
 )
+CODEX_CONTROL_CONFIG = deployment_config.load_codex_control_config(os.environ)
+CODEX_CONTROL = codex_app_server_control.CodexAppServerControl(CODEX_CONTROL_CONFIG)
 API_LOOP_INSTANCE_NONCE = os.environ.get("API_LOOP_INSTANCE_NONCE", "")
 API_LOOP_INTERNAL_TOKEN = os.environ.get("API_LOOP_INTERNAL_TOKEN", "")
 LOOP_INTERNAL_REQUEST_MAX_BYTES = deployment_config.parse_bounded_int(
@@ -725,7 +732,15 @@ async def handle_ingest(
             "relay": body, "api": meta}
 
 
-app = FastAPI(title="companion-api-loop")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        await CODEX_CONTROL.close()
+
+
+app = FastAPI(title="companion-api-loop", lifespan=lifespan)
 
 
 def check_internal_auth(request: Request) -> None:
@@ -757,6 +772,16 @@ async def read_internal_json(request: Request) -> Any:
         raise HTTPException(status_code=400, detail="malformed json") from None
 
 
+async def _provider_control(operation) -> dict[str, object]:
+    try:
+        return await operation()
+    except codex_app_server_control.CodexControlError as exc:
+        status = 409 if exc.category == "codex_login_in_progress" else 503
+        if exc.category == "codex_not_authenticated":
+            status = 401
+        raise HTTPException(status_code=status, detail=exc.category) from None
+
+
 @app.get("/healthz")
 async def healthz():
     if RENDER_TELEGRAM_MVP:
@@ -780,6 +805,37 @@ async def loop_config(request: Request):
 async def loop_config_update(request: Request):
     check_internal_auth(request)
     return update_config(await read_internal_json(request))
+
+
+@app.get("/loop/provider/status")
+async def loop_provider_status(request: Request):
+    check_internal_auth(request)
+    result = await _provider_control(CODEX_CONTROL.status)
+    return {**result, "generation_provider": "api"}
+
+
+@app.get("/loop/provider/usage")
+async def loop_provider_usage(request: Request):
+    check_internal_auth(request)
+    return await _provider_control(CODEX_CONTROL.usage)
+
+
+@app.post("/loop/provider/login/start")
+async def loop_provider_login_start(request: Request):
+    check_internal_auth(request)
+    return await _provider_control(CODEX_CONTROL.login_start)
+
+
+@app.post("/loop/provider/login/cancel")
+async def loop_provider_login_cancel(request: Request):
+    check_internal_auth(request)
+    return await _provider_control(CODEX_CONTROL.login_cancel)
+
+
+@app.post("/loop/provider/logout")
+async def loop_provider_logout(request: Request):
+    check_internal_auth(request)
+    return await _provider_control(CODEX_CONTROL.logout)
 
 
 @app.get("/loop/sessions")
