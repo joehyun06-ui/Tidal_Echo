@@ -120,12 +120,14 @@ class CodexGenerationHardeningTransport:
             name: {"enabled": False} for name in sorted(mcp_names)
         }
         rewritten["config"] = hardened
-        rewritten["environments"] = []
         rewritten["runtimeWorkspaceRoots"] = []
         rewritten["approvalPolicy"] = "never"
         rewritten["sandbox"] = "read-only"
         if method == "thread/start":
+            rewritten["environments"] = []
             rewritten["dynamicTools"] = []
             rewritten["selectedCapabilityRoots"] = []
             rewritten["experimentalRawEvents"] = False
+        else:
+            rewritten.pop("environments", None)
         return await self._transport.request(method, rewritten)
