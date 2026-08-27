@@ -7,6 +7,8 @@ without sharing RPC authority.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Mapping
 
 from .codex_account_control_facade import (
@@ -18,6 +20,7 @@ from .codex_app_server_shared_transport import (
     CodexSharedAppServerRuntime,
     CodexSharedTransportConfig,
 )
+from .codex_generation_hardening_transport import CodexGenerationHardeningTransport
 from .codex_generation_protocol import (
     GENERATION_NOTIFICATIONS,
     GENERATION_RPC_METHODS,
@@ -59,7 +62,10 @@ class SharedCodexProviderFoundation:
             notifications=GENERATION_NOTIFICATIONS,
             handler=self._on_generation_notification,
         )
-        self.generation = CodexGenerationProtocol(generation_config, generation_scope)
+        hardened_generation_scope = CodexGenerationHardeningTransport(generation_scope)
+        self.generation = CodexGenerationProtocol(
+            generation_config, hardened_generation_scope
+        )
 
     async def _on_account_notification(
         self, method: str, params: Mapping[str, object]
@@ -73,8 +79,16 @@ class SharedCodexProviderFoundation:
         if event is None or self._generation_event_handler is None:
             return
         outcome = self._generation_event_handler(event)
-        if hasattr(outcome, "__await__"):
-            await outcome
+        if inspect.isawaitable(outcome):
+            task = asyncio.ensure_future(outcome)
+            task.add_done_callback(self._consume_callback_result)
+
+    @staticmethod
+    def _consume_callback_result(task: asyncio.Future) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def close(self) -> None:
         await self.runtime.close()
