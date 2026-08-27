@@ -66,6 +66,10 @@ jobs:
           env = {item["key"]: item for item in service.get("envVars", [])}
           assert env["KELIVO_ENABLED"].get("value") == "true"
           assert env["TRANSIENT_CONTINUITY_ENABLED"].get("value") == "true"
+          assert env["CODEX_CONTROL_ENABLED"].get("value") == "false"
+          assert env["CODEX_HOME"].get("value") == "/var/data/codex-home"
+          assert env["CODEX_WORKSPACE"].get("value") == "/var/data/codex-workspace"
+          assert env["CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS"].get("value") == "10"
           assert env["MEMORY_RETRIEVAL_V2_SHADOW_ENABLED"].get("value") == "false"
           assert env["MEMORY_RETRIEVAL_V2_ACTIVE_ENABLED"].get("value") == "false"
           assert env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"].get("value") == "false"

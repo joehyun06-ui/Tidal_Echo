@@ -182,6 +182,14 @@ class HeartbeatConfig:
 
 
 @dataclass(frozen=True)
+class CodexControlConfig:
+    enabled: bool
+    codex_home: Path
+    workspace: Path
+    request_timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     enabled: bool
     context_injection_enabled: bool
@@ -221,6 +229,7 @@ class DeploymentConfig:
     kelivo: KelivoConfig
     operit_share: OperitShareConfig
     heartbeat: HeartbeatConfig
+    codex_control: CodexControlConfig
     memory: MemoryConfig
 
 
@@ -385,6 +394,59 @@ def validate_loop_config_file(path: Path, *, render_mvp: bool) -> None:
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise DeploymentConfigError("invalid_loop_config") from None
     validate_loop_config_payload(payload, render_mvp=render_mvp)
+
+
+def load_codex_control_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    render_mvp: bool | None = None,
+    persistent_root: Path | None = None,
+) -> CodexControlConfig:
+    """Load the independently gated, control-plane-only Codex configuration."""
+    env = os.environ if environ is None else environ
+    if render_mvp is None:
+        render_mvp = parse_strict_bool(
+            env.get("RENDER_TELEGRAM_MVP", "false"),
+            "invalid_render_telegram_mvp",
+        )
+    enabled = parse_strict_bool(
+        env.get("CODEX_CONTROL_ENABLED", "false"),
+        "invalid_codex_control_enabled",
+    )
+    timeout = parse_positive_finite_float(
+        env.get("CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS", "10"),
+        "invalid_codex_app_server_request_timeout",
+    )
+    if timeout < 1 or timeout > 30:
+        raise DeploymentConfigError("invalid_codex_app_server_request_timeout")
+
+    home = Path(str(env.get("CODEX_HOME", "/var/data/codex-home"))).expanduser()
+    workspace = Path(
+        str(env.get("CODEX_WORKSPACE", "/var/data/codex-workspace"))
+    ).expanduser()
+    try:
+        home_resolved = home.resolve(strict=False)
+        workspace_resolved = workspace.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        raise DeploymentConfigError("invalid_codex_control_path") from None
+    if home_resolved == workspace_resolved:
+        raise DeploymentConfigError("invalid_codex_control_path")
+
+    if render_mvp:
+        root = (
+            persistent_root
+            if persistent_root is not None
+            else Path(str(env.get("RENDER_PERSISTENT_ROOT", "/var/data"))).expanduser()
+        )
+        if not path_within_root(home, root) or not path_within_root(workspace, root):
+            raise DeploymentConfigError("invalid_codex_control_path")
+
+    return CodexControlConfig(
+        enabled=enabled,
+        codex_home=home_resolved,
+        workspace=workspace_resolved,
+        request_timeout_seconds=timeout,
+    )
 
 
 def load_deployment_config(
@@ -740,6 +802,11 @@ def load_deployment_config(
         raise DeploymentConfigError("invalid_kelivo_auto_idempotency_replay_window")
 
     persistent_root = Path(str(env.get("RENDER_PERSISTENT_ROOT", "/var/data"))).expanduser()
+    codex_control = load_codex_control_config(
+        env,
+        render_mvp=render_mvp,
+        persistent_root=persistent_root,
+    )
     db_path = Path(str(env.get("RELAY_DB", Path(__file__).parent / "relay.db"))).expanduser()
     upload_dir = Path(str(env.get("RELAY_UPLOAD_DIR", Path(__file__).parent / "uploads"))).expanduser()
     brain_file = Path(str(env.get("RELAY_BRAIN_FILE", Path(__file__).parent / "brain_target"))).expanduser()
@@ -822,6 +889,7 @@ def load_deployment_config(
             model_alias=operit_share_model_alias,
         ),
         heartbeat=heartbeat_config,
+        codex_control=codex_control,
         memory=MemoryConfig(
             enabled=memory_enabled,
             context_injection_enabled=memory_context_injection,
@@ -885,6 +953,11 @@ def prepare_persistent_paths(config: DeploymentConfig) -> None:
         config.brain_file.parent,
         config.loop_config.parent,
     }
+    if config.codex_control.enabled:
+        directories.update({
+            config.codex_control.codex_home,
+            config.codex_control.workspace,
+        })
     try:
         config.persistent_root.mkdir(parents=True, exist_ok=True)
         for directory in directories:

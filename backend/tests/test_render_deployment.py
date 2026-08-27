@@ -54,10 +54,89 @@ def render_env(root: Path) -> dict[str, str]:
         "LLM_API_KEY": "invalid-test-model-key",
         "LLM_MODEL": "test-model",
         "API_LOOP_INTERNAL_TOKEN": "test-internal-loop-token-1234567890",
+        "CODEX_CONTROL_ENABLED": "false",
+        "CODEX_HOME": str(root / "codex-home"),
+        "CODEX_WORKSPACE": str(root / "codex-workspace"),
+        "CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS": "10",
     }
 
 
 class DeploymentConfigTests(NoNetworkMixin, unittest.TestCase):
+    def test_codex_control_defaults_disabled(self):
+        config = deployment_config.load_codex_control_config({})
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.request_timeout_seconds, 10)
+
+    def test_codex_control_boolean_is_strict(self):
+        with self.assertRaisesRegex(
+            deployment_config.DeploymentConfigError,
+            "invalid_codex_control_enabled",
+        ):
+            deployment_config.load_codex_control_config({"CODEX_CONTROL_ENABLED": " true "})
+
+    def test_codex_control_timeout_is_finite_and_bounded(self):
+        for value in ("0.9", "31", "nan", "inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                "invalid_codex_app_server_request_timeout",
+            ):
+                deployment_config.load_codex_control_config({
+                    "CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS": value,
+                })
+        self.assertEqual(
+            deployment_config.load_codex_control_config({
+                "CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS": "1",
+            }).request_timeout_seconds,
+            1,
+        )
+
+    def test_codex_control_render_paths_are_safe_and_distinct(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            env = render_env(Path(root))
+            config = deployment_config.load_deployment_config(
+                type("Telegram", (), {"requested": True, "enabled": True})(), env
+            )
+            self.assertNotEqual(config.codex_control.codex_home, config.codex_control.workspace)
+            for name, value in (
+                ("CODEX_HOME", root),
+                ("CODEX_WORKSPACE", str(Path(outside) / "workspace")),
+            ):
+                invalid = dict(env)
+                invalid[name] = value
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    deployment_config.DeploymentConfigError,
+                    "invalid_codex_control_path",
+                ):
+                    deployment_config.load_deployment_config(
+                        type("Telegram", (), {"requested": True, "enabled": True})(), invalid
+                    )
+            equal = dict(env)
+            equal["CODEX_WORKSPACE"] = equal["CODEX_HOME"]
+            with self.assertRaisesRegex(
+                deployment_config.DeploymentConfigError,
+                "invalid_codex_control_path",
+            ):
+                deployment_config.load_deployment_config(
+                    type("Telegram", (), {"requested": True, "enabled": True})(), equal
+                )
+
+    def test_disabled_codex_control_creates_no_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            env = render_env(Path(root))
+            config = render_start.preflight(env).deployment
+            self.assertFalse(config.codex_control.enabled)
+            self.assertFalse(Path(env["CODEX_HOME"]).exists())
+            self.assertFalse(Path(env["CODEX_WORKSPACE"]).exists())
+
+    def test_enabled_codex_control_prepares_only_validated_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            env = render_env(Path(root))
+            env["CODEX_CONTROL_ENABLED"] = "true"
+            config = render_start.preflight(env).deployment
+            self.assertTrue(config.codex_control.enabled)
+            self.assertTrue(Path(env["CODEX_HOME"]).is_dir())
+            self.assertTrue(Path(env["CODEX_WORKSPACE"]).is_dir())
+
     def test_enabled_telegram_missing_config_fails_app_startup(self):
         env = {"RELAY_SECRET": "relay-only", "TELEGRAM_ENABLED": "true"}
         with mock.patch.dict(os.environ, env, clear=True):
@@ -643,6 +722,12 @@ class RuntimeConfigAndWebhookTests(NoNetworkMixin, unittest.TestCase):
 
 
 class BlueprintTests(unittest.TestCase):
+    def test_codex_runtime_dependency_is_exactly_pinned(self):
+        requirements = (
+            Path(__file__).parents[1] / "requirements.txt"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(requirements.count("openai-codex==0.147.0"), 1)
+
     def test_render_blueprint_structure_and_secret_placeholders(self):
         blueprint = json.loads((Path(__file__).parents[2] / "render.yaml").read_text(encoding="utf-8"))
         self.assertEqual(len(blueprint["services"]), 1)
@@ -667,6 +752,12 @@ class BlueprintTests(unittest.TestCase):
         self.assertEqual(env["KELIVO_CLIENT_ID"]["value"], "primary-kelivo")
         self.assertEqual(env["KELIVO_MODEL_ALIAS"]["value"], "ouou-home")
         self.assertEqual(env["TRANSIENT_CONTINUITY_ENABLED"]["value"], "true")
+        self.assertEqual(env["CODEX_CONTROL_ENABLED"]["value"], "false")
+        self.assertEqual(env["CODEX_HOME"]["value"], "/var/data/codex-home")
+        self.assertEqual(env["CODEX_WORKSPACE"]["value"], "/var/data/codex-workspace")
+        self.assertEqual(
+            env["CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS"]["value"], "10"
+        )
         self.assertEqual(
             env["MEMORY_RETRIEVAL_V2_SHADOW_ENABLED"]["value"],
             "false",
