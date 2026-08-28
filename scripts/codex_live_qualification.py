@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Operator-side live qualification harness for the staged Codex Web canary.
 
-This tool never mutates Render configuration, deploys services, or changes startup
-commands. The default command is ``plan`` and performs no network I/O. Live state
-changes are split into explicit subcommands so an operator can stop between gates.
-
-Secrets are read from an environment variable (``RELAY_SECRET`` by default) rather
-than from argv, keeping the Bearer value out of normal process listings and receipts.
+The default command is ``plan`` and performs no network I/O. This tool never edits
+Render configuration, switches startup commands, triggers a deploy/restart, or sends
+chat messages. State-changing live operations remain separate explicit subcommands.
 """
 
 from __future__ import annotations
@@ -15,7 +12,6 @@ import argparse
 import json
 import os
 import re
-import sys
 import tempfile
 import time
 import urllib.error
@@ -27,8 +23,10 @@ from typing import Mapping
 
 
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_RECEIPT_BYTES = 16 * 1024
 DEFAULT_TIMEOUT_SECONDS = 20.0
 RECEIPT_VERSION = 1
+
 _SAFE_SESSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SAFE_USER_CODE = re.compile(r"^[A-Za-z0-9-]{3,64}$")
@@ -107,10 +105,18 @@ class CanaryState:
 
 
 class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Never follow redirects while carrying the relay Bearer credential."""
+    """Turn every redirect into an HTTPError before a Bearer header can be replayed."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+    def _reject(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect rejected", headers, fp)
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        return self._reject(req, fp, code, msg, headers)
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_RejectRedirectHandler())
@@ -150,23 +156,21 @@ def normalize_base_url(raw: str) -> str:
     if not isinstance(raw, str) or not raw or raw != raw.strip() or len(raw) > 512:
         raise QualificationError("qualification_base_url_invalid")
     parsed = urllib.parse.urlsplit(raw)
-    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+    if parsed.query or parsed.fragment or parsed.username or parsed.password or not parsed.netloc:
         raise QualificationError("qualification_base_url_invalid")
     host = (parsed.hostname or "").casefold()
     localhost = host in {"localhost", "127.0.0.1", "::1"}
     if parsed.scheme != "https" and not (parsed.scheme == "http" and localhost):
         raise QualificationError("qualification_base_url_invalid")
-    if not parsed.netloc:
+    if any(part in {".", ".."} for part in urllib.parse.unquote(parsed.path).split("/")):
         raise QualificationError("qualification_base_url_invalid")
-    decoded_parts = urllib.parse.unquote(parsed.path).split("/")
-    if any(part in {".", ".."} for part in decoded_parts):
-        raise QualificationError("qualification_base_url_invalid")
-    path = parsed.path.rstrip("/")
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
+    )
 
 
 def load_secret(environ: Mapping[str, str], name: str = "RELAY_SECRET") -> str:
-    if not isinstance(name, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name):
+    if not isinstance(name, str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) is None:
         raise QualificationError("qualification_secret_env_invalid")
     value = environ.get(name, "")
     if (
@@ -232,9 +236,14 @@ class RelayClient:
 
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> dict:
         data = None
-        headers = {"Authorization": f"Bearer {self._secret}", "Accept": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {self._secret}",
+            "Accept": "application/json",
+        }
         if body is not None:
-            data = json.dumps(dict(body), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            data = json.dumps(
+                dict(body), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
             if len(data) > 4096:
                 raise QualificationError("qualification_request_too_large")
             headers["Content-Type"] = "application/json"
@@ -243,10 +252,12 @@ class RelayClient:
         )
         try:
             response = self._opener(request, timeout=self.timeout_seconds)
+            if response is None or not hasattr(response, "read"):
+                raise QualificationError("qualification_response_invalid")
             with response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
-                if len(raw) > MAX_RESPONSE_BYTES:
-                    raise QualificationError("qualification_response_too_large")
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise QualificationError("qualification_response_too_large")
         except urllib.error.HTTPError as exc:
             raw = exc.read(4097)
             payload: object = {}
@@ -280,20 +291,17 @@ class RelayClient:
         return {"connected": connected, "generation_provider": "api"}
 
     def provider_usage(self) -> dict[str, object]:
-        payload = self.request("GET", "/provider/usage")
-        if not isinstance(payload, dict):
-            raise QualificationError("qualification_usage_invalid")
+        self.request("GET", "/provider/usage")
         return {"available": True}
 
     def login_start(self) -> dict[str, str]:
         payload = self.request("POST", "/provider/login/start")
         url = _verification_url(payload.get("verification_url"))
         code = payload.get("user_code")
-        status = payload.get("status")
         if (
             not isinstance(code, str)
             or _SAFE_USER_CODE.fullmatch(code) is None
-            or status != "pending"
+            or payload.get("status") != "pending"
         ):
             raise QualificationError("qualification_login_response_invalid")
         return {"verification_url": url, "user_code": code, "status": "pending"}
@@ -329,7 +337,9 @@ class RelayClient:
             api_session=sid,
             status=str(status),
             model=_safe_model(row.get("model"), "qualification_model_invalid"),
-            model_provider=_safe_model(row.get("model_provider"), "qualification_provider_invalid"),
+            model_provider=_safe_model(
+                row.get("model_provider"), "qualification_provider_invalid"
+            ),
             reasoning_effort=_safe_effort(row.get("reasoning_effort")),
             thread_bound=thread_bound,
         )
@@ -363,7 +373,11 @@ def account_check(client: RelayClient) -> dict[str, object]:
     if status["connected"] is not True:
         raise QualificationError("qualification_account_not_connected")
     client.provider_usage()
-    return {"connected": True, "generation_provider": "api", "usage_available": True}
+    return {
+        "connected": True,
+        "generation_provider": "api",
+        "usage_available": True,
+    }
 
 
 def wait_thread_bound(
@@ -390,25 +404,72 @@ def wait_thread_bound(
         sleeper(poll_seconds)
 
 
+def _validate_receipt(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"version", "account", "canary"}:
+        raise QualificationError("qualification_receipt_invalid")
+    if value.get("version") != RECEIPT_VERSION:
+        raise QualificationError("qualification_receipt_invalid")
+    account = value.get("account")
+    if (
+        not isinstance(account, dict)
+        or set(account) != {"connected", "generation_provider", "usage_available"}
+        or account.get("connected") is not True
+        or account.get("generation_provider") != "api"
+        or account.get("usage_available") is not True
+    ):
+        raise QualificationError("qualification_receipt_invalid")
+    canary = value.get("canary")
+    if not isinstance(canary, dict) or set(canary) != {
+        "api_session", "status", "model", "model_provider", "reasoning_effort", "thread_bound"
+    }:
+        raise QualificationError("qualification_receipt_invalid")
+    state = CanaryState(
+        api_session=_safe_session(canary.get("api_session")),
+        status=str(canary.get("status")),
+        model=_safe_model(canary.get("model"), "qualification_receipt_invalid"),
+        model_provider=_safe_model(
+            canary.get("model_provider"), "qualification_receipt_invalid"
+        ),
+        reasoning_effort=_safe_effort(canary.get("reasoning_effort")),
+        thread_bound=canary.get("thread_bound") is True,
+    )
+    if (
+        state.status != "active"
+        or not state.thread_bound
+        or state.model_provider == "unresolved"
+    ):
+        raise QualificationError("qualification_receipt_invalid")
+    return {
+        "version": RECEIPT_VERSION,
+        "account": {
+            "connected": True,
+            "generation_provider": "api",
+            "usage_available": True,
+        },
+        "canary": state.public_dict(),
+    }
+
+
 def build_receipt(client: RelayClient, api_session: str) -> dict[str, object]:
     account = account_check(client)
     state = client.canary_status(api_session)
     if state.status != "active" or not state.thread_bound or state.model_provider == "unresolved":
         raise QualificationError("qualification_snapshot_not_ready")
-    return {
-        "version": RECEIPT_VERSION,
-        "account": account,
-        "canary": state.public_dict(),
-    }
+    return _validate_receipt(
+        {"version": RECEIPT_VERSION, "account": account, "canary": state.public_dict()}
+    )
 
 
 def write_receipt(path: Path, receipt: Mapping[str, object]) -> None:
     if not isinstance(path, Path):
         raise QualificationError("qualification_receipt_path_invalid")
+    normalized = _validate_receipt(dict(receipt))
     temp_name: str | None = None
     try:
-        encoded = (json.dumps(dict(receipt), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-        if len(encoded) > 16 * 1024:
+        encoded = (
+            json.dumps(normalized, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        if len(encoded) > MAX_RECEIPT_BYTES:
             raise QualificationError("qualification_receipt_invalid")
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(
@@ -455,34 +516,30 @@ def load_receipt(path: Path) -> dict[str, object]:
         raw = path.read_bytes()
     except OSError:
         raise QualificationError("qualification_receipt_read_failed") from None
-    if not raw or len(raw) > 16 * 1024:
+    if not raw or len(raw) > MAX_RECEIPT_BYTES:
         raise QualificationError("qualification_receipt_invalid")
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError, ValueError):
         raise QualificationError("qualification_receipt_invalid") from None
-    if not isinstance(payload, dict) or payload.get("version") != RECEIPT_VERSION:
-        raise QualificationError("qualification_receipt_invalid")
-    return payload
+    return _validate_receipt(payload)
 
 
 def verify_after_restart(client: RelayClient, receipt: Mapping[str, object]) -> dict[str, object]:
-    if not isinstance(receipt, dict):
-        raise QualificationError("qualification_receipt_invalid")
-    expected = receipt.get("canary")
-    if not isinstance(expected, dict):
-        raise QualificationError("qualification_receipt_invalid")
-    sid = _safe_session(expected.get("api_session"))
+    expected_receipt = _validate_receipt(dict(receipt))
+    expected = expected_receipt["canary"]
+    sid = str(expected["api_session"])
     account = account_check(client)
     current = client.canary_status(sid)
     if current.status != "active" or not current.thread_bound:
         raise QualificationError("qualification_restart_persistence_failed")
+    current_dict = current.public_dict()
     for field in ("model", "model_provider", "reasoning_effort"):
-        if current.public_dict().get(field) != expected.get(field):
+        if current_dict.get(field) != expected.get(field):
             raise QualificationError("qualification_restart_contract_changed")
     return {
         "account": account,
-        "canary": current.public_dict(),
+        "canary": current_dict,
         "restart_persistence": True,
     }
 
@@ -517,7 +574,7 @@ def _print_json(value: object) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default=os.environ.get("CODEX_QUALIFICATION_BASE_URL", ""))
+    parser.add_argument("--base-url", default="")
     parser.add_argument("--secret-env", default="RELAY_SECRET")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     sub = parser.add_subparsers(dest="command")
@@ -528,12 +585,11 @@ def build_parser() -> argparse.ArgumentParser:
     create = sub.add_parser("canary-create")
     create.add_argument("--title", default="Codex canary")
     for name in ("canary-status", "wait-bound", "snapshot", "canary-retire", "verify-retired"):
-        p = sub.add_parser(name)
-        p.add_argument("--session", required=True)
+        item = sub.add_parser(name)
+        item.add_argument("--session", required=True)
         if name == "wait-bound":
-            p.add_argument("--wait-timeout", type=float, default=90.0)
-    snapshot = sub.choices["snapshot"]
-    snapshot.add_argument("--receipt", required=True)
+            item.add_argument("--wait-timeout", type=float, default=90.0)
+    sub.choices["snapshot"].add_argument("--receipt", required=True)
     verify = sub.add_parser("verify-after-restart")
     verify.add_argument("--receipt", required=True)
     rollback = sub.add_parser("rollback-check")
@@ -548,9 +604,10 @@ def main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None
         _print_json({"network": False, "steps": list(PLAN)})
         return 0
     env = os.environ if environ is None else environ
+    base_url = args.base_url or str(env.get("CODEX_QUALIFICATION_BASE_URL", ""))
     try:
         client = RelayClient(
-            args.base_url,
+            base_url,
             load_secret(env, args.secret_env),
             timeout_seconds=args.timeout,
         )
@@ -565,7 +622,9 @@ def main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None
         elif command == "canary-status":
             result = client.canary_status(args.session).public_dict()
         elif command == "wait-bound":
-            result = wait_thread_bound(client, args.session, timeout_seconds=args.wait_timeout).public_dict()
+            result = wait_thread_bound(
+                client, args.session, timeout_seconds=args.wait_timeout
+            ).public_dict()
         elif command == "snapshot":
             result = build_receipt(client, args.session)
             write_receipt(Path(args.receipt), result)
@@ -576,7 +635,9 @@ def main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None
         elif command == "verify-retired":
             result = verify_retired(client, args.session)
         elif command == "rollback-check":
-            result = rollback_check(client, expect_control_disabled=args.expect_control_disabled)
+            result = rollback_check(
+                client, expect_control_disabled=args.expect_control_disabled
+            )
         else:
             raise QualificationError("qualification_command_invalid")
     except QualificationError as exc:
