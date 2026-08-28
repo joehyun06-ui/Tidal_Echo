@@ -78,10 +78,19 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
             "http://api.example.invalid",
             "https://user:pass@example.invalid",
             "https://example.invalid/?secret=x",
+            "https://example.invalid/a/../b",
+            "https://example.invalid/a/%2e%2e/b",
             " https://example.invalid",
         ):
             with self.subTest(value=value), self.assertRaises(harness.QualificationError):
                 harness.normalize_base_url(value)
+
+    def test_default_redirect_handler_refuses_redirect_requests(self):
+        handler = harness._RejectRedirectHandler()
+        request = object()
+        self.assertIsNone(
+            handler.redirect_request(request, None, 302, "Found", {}, "https://other.invalid")
+        )
 
     def test_secret_is_read_from_named_environment_only(self):
         env = {"RELAY_SECRET": "abcDEF123!"}
@@ -106,13 +115,21 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.QualificationError, "qualification_generation_authority_changed"):
             bad.provider_status()
 
-    def test_login_start_matches_p1_external_wire(self):
+    def test_login_start_matches_p1_external_wire_and_rejects_credentialed_url(self):
         client, _ = self.client([{
             "verification_url": "https://example.invalid/device",
             "user_code": "ABCD-1234",
             "status": "pending",
         }])
         self.assertEqual(client.login_start()["user_code"], "ABCD-1234")
+
+        bad, _ = self.client([{
+            "verification_url": "https://user:pass@example.invalid/device",
+            "user_code": "ABCD-1234",
+            "status": "pending",
+        }])
+        with self.assertRaisesRegex(harness.QualificationError, "qualification_login_response_invalid"):
+            bad.login_start()
 
     def test_account_check_requires_connected_and_usage(self):
         client, _ = self.client([
@@ -198,7 +215,7 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
         ):
             harness.wait_thread_bound(client, "api-canary-1", timeout_seconds=1, sleeper=lambda _x: None)
 
-    def test_receipt_contains_no_secret_or_thread_identifier_and_is_mode_600(self):
+    def test_receipt_contains_no_secret_or_thread_identifier_is_atomic_and_mode_600(self):
         client, _ = self.client([
             {"connected": True, "generation_provider": "api", "account_type": "chatgpt"},
             {"lifetime_tokens": 12},
@@ -226,6 +243,7 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
             path = Path(temp) / "receipt.json"
             harness.write_receipt(path, receipt)
             self.assertEqual(harness.load_receipt(path), receipt)
+            self.assertEqual(list(path.parent.glob(".receipt.json.*.tmp")), [])
             if os.name == "posix":
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -288,7 +306,7 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
 
     def test_main_live_command_does_not_echo_secret(self):
         opener = QueueOpener([{"connected": True, "generation_provider": "api"}])
-        with mock.patch.object(urllib.request, "urlopen", opener):
+        with mock.patch.object(harness, "_open_no_redirect", opener):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = harness.main(
