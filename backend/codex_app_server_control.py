@@ -7,6 +7,7 @@ bounded login-attempt status for live qualification.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from . import codex_app_server_control_base as _base
@@ -28,6 +29,15 @@ class CodexAppServerControl(_base.CodexAppServerControl):
         self._login_status = _LOGIN_IDLE
         self._raced_login_id = ""
         self._raced_login_status = ""
+
+    @staticmethod
+    async def _bounded_teardown_await(awaitable) -> None:
+        """Keep public-module timeout patching compatible with the original P1 class."""
+        try:
+            async with asyncio.timeout(PROCESS_TEARDOWN_STEP_TIMEOUT_SECONDS):
+                await awaitable
+        except (asyncio.CancelledError, TimeoutError, Exception):
+            pass
 
     async def _consume_message(self, message: object, *, owner: Any | None = None) -> None:
         if isinstance(message, dict) and message.get("method") == "account/login/completed":
