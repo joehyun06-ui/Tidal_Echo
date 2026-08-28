@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -105,6 +106,20 @@ class CanaryState:
         }
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects while carrying the relay Bearer credential."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_RejectRedirectHandler())
+
+
+def _open_no_redirect(request, timeout):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
 def _safe_session(value: object) -> str:
     if not isinstance(value, str) or _SAFE_SESSION.fullmatch(value) is None:
         raise QualificationError("qualification_session_invalid")
@@ -143,6 +158,9 @@ def normalize_base_url(raw: str) -> str:
         raise QualificationError("qualification_base_url_invalid")
     if not parsed.netloc:
         raise QualificationError("qualification_base_url_invalid")
+    decoded_parts = urllib.parse.unquote(parsed.path).split("/")
+    if any(part in {".", ".."} for part in decoded_parts):
+        raise QualificationError("qualification_base_url_invalid")
     path = parsed.path.rstrip("/")
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
@@ -171,6 +189,20 @@ def _category_from_error_payload(payload: object) -> str:
     return "qualification_remote_error"
 
 
+def _verification_url(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 512:
+        raise QualificationError("qualification_login_response_invalid")
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise QualificationError("qualification_login_response_invalid")
+    return value
+
+
 class RelayClient:
     def __init__(
         self,
@@ -190,7 +222,7 @@ class RelayClient:
         if timeout < 1 or timeout > 120:
             raise QualificationError("qualification_timeout_invalid")
         self.timeout_seconds = timeout
-        self._opener = opener or urllib.request.urlopen
+        self._opener = opener or _open_no_redirect
         self._secret = secret
 
     def _url(self, path: str) -> str:
@@ -251,19 +283,15 @@ class RelayClient:
         payload = self.request("GET", "/provider/usage")
         if not isinstance(payload, dict):
             raise QualificationError("qualification_usage_invalid")
-        # Preserve only structural success; never mirror arbitrary usage/account fields into receipts.
         return {"available": True}
 
     def login_start(self) -> dict[str, str]:
         payload = self.request("POST", "/provider/login/start")
-        url = payload.get("verification_url")
+        url = _verification_url(payload.get("verification_url"))
         code = payload.get("user_code")
         status = payload.get("status")
         if (
-            not isinstance(url, str)
-            or not url.startswith("https://")
-            or len(url) > 512
-            or not isinstance(code, str)
+            not isinstance(code, str)
             or _SAFE_USER_CODE.fullmatch(code) is None
             or status != "pending"
         ):
@@ -377,19 +405,49 @@ def build_receipt(client: RelayClient, api_session: str) -> dict[str, object]:
 def write_receipt(path: Path, receipt: Mapping[str, object]) -> None:
     if not isinstance(path, Path):
         raise QualificationError("qualification_receipt_path_invalid")
+    temp_name: str | None = None
     try:
         encoded = (json.dumps(dict(receipt), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
         if len(encoded) > 16 * 1024:
             raise QualificationError("qualification_receipt_invalid")
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_name(path.name + ".tmp")
-        temp.write_bytes(encoded)
-        os.chmod(temp, 0o600)
-        os.replace(temp, path)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb", closefd=True) as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.replace(temp_name, path)
+        temp_name = None
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except QualificationError:
         raise
     except OSError:
         raise QualificationError("qualification_receipt_write_failed") from None
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
 
 
 def load_receipt(path: Path) -> dict[str, object]:
