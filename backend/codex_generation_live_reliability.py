@@ -21,16 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import codex_generation_store as store
+from .codex_0147_wire_compat import correlated_turn_from_page, final_answer_from_turn
 from .codex_canary_loop_integration import (
     CodexCanaryLoopIntegration,
     CodexCanaryLoopIntegrationError,
 )
-from .codex_generation_protocol import (
-    GenerationNotification,
-    correlated_turn_from_page,
-    final_answer_from_turn,
-    project_notification,
-)
+from .codex_generation_protocol import GenerationNotification, project_notification
 from .codex_generation_runtime import CodexGenerationRuntime
 from .codex_generation_runtime_config import compose_shared_transport_config
 from .codex_generation_worker import CodexGenerationWorker
