@@ -154,7 +154,7 @@ class CodexGenerationWorkerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.callbacks, [])
         self.assertIsNone(store.claim_next_job(self.store_path))
 
-    async def test_verified_absent_recovery_returns_to_processing_without_callback(self):
+    async def test_unresolved_recovery_fails_closed_without_requeue_or_callback(self):
         worker = self.worker()
         claimed = store.claim_next_job(self.store_path)
         cwd = str(self.workspace / "sessions" / "api-canary" / "attempt-1")
@@ -176,8 +176,10 @@ class CodexGenerationWorkerTest(unittest.IsolatedAsyncioTestCase):
         self.protocol.resume_page = {"data": []}
         await worker.run_once()
         job = store.get_job(self.store_path, claimed["id"])
-        self.assertEqual(job["status"], "processing")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_category"], "codex_generation_reconcile_unresolved")
         self.assertEqual(self.callbacks, [])
+        self.assertIsNone(store.claim_next_job(self.store_path))
 
     async def test_callback_failure_leaves_callback_pending_for_idempotent_retry(self):
         await self.seed_completed_event()

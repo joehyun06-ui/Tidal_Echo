@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from backend import codex_canary_admin_proxy as proxy
+from backend import codex_generation_store as generation_store
 
 
 class CodexCanaryAdminProxyTest(unittest.IsolatedAsyncioTestCase):
@@ -105,6 +110,77 @@ class CodexCanaryAdminProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["session"]["thread_bound"], False)
         self.assertNotIn("persona_hash", payload["session"])
         self.assertNotIn("thread_id", payload["session"])
+
+    async def test_diagnostic_route_is_authenticated_and_projects_only_bounded_state(self):
+        diagnostic = {
+            "ok": True,
+            "provider": "codex",
+            "diagnostic": {
+                "api_session": "api-canary-1",
+                "session_status": "active",
+                "thread_bound": True,
+                "model_provider": "openai",
+                "latest_job": {
+                    "status": "dispatch_uncertain",
+                    "attempt_count": 1,
+                    "recovery_count": 2,
+                    "turn_bound": True,
+                    "assistant_message_bound": False,
+                    "error_category": "codex_dispatch_uncertain",
+                },
+            },
+        }
+        with patch.object(proxy, "_read_generation_diagnostic", return_value=diagnostic) as read:
+            response = await self.request(
+                "GET",
+                "/provider/canary/api-canary-1/diagnostic",
+                headers={"Authorization": "Bearer test-secret"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), diagnostic)
+        read.assert_called_once_with("api-canary-1")
+        self.assertNotIn("thread_id", response.text)
+        self.assertNotIn("client_message_id", response.text)
+        self.assertNotIn("callback_identity", response.text)
+
+    async def test_diagnostic_reader_works_while_generation_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store_path = root / "codex-generation.db"
+            generation_store.initialize(store_path)
+            generation_store.pin_session(
+                store_path,
+                api_session="api-canary-1",
+                model="gpt-test",
+                model_provider="openai",
+                reasoning_effort="low",
+                persona_hash="a" * 64,
+            )
+            generation_store.enqueue_job(
+                store_path,
+                api_session="api-canary-1",
+                canonical_message_id=41,
+                input_digest="b" * 64,
+                generation_id="codex-gen-41",
+                client_message_id="codex-client-41",
+                callback_identity="codex-callback-41",
+            )
+            with patch.dict(os.environ, {
+                "RENDER_PERSISTENT_ROOT": str(root),
+                "CODEX_GENERATION_DB": str(store_path),
+                "CODEX_GENERATION_ENABLED": "false",
+            }, clear=False):
+                payload = proxy._read_generation_diagnostic("api-canary-1")
+        self.assertEqual(payload["diagnostic"]["session_status"], "active")
+        self.assertEqual(payload["diagnostic"]["model_provider"], "openai")
+        self.assertEqual(payload["diagnostic"]["latest_job"], {
+            "status": "queued",
+            "attempt_count": 0,
+            "recovery_count": 0,
+            "turn_bound": False,
+            "assistant_message_bound": False,
+            "error_category": None,
+        })
 
     async def test_retire_requires_exact_session_correlation(self):
         response = await self.request(

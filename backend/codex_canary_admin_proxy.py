@@ -1,23 +1,32 @@
 """Opt-in external admin proxy for the explicit Codex Web canary.
 
 The routes in this module are installed only by ``backend.codex_canary_relay_app``.
-They reuse the relay's existing authentication and its localhost/internal-token loop
-proxy. Raw loop errors are never reflected to the external caller.
+They reuse the relay's existing authentication and localhost/internal-token loop
+proxy. A bounded diagnostic route reads only sanitized durable generation state so
+operators can inspect a frozen canary while generation is disabled. Raw loop errors,
+thread ids, callback identities, prompts, and chat text are never reflected externally.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping
+from contextlib import closing
+from pathlib import Path
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+
+from . import codex_generation_store
+from .codex_generation_runtime_config import load_generation_runtime_config
 
 
 MAX_ADMIN_BODY_BYTES = 4096
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MODEL_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_ERROR_CATEGORY = re.compile(r"^[a-z0-9_:-]{1,96}$")
 
 _SAFE_LOOP_ERRORS = frozenset({
     "invalid_canary_request",
@@ -77,6 +86,20 @@ def _safe_effort(value: object) -> str | None:
     return value
 
 
+def _safe_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 1_000_000:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    return value
+
+
+def _safe_error_category(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _ERROR_CATEGORY.fullmatch(value) is None:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    return value
+
+
 def _loop_error(exc: HTTPException) -> CodexCanaryAdminProxyError:
     detail = exc.detail if isinstance(exc.detail, str) else ""
     parsed = None
@@ -107,6 +130,69 @@ def _proxy(relay_module, path: str, *, method: str = "GET", body=None) -> Mappin
     if not isinstance(result, dict):
         raise CodexCanaryAdminProxyError("codex_canary_unavailable")
     return result
+
+
+def _generation_store_path() -> Path:
+    persistent_root = Path(os.environ.get("RENDER_PERSISTENT_ROOT", "/var/data"))
+    if not persistent_root.is_absolute() or ".." in persistent_root.parts:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    try:
+        return load_generation_runtime_config(
+            os.environ,
+            persistent_root=persistent_root,
+        ).store_path
+    except Exception:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable") from None
+
+
+def _read_generation_diagnostic(expected_session: str) -> dict[str, object]:
+    """Read only fixed, non-secret job state; this never starts the Codex runtime."""
+    try:
+        with closing(codex_generation_store.connect(_generation_store_path())) as conn:
+            session = conn.execute(
+                """SELECT status,model_provider,thread_id
+                   FROM codex_sessions WHERE api_session=?""",
+                (expected_session,),
+            ).fetchone()
+            latest = conn.execute(
+                """SELECT status,attempt_count,recovery_count,turn_id,
+                          assistant_message_id,error_category
+                   FROM codex_generation_jobs
+                   WHERE api_session=? ORDER BY id DESC LIMIT 1""",
+                (expected_session,),
+            ).fetchone()
+    except Exception:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable") from None
+    if session is None:
+        raise CodexCanaryAdminProxyError("codex_canary_session_not_found", status_code=404)
+    session_status = session["status"]
+    if session_status not in {"active", "retired"}:
+        raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+    model_provider = _safe_model_value(session["model_provider"])
+    job = None
+    if latest is not None:
+        status = latest["status"]
+        if status not in codex_generation_store.JOB_STATUSES:
+            raise CodexCanaryAdminProxyError("codex_canary_unavailable")
+        job = {
+            "status": status,
+            "attempt_count": _safe_count(latest["attempt_count"]),
+            "recovery_count": _safe_count(latest["recovery_count"]),
+            "turn_bound": latest["turn_id"] is not None,
+            "assistant_message_bound": latest["assistant_message_id"] is not None,
+            "error_category": _safe_error_category(latest["error_category"]),
+        }
+    return {
+        "ok": True,
+        "provider": "codex",
+        "diagnostic": {
+            "api_session": expected_session,
+            "session_status": session_status,
+            "thread_bound": session["thread_id"] is not None,
+            "model_provider": model_provider,
+            "latest_job": job,
+        },
+    }
 
 
 async def _read_create_body(request: Request) -> dict[str, object]:
@@ -232,6 +318,14 @@ def install(relay_module) -> None:
                 relay_module,
                 f"/loop/provider/canary/{sid}/status",
             ), sid)
+        except CodexCanaryAdminProxyError as exc:
+            return _error(exc)
+
+    @app.get("/provider/canary/{session_id}/diagnostic")
+    async def canary_diagnostic(session_id: str, request: Request):
+        relay_module.check_auth(request)
+        try:
+            return _read_generation_diagnostic(_session_id(session_id))
         except CodexCanaryAdminProxyError as exc:
             return _error(exc)
 
