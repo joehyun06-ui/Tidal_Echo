@@ -357,7 +357,11 @@ class CodexGenerationWorker:
         correlated = correlated_turn_from_page(page, str(job["client_message_id"]))
         if correlated is None:
             if job["status"] in {"turn_dispatching", "dispatch_uncertain"}:
-                store.requeue_after_verified_turn_absent(self.store_path, job_id=job_id)
+                store.mark_failed(
+                    self.store_path,
+                    job_id=job_id,
+                    category="codex_generation_reconcile_unresolved",
+                )
             return
         updated = store.record_reconciled_turn(
             self.store_path,
