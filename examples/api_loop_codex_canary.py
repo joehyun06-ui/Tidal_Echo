@@ -20,9 +20,9 @@ from backend.codex_canary_loop_integration import (
     CodexCanaryLoopIntegrationError,
     build_completion_callback,
 )
-from backend.codex_generation_live_reliability import (
-    FailClosedCodexCanaryLoopIntegration,
-    ReliableCodexGenerationRuntime,
+from backend.codex_generation_live_reliability import FailClosedCodexCanaryLoopIntegration
+from backend.codex_generation_subscription_reliability import (
+    ResubscribingCodexGenerationRuntime,
 )
 from backend.codex_generation_runtime_config import load_generation_runtime_config
 from examples import api_loop as legacy
@@ -34,7 +34,7 @@ GENERATION_CONFIG = load_generation_runtime_config(
     persistent_root=PERSISTENT_ROOT,
     relay_db=Path(legacy.RELAY_DB),
 )
-RUNTIME = ReliableCodexGenerationRuntime(
+RUNTIME = ResubscribingCodexGenerationRuntime(
     control_config=legacy.CODEX_CONTROL_CONFIG,
     generation_config=GENERATION_CONFIG,
     relay_db=legacy.RELAY_DB,
