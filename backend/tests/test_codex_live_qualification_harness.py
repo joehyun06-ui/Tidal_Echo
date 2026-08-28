@@ -85,12 +85,19 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(harness.QualificationError):
                 harness.normalize_base_url(value)
 
-    def test_default_redirect_handler_refuses_redirect_requests(self):
+    def test_redirect_handler_turns_redirect_into_http_error(self):
         handler = harness._RejectRedirectHandler()
-        request = object()
-        self.assertIsNone(
-            handler.redirect_request(request, None, 302, "Found", {}, "https://other.invalid")
-        )
+        request = urllib.request.Request("https://api.example.invalid/provider/status")
+        body = io.BytesIO(b"")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            handler.http_error_302(
+                request,
+                body,
+                302,
+                "Found",
+                {"Location": "https://other.invalid"},
+            )
+        self.assertEqual(raised.exception.code, 302)
 
     def test_secret_is_read_from_named_environment_only(self):
         env = {"RELAY_SECRET": "abcDEF123!"}
@@ -247,6 +254,35 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_receipt_rejects_extra_fields_unresolved_provider_and_unbound_thread(self):
+        base = {
+            "version": 1,
+            "account": {
+                "connected": True,
+                "generation_provider": "api",
+                "usage_available": True,
+            },
+            "canary": {
+                "api_session": "api-canary-1",
+                "status": "active",
+                "model": "gpt-test",
+                "model_provider": "chatgpt",
+                "reasoning_effort": "high",
+                "thread_bound": True,
+            },
+        }
+        bad_extra = dict(base)
+        bad_extra["secret"] = "nope"
+        with self.assertRaisesRegex(harness.QualificationError, "qualification_receipt_invalid"):
+            harness._validate_receipt(bad_extra)
+        for field, value in (("model_provider", "unresolved"), ("thread_bound", False)):
+            bad = json.loads(json.dumps(base))
+            bad["canary"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                harness.QualificationError, "qualification_receipt_invalid"
+            ):
+                harness._validate_receipt(bad)
+
     def test_verify_after_restart_requires_same_pinned_contract(self):
         receipt = {
             "version": 1,
@@ -272,8 +308,7 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
         result = harness.verify_after_restart(client, receipt)
         self.assertTrue(result["restart_persistence"])
 
-        changed = dict(receipt)
-        changed["canary"] = dict(receipt["canary"])
+        changed = json.loads(json.dumps(receipt))
         changed["canary"]["model"] = "different-model"
         client, _ = self.client([
             {"connected": True, "generation_provider": "api"},
@@ -304,14 +339,17 @@ class CodexLiveQualificationHarnessTest(unittest.TestCase):
             "codex_control_disabled": True,
         })
 
-    def test_main_live_command_does_not_echo_secret(self):
+    def test_main_live_command_uses_supplied_environment_and_does_not_echo_secret(self):
         opener = QueueOpener([{"connected": True, "generation_provider": "api"}])
         with mock.patch.object(harness, "_open_no_redirect", opener):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = harness.main(
-                    ["--base-url", "https://api.example.invalid", "status"],
-                    environ={"RELAY_SECRET": "super-secret-token"},
+                    ["status"],
+                    environ={
+                        "RELAY_SECRET": "super-secret-token",
+                        "CODEX_QUALIFICATION_BASE_URL": "https://api.example.invalid",
+                    },
                 )
         self.assertEqual(code, 0)
         self.assertNotIn("super-secret-token", output.getvalue())
