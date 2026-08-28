@@ -87,6 +87,25 @@ print("ok")
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("ok", completed.stdout)
 
+    def test_render_canary_supervisor_bootstraps_repo_root_when_executed_directly(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = self._base_env(root)
+            env.pop("PYTHONPATH", None)
+            env["CODEX_CANARY_ENTRYPOINTS_ENABLED"] = "false"
+            env["PORT"] = ""
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "render_start_codex_canary.py")],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertNotIn("ModuleNotFoundError", completed.stderr)
+            self.assertIn("preflight_failed", completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
