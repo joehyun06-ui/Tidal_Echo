@@ -17,7 +17,7 @@ import time
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from backend import deployment_config, kelivo_service
+from backend import autonomous_wake_session_guard, deployment_config, kelivo_service
 from backend import app as relay_app
 
 
@@ -141,6 +141,15 @@ async def autonomous_wake_out(request: Request):
     existing = _existing_autonomous_message(run_id)
     if existing is not None:
         return {"ok": True, "status": "delivered", "id": existing["id"], "duplicate": True}
+
+    try:
+        if autonomous_wake_session_guard.is_active_codex_session(
+            api_session,
+            os.environ,
+        ):
+            return _error(409, "autonomous_wake_codex_session_forbidden")
+    except autonomous_wake_session_guard.AutonomousWakeSessionError as error:
+        return _error(503, error.category)
 
     meta = {
         "autonomous": True,
