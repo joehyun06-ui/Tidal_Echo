@@ -5,12 +5,11 @@ creation order, titles, and the active-session pointer.  P3-A extends only that
 existing session record with an immutable ``provider`` field.
 
 Safety rules:
-- missing provider on a pre-P3 row means ``api`` for backward compatibility;
 - a present provider must be exactly ``api`` or ``codex``;
+- missing provider on an ordinary pre-P3 row means ``api``;
+- missing provider with durable historical Codex evidence means ``codex``;
 - provider is immutable after session publication;
-- callers must still cross-check Codex rows against the durable Codex generation
-  store before dispatch.  This module never treats a UI title or ``pinned`` bit as
-  provider authority.
+- UI title/current-window/``pinned`` metadata never determines provider authority.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 
@@ -93,8 +92,14 @@ def _safe_created_at(value: object) -> str:
 class WebSessionProviderAuthority:
     """Read/write provider-aware Web sessions through the legacy api-loop config."""
 
-    def __init__(self, legacy) -> None:
+    def __init__(
+        self,
+        legacy,
+        *,
+        historical_provider: Callable[[str], str | None] | None = None,
+    ) -> None:
         self.legacy = legacy
+        self._historical_provider = historical_provider
 
     def _raw_rows(self) -> list[Mapping[str, object]]:
         rows = self.legacy.load_config().get("sessions")
@@ -109,19 +114,30 @@ class WebSessionProviderAuthority:
             out.append(item)
         return out
 
+    def _missing_provider(self, session_id: str) -> str:
+        if self._historical_provider is None:
+            return API_PROVIDER
+        historical = self._historical_provider(session_id)
+        if historical is None:
+            return API_PROVIDER
+        return normalize_provider(historical)
+
     def normalize_row(self, item: Mapping[str, object]) -> dict[str, Any]:
         if "id" not in item:
             raise WebSessionProviderAuthorityError("web_session_authority_invalid")
+        session_id = _safe_session_id(item.get("id"))
+        provider = (
+            normalize_provider(item.get("provider"))
+            if "provider" in item
+            else self._missing_provider(session_id)
+        )
         row: dict[str, Any] = {
-            "id": _safe_session_id(item.get("id")),
+            "id": session_id,
             "title": _safe_title(item.get("title")),
             "since_id": _safe_since_id(item.get("since_id")),
             "created_at": _safe_created_at(item.get("created_at")),
             "pinned": bool(item.get("pinned", False)),
-            "provider": normalize_provider(
-                item.get("provider"),
-                missing_means_api="provider" not in item,
-            ),
+            "provider": provider,
         }
         return row
 
