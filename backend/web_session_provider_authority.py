@@ -1,13 +1,14 @@
 """Durable per-Web-session generation-provider authority for P3-A.
 
 The api-loop config file is already the durable authority for Web session identity,
-creation order, titles, and the active-session pointer.  P3-A extends only that
+creation order, titles, and the active-session pointer. P3-A extends only that
 existing session record with an immutable ``provider`` field.
 
 Safety rules:
 - a present provider must be exactly ``api`` or ``codex``;
 - missing provider on an ordinary pre-P3 row means ``api``;
 - missing provider with durable historical Codex evidence means ``codex``;
+- explicit API authority conflicting with Codex history fails closed;
 - provider is immutable after session publication;
 - UI title/current-window/``pinned`` metadata never determines provider authority.
 """
@@ -114,23 +115,25 @@ class WebSessionProviderAuthority:
             out.append(item)
         return out
 
-    def _missing_provider(self, session_id: str) -> str:
+    def _historical(self, session_id: str) -> str | None:
         if self._historical_provider is None:
-            return API_PROVIDER
+            return None
         historical = self._historical_provider(session_id)
-        if historical is None:
-            return API_PROVIDER
-        return normalize_provider(historical)
+        return normalize_provider(historical) if historical is not None else None
 
     def normalize_row(self, item: Mapping[str, object]) -> dict[str, Any]:
         if "id" not in item:
             raise WebSessionProviderAuthorityError("web_session_authority_invalid")
         session_id = _safe_session_id(item.get("id"))
-        provider = (
-            normalize_provider(item.get("provider"))
-            if "provider" in item
-            else self._missing_provider(session_id)
-        )
+        historical = self._historical(session_id)
+        if "provider" in item:
+            provider = normalize_provider(item.get("provider"))
+            if historical is not None and historical != provider:
+                raise WebSessionProviderAuthorityError(
+                    "web_session_provider_authority_conflict"
+                )
+        else:
+            provider = historical or API_PROVIDER
         row: dict[str, Any] = {
             "id": session_id,
             "title": _safe_title(item.get("title")),
