@@ -50,6 +50,41 @@ class WebSessionProviderAuthorityTest(unittest.TestCase):
         self.assertTrue(row["pinned"])
         self.assertEqual(authority.provider_for_session("api-old"), API_PROVIDER)
 
+    def test_pre_p3_row_with_durable_codex_history_bootstraps_to_codex(self):
+        legacy = FakeLegacy({
+            "sessions": [{
+                "id": "api-old-canary",
+                "title": "Anything",
+                "since_id": 0,
+                "created_at": "2026-08-28T00:00:00+00:00",
+            }]
+        })
+        authority = WebSessionProviderAuthority(
+            legacy,
+            historical_provider=lambda sid: CODEX_PROVIDER if sid == "api-old-canary" else None,
+        )
+        self.assertEqual(
+            authority.provider_for_session("api-old-canary"),
+            CODEX_PROVIDER,
+        )
+        self.assertEqual(authority.session_rows()[0]["provider"], CODEX_PROVIDER)
+
+    def test_explicit_provider_wins_and_is_not_overwritten_by_history(self):
+        legacy = FakeLegacy({
+            "sessions": [{
+                "id": "api-explicit",
+                "title": "API",
+                "since_id": 0,
+                "created_at": "",
+                "provider": API_PROVIDER,
+            }]
+        })
+        authority = WebSessionProviderAuthority(
+            legacy,
+            historical_provider=lambda _sid: CODEX_PROVIDER,
+        )
+        self.assertEqual(authority.provider_for_session("api-explicit"), API_PROVIDER)
+
     def test_explicit_codex_provider_is_durable_across_reopen(self):
         legacy = FakeLegacy()
         authority = WebSessionProviderAuthority(legacy)
