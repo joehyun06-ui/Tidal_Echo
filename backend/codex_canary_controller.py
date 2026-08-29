@@ -8,6 +8,7 @@ Admission persists a durable job and returns immediately; generation is worker-o
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 from typing import Mapping
 
@@ -82,10 +83,33 @@ class CodexCanaryController:
         except store.CodexGenerationStoreError as exc:
             raise CodexCanaryControllerError(exc.category) from None
 
+    def historical_provider(self, api_session: str) -> str | None:
+        """Return durable pre-P3 provider evidence for active or retired sessions.
+
+        A missing store means there is no historical Codex evidence.  A present but
+        unreadable/invalid store fails closed so a historical Codex session cannot
+        be silently reclassified as API during P3 bootstrap.
+        """
+        if not self.store_path.is_file():
+            return None
+        try:
+            row = store.get_session(self.store_path, api_session)
+        except (OSError, sqlite3.Error, store.CodexGenerationStoreError):
+            raise CodexCanaryControllerError(
+                "codex_generation_store_unavailable"
+            ) from None
+        if row is None:
+            return None
+        if row.get("provider") != "codex":
+            raise CodexCanaryControllerError(
+                "codex_generation_store_schema_invalid"
+            )
+        return "codex"
+
     def is_pinned(self, api_session: str) -> bool:
         try:
             row = store.get_session(self.store_path, api_session)
-        except store.CodexGenerationStoreError:
+        except (sqlite3.Error, store.CodexGenerationStoreError):
             return False
         return row is not None and row.get("status") == "active"
 
