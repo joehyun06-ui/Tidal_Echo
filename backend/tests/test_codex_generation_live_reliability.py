@@ -227,21 +227,52 @@ class CompletionProjectionTest(unittest.TestCase):
 
 
 class FailClosedIntegrationTest(unittest.IsolatedAsyncioTestCase):
-    def legacy(self):
+    def legacy(self, *, provider=None):
         class Legacy:
             TRANSIENT_CONTINUITY_ENABLED = False
             RELAY_DB = "/tmp/relay.db"
             CODEX_CONTROL = object()
             _CODEX_CANARY_SESSION_LOCK_INSTALLED = False
 
-            def __init__(self):
+            def __init__(self, selected_provider):
+                self.legacy_calls = []
+                row = {
+                    "id": "api-canary" if selected_provider == "codex" else "api-normal",
+                    "title": "test",
+                    "since_id": 0,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                }
+                if selected_provider is not None:
+                    row["provider"] = selected_provider
+                self.cfg = {"sessions": [row]}
                 self.create_session = lambda *a, **k: None
                 self.patch_session = lambda *a, **k: None
                 self.save_sessions = lambda *a, **k: None
-                self.legacy_calls = []
+
+            def load_config(self):
+                return {
+                    **self.cfg,
+                    "sessions": [dict(row) for row in self.cfg.get("sessions", [])],
+                }
+
+            def save_config(self, cfg):
+                self.cfg = {
+                    **cfg,
+                    "sessions": [dict(row) for row in cfg.get("sessions", [])],
+                }
+
+            def session_rows(self):
+                return [dict(row) for row in self.cfg.get("sessions", [])]
+
+            def sessions_public(self):
+                return {"active_session": self.active_session_id(), "sessions": self.session_rows()}
 
             def active_session_id(self):
-                return "api-normal"
+                rows = self.cfg.get("sessions", [])
+                return rows[-1]["id"] if rows else ""
+
+            def now_iso(self):
+                return "2026-01-01T00:00:00+00:00"
 
             async def handle_ingest(self, text, before_id, session_id, **kwargs):
                 self.legacy_calls.append((text, before_id, session_id, kwargs))
@@ -253,10 +284,10 @@ class FailClosedIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     "api_session": session_id,
                 }
 
-        return Legacy()
+        return Legacy(provider)
 
-    async def test_pinned_session_generation_freeze_does_not_fallback_to_api(self):
-        legacy = self.legacy()
+    async def test_codex_session_generation_freeze_does_not_fallback_to_api(self):
+        legacy = self.legacy(provider="codex")
         runtime = SimpleNamespace(
             generation_enabled=False,
             controller=SimpleNamespace(is_pinned=lambda sid: sid == "api-canary"),
@@ -272,8 +303,8 @@ class FailClosedIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(legacy.legacy_calls, [])
 
-    async def test_unpinned_session_generation_freeze_keeps_legacy_api_path(self):
-        legacy = self.legacy()
+    async def test_api_session_generation_freeze_keeps_legacy_api_path(self):
+        legacy = self.legacy(provider="api")
         runtime = SimpleNamespace(
             generation_enabled=False,
             controller=SimpleNamespace(is_pinned=lambda _sid: False),

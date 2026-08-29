@@ -1,8 +1,9 @@
-"""Opt-in api-loop integration controller for the explicit Codex Web canary.
+"""Opt-in api-loop integration controller for explicit Codex Web sessions.
 
-The current `examples.api_loop` remains the authority for every unpinned surface.
-Only an explicitly pinned session is intercepted, and pinned ineligible input fails
-closed rather than crossing back to the API provider.
+P3-A makes the durable Web-session record the provider authority. Existing rows
+without a provider field remain API unless the durable Codex generation store proves
+that exact session was previously Codex. Codex dispatch requires both Codex Web
+authority and an active durable Codex pin; disagreement fails closed.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import uuid
 from collections.abc import Mapping
 from threading import RLock
 
+from . import web_session_provider_authority
 from .codex_account_control_facade import CodexAccountFacadeError
 from .codex_app_server_control import CodexControlError
 from .codex_canary_controller import CodexCanaryControllerError
@@ -87,33 +89,116 @@ def build_completion_callback(legacy):
     return completion_callback
 
 
+def _authority_status(category: str) -> int:
+    if category in {
+        "web_session_provider_invalid",
+        "web_session_id_invalid",
+        "web_session_title_invalid",
+        "web_session_since_id_invalid",
+        "web_session_created_at_invalid",
+        "web_session_patch_invalid",
+    }:
+        return 400
+    if category == "web_session_not_found":
+        return 404
+    if category in {"web_session_provider_immutable", "web_session_conflict"}:
+        return 409
+    return 503
+
+
 class CodexCanaryLoopIntegration:
     def __init__(self, legacy, runtime) -> None:
         self.legacy = legacy
         self.runtime = runtime
         self._session_lock = RLock()
+        historical = getattr(self.runtime.controller, "historical_provider", None)
+
+        def historical_provider(session_id: str) -> str | None:
+            if not callable(historical):
+                return None
+            try:
+                return historical(session_id)
+            except CodexCanaryControllerError:
+                raise web_session_provider_authority.WebSessionProviderAuthorityError(
+                    "web_session_provider_authority_unavailable"
+                ) from None
+
+        self.session_authority = web_session_provider_authority.WebSessionProviderAuthority(
+            legacy,
+            historical_provider=historical_provider,
+        )
         self._original_create_session = legacy.create_session
         self._original_patch_session = legacy.patch_session
         self._original_save_sessions = legacy.save_sessions
+        self._original_session_rows = legacy.session_rows
+        self._original_active_session_id = legacy.active_session_id
+        self._original_sessions_public = legacy.sessions_public
+
+    def _authority_call(self, operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+            raise CodexCanaryLoopIntegrationError(
+                exc.category,
+                status_code=_authority_status(exc.category),
+            ) from None
 
     def install_legacy_globals(self) -> None:
-        """Use the shared P1 facade and serialize legacy session mutations in this entrypoint."""
+        """Use shared P1 control plus provider-aware serialized session mutations."""
         self.legacy.CODEX_CONTROL = LegacyControlAdapter(self.runtime.control)
         if getattr(self.legacy, "_CODEX_CANARY_SESSION_LOCK_INSTALLED", False):
             return
 
-        def create_session(*args, **kwargs):
+        def session_rows():
             with self._session_lock:
-                return self._original_create_session(*args, **kwargs)
+                return self._authority_call(self.session_authority.session_rows)
 
-        def patch_session(*args, **kwargs):
+        def active_session_id():
             with self._session_lock:
-                return self._original_patch_session(*args, **kwargs)
+                return self._authority_call(self.session_authority.active_session_id)
 
-        def save_sessions(*args, **kwargs):
+        def sessions_public():
             with self._session_lock:
-                return self._original_save_sessions(*args, **kwargs)
+                return self._authority_call(self.session_authority.sessions_public)
 
+        def create_session(
+            title="New chat",
+            since_id=0,
+            activate=True,
+            provider=web_session_provider_authority.API_PROVIDER,
+        ):
+            if provider != web_session_provider_authority.API_PROVIDER:
+                raise CodexCanaryLoopIntegrationError(
+                    "web_session_provider_requires_async_creation",
+                    status_code=409,
+                )
+            with self._session_lock:
+                return self._authority_call(
+                    self.session_authority.create_api_session,
+                    title=title,
+                    since_id=since_id,
+                    activate=activate,
+                )
+
+        def patch_session(session_id, body):
+            with self._session_lock:
+                return self._authority_call(
+                    self.session_authority.patch_session,
+                    session_id,
+                    body,
+                )
+
+        def save_sessions(rows, active=None):
+            with self._session_lock:
+                return self._authority_call(
+                    self.session_authority.save_sessions,
+                    rows,
+                    active,
+                )
+
+        self.legacy.session_rows = session_rows
+        self.legacy.active_session_id = active_session_id
+        self.legacy.sessions_public = sessions_public
         self.legacy.create_session = create_session
         self.legacy.patch_session = patch_session
         self.legacy.save_sessions = save_sessions
@@ -173,6 +258,13 @@ class CodexCanaryLoopIntegration:
             channel_conversation=str(body.get("channel_conversation") or "").strip(),
         )
 
+    def provider_for_session(self, session_id: str) -> str:
+        with self._session_lock:
+            return self._authority_call(
+                self.session_authority.provider_for_session,
+                session_id,
+            )
+
     async def handle_ingest(self, body: Mapping[str, object]):
         if not isinstance(body, dict):
             raise CodexCanaryLoopIntegrationError("invalid body", status_code=400)
@@ -185,8 +277,37 @@ class CodexCanaryLoopIntegration:
             or self.legacy.active_session_id()
             or ""
         ).strip()
-        if not self.runtime.generation_enabled or not self.runtime.controller.is_pinned(session_id):
+        provider = self.provider_for_session(session_id)
+        if provider == web_session_provider_authority.API_PROVIDER:
+            # Preserve the generation-off transport boundary: an API-authority
+            # session must not even touch the Codex generation store while the
+            # generation gate is closed.
+            if self.runtime.generation_enabled:
+                pinned = bool(session_id and self.runtime.controller.is_pinned(session_id))
+                if pinned:
+                    raise CodexCanaryLoopIntegrationError(
+                        "web_session_provider_authority_mismatch",
+                        status_code=409,
+                    )
             return await self._legacy_ingest(body)
+        if provider != web_session_provider_authority.CODEX_PROVIDER:
+            raise CodexCanaryLoopIntegrationError(
+                "web_session_provider_invalid",
+                status_code=503,
+            )
+        # A Codex-authority session freezes before any pin lookup. This keeps
+        # generation OFF from creating or opening a Codex generation database.
+        if not self.runtime.generation_enabled:
+            raise CodexCanaryLoopIntegrationError(
+                "codex_generation_disabled",
+                status_code=503,
+            )
+        pinned = bool(session_id and self.runtime.controller.is_pinned(session_id))
+        if not pinned:
+            raise CodexCanaryLoopIntegrationError(
+                "web_session_provider_authority_mismatch",
+                status_code=409,
+            )
         if bool(body.get("dry")):
             raise CodexCanaryLoopIntegrationError("codex_canary_dry_unsupported", status_code=409)
         msg_id = body.get("id")
@@ -212,8 +333,10 @@ class CodexCanaryLoopIntegration:
         except CodexCanaryControllerError as exc:
             raise CodexCanaryLoopIntegrationError(exc.category, status_code=409) from None
         if accepted is None:
-            # Pin disappeared between the first read and admission. Do not cross provider.
-            raise CodexCanaryLoopIntegrationError("codex_canary_session_unavailable", status_code=409)
+            raise CodexCanaryLoopIntegrationError(
+                "web_session_provider_authority_mismatch",
+                status_code=409,
+            )
         return {
             "ok": True,
             "queued": True,
@@ -225,7 +348,29 @@ class CodexCanaryLoopIntegration:
             "status": accepted["status"],
         }
 
-    async def create_canary_session(self, *, title: str = "Codex canary") -> Mapping[str, object]:
+    async def create_web_session(
+        self,
+        *,
+        provider: str,
+        title: str = "New chat",
+        since_id: int = 0,
+        activate: bool = True,
+    ) -> Mapping[str, object]:
+        try:
+            provider = web_session_provider_authority.normalize_provider(provider)
+        except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+            raise CodexCanaryLoopIntegrationError(
+                exc.category,
+                status_code=_authority_status(exc.category),
+            ) from None
+        if provider == web_session_provider_authority.API_PROVIDER:
+            with self._session_lock:
+                return self._authority_call(
+                    self.session_authority.create_api_session,
+                    title=title,
+                    since_id=since_id,
+                    activate=activate,
+                )
         if not self.runtime.generation_enabled:
             raise CodexCanaryLoopIntegrationError("codex_generation_disabled", status_code=503)
         sid = (
@@ -235,29 +380,58 @@ class CodexCanaryLoopIntegration:
             + uuid.uuid4().hex[:4]
         )
         try:
+            row = self.session_authority.new_row(
+                title=title,
+                since_id=since_id,
+                provider=web_session_provider_authority.CODEX_PROVIDER,
+                session_id=sid,
+            )
+        except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+            raise CodexCanaryLoopIntegrationError(
+                exc.category,
+                status_code=_authority_status(exc.category),
+            ) from None
+        try:
             await self.runtime.controller.pin_session(sid)
         except CodexCanaryControllerError as exc:
             raise CodexCanaryLoopIntegrationError(exc.category, status_code=503) from None
-        row = {
-            "id": sid,
-            "title": (title or "Codex canary").strip()[:120] or "Codex canary",
-            "since_id": 0,
-            "created_at": self.legacy.now_iso(),
-        }
         try:
             with self._session_lock:
-                rows = self.legacy.session_rows()
-                if any(item.get("id") == sid for item in rows):
-                    raise CodexCanaryLoopIntegrationError("codex_canary_session_conflict")
-                rows.append(row)
-                self._original_save_sessions(rows, None)
+                return self._authority_call(
+                    self.session_authority.publish_row,
+                    row,
+                    activate=activate,
+                )
         except Exception:
             try:
                 self.runtime.controller.retire_session(sid)
             except Exception:
                 pass
             raise
-        return row
+
+    async def create_canary_session(self, *, title: str = "Codex canary") -> Mapping[str, object]:
+        return await self.create_web_session(
+            provider=web_session_provider_authority.CODEX_PROVIDER,
+            title=title,
+            since_id=0,
+            activate=False,
+        )
+
+    def patch_web_session(
+        self,
+        session_id: str,
+        body: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        with self._session_lock:
+            return self._authority_call(
+                self.session_authority.patch_session,
+                session_id,
+                body,
+            )
+
+    def sessions_public(self) -> Mapping[str, object]:
+        with self._session_lock:
+            return self._authority_call(self.session_authority.sessions_public)
 
     def retire_canary_session(self, api_session: str) -> Mapping[str, object]:
         try:

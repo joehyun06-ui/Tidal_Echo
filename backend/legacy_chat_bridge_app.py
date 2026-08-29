@@ -143,7 +143,7 @@ async def autonomous_wake_out(request: Request):
         return {"ok": True, "status": "delivered", "id": existing["id"], "duplicate": True}
 
     try:
-        if autonomous_wake_session_guard.is_active_codex_session(
+        if autonomous_wake_session_guard.is_codex_web_session(
             api_session,
             os.environ,
         ):
