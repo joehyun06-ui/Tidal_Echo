@@ -1,10 +1,10 @@
 """Fail-closed routing guard for autonomous wake chat delivery.
 
-Autonomous wake is an ordinary/API surface.  It must never inherit whichever Web
+Autonomous wake is an ordinary/API surface. It must never inherit whichever Web
 session happens to be active and, under P3, it must never target any Web session
 whose durable provider authority is Codex -- even after that Codex session has been
-retired.  The durable Web provider field and Codex generation store are independent
-cross-checks; UI titles and the presentation-level ``pinned`` field are never used.
+retired. Missing pre-P3 provider fields are reconciled only against durable Codex
+store history; UI titles and presentation-level ``pinned`` metadata are never used.
 """
 
 from __future__ import annotations
@@ -55,8 +55,8 @@ def _store_path(environ: Mapping[str, str]) -> Path:
     return path
 
 
-def _loop_provider_map(environ: Mapping[str, str]) -> dict[str, str]:
-    """Read only session id/provider from the durable loop config when configured."""
+def _loop_provider_map(environ: Mapping[str, str]) -> dict[str, str | None]:
+    """Read only session id and explicit provider from durable loop config."""
     raw = str(environ.get("LOOP_CONFIG", "")).strip()
     if not raw:
         return {}
@@ -90,44 +90,36 @@ def _loop_provider_map(environ: Mapping[str, str]) -> dict[str, str]:
         rows = []
     if not isinstance(rows, list):
         raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
-    result: dict[str, str] = {}
+    result: dict[str, str | None] = {}
     for item in rows:
         if not isinstance(item, dict):
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
         session = str(item.get("id") or "").strip()
         if _API_SESSION_RE.fullmatch(session) is None or session in result:
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
-        provider = item.get("provider", "api")
-        if provider not in {"api", "codex"}:
+        provider = item.get("provider") if "provider" in item else None
+        if provider is not None and provider not in {"api", "codex"}:
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
-        result[session] = str(provider)
+        result[session] = str(provider) if provider is not None else None
     return result
 
 
-def is_active_codex_session(
+def _codex_session(
     api_session: str,
-    environ: Mapping[str, str] | None = None,
-) -> bool:
-    """Return whether ``api_session`` is active in the Codex generation store.
-
-    When Codex generation is enabled, inability to read its authority store is a
-    hard failure instead of being interpreted as "not Codex".
-    """
-    env = os.environ if environ is None else environ
+    environ: Mapping[str, str],
+) -> Mapping[str, object] | None:
     session = str(api_session or "").strip()
     if not session:
-        return False
+        return None
     if _API_SESSION_RE.fullmatch(session) is None:
         raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
-
-    store_path = _store_path(env)
+    store_path = _store_path(environ)
     if not store_path.is_file():
-        if _generation_enabled(env):
+        if _generation_enabled(environ):
             raise AutonomousWakeSessionError(
                 "autonomous_wake_session_guard_unavailable"
             )
-        return False
-
+        return None
     try:
         row = codex_generation_store.get_session(store_path, session)
     except (
@@ -138,11 +130,19 @@ def is_active_codex_session(
         raise AutonomousWakeSessionError(
             "autonomous_wake_session_guard_unavailable"
         ) from None
-    return bool(
-        row is not None
-        and row.get("provider") == "codex"
-        and row.get("status") == "active"
-    )
+    if row is not None and row.get("provider") != "codex":
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+    return row
+
+
+def is_active_codex_session(
+    api_session: str,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether ``api_session`` is active in the Codex generation store."""
+    env = os.environ if environ is None else environ
+    row = _codex_session(api_session, env)
+    return bool(row is not None and row.get("status") == "active")
 
 
 def select_wake_api_session(
@@ -151,12 +151,12 @@ def select_wake_api_session(
 ) -> str:
     """Choose the stable ordinary/API session used by autonomous wake.
 
-    ``AUTONOMOUS_WAKE_API_SESSION`` may explicitly pin the target.  Without an
-    override, API-loop session order is used as a stable primary-session order.
-    A durable Web ``provider=codex`` row is never ordinary, including after Codex
-    retirement.  An API row that is nevertheless active in the Codex store is an
-    authority mismatch and fails closed.  If no ordinary API session exists, the
-    untagged legacy surface (``""``) is used.  The active Web window is never read.
+    ``AUTONOMOUS_WAKE_API_SESSION`` may explicitly pin the target. Without an
+    override, API-loop creation order is used. Explicit ``provider=codex`` is never
+    ordinary. A pre-P3 row with no provider becomes Codex only when the durable
+    Codex store proves that exact session existed there (active or retired).
+    Explicit API authority conflicting with any Codex-store history fails closed.
+    If no ordinary API session exists, the untagged legacy surface (``""``) is used.
     """
     env = os.environ if environ is None else environ
     explicit = str(env.get("AUTONOMOUS_WAKE_API_SESSION", "")).strip()
@@ -174,7 +174,7 @@ def select_wake_api_session(
         if _API_SESSION_RE.fullmatch(session) is None:
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
         session_ids.append(session)
-        row_provider = item.get("provider")
+        row_provider = item.get("provider") if "provider" in item else None
         if row_provider is not None and row_provider not in {"api", "codex"}:
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
         configured_provider = config_providers.get(session)
@@ -184,11 +184,16 @@ def select_wake_api_session(
             and row_provider != configured_provider
         ):
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
-        provider = str(row_provider or configured_provider or "api")
-        providers[session] = provider
-        active_codex = is_active_codex_session(session, env)
-        if provider == "api" and active_codex:
+
+        explicit_provider = row_provider or configured_provider
+        historical_codex = _codex_session(session, env) is not None
+        if explicit_provider == "api" and historical_codex:
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        provider = str(
+            explicit_provider
+            or ("codex" if historical_codex else "api")
+        )
+        providers[session] = provider
         if provider == "api":
             ordinary.append(session)
 
@@ -197,8 +202,6 @@ def select_wake_api_session(
             raise AutonomousWakeSessionError("autonomous_wake_target_invalid")
         if providers.get(explicit) == "codex":
             raise AutonomousWakeSessionError("autonomous_wake_codex_session_forbidden")
-        if is_active_codex_session(explicit, env):
-            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
         return explicit
 
     return ordinary[0] if ordinary else ""
