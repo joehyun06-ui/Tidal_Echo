@@ -10,7 +10,8 @@ Safety rules:
 - missing provider with durable historical Codex evidence means ``codex``;
 - explicit API authority conflicting with Codex history fails closed;
 - provider is immutable after session publication;
-- UI title/current-window/``pinned`` metadata never determines provider authority.
+- UI title/current-window/``pinned`` metadata never determines provider authority;
+- provider lookup for a non-Web session does not validate unrelated Web rows.
 """
 
 from __future__ import annotations
@@ -155,10 +156,13 @@ class WebSessionProviderAuthority:
         if not session_id:
             return None
         session_id = _safe_session_id(session_id)
-        for row in self.session_rows():
-            if row["id"] == session_id:
-                return row
-        return None
+        matches: list[Mapping[str, object]] = []
+        for item in self._raw_rows():
+            if item.get("id") == session_id:
+                matches.append(item)
+        if len(matches) > 1:
+            raise WebSessionProviderAuthorityError("web_session_authority_invalid")
+        return self.normalize_row(matches[0]) if matches else None
 
     def provider_for_session(self, session_id: str) -> str:
         """Return API for non-Web/unknown sessions; known Web rows carry authority."""
