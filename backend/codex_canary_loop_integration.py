@@ -278,24 +278,31 @@ class CodexCanaryLoopIntegration:
             or ""
         ).strip()
         provider = self.provider_for_session(session_id)
-        pinned = bool(session_id and self.runtime.controller.is_pinned(session_id))
         if provider == web_session_provider_authority.API_PROVIDER:
-            if pinned:
-                raise CodexCanaryLoopIntegrationError(
-                    "web_session_provider_authority_mismatch",
-                    status_code=409,
-                )
+            # Preserve the generation-off transport boundary: an API-authority
+            # session must not even touch the Codex generation store while the
+            # generation gate is closed.
+            if self.runtime.generation_enabled:
+                pinned = bool(session_id and self.runtime.controller.is_pinned(session_id))
+                if pinned:
+                    raise CodexCanaryLoopIntegrationError(
+                        "web_session_provider_authority_mismatch",
+                        status_code=409,
+                    )
             return await self._legacy_ingest(body)
         if provider != web_session_provider_authority.CODEX_PROVIDER:
             raise CodexCanaryLoopIntegrationError(
                 "web_session_provider_invalid",
                 status_code=503,
             )
+        # A Codex-authority session freezes before any pin lookup. This keeps
+        # generation OFF from creating or opening a Codex generation database.
         if not self.runtime.generation_enabled:
             raise CodexCanaryLoopIntegrationError(
                 "codex_generation_disabled",
                 status_code=503,
             )
+        pinned = bool(session_id and self.runtime.controller.is_pinned(session_id))
         if not pinned:
             raise CodexCanaryLoopIntegrationError(
                 "web_session_provider_authority_mismatch",
