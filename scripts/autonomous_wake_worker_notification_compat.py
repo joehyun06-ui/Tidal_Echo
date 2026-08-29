@@ -4,11 +4,10 @@
 The Supabase wake bridge remains responsible for phone-activity input, durable
 wake-run bookkeeping, policy values, and the historical ntfy side channel.
 GuiTing's real chat moved to the Render relay SQLite, so this launcher replaces
-the stale Supabase recent-chat/idle fields with a read-only snapshot of the
-currently active canonical relay session before each agent run. Accepted wake
-messages are then written into that same relay session through an authenticated
-localhost endpoint, which fans them out to GuiTing and deduplicates by wake run
-id.
+the stale Supabase recent-chat/idle fields with a read-only snapshot of a stable
+ordinary/API relay session before each agent run. Accepted wake messages are then
+written into that same ordinary session through an authenticated localhost
+endpoint, which fans them out to GuiTing and deduplicates by wake run id.
 
 ntfy failure stays non-fatal: the canonical relay is the user-visible source of
 truth, not the ntfy side channel.
@@ -25,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from backend import autonomous_wake_session_guard
 
 import autonomous_wake_worker as worker
 
@@ -59,14 +60,18 @@ def _parse_utc(value: object) -> datetime | None:
 
 
 def _active_api_session() -> str:
+    """Return the stable autonomous-wake target, never the active Web window."""
     try:
         from examples import api_loop
-        active = str(api_loop.active_session_id() or "").strip()
+
+        return autonomous_wake_session_guard.select_wake_api_session(
+            api_loop.session_rows(),
+            os.environ,
+        )
+    except autonomous_wake_session_guard.AutonomousWakeSessionError as error:
+        raise RuntimeError(error.category) from None
     except Exception:
         raise RuntimeError("canonical_relay_unavailable") from None
-    if len(active) > 128:
-        raise RuntimeError("canonical_relay_unavailable")
-    return active
 
 
 def _canonical_context() -> dict[str, Any]:
