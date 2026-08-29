@@ -108,6 +108,30 @@ class WebSessionProviderAuthorityTest(unittest.TestCase):
         self.assertEqual(authority.provider_for_session("telegram-conversation"), API_PROVIDER)
         self.assertEqual(authority.provider_for_session(""), API_PROVIDER)
 
+    def test_unknown_non_web_session_ignores_unrelated_web_conflict(self):
+        legacy = FakeLegacy({
+            "sessions": [{
+                "id": "api-conflict",
+                "title": "bad web row",
+                "since_id": 0,
+                "created_at": "",
+                "provider": API_PROVIDER,
+            }]
+        })
+        authority = WebSessionProviderAuthority(
+            legacy,
+            historical_provider=lambda sid: CODEX_PROVIDER if sid == "api-conflict" else None,
+        )
+        self.assertEqual(
+            authority.provider_for_session("telegram-conversation"),
+            API_PROVIDER,
+        )
+        with self.assertRaisesRegex(
+            WebSessionProviderAuthorityError,
+            "web_session_provider_authority_conflict",
+        ):
+            authority.session_rows()
+
     def test_provider_is_immutable(self):
         legacy = FakeLegacy()
         authority = WebSessionProviderAuthority(legacy)
