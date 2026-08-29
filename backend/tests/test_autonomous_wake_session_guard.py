@@ -164,7 +164,7 @@ class AutonomousWakeSessionGuardTests(unittest.TestCase):
 
         self.assertEqual(selected, "api-main")
 
-    def test_loop_config_authority_excludes_retired_codex_when_worker_rows_lack_provider(self):
+    def test_pre_p3_missing_provider_uses_retired_codex_store_history(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             store_path = root / "codex-generation.db"
@@ -174,8 +174,9 @@ class AutonomousWakeSessionGuardTests(unittest.TestCase):
                 store_path,
                 api_session="api-canary",
             )
+            # This matches the real pre-P3 canary: Web row has no provider field.
             self._write_loop_config(loop_config, [
-                {"id": "api-canary", "provider": "codex"},
+                {"id": "api-canary", "title": "ordinary-looking-title"},
             ])
 
             selected = guard.select_wake_api_session(
@@ -212,7 +213,7 @@ class AutonomousWakeSessionGuardTests(unittest.TestCase):
                     env,
                 )
 
-    def test_api_authority_with_active_codex_pin_fails_closed(self):
+    def test_api_authority_with_codex_store_history_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             store_path = root / "codex-generation.db"
