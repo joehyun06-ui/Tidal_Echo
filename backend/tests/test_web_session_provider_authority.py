@@ -69,7 +69,7 @@ class WebSessionProviderAuthorityTest(unittest.TestCase):
         )
         self.assertEqual(authority.session_rows()[0]["provider"], CODEX_PROVIDER)
 
-    def test_explicit_provider_wins_and_is_not_overwritten_by_history(self):
+    def test_explicit_api_conflicting_with_codex_history_fails_closed(self):
         legacy = FakeLegacy({
             "sessions": [{
                 "id": "api-explicit",
@@ -83,7 +83,11 @@ class WebSessionProviderAuthorityTest(unittest.TestCase):
             legacy,
             historical_provider=lambda _sid: CODEX_PROVIDER,
         )
-        self.assertEqual(authority.provider_for_session("api-explicit"), API_PROVIDER)
+        with self.assertRaisesRegex(
+            WebSessionProviderAuthorityError,
+            "web_session_provider_authority_conflict",
+        ):
+            authority.provider_for_session("api-explicit")
 
     def test_explicit_codex_provider_is_durable_across_reopen(self):
         legacy = FakeLegacy()
