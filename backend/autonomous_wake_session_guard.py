@@ -163,6 +163,35 @@ def is_active_codex_session(
     return bool(row is not None and row.get("status") == "active")
 
 
+def is_codex_web_session(
+    api_session: str,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether autonomous wake must treat a Web session as Codex forever.
+
+    This is the final-persistence-boundary classifier. An explicit durable
+    ``provider=codex`` row is sufficient to forbid wake delivery. A pre-P3 row with
+    no provider is Codex when the generation store proves historical Codex ownership
+    (active or retired). Explicit API authority conflicting with Codex history fails
+    closed instead of being interpreted as ordinary API.
+    """
+    env = os.environ if environ is None else environ
+    session = str(api_session or "").strip()
+    if not session:
+        return False
+    if _API_SESSION_RE.fullmatch(session) is None:
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+
+    provider = _loop_provider_map(env).get(session)
+    if provider == "codex":
+        return True
+
+    historical_codex = _codex_session(session, env) is not None
+    if provider == "api" and historical_codex:
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+    return historical_codex
+
+
 def select_wake_api_session(
     sessions: Iterable[Mapping[str, object]],
     environ: Mapping[str, str] | None = None,
