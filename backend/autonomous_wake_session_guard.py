@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -55,6 +56,24 @@ def _store_path(environ: Mapping[str, str]) -> Path:
     return path
 
 
+def _regular_file_size(path: Path, *, missing_ok: bool) -> int | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise AutonomousWakeSessionError(
+            "autonomous_wake_session_guard_unavailable"
+        ) from None
+    except OSError:
+        raise AutonomousWakeSessionError(
+            "autonomous_wake_session_guard_unavailable"
+        ) from None
+    if not stat.S_ISREG(info.st_mode):
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+    return int(info.st_size)
+
+
 def _loop_provider_map(environ: Mapping[str, str]) -> dict[str, str | None]:
     """Read only session id and explicit provider from durable loop config."""
     raw = str(environ.get("LOOP_CONFIG", "")).strip()
@@ -68,17 +87,13 @@ def _loop_provider_map(environ: Mapping[str, str]) -> dict[str, str | None]:
         ) from None
     if not path.is_absolute() or ".." in path.parts:
         raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
-    if not path.exists():
+    size = _regular_file_size(path, missing_ok=True)
+    if size is None:
         return {}
+    if size <= 0 or size > _LOOP_CONFIG_MAX_BYTES:
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
     try:
-        size = path.stat().st_size
-        if size <= 0 or size > _LOOP_CONFIG_MAX_BYTES:
-            raise AutonomousWakeSessionError(
-                "autonomous_wake_session_guard_unavailable"
-            )
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except AutonomousWakeSessionError:
-        raise
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise AutonomousWakeSessionError(
             "autonomous_wake_session_guard_unavailable"
@@ -114,12 +129,15 @@ def _codex_session(
     if _API_SESSION_RE.fullmatch(session) is None:
         raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
     store_path = _store_path(environ)
-    if not store_path.is_file():
+    size = _regular_file_size(store_path, missing_ok=True)
+    if size is None:
         if _generation_enabled(environ):
             raise AutonomousWakeSessionError(
                 "autonomous_wake_session_guard_unavailable"
             )
         return None
+    if size <= 0:
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
     try:
         row = codex_generation_store.get_session(store_path, session)
     except (
