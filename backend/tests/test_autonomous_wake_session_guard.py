@@ -232,6 +232,65 @@ class AutonomousWakeSessionGuardTests(unittest.TestCase):
                     self._codex_env(store_path, loop_config),
                 )
 
+    def test_persistence_classifier_blocks_retired_explicit_codex(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store_path = root / "codex-generation.db"
+            loop_config = root / "loop.json"
+            self._pin_canary(store_path)
+            codex_generation_store.retire_session(
+                store_path,
+                api_session="api-canary",
+            )
+            self._write_loop_config(loop_config, [
+                {"id": "api-canary", "provider": "codex"},
+            ])
+
+            forbidden = guard.is_codex_web_session(
+                "api-canary",
+                self._codex_env(store_path, loop_config),
+            )
+
+        self.assertTrue(forbidden)
+
+    def test_persistence_classifier_blocks_pre_p3_retired_codex_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store_path = root / "codex-generation.db"
+            loop_config = root / "loop.json"
+            self._pin_canary(store_path)
+            codex_generation_store.retire_session(
+                store_path,
+                api_session="api-canary",
+            )
+            self._write_loop_config(loop_config, [
+                {"id": "api-canary", "title": "old canary"},
+            ])
+
+            forbidden = guard.is_codex_web_session(
+                "api-canary",
+                self._codex_env(store_path, loop_config),
+            )
+
+        self.assertTrue(forbidden)
+
+    def test_persistence_classifier_allows_ordinary_api(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store_path = root / "codex-generation.db"
+            loop_config = root / "loop.json"
+            codex_generation_store.initialize(store_path)
+            self._write_loop_config(loop_config, [
+                {"id": "api-main", "provider": "api"},
+            ])
+
+            forbidden = guard.is_codex_web_session(
+                "api-main",
+                self._codex_env(store_path, loop_config),
+            )
+
+        self.assertFalse(forbidden)
+
     def test_malformed_loop_provider_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
