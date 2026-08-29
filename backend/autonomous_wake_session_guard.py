@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -78,7 +79,11 @@ def is_active_codex_session(
 
     try:
         row = codex_generation_store.get_session(store_path, session)
-    except (OSError, codex_generation_store.CodexGenerationStoreError):
+    except (
+        OSError,
+        sqlite3.Error,
+        codex_generation_store.CodexGenerationStoreError,
+    ):
         raise AutonomousWakeSessionError(
             "autonomous_wake_session_guard_unavailable"
         ) from None
