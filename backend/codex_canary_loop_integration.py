@@ -1,9 +1,9 @@
 """Opt-in api-loop integration controller for explicit Codex Web sessions.
 
-P3-A makes the durable Web-session record the provider authority.  Existing rows
-without a provider field remain API for backward compatibility.  Codex dispatch
-requires both ``provider='codex'`` in that durable row and an active durable Codex
-session pin; any disagreement fails closed rather than crossing providers.
+P3-A makes the durable Web-session record the provider authority. Existing rows
+without a provider field remain API unless the durable Codex generation store proves
+that exact session was previously Codex. Codex dispatch requires both Codex Web
+authority and an active durable Codex pin; disagreement fails closed.
 """
 
 from __future__ import annotations
@@ -111,8 +111,21 @@ class CodexCanaryLoopIntegration:
         self.legacy = legacy
         self.runtime = runtime
         self._session_lock = RLock()
+        historical = getattr(self.runtime.controller, "historical_provider", None)
+
+        def historical_provider(session_id: str) -> str | None:
+            if not callable(historical):
+                return None
+            try:
+                return historical(session_id)
+            except CodexCanaryControllerError:
+                raise web_session_provider_authority.WebSessionProviderAuthorityError(
+                    "web_session_provider_authority_unavailable"
+                ) from None
+
         self.session_authority = web_session_provider_authority.WebSessionProviderAuthority(
-            legacy
+            legacy,
+            historical_provider=historical_provider,
         )
         self._original_create_session = legacy.create_session
         self._original_patch_session = legacy.patch_session
