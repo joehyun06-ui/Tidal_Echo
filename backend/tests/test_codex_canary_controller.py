@@ -74,6 +74,14 @@ class CodexCanaryControllerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["model_provider"], provider_binding.UNRESOLVED_MODEL_PROVIDER)
         self.assertTrue(self.controller.is_pinned("api-canary"))
 
+    async def test_historical_provider_survives_retirement(self):
+        await self.controller.pin_session("api-canary")
+        self.assertEqual(self.controller.historical_provider("api-canary"), "codex")
+        self.controller.retire_session("api-canary")
+        self.assertFalse(self.controller.is_pinned("api-canary"))
+        self.assertEqual(self.controller.historical_provider("api-canary"), "codex")
+        self.assertIsNone(self.controller.historical_provider("api-never-codex"))
+
     async def test_normal_unpinned_session_is_not_intercepted(self):
         mid = self.insert(session="api-normal")
         result = self.controller.admit_if_pinned(
