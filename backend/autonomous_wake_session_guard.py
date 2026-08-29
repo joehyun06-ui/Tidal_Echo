@@ -1,14 +1,15 @@
 """Fail-closed routing guard for autonomous wake chat delivery.
 
 Autonomous wake is an ordinary/API surface.  It must never inherit whichever Web
-session happens to be active, and it must never target an active Codex-pinned
-session.  The Codex generation store is the authority for that distinction; UI
-titles and the API-loop presentation-level ``pinned`` field are deliberately not
-used here.
+session happens to be active and, under P3, it must never target any Web session
+whose durable provider authority is Codex -- even after that Codex session has been
+retired.  The durable Web provider field and Codex generation store are independent
+cross-checks; UI titles and the presentation-level ``pinned`` field are never used.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -19,6 +20,7 @@ from . import codex_generation_store
 
 
 _API_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_LOOP_CONFIG_MAX_BYTES = 1024 * 1024
 
 
 class AutonomousWakeSessionError(RuntimeError):
@@ -53,11 +55,60 @@ def _store_path(environ: Mapping[str, str]) -> Path:
     return path
 
 
+def _loop_provider_map(environ: Mapping[str, str]) -> dict[str, str]:
+    """Read only session id/provider from the durable loop config when configured."""
+    raw = str(environ.get("LOOP_CONFIG", "")).strip()
+    if not raw:
+        return {}
+    try:
+        path = Path(raw)
+    except (TypeError, ValueError):
+        raise AutonomousWakeSessionError(
+            "autonomous_wake_session_guard_unavailable"
+        ) from None
+    if not path.is_absolute() or ".." in path.parts:
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+    if not path.exists():
+        return {}
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > _LOOP_CONFIG_MAX_BYTES:
+            raise AutonomousWakeSessionError(
+                "autonomous_wake_session_guard_unavailable"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except AutonomousWakeSessionError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise AutonomousWakeSessionError(
+            "autonomous_wake_session_guard_unavailable"
+        ) from None
+    if not isinstance(payload, dict):
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+    rows = payload.get("sessions", [])
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+    result: dict[str, str] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        session = str(item.get("id") or "").strip()
+        if _API_SESSION_RE.fullmatch(session) is None or session in result:
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        provider = item.get("provider", "api")
+        if provider not in {"api", "codex"}:
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        result[session] = str(provider)
+    return result
+
+
 def is_active_codex_session(
     api_session: str,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    """Return whether ``api_session`` is an active Codex session.
+    """Return whether ``api_session`` is active in the Codex generation store.
 
     When Codex generation is enabled, inability to read its authority store is a
     hard failure instead of being interpreted as "not Codex".
@@ -101,17 +152,20 @@ def select_wake_api_session(
     """Choose the stable ordinary/API session used by autonomous wake.
 
     ``AUTONOMOUS_WAKE_API_SESSION`` may explicitly pin the target.  Without an
-    override, API-loop session order is used as a stable primary-session order:
-    the first session that is not active in the Codex authority store wins.  If
-    no ordinary API session exists, the untagged legacy surface (``""``) is used.
-    The current active Web session is never consulted.
+    override, API-loop session order is used as a stable primary-session order.
+    A durable Web ``provider=codex`` row is never ordinary, including after Codex
+    retirement.  An API row that is nevertheless active in the Codex store is an
+    authority mismatch and fails closed.  If no ordinary API session exists, the
+    untagged legacy surface (``""``) is used.  The active Web window is never read.
     """
     env = os.environ if environ is None else environ
     explicit = str(env.get("AUTONOMOUS_WAKE_API_SESSION", "")).strip()
     if explicit and _API_SESSION_RE.fullmatch(explicit) is None:
         raise AutonomousWakeSessionError("autonomous_wake_target_invalid")
 
+    config_providers = _loop_provider_map(env)
     session_ids: list[str] = []
+    providers: dict[str, str] = {}
     ordinary: list[str] = []
     for item in sessions:
         if not isinstance(item, Mapping):
@@ -120,14 +174,31 @@ def select_wake_api_session(
         if _API_SESSION_RE.fullmatch(session) is None:
             raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
         session_ids.append(session)
-        if not is_active_codex_session(session, env):
+        row_provider = item.get("provider")
+        if row_provider is not None and row_provider not in {"api", "codex"}:
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        configured_provider = config_providers.get(session)
+        if (
+            row_provider is not None
+            and configured_provider is not None
+            and row_provider != configured_provider
+        ):
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        provider = str(row_provider or configured_provider or "api")
+        providers[session] = provider
+        active_codex = is_active_codex_session(session, env)
+        if provider == "api" and active_codex:
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
+        if provider == "api":
             ordinary.append(session)
 
     if explicit:
         if explicit not in session_ids:
             raise AutonomousWakeSessionError("autonomous_wake_target_invalid")
-        if is_active_codex_session(explicit, env):
+        if providers.get(explicit) == "codex":
             raise AutonomousWakeSessionError("autonomous_wake_codex_session_forbidden")
+        if is_active_codex_session(explicit, env):
+            raise AutonomousWakeSessionError("autonomous_wake_session_guard_unavailable")
         return explicit
 
     return ordinary[0] if ordinary else ""
