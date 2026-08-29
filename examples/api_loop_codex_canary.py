@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Alternate api-loop entrypoint for the explicit Codex Web canary.
+"""Alternate api-loop entrypoint for explicit provider-aware Web sessions.
 
-Current Render startup still imports `examples.api_loop:app`; therefore merging this
-module alone does not activate Codex generation. A later explicit activation change
-may point the supervisor at `examples.api_loop_codex_canary:app`.
+Current Render production uses ``examples.api_loop:app``.  This alternate entrypoint
+remains opt-in and is the only place P3-A exposes ``provider=api|codex`` session
+creation.  Existing sessions without a provider field are projected as API.
 """
 
 from __future__ import annotations
@@ -74,6 +74,69 @@ def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:
         },
         status_code=exc.status_code,
     )
+
+
+def _valid_session_create_body(body) -> bool:
+    if not isinstance(body, dict) or set(body) - {
+        "title", "since_id", "activate", "provider"
+    }:
+        return False
+    if "title" in body and (
+        not isinstance(body["title"], str) or len(body["title"]) > 120
+    ):
+        return False
+    if "since_id" in body and (
+        isinstance(body["since_id"], bool)
+        or not isinstance(body["since_id"], int)
+        or body["since_id"] < 0
+    ):
+        return False
+    if "activate" in body and not isinstance(body["activate"], bool):
+        return False
+    if "provider" in body and body["provider"] not in {"api", "codex"}:
+        return False
+    return True
+
+
+@app.get("/loop/sessions")
+async def loop_sessions(request: Request):
+    legacy.check_internal_auth(request)
+    try:
+        return INTEGRATION.sessions_public()
+    except CodexCanaryLoopIntegrationError as exc:
+        return _error(exc)
+
+
+@app.post("/loop/sessions")
+async def loop_sessions_create(request: Request):
+    legacy.check_internal_auth(request)
+    body = await legacy.read_internal_json(request)
+    if not _valid_session_create_body(body):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_session_request"},
+            status_code=400,
+        )
+    try:
+        row = await INTEGRATION.create_web_session(
+            provider=body.get("provider", "api"),
+            title=body.get("title", "New chat"),
+            since_id=body.get("since_id", 0),
+            activate=body.get("activate", True),
+        )
+        public = INTEGRATION.sessions_public()
+    except CodexCanaryLoopIntegrationError as exc:
+        return _error(exc)
+    return {**public, "created": row}
+
+
+@app.patch("/loop/sessions/{session_id}")
+async def loop_sessions_patch(session_id: str, request: Request):
+    legacy.check_internal_auth(request)
+    body = await legacy.read_internal_json(request)
+    try:
+        return INTEGRATION.patch_web_session(session_id, body)
+    except CodexCanaryLoopIntegrationError as exc:
+        return _error(exc)
 
 
 @app.post("/loop/ingest")
