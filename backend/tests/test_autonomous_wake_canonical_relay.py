@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,29 @@ class AutonomousWakeCanonicalRelayTests(unittest.TestCase):
             [(item["role"], item["content"]) for item in context["recent_messages"]],
             [("user", "legacy user")],
         )
+
+    def test_direct_execution_bootstraps_repo_root_without_pythonpath(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env["AUTONOMOUS_WAKE_ENABLED"] = "true"
+            env["AUTONOMOUS_WAKE_BRIDGE_URL"] = ""
+            env["AUTONOMOUS_WAKE_TOKEN"] = ""
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "autonomous_wake_worker_notification_compat.py"),
+                ],
+                cwd=temp,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertNotIn("ModuleNotFoundError", completed.stdout + completed.stderr)
+        self.assertIn("invalid_autonomous_wake_bridge_url", completed.stdout)
 
 
 if __name__ == "__main__":
