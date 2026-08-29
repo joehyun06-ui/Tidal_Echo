@@ -71,17 +71,19 @@ def _safe_since_id(value: object) -> int:
         return 0
     if isinstance(value, bool):
         raise WebSessionProviderAuthorityError("web_session_since_id_invalid")
-    try:
-        result = int(value)
-    except (TypeError, ValueError):
-        raise WebSessionProviderAuthorityError("web_session_since_id_invalid") from None
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.isascii() and value.isdecimal():
+        result = int(value, 10)
+    else:
+        raise WebSessionProviderAuthorityError("web_session_since_id_invalid")
     if result < 0:
         raise WebSessionProviderAuthorityError("web_session_since_id_invalid")
     return result
 
 
 def _safe_created_at(value: object) -> str:
-    if value in {None, ""}:
+    if value is None or value == "":
         return ""
     if not isinstance(value, str) or len(value) > 80:
         raise WebSessionProviderAuthorityError("web_session_created_at_invalid")
