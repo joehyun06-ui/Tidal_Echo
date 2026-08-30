@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import urllib.parse
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from backend import legacy_chat_bridge_app as bridge
-from backend import p3_provider_status, web_provider_capabilities
+from backend import p3_provider_status, p3_session_retire, web_provider_capabilities
 
 
 relay_app = bridge.relay_app
@@ -24,6 +24,13 @@ def _fixed_status_error() -> JSONResponse:
     return JSONResponse(
         {"ok": False, "error": p3_provider_status.ERROR_CATEGORY},
         status_code=503,
+    )
+
+
+def _retire_error(error: p3_session_retire.P3SessionRetireError) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": error.category},
+        status_code=error.status_code,
     )
 
 
@@ -72,6 +79,52 @@ def _install_provider_status_route() -> None:
     relay_app._P3_PROVIDER_STATUS_INSTALLED = True
 
 
+def _install_session_retire_route() -> None:
+    if getattr(relay_app, "_P3_SESSION_RETIRE_INSTALLED", False):
+        return
+
+    @app.post("/app/sessions/{session_id}/retire")
+    async def app_sessions_retire(session_id: str, request: Request):
+        relay_app.check_auth(request)
+        try:
+            sid = p3_session_retire.safe_session_id(session_id)
+            before = relay_app.loop_json("/loop/sessions")
+            p3_session_retire.require_codex_target(before, sid)
+            encoded = urllib.parse.quote(sid, safe="")
+            try:
+                upstream = relay_app.loop_json(
+                    f"/loop/provider/canary/{encoded}/retire",
+                    method="POST",
+                )
+            except HTTPException as error:
+                p3_session_retire.raise_loop_retire_error(
+                    error.status_code,
+                    error.detail,
+                )
+                raise AssertionError("unreachable")
+            after = relay_app.loop_json("/loop/sessions")
+            return p3_session_retire.project_retired(upstream, after, sid)
+        except p3_session_retire.P3SessionRetireError as error:
+            return _retire_error(error)
+        except HTTPException:
+            # A localhost loop failure outside the bounded retire error projection
+            # is uncertain. Never expose raw loop details and never continue to
+            # deletion from the browser.
+            return _retire_error(
+                p3_session_retire.P3SessionRetireError(
+                    p3_session_retire.RETIRE_UNAVAILABLE
+                )
+            )
+        except Exception:
+            return _retire_error(
+                p3_session_retire.P3SessionRetireError(
+                    p3_session_retire.RETIRE_UNAVAILABLE
+                )
+            )
+
+    relay_app._P3_SESSION_RETIRE_INSTALLED = True
+
+
 def _install_session_delete_route() -> None:
     if getattr(relay_app, "_P3_SESSION_DELETE_INSTALLED", False):
         return
@@ -90,4 +143,5 @@ def _install_session_delete_route() -> None:
 
 _install_capability_route()
 _install_provider_status_route()
+_install_session_retire_route()
 _install_session_delete_route()
