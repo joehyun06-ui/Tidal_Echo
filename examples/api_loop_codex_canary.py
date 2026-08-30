@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from backend import codex_generation_store
+from backend import codex_generation_observability, codex_generation_store
 from backend import web_session_delete, web_session_provider_authority
 from backend.codex_canary_loop_integration import (
     CodexCanaryLoopIntegrationError,
@@ -59,6 +59,10 @@ async def lifespan(_app: FastAPI):
     async with legacy.lifespan(legacy.app):
         try:
             await RUNTIME.start()
+            if RUNTIME.generation_enabled:
+                codex_generation_observability.log_latest_job_snapshot(
+                    GENERATION_CONFIG.store_path
+                )
             yield
         finally:
             await RUNTIME.close()
