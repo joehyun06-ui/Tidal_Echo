@@ -8,6 +8,7 @@ Rules:
 - ordinary/unknown sessions continue through the reviewed legacy API loop;
 - Web session lists project durable ``provider: api|codex`` authority;
 - new sessions created here are API-authority only;
+- only API-authority Web session index rows may be deleted;
 - any explicit or historical Codex Web session fails closed before API model work;
 - provider authority is never inferred from UI title, active-window state, local
   storage, or the presentation-level ``pinned`` bit.
@@ -23,6 +24,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from backend import autonomous_wake_session_guard
+from backend import web_session_delete
 from backend import web_session_provider_authority
 from examples import api_loop as legacy
 
@@ -64,7 +66,11 @@ def _authority_status(category: str) -> int:
         return 400
     if category == "web_session_not_found":
         return 404
-    if category in {"web_session_provider_immutable", "web_session_conflict"}:
+    if category in {
+        "web_session_provider_immutable",
+        "web_session_conflict",
+        web_session_delete.DELETE_FORBIDDEN,
+    }:
         return 409
     return 503
 
@@ -171,6 +177,16 @@ async def loop_sessions_patch(session_id: str, request: Request):
     try:
         with _SESSION_LOCK:
             return AUTHORITY.patch_session(session_id, body)
+    except web_session_provider_authority.WebSessionProviderAuthorityError as error:
+        return _authority_error(error)
+
+
+@app.delete("/loop/sessions/{session_id}")
+async def loop_sessions_delete(session_id: str, request: Request):
+    legacy.check_internal_auth(request)
+    try:
+        with _SESSION_LOCK:
+            return web_session_delete.delete_api_session(AUTHORITY, session_id)
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
 
