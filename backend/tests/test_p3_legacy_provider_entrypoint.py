@@ -16,6 +16,18 @@ from backend.tests._support import NoNetworkMixin, request
 
 
 class LegacyProviderGuardTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _clear_api_loop_modules() -> None:
+        package = importlib.import_module("examples")
+        for module_name, attribute in (
+            ("examples.api_loop_provider_guard", "api_loop_provider_guard"),
+            ("examples.api_loop", "api_loop"),
+        ):
+            sys.modules.pop(module_name, None)
+            if hasattr(package, attribute):
+                delattr(package, attribute)
+        importlib.invalidate_caches()
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -30,7 +42,7 @@ class LegacyProviderGuardTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase)
             conn.commit()
         self.token = "test-internal-loop-token-1234567890"
         self.headers = {"X-API-Loop-Internal-Token": self.token}
-        os.environ.update({
+        env = {
             "RELAY_DB": str(self.db_path),
             "LOOP_CONFIG": str(self.config_path),
             "RELAY_SECRET": "invalid-test-relay-secret",
@@ -48,11 +60,16 @@ class LegacyProviderGuardTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase)
             "CODEX_GENERATION_ENABLED": "false",
             "CODEX_GENERATION_DB": str(self.store_path),
             "RENDER_TELEGRAM_MVP": "false",
-        })
-        for name in ("examples.api_loop_provider_guard", "examples.api_loop"):
-            sys.modules.pop(name, None)
+        }
+        self.env_patch = mock.patch.dict(os.environ, env, clear=True)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        self._clear_api_loop_modules()
+        self.addCleanup(self._clear_api_loop_modules)
         self.module = importlib.import_module("examples.api_loop_provider_guard")
         self.legacy = self.module.legacy
+        self.assertEqual(self.legacy.LOOP_CONFIG, self.config_path)
+        self.assertEqual(os.environ["CODEX_GENERATION_DB"], str(self.store_path))
 
     def write_sessions(self, rows, *, active=""):
         payload = {"sessions": rows}
@@ -241,6 +258,7 @@ class LegacyProviderGuardTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase)
             headers=self.headers,
             json={"title": "ordinary"},
         )
+        self.assertEqual(created.status_code, 200)
         sid = created.json()["created"]["id"]
         response = await request(
             self.module,
