@@ -1869,7 +1869,7 @@
   </header>
   <div class="session-pop" id="sessionPop" hidden>
     <div class="session-head">
-      <div class="session-title">API 窗口</div>
+      <div class="session-title">聊天窗口</div>
       <button class="session-new" id="sessionNewBtn" type="button">新对话</button>
     </div>
     <div class="session-list" id="sessionList"></div>
@@ -2297,6 +2297,11 @@ const LEGACY_SESSION_ID = "__legacy__";
 const TERMINAL_WRAP = "[companion:pseudo-terminal]";
 let apiSessions = [];
 let activeApiSession = LEGACY_SESSION_ID;
+let providerCapabilities = {
+  default_provider:"api",
+  provider_immutable:true,
+  providers:{ api:{ create:true }, codex:{ create:false, text_only:true } }
+};
 
 function currentTheme(){
   const t = document.documentElement.getAttribute("data-theme");
@@ -3390,12 +3395,57 @@ function msgInActiveSession(m){
 function sessionFiltered(msgs){
   return (msgs || []).filter(msgInActiveSession);
 }
+function resetProviderCapabilities(){
+  providerCapabilities = {
+    default_provider:"api",
+    provider_immutable:true,
+    providers:{ api:{ create:true }, codex:{ create:false, text_only:true } }
+  };
+}
+function providerCanCreate(provider){
+  return !!(providerCapabilities && providerCapabilities.providers && providerCapabilities.providers[provider] && providerCapabilities.providers[provider].create === true);
+}
+function sessionProvider(sessionId){
+  if (!sessionId || sessionId === LEGACY_SESSION_ID) return "api";
+  const row = (apiSessions || []).find((s) => s && s.id === sessionId);
+  return row && row.provider === "codex" ? "codex" : "api";
+}
+function currentSessionTextOnly(){
+  return sessionProvider(activeApiSession) === "codex";
+}
+async function loadProviderCapabilities(){
+  resetProviderCapabilities();
+  if (USE_MOCK || !secret) return providerCapabilities;
+  try{
+    const r = await fetch(`${API_BASE}/app/provider/capabilities`, { headers: authHeaders() });
+    if (!r.ok) throw new Error("provider capabilities " + r.status);
+    const d = await r.json();
+    const ws = d && d.web_sessions;
+    const providers = ws && ws.providers;
+    if (
+      !d || d.ok !== true || d.contract_version !== 1 || !ws ||
+      ws.default_provider !== "api" || ws.provider_immutable !== true ||
+      !providers || !providers.api || providers.api.create !== true ||
+      !providers.codex || typeof providers.codex.create !== "boolean" ||
+      providers.codex.text_only !== true
+    ) throw new Error("provider capabilities invalid");
+    providerCapabilities = ws;
+  }catch(_){
+    resetProviderCapabilities();
+  }
+  return providerCapabilities;
+}
+function chooseNewSessionProvider(){
+  if (!providerCanCreate("codex")) return "api";
+  return confirm("新对话使用 Codex？\n\n确定：Codex（当前仅文本）\n取消：API") ? "codex" : "api";
+}
 function renderSessionList(){
   if (!sessionList) return;
+  if (sessionNewBtn) sessionNewBtn.textContent = providerCanCreate("codex") ? "新对话 ▾" : "新对话";
   const rows = [{ id:LEGACY_SESSION_ID, title:"旧主线 / Desktop 记录", since_id:0, virtual:true }].concat(apiSessions || []);
   sessionList.innerHTML = rows.map((s) => {
     const active = (s.id || "") === activeApiSession;
-    const meta = s.virtual ? "没有 api_session 标记的记录" : `since #${s.since_id || 0}`;
+    const meta = s.virtual ? "没有 api_session 标记的记录" : `${s.provider === "codex" ? "Codex" : "API"} · since #${s.since_id || 0}`;
     const rename = s.virtual ? "" : `<button class="session-rename" type="button" data-rename="${escapeHtml(s.id || "")}" aria-label="改名" title="改名">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
     </button>`;
@@ -3425,6 +3475,7 @@ async function loadSessions(){
     apiSessions = [];
     activeApiSession = LEGACY_SESSION_ID;
   }
+  await loadProviderCapabilities();
   renderSessionList();
 }
 async function activateSession(sessionId, { reload = true } = {}){
@@ -3449,24 +3500,30 @@ async function activateSession(sessionId, { reload = true } = {}){
   }
 }
 async function createNewSession(){
+  const provider = chooseNewSessionProvider();
+  if (!providerCanCreate(provider)){
+    showToast(provider === "codex" ? "Codex 当前不可用" : "新对话失败");
+    return;
+  }
   try{
     const r = await fetch(`${API_BASE}/app/sessions`, {
       method:"POST",
       headers:{ ...authHeaders(), "Content-Type":"application/json" },
-      body:JSON.stringify({ title:"新对话", activate:true })
+      body:JSON.stringify({ title:provider === "codex" ? "Codex 对话" : "新对话", activate:true, provider })
     });
     if (!r.ok) throw new Error("sessions " + r.status);
     const d = await r.json();
+    if (!d.created || d.created.provider !== provider) throw new Error("provider mismatch");
     apiSessions = Array.isArray(d.sessions) ? d.sessions : [];
-    activeApiSession = d.active_session || (d.created && d.created.id) || LEGACY_SESSION_ID;
+    activeApiSession = d.active_session || d.created.id || LEGACY_SESSION_ID;
     try{ localStorage.setItem(SESSION_PICK_KEY, activeApiSession); }catch(_){}
     resetServerHistoryCache();
     renderSessionList();
     setSessionPopover(false);
     startChat([]);
-    showToast("已开启新 API 窗口");
+    showToast(`已开启新 ${provider === "codex" ? "Codex" : "API"} 窗口`);
   }catch(_){
-    showToast("新对话失败");
+    showToast(provider === "codex" ? "Codex 当前不可用" : "新对话失败");
   }
 }
 async function renameSession(sessionId){
@@ -3491,8 +3548,9 @@ async function renameSession(sessionId){
     showToast("改名失败");
   }
 }
-if (sessionBtn) sessionBtn.addEventListener("click", (e) => {
+if (sessionBtn) sessionBtn.addEventListener("click", async (e) => {
   e.stopPropagation();
+  await loadProviderCapabilities();
   renderSessionList();
   setSessionPopover(sessionPop ? sessionPop.hidden : false);
 });
@@ -3592,6 +3650,7 @@ async function apiNewerHistory(since, limit = 200){
 }
 
 async function apiSend(text, attachments){
+  if (attachments && attachments.length && currentSessionTextOnly()) throw new Error("codex_text_only");
   if (USE_MOCK) return Mock.send(text);
   const payload = { text: text || "" };
   const sid = effectiveApiSession();
@@ -5478,6 +5537,10 @@ function imageToJpeg(file){
 }
 async function sendOneFile(file){
   if (!secret) return;
+  if (currentSessionTextOnly()){
+    showToast("Codex 窗口当前仅支持文本");
+    return;
+  }
   ensureAudio();
   const image = isImageFile(file);
   let blob = file, name = file.name || (image ? "image" : "file"), mime = file.type || "";
