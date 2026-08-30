@@ -48,14 +48,23 @@ class WebProviderCapabilitiesContractTests(unittest.TestCase):
         )
         self.assertTrue(enabled["web_sessions"]["providers"]["codex"]["create"])
 
-    def test_invalid_gate_value_fails_closed(self):
-        with self.assertRaisesRegex(
-            web_provider_capabilities.WebProviderCapabilitiesError,
-            "web_provider_capabilities_unavailable",
+    def test_every_gate_is_validated_even_when_codex_is_already_disabled(self):
+        for name in (
+            web_provider_capabilities.CONTROL_FLAG,
+            web_provider_capabilities.ENTRYPOINT_FLAG,
+            web_provider_capabilities.GENERATION_FLAG,
         ):
-            web_provider_capabilities.public_capabilities({
-                web_provider_capabilities.CONTROL_FLAG: " true ",
-            })
+            env = {
+                web_provider_capabilities.CONTROL_FLAG: "false",
+                web_provider_capabilities.ENTRYPOINT_FLAG: "false",
+                web_provider_capabilities.GENERATION_FLAG: "false",
+                name: " true ",
+            }
+            with self.subTest(name=name), self.assertRaisesRegex(
+                web_provider_capabilities.WebProviderCapabilitiesError,
+                "web_provider_capabilities_unavailable",
+            ):
+                web_provider_capabilities.public_capabilities(env)
 
 
 class P3ProviderCapabilitiesRelayTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
