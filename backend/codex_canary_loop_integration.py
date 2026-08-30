@@ -101,6 +101,8 @@ def _authority_status(category: str) -> int:
         return 400
     if category == "web_session_not_found":
         return 404
+    if category == "web_session_deleted":
+        return 410
     if category in {"web_session_provider_immutable", "web_session_conflict"}:
         return 409
     return 503
