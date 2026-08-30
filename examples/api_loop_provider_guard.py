@@ -1,23 +1,14 @@
 """Provider-aware fail-closed wrapper for the legacy API loop.
 
-P3-B keeps ordinary production generation on the existing API provider while making
-rollback semantics safe for durable Web-session provider authority introduced in
-P3-A. This entrypoint owns no Codex runtime and cannot generate through Codex.
-
-Rules:
-- ordinary/unknown sessions continue through the reviewed legacy API loop;
-- Web session lists project durable ``provider: api|codex`` authority;
-- new sessions created here are API-authority only;
-- only API-authority Web session index rows may be deleted;
-- any explicit or historical Codex Web session fails closed before API model work;
-- provider authority is never inferred from UI title, active-window state, local
-  storage, or the presentation-level ``pinned`` bit.
+P3 keeps ordinary generation on API while enforcing durable per-Web-session provider
+authority, deleted-session tombstones, and safe conversation hard deletion.
 """
 
 from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import RLock
 
 from fastapi import FastAPI, Request
@@ -54,6 +45,25 @@ AUTHORITY = web_session_provider_authority.WebSessionProviderAuthority(
 )
 
 
+def _upload_dir() -> Path | None:
+    raw = str(os.environ.get("RELAY_UPLOAD_DIR", "")).strip()
+    return Path(raw) if raw else None
+
+
+def _codex_store() -> Path:
+    return Path(
+        str(os.environ.get("CODEX_GENERATION_DB", "/var/data/codex-generation.db"))
+    )
+
+
+def _public_sessions() -> dict:
+    return web_session_delete.public_session_state(
+        AUTHORITY,
+        relay_db=legacy.RELAY_DB,
+        codex_store=_codex_store(),
+    )
+
+
 def _authority_status(category: str) -> int:
     if category in {
         "web_session_provider_invalid",
@@ -66,10 +76,14 @@ def _authority_status(category: str) -> int:
         return 400
     if category == "web_session_not_found":
         return 404
+    if category == "web_session_deleted":
+        return 410
     if category in {
         "web_session_provider_immutable",
         "web_session_conflict",
         web_session_delete.DELETE_FORBIDDEN,
+        web_session_delete.DELETE_REQUIRES_RETIREMENT,
+        web_session_delete.DELETE_JOB_ACTIVE,
     }:
         return 409
     return 503
@@ -119,8 +133,6 @@ def _valid_session_create_body(body) -> bool:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Mounted sub-app lifespans are not relied upon. Keep the legacy lifecycle
-    # exactly once while this wrapper owns only provider-authority routing.
     async with legacy.lifespan(legacy.app):
         yield
 
@@ -138,7 +150,7 @@ async def loop_sessions(request: Request):
     legacy.check_internal_auth(request)
     try:
         with _SESSION_LOCK:
-            return AUTHORITY.sessions_public()
+            return _public_sessions()
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
 
@@ -154,8 +166,6 @@ async def loop_sessions_create(request: Request):
         web_session_provider_authority.API_PROVIDER,
     )
     if provider == web_session_provider_authority.CODEX_PROVIDER:
-        # This entrypoint deliberately owns no Codex runtime. Creating a Codex
-        # authority row here would publish a session that cannot be serviced.
         return _error(503, "codex_generation_disabled")
     try:
         with _SESSION_LOCK:
@@ -164,7 +174,7 @@ async def loop_sessions_create(request: Request):
                 since_id=body.get("since_id", 0),
                 activate=body.get("activate", True),
             )
-            public = AUTHORITY.sessions_public()
+            public = _public_sessions()
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
     return {**public, "created": row}
@@ -176,7 +186,8 @@ async def loop_sessions_patch(session_id: str, request: Request):
     body = await legacy.read_internal_json(request)
     try:
         with _SESSION_LOCK:
-            return AUTHORITY.patch_session(session_id, body)
+            AUTHORITY.patch_session(session_id, body)
+            return _public_sessions()
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
 
@@ -186,7 +197,13 @@ async def loop_sessions_delete(session_id: str, request: Request):
     legacy.check_internal_auth(request)
     try:
         with _SESSION_LOCK:
-            return web_session_delete.delete_api_session(AUTHORITY, session_id)
+            return web_session_delete.delete_conversation(
+                AUTHORITY,
+                session_id,
+                relay_db=legacy.RELAY_DB,
+                upload_dir=_upload_dir(),
+                codex_store=_codex_store(),
+            )
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
 
@@ -196,12 +213,14 @@ async def loop_config(request: Request):
     legacy.check_internal_auth(request)
     try:
         with _SESSION_LOCK:
-            sessions = AUTHORITY.sessions_public()
+            sessions = _public_sessions()
         payload = legacy.public_config()
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
     payload["active_session"] = sessions["active_session"]
     payload["sessions"] = sessions["sessions"]
+    payload["legacy_available"] = sessions["legacy_available"]
+    payload["legacy_delete_allowed"] = sessions["legacy_delete_allowed"]
     return payload
 
 
@@ -226,8 +245,6 @@ async def loop_ingest(request: Request):
     except web_session_provider_authority.WebSessionProviderAuthorityError as error:
         return _authority_error(error)
     if provider == web_session_provider_authority.CODEX_PROVIDER:
-        # Critical rollback invariant: a Codex-authority Web session may not cross
-        # into the API model merely because a non-Codex supervisor is active.
         return _error(503, "codex_generation_disabled")
     if provider != web_session_provider_authority.API_PROVIDER:
         return _error(503, "web_session_provider_invalid")
@@ -257,7 +274,4 @@ async def loop_ingest(request: Request):
     return result
 
 
-# Every route not involved in Web-session authority remains the reviewed legacy API
-# surface: provider control, Kelivo internal chat, health, config mutation, and other
-# frozen contracts.
 app.mount("/", legacy.app)
