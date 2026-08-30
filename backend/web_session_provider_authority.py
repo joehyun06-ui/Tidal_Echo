@@ -1,8 +1,7 @@
-"""Durable per-Web-session generation-provider authority for P3-A.
+"""Durable per-Web-session generation-provider authority for P3.
 
-The api-loop config file is already the durable authority for Web session identity,
-creation order, titles, and the active-session pointer. P3-A extends only that
-existing session record with an immutable ``provider`` field.
+The api-loop config file is the durable authority for visible Web sessions and for
+small deleted-session tombstones. Provider identity is never inferred from UI state.
 
 Safety rules:
 - a present provider must be exactly ``api`` or ``codex``;
@@ -10,8 +9,9 @@ Safety rules:
 - missing provider with durable historical Codex evidence means ``codex``;
 - explicit API authority conflicting with Codex history fails closed;
 - provider is immutable after session publication;
-- UI title/current-window/``pinned`` metadata never determines provider authority;
-- provider lookup for a non-Web session does not validate unrelated Web rows.
+- deleted session ids are tombstoned and may never silently become ordinary API;
+- tombstones retain only id/provider/deleted_at, never chat text or titles;
+- UI title/current-window/``pinned`` metadata never determines provider authority.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from typing import Any
 API_PROVIDER = "api"
 CODEX_PROVIDER = "codex"
 PROVIDERS = frozenset({API_PROVIDER, CODEX_PROVIDER})
+DELETED_SESSIONS_KEY = "deleted_sessions"
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 
 
@@ -91,6 +92,12 @@ def _safe_created_at(value: object) -> str:
     return value
 
 
+def _safe_deleted_at(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 80:
+        raise WebSessionProviderAuthorityError("web_session_tombstone_invalid")
+    return value
+
+
 class WebSessionProviderAuthority:
     """Read/write provider-aware Web sessions through the legacy api-loop config."""
 
@@ -116,6 +123,19 @@ class WebSessionProviderAuthority:
             out.append(item)
         return out
 
+    def _raw_tombstones(self) -> list[Mapping[str, object]]:
+        rows = self.legacy.load_config().get(DELETED_SESSIONS_KEY, [])
+        if rows is None:
+            return []
+        if not isinstance(rows, list):
+            raise WebSessionProviderAuthorityError("web_session_tombstone_invalid")
+        out: list[Mapping[str, object]] = []
+        for item in rows:
+            if not isinstance(item, dict) or set(item) != {"id", "provider", "deleted_at"}:
+                raise WebSessionProviderAuthorityError("web_session_tombstone_invalid")
+            out.append(item)
+        return out
+
     def _historical(self, session_id: str) -> str | None:
         if self._historical_provider is None:
             return None
@@ -135,7 +155,7 @@ class WebSessionProviderAuthority:
                 )
         else:
             provider = historical or API_PROVIDER
-        row: dict[str, Any] = {
+        return {
             "id": session_id,
             "title": _safe_title(item.get("title")),
             "since_id": _safe_since_id(item.get("since_id")),
@@ -143,12 +163,46 @@ class WebSessionProviderAuthority:
             "pinned": bool(item.get("pinned", False)),
             "provider": provider,
         }
-        return row
+
+    def normalize_tombstone(self, item: Mapping[str, object]) -> dict[str, str]:
+        if not isinstance(item, Mapping) or set(item) != {"id", "provider", "deleted_at"}:
+            raise WebSessionProviderAuthorityError("web_session_tombstone_invalid")
+        session_id = _safe_session_id(item.get("id"))
+        provider = normalize_provider(item.get("provider"))
+        historical = self._historical(session_id)
+        if historical is not None and historical != provider:
+            raise WebSessionProviderAuthorityError(
+                "web_session_provider_authority_conflict"
+            )
+        return {
+            "id": session_id,
+            "provider": provider,
+            "deleted_at": _safe_deleted_at(item.get("deleted_at")),
+        }
+
+    def tombstones(self) -> list[dict[str, str]]:
+        rows = [self.normalize_tombstone(item) for item in self._raw_tombstones()]
+        ids = [row["id"] for row in rows]
+        if len(ids) != len(set(ids)):
+            raise WebSessionProviderAuthorityError("web_session_tombstone_invalid")
+        return rows
+
+    def tombstone_for_session(self, session_id: str) -> dict[str, str] | None:
+        if not session_id:
+            return None
+        session_id = _safe_session_id(session_id)
+        matches = [item for item in self.tombstones() if item["id"] == session_id]
+        if len(matches) > 1:
+            raise WebSessionProviderAuthorityError("web_session_tombstone_invalid")
+        return matches[0] if matches else None
 
     def session_rows(self) -> list[dict[str, Any]]:
         rows = [self.normalize_row(item) for item in self._raw_rows()]
         ids = [row["id"] for row in rows]
         if len(ids) != len(set(ids)):
+            raise WebSessionProviderAuthorityError("web_session_authority_invalid")
+        tombstone_ids = {row["id"] for row in self.tombstones()}
+        if tombstone_ids.intersection(ids):
             raise WebSessionProviderAuthorityError("web_session_authority_invalid")
         return rows
 
@@ -165,8 +219,12 @@ class WebSessionProviderAuthority:
         return self.normalize_row(matches[0]) if matches else None
 
     def provider_for_session(self, session_id: str) -> str:
-        """Return API for non-Web/unknown sessions; known Web rows carry authority."""
-        row = self.row_for_session(session_id) if session_id else None
+        """Return provider for live Web rows; deleted ids fail closed forever."""
+        if not session_id:
+            return API_PROVIDER
+        if self.tombstone_for_session(session_id) is not None:
+            raise WebSessionProviderAuthorityError("web_session_deleted")
+        row = self.row_for_session(session_id)
         return str(row["provider"]) if row is not None else API_PROVIDER
 
     def active_session_id(self) -> str:
@@ -192,6 +250,9 @@ class WebSessionProviderAuthority:
         normalized = [self.normalize_row(item) for item in rows]
         ids = [row["id"] for row in normalized]
         if len(ids) != len(set(ids)):
+            raise WebSessionProviderAuthorityError("web_session_authority_invalid")
+        tombstone_ids = {row["id"] for row in self.tombstones()}
+        if tombstone_ids.intersection(ids):
             raise WebSessionProviderAuthorityError("web_session_authority_invalid")
         if active is not None:
             active = _safe_session_id(active)
@@ -219,8 +280,11 @@ class WebSessionProviderAuthority:
             + "-"
             + uuid.uuid4().hex[:4]
         )
+        sid = _safe_session_id(sid)
+        if self.tombstone_for_session(sid) is not None:
+            raise WebSessionProviderAuthorityError("web_session_conflict")
         return {
-            "id": _safe_session_id(sid),
+            "id": sid,
             "title": _safe_title(title),
             "since_id": _safe_since_id(since_id),
             "created_at": self.legacy.now_iso(),
@@ -248,7 +312,10 @@ class WebSessionProviderAuthority:
     def publish_row(self, row: Mapping[str, object], *, activate: bool) -> dict[str, Any]:
         normalized = self.normalize_row(row)
         rows = self.session_rows()
-        if any(item["id"] == normalized["id"] for item in rows):
+        if (
+            any(item["id"] == normalized["id"] for item in rows)
+            or self.tombstone_for_session(normalized["id"]) is not None
+        ):
             raise WebSessionProviderAuthorityError("web_session_conflict")
         rows.append(normalized)
         self.save_sessions(rows, normalized["id"] if activate else None)
@@ -260,6 +327,8 @@ class WebSessionProviderAuthority:
         body: Mapping[str, object],
     ) -> dict[str, Any]:
         session_id = _safe_session_id(session_id)
+        if self.tombstone_for_session(session_id) is not None:
+            raise WebSessionProviderAuthorityError("web_session_deleted")
         if not isinstance(body, dict):
             raise WebSessionProviderAuthorityError("web_session_patch_invalid")
         if "provider" in body:

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Alternate api-loop entrypoint for explicit provider-aware Web sessions.
-
-Current Render production uses ``examples.api_loop:app``.  This alternate entrypoint
-remains opt-in and is the only place P3-A exposes ``provider=api|codex`` session
-creation.  Existing sessions without a provider field are projected as API.
-"""
+"""Alternate api-loop entrypoint for explicit provider-aware Web sessions."""
 
 from __future__ import annotations
 
@@ -16,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from backend import codex_generation_store
+from backend import web_session_delete, web_session_provider_authority
 from backend.codex_canary_loop_integration import (
     CodexCanaryLoopIntegrationError,
     build_completion_callback,
@@ -45,10 +41,21 @@ INTEGRATION = FailClosedCodexCanaryLoopIntegration(legacy, RUNTIME)
 INTEGRATION.install_legacy_globals()
 
 
+def _upload_dir() -> Path | None:
+    raw = str(os.environ.get("RELAY_UPLOAD_DIR", "")).strip()
+    return Path(raw) if raw else None
+
+
+def _public_sessions() -> dict:
+    return web_session_delete.public_session_state(
+        INTEGRATION.session_authority,
+        relay_db=legacy.RELAY_DB,
+        codex_store=GENERATION_CONFIG.store_path,
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Mounted sub-app lifespans are not relied upon. Run the reviewed legacy lifespan
-    # explicitly, with its CODEX_CONTROL global already replaced by a no-op-close adapter.
     async with legacy.lifespan(legacy.app):
         try:
             await RUNTIME.start()
@@ -73,6 +80,40 @@ def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:
             "error": exc.category,
         },
         status_code=exc.status_code,
+    )
+
+
+def _authority_status(category: str) -> int:
+    if category in {
+        "web_session_provider_invalid",
+        "web_session_id_invalid",
+        "web_session_title_invalid",
+        "web_session_since_id_invalid",
+        "web_session_created_at_invalid",
+        "web_session_patch_invalid",
+    }:
+        return 400
+    if category == "web_session_not_found":
+        return 404
+    if category == "web_session_deleted":
+        return 410
+    if category in {
+        "web_session_provider_immutable",
+        "web_session_conflict",
+        web_session_delete.DELETE_FORBIDDEN,
+        web_session_delete.DELETE_REQUIRES_RETIREMENT,
+        web_session_delete.DELETE_JOB_ACTIVE,
+    }:
+        return 409
+    return 503
+
+
+def _authority_error(
+    exc: web_session_provider_authority.WebSessionProviderAuthorityError,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "dispatch_uncertain": False, "error": exc.category},
+        status_code=_authority_status(exc.category),
     )
 
 
@@ -102,9 +143,9 @@ def _valid_session_create_body(body) -> bool:
 async def loop_sessions(request: Request):
     legacy.check_internal_auth(request)
     try:
-        return INTEGRATION.sessions_public()
-    except CodexCanaryLoopIntegrationError as exc:
-        return _error(exc)
+        return _public_sessions()
+    except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+        return _authority_error(exc)
 
 
 @app.post("/loop/sessions")
@@ -123,9 +164,11 @@ async def loop_sessions_create(request: Request):
             since_id=body.get("since_id", 0),
             activate=body.get("activate", True),
         )
-        public = INTEGRATION.sessions_public()
+        public = _public_sessions()
     except CodexCanaryLoopIntegrationError as exc:
         return _error(exc)
+    except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+        return _authority_error(exc)
     return {**public, "created": row}
 
 
@@ -134,9 +177,28 @@ async def loop_sessions_patch(session_id: str, request: Request):
     legacy.check_internal_auth(request)
     body = await legacy.read_internal_json(request)
     try:
-        return INTEGRATION.patch_web_session(session_id, body)
+        INTEGRATION.patch_web_session(session_id, body)
+        return _public_sessions()
     except CodexCanaryLoopIntegrationError as exc:
         return _error(exc)
+    except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+        return _authority_error(exc)
+
+
+@app.delete("/loop/sessions/{session_id}")
+async def loop_sessions_delete(session_id: str, request: Request):
+    legacy.check_internal_auth(request)
+    try:
+        with INTEGRATION._session_lock:
+            return web_session_delete.delete_conversation(
+                INTEGRATION.session_authority,
+                session_id,
+                relay_db=legacy.RELAY_DB,
+                upload_dir=_upload_dir(),
+                codex_store=GENERATION_CONFIG.store_path,
+            )
+    except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
+        return _authority_error(exc)
 
 
 @app.post("/loop/ingest")
@@ -225,5 +287,4 @@ async def retire_canary(session_id: str, request: Request):
     }
 
 
-# All non-overridden routes remain exactly the reviewed legacy api-loop surface.
 app.mount("/", legacy.app)
