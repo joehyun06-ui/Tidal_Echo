@@ -5,8 +5,9 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from backend import web_provider_capabilities
+from backend import p3_provider_status, web_provider_capabilities
 from backend.tests._support import NoNetworkMixin, load_app, request
 
 
@@ -65,6 +66,64 @@ class WebProviderCapabilitiesContractTests(unittest.TestCase):
                 "web_provider_capabilities_unavailable",
             ):
                 web_provider_capabilities.public_capabilities(env)
+
+
+class P3ProviderStatusProjectionTests(unittest.TestCase):
+    @staticmethod
+    def capabilities(*, codex: bool) -> dict[str, object]:
+        value = "true" if codex else "false"
+        return web_provider_capabilities.public_capabilities({
+            web_provider_capabilities.CONTROL_FLAG: value,
+            web_provider_capabilities.ENTRYPOINT_FLAG: value,
+            web_provider_capabilities.GENERATION_FLAG: value,
+        })
+
+    def test_active_provider_comes_only_from_durable_session_projection(self):
+        projected = p3_provider_status.project_provider_status(
+            {
+                "active_session": "api-codex",
+                "sessions": [
+                    {"id": "api-api", "provider": "api", "title": "Codex-looking title"},
+                    {"id": "api-codex", "provider": "codex", "title": "ordinary title"},
+                ],
+            },
+            self.capabilities(codex=True),
+        )
+        self.assertEqual(projected["active_session"], "api-codex")
+        self.assertEqual(projected["active_provider"], "codex")
+        self.assertTrue(projected["web_sessions"]["providers"]["codex"]["create"])
+        self.assertNotIn("generation_provider", projected)
+
+    def test_empty_session_state_is_explicitly_providerless(self):
+        projected = p3_provider_status.project_provider_status(
+            {"active_session": "", "sessions": []},
+            self.capabilities(codex=False),
+        )
+        self.assertIsNone(projected["active_session"])
+        self.assertIsNone(projected["active_provider"])
+
+    def test_inconsistent_or_malformed_authority_fails_closed(self):
+        bad_states = [
+            {"active_session": "missing", "sessions": []},
+            {"active_session": "", "sessions": [{"id": "api-a", "provider": "api"}]},
+            {"active_session": "api-a", "sessions": [{"id": "api-a", "provider": "other"}]},
+            {
+                "active_session": "api-a",
+                "sessions": [
+                    {"id": "api-a", "provider": "api"},
+                    {"id": "api-a", "provider": "api"},
+                ],
+            },
+        ]
+        for state in bad_states:
+            with self.subTest(state=state), self.assertRaisesRegex(
+                p3_provider_status.P3ProviderStatusError,
+                p3_provider_status.ERROR_CATEGORY,
+            ):
+                p3_provider_status.project_provider_status(
+                    state,
+                    self.capabilities(codex=True),
+                )
 
 
 class P3ProviderCapabilitiesRelayTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
@@ -140,6 +199,69 @@ class P3ProviderCapabilitiesRelayTests(NoNetworkMixin, unittest.IsolatedAsyncioT
         self.assertEqual(
             response.json(),
             {"ok": False, "error": "web_provider_capabilities_unavailable"},
+        )
+
+    async def test_status_route_requires_existing_relay_auth(self):
+        response = await request(
+            self.module,
+            "GET",
+            "/app/provider/status",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    async def test_status_route_is_authority_only_and_does_not_start_account_control(self):
+        os.environ.update({
+            web_provider_capabilities.CONTROL_FLAG: "true",
+            web_provider_capabilities.ENTRYPOINT_FLAG: "true",
+            web_provider_capabilities.GENERATION_FLAG: "true",
+        })
+        session_state = {
+            "active_session": "api-codex",
+            "sessions": [
+                {"id": "api-api", "provider": "api"},
+                {"id": "api-codex", "provider": "codex"},
+            ],
+        }
+        with mock.patch.object(
+            self.module.relay_app,
+            "loop_json",
+            return_value=session_state,
+        ) as loop_json, mock.patch.object(
+            self.module.relay_app,
+            "provider_loop_json",
+            side_effect=AssertionError("provider control must stay cold"),
+        ) as provider_loop_json:
+            response = await request(
+                self.module,
+                "GET",
+                "/app/provider/status",
+                headers={"Authorization": "Bearer test-relay-secret"},
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["active_session"], "api-codex")
+        self.assertEqual(payload["active_provider"], "codex")
+        self.assertNotIn("generation_provider", payload)
+        loop_json.assert_called_once_with("/loop/sessions")
+        provider_loop_json.assert_not_called()
+        self.assertTrue(self.module.relay_app._P3_PROVIDER_STATUS_INSTALLED)
+
+    async def test_status_route_collapses_malformed_authority_to_fixed_503(self):
+        with mock.patch.object(
+            self.module.relay_app,
+            "loop_json",
+            return_value={"active_session": "missing", "sessions": []},
+        ):
+            response = await request(
+                self.module,
+                "GET",
+                "/app/provider/status",
+                headers={"Authorization": "Bearer test-relay-secret"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {"ok": False, "error": p3_provider_status.ERROR_CATEGORY},
         )
 
 
