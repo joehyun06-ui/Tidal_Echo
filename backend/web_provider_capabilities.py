@@ -46,11 +46,10 @@ def public_capabilities(
     environment value, model configuration, or internal route is exposed.
     """
     env = os.environ if environ is None else environ
-    codex_create = (
-        _strict_flag(env, CONTROL_FLAG)
-        and _strict_flag(env, ENTRYPOINT_FLAG)
-        and _strict_flag(env, GENERATION_FLAG)
-    )
+    control_enabled = _strict_flag(env, CONTROL_FLAG)
+    entrypoints_enabled = _strict_flag(env, ENTRYPOINT_FLAG)
+    generation_enabled = _strict_flag(env, GENERATION_FLAG)
+    codex_create = control_enabled and entrypoints_enabled and generation_enabled
     return {
         "ok": True,
         "contract_version": 1,
