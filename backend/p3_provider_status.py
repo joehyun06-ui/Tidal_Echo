@@ -8,6 +8,7 @@ account RPCs, or the Codex App Server.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 
@@ -15,6 +16,7 @@ API_PROVIDER = "api"
 CODEX_PROVIDER = "codex"
 VALID_PROVIDERS = frozenset({API_PROVIDER, CODEX_PROVIDER})
 ERROR_CATEGORY = "p3_provider_status_unavailable"
+_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class P3ProviderStatusError(RuntimeError):
@@ -83,18 +85,18 @@ def _project_active_session(payload: object) -> tuple[str | None, str | None]:
         provider = item.get("provider")
         if (
             not isinstance(session_id, str)
-            or not session_id
-            or len(session_id) > 128
+            or _SESSION_ID.fullmatch(session_id) is None
+            or not isinstance(provider, str)
             or provider not in VALID_PROVIDERS
             or session_id in seen
         ):
             _raise()
         seen.add(session_id)
         if session_id == active:
-            active_provider = str(provider)
+            active_provider = provider
 
     if active:
-        if active_provider is None:
+        if _SESSION_ID.fullmatch(active) is None or active_provider is None:
             _raise()
         return active, active_provider
     if sessions:
