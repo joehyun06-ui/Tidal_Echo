@@ -1,8 +1,8 @@
 """Alternate relay entrypoint for the explicit Codex Web canary.
 
-Current Render startup still imports `backend.legacy_chat_bridge_app:app`; therefore
-merging this module alone does not change production behavior. A later explicit
-activation change may point the supervisor at this entrypoint.
+P3 keeps the provider-capability projection present in both API-only and Codex
+entrypoint modes. Codex-specific relay/admin integrations remain installed only by
+this alternate entrypoint.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from backend import codex_canary_admin_proxy
 from backend import codex_canary_recovery_admin
 from backend import codex_canary_relay_integration
-from backend import legacy_chat_bridge_app as bridge
+from backend import p3_relay_app as bridge
 
 
 codex_canary_relay_integration.install(bridge.relay_app)

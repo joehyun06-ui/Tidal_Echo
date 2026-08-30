@@ -30,7 +30,7 @@ def supervisor_config(*, autonomous_wake_enabled: bool = False):
 
 
 class P3ProviderGuardSupervisorTests(unittest.TestCase):
-    def test_default_selection_changes_only_api_loop_to_provider_guard(self):
+    def test_default_selection_wraps_only_api_loop_and_relay(self):
         config = supervisor_config(autonomous_wake_enabled=True)
         base = render_start.child_commands(config, executable="python-test")
         actual = render_start_p3.child_commands(
@@ -40,13 +40,19 @@ class P3ProviderGuardSupervisorTests(unittest.TestCase):
         )
         self.assertIn(render_start_p3.GUARD_API_LOOP, actual["api_loop"])
         self.assertNotIn(render_start_p3.BASE_API_LOOP, actual["api_loop"])
-        self.assertEqual(actual["relay"], base["relay"])
+        self.assertIn(render_start_p3.P3_RELAY, actual["relay"])
+        self.assertNotIn(render_start_p3.LEGACY_RELAY, actual["relay"])
         self.assertEqual(actual["autonomous_wake"], base["autonomous_wake"])
         normalized = {name: list(command) for name, command in actual.items()}
         normalized["api_loop"] = [
             render_start_p3.BASE_API_LOOP
             if item == render_start_p3.GUARD_API_LOOP else item
             for item in normalized["api_loop"]
+        ]
+        normalized["relay"] = [
+            render_start_p3.LEGACY_RELAY
+            if item == render_start_p3.P3_RELAY else item
+            for item in normalized["relay"]
         ]
         self.assertEqual(normalized, base)
 
@@ -69,7 +75,7 @@ class P3ProviderGuardSupervisorTests(unittest.TestCase):
                 render_start_p3.GENERATION_FLAG: "true",
             })
 
-    def test_enabled_codex_gate_swaps_guard_and_relay_only(self):
+    def test_enabled_codex_gate_swaps_p3_wrappers_only(self):
         config = supervisor_config(autonomous_wake_enabled=True)
         guarded = render_start_p3.child_commands(
             config,
@@ -87,7 +93,7 @@ class P3ProviderGuardSupervisorTests(unittest.TestCase):
         self.assertIn(render_start_p3.CODEX_API_LOOP, actual["api_loop"])
         self.assertNotIn(render_start_p3.GUARD_API_LOOP, actual["api_loop"])
         self.assertIn(render_start_p3.CODEX_RELAY, actual["relay"])
-        self.assertNotIn(render_start_p3.LEGACY_RELAY, actual["relay"])
+        self.assertNotIn(render_start_p3.P3_RELAY, actual["relay"])
         self.assertEqual(actual["autonomous_wake"], guarded["autonomous_wake"])
 
     def test_main_selector_is_scoped_and_restores_base_supervisor(self):
@@ -110,6 +116,7 @@ class P3ProviderGuardSupervisorTests(unittest.TestCase):
 
         self.assertIsNot(observed["selector"], original)
         self.assertIn(render_start_p3.GUARD_API_LOOP, observed["commands"]["api_loop"])
+        self.assertIn(render_start_p3.P3_RELAY, observed["commands"]["relay"])
         self.assertIs(render_start.child_commands, original)
 
     def test_direct_execution_bootstraps_repo_root_before_preflight(self):
