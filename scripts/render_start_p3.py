@@ -3,8 +3,8 @@
 
 With Codex entrypoints disabled, the reviewed production supervisor is preserved
 except that the localhost API-loop target is wrapped by
-``examples.api_loop_provider_guard:app``. That guard keeps ordinary traffic on API
-while refusing any durable Codex-authority Web session before API model work.
+``examples.api_loop_provider_guard:app`` and the public relay target is wrapped by
+``backend.p3_relay_app:app`` for a read-only provider capability projection.
 
 A later explicit Codex rollout can enable the existing alternate Codex api-loop and
 relay behind the same strict canary/generation gates. This file does not itself
@@ -33,6 +33,7 @@ BASE_API_LOOP = "examples.api_loop:app"
 GUARD_API_LOOP = "examples.api_loop_provider_guard:app"
 CODEX_API_LOOP = "examples.api_loop_codex_canary:app"
 LEGACY_RELAY = "backend.legacy_chat_bridge_app:app"
+P3_RELAY = "backend.p3_relay_app:app"
 CODEX_RELAY = "backend.codex_canary_relay_app:app"
 
 
@@ -74,6 +75,11 @@ def _select_child_commands(
         BASE_API_LOOP,
         GUARD_API_LOOP,
     )
+    commands["relay"] = _replace_target(
+        list(commands["relay"]),
+        LEGACY_RELAY,
+        P3_RELAY,
+    )
     if not codex_entrypoints_enabled(environ):
         return commands
     commands["api_loop"] = _replace_target(
@@ -83,7 +89,7 @@ def _select_child_commands(
     )
     commands["relay"] = _replace_target(
         list(commands["relay"]),
-        LEGACY_RELAY,
+        P3_RELAY,
         CODEX_RELAY,
     )
     return commands
