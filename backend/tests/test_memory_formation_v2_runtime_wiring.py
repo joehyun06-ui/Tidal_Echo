@@ -13,7 +13,6 @@ from backend.tests._support import NoNetworkMixin, load_app, request
 
 MEMORY_SECRET = "Synthetic-App-Candidate-HMAC-Key-2026!Z9q7"
 V1_SESSION = "memory-formation-extractor-v1"
-V2_SESSION = "memory-formation-extractor-v2"
 GATE = "MEMORY_FORMATION_V2_SHADOW_ENABLED"
 
 
@@ -89,7 +88,7 @@ class MemoryFormationV2RuntimeWiringTests(
         return module, patch
 
     async def wait_for_shadow(self, module):
-        for _ in range(400):
+        for _ in range(600):
             task = getattr(module.app.state, "memory_formation_shadow_task", None)
             if task is None:
                 return
@@ -116,6 +115,12 @@ class MemoryFormationV2RuntimeWiringTests(
             },
         )
 
+    def v2_extraction(self, patch, source: str, signal_type: str, spans):
+        return patch.memory_formation_extractor_v2._parse_model_output(
+            v2_output(signal_type, list(spans)),
+            len(source),
+        )
+
     def memory_counts(self, module) -> dict[str, int]:
         with module.db() as conn:
             return {
@@ -132,11 +137,11 @@ class MemoryFormationV2RuntimeWiringTests(
     async def test_gate_defaults_off_and_does_not_patch_v1_task(self):
         module, patch = self.load(gate=None)
         original = module._run_memory_formation_shadow_task
+        original_forward = module.forward_to_loop
         self.assertFalse(patch.install(module))
         self.assertIs(module._run_memory_formation_shadow_task, original)
-        self.assertFalse(
-            getattr(module, patch.ENABLED_MARKER, True)
-        )
+        self.assertIs(module.forward_to_loop, original_forward)
+        self.assertFalse(getattr(module, patch.ENABLED_MARKER, True))
 
     async def test_gate_is_strict_and_requires_existing_v1_auto_formation(self):
         module, patch = self.load(gate="not-a-bool")
@@ -177,21 +182,33 @@ class MemoryFormationV2RuntimeWiringTests(
         first = "Project Atlas uses PostgreSQL 16."
         second = "The project runs on port 5432."
         calls = []
+        order = []
 
         async def generate(messages, session, model, temperature, max_tokens, context):
             calls.append(session)
             if session == V1_SESSION:
+                order.append("v1")
                 start, end = part_span(source, first)
                 return {"text": v1_output("project_fact", start, end)}
-            if session == V2_SESSION:
-                return {"text": v2_output(
-                    "project_fact",
-                    [part_span(source, first), part_span(source, second)],
-                )}
+            order.append("main")
             return {"text": "authoritative reply", "usage": {}}
 
+        async def extract_v2(**kwargs):
+            order.append("v2")
+            self.assertEqual(kwargs["source_text"], source)
+            return self.v2_extraction(
+                patch,
+                source,
+                "project_fact",
+                [part_span(source, first), part_span(source, second)],
+            )
+
         module.KELIVO_GENERATOR = generate
-        with mock.patch("builtins.print") as printed:
+        with mock.patch.object(
+            patch.memory_formation_v2_loopback,
+            "extract_v2_via_loopback",
+            side_effect=extract_v2,
+        ) as v2_call, mock.patch("builtins.print") as printed:
             response = await self.post(module, "v2-runtime-key-0001", source)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(
@@ -200,7 +217,9 @@ class MemoryFormationV2RuntimeWiringTests(
             )
             await self.wait_for_shadow(module)
 
-        self.assertEqual(calls, ["shared-test-session", V1_SESSION, V2_SESSION])
+        self.assertEqual(calls, ["shared-test-session", V1_SESSION])
+        self.assertEqual(order, ["main", "v1", "v2"])
+        self.assertEqual(v2_call.await_count, 1)
         self.assertEqual(
             self.memory_counts(module),
             {
@@ -256,12 +275,19 @@ class MemoryFormationV2RuntimeWiringTests(
             calls.append(session)
             if session == V1_SESSION:
                 return {"text": v1_output("project_fact", 0, len(source))}
-            if session == V2_SESSION:
-                return {"text": "PRIVATE MALFORMED V2 OUTPUT"}
             return {"text": "stable main reply", "usage": {}}
 
+        async def fail_v2(**_kwargs):
+            raise patch.memory_formation_v2_loopback.MemoryFormationV2LoopbackError(
+                "extractor_invalid_output"
+            )
+
         module.KELIVO_GENERATOR = generate
-        with mock.patch("builtins.print") as printed:
+        with mock.patch.object(
+            patch.memory_formation_v2_loopback,
+            "extract_v2_via_loopback",
+            side_effect=fail_v2,
+        ), mock.patch("builtins.print") as printed:
             response = await self.post(module, "v2-runtime-key-0002", source)
             await self.wait_for_shadow(module)
 
@@ -270,7 +296,7 @@ class MemoryFormationV2RuntimeWiringTests(
             response.json()["choices"][0]["message"]["content"],
             "stable main reply",
         )
-        self.assertEqual(calls, ["shared-test-session", V1_SESSION, V2_SESSION])
+        self.assertEqual(calls, ["shared-test-session", V1_SESSION])
         self.assertEqual(
             self.memory_counts(module),
             {
@@ -290,50 +316,75 @@ class MemoryFormationV2RuntimeWiringTests(
             "v1_proposals=1 v1_candidates=1",
             logs,
         )
-        self.assertNotIn("PRIVATE MALFORMED V2 OUTPUT", logs)
 
-    async def test_natural_ingress_uses_same_sequential_v1_then_v2_task(self):
+    async def test_web_app_send_waits_for_main_forward_before_v1_then_v2(self):
         module, patch = self.load(
             gate="true",
             natural_ingress=True,
         )
-        patch.install(module)
         source = (
             "Project Atlas uses Python. filler. "
             "The project runs on Render."
         )
         first = "Project Atlas uses Python."
         second = "The project runs on Render."
+        forward_started = asyncio.Event()
+        release_forward = asyncio.Event()
         calls = []
+        order = []
+
+        async def fake_forward(_msg):
+            order.append("main-forward-start")
+            forward_started.set()
+            await release_forward.wait()
+            order.append("main-forward-done")
+
+        module.forward_to_loop = fake_forward
+        patch.install(module)
 
         async def generate(messages, session, model, temperature, max_tokens, context):
             calls.append(session)
-            if session == V1_SESSION:
-                start, end = part_span(source, first)
-                return {"text": v1_output("project_fact", start, end)}
-            if session == V2_SESSION:
-                return {"text": v2_output(
-                    "project_fact",
-                    [part_span(source, first), part_span(source, second)],
-                )}
-            raise AssertionError("natural ingress must perform extraction calls only")
+            self.assertEqual(session, V1_SESSION)
+            order.append("v1")
+            start, end = part_span(source, first)
+            return {"text": v1_output("project_fact", start, end)}
+
+        async def extract_v2(**kwargs):
+            order.append("v2")
+            return self.v2_extraction(
+                patch,
+                source,
+                "project_fact",
+                [part_span(source, first), part_span(source, second)],
+            )
 
         module.KELIVO_GENERATOR = generate
-        message = module.save_message(
-            "in",
-            "user",
-            source,
-            {"channel": "web", "source": "relay"},
+        with mock.patch.object(
+            patch.memory_formation_v2_loopback,
+            "extract_v2_via_loopback",
+            side_effect=extract_v2,
+        ) as v2_call:
+            response = await request(
+                module,
+                "POST",
+                "/app/send",
+                headers={"Authorization": "Bearer test-relay-secret"},
+                json={"text": source, "api_session": "shared-test-session"},
+            )
+            self.assertEqual(response.status_code, 200)
+            await asyncio.wait_for(forward_started.wait(), 1)
+            await asyncio.sleep(0.02)
+            self.assertEqual(calls, [])
+            self.assertNotIn("v2", order)
+            release_forward.set()
+            await self.wait_for_shadow(module)
+
+        self.assertEqual(calls, [V1_SESSION])
+        self.assertEqual(
+            order,
+            ["main-forward-start", "main-forward-done", "v1", "v2"],
         )
-        scheduled = module._schedule_natural_ingress_memory_formation_shadow(
-            canonical_message_id=message["id"],
-            channel="web",
-            source="relay",
-            generation_callable=generate,
-        )
-        self.assertTrue(scheduled)
-        await self.wait_for_shadow(module)
-        self.assertEqual(calls, [V1_SESSION, V2_SESSION])
+        self.assertEqual(v2_call.await_count, 1)
         self.assertEqual(
             self.memory_counts(module),
             {
@@ -342,6 +393,49 @@ class MemoryFormationV2RuntimeWiringTests(
                 "memory_auto_formation_runs": 1,
             },
         )
+
+    async def test_natural_ingress_without_tracked_forward_remains_supported(self):
+        module, patch = self.load(
+            gate="true",
+            natural_ingress=True,
+        )
+        patch.install(module)
+        source = "Project Atlas uses Python."
+        calls = []
+
+        async def generate(messages, session, model, temperature, max_tokens, context):
+            calls.append(session)
+            return {"text": v1_output("project_fact", 0, len(source))}
+
+        async def extract_v2(**_kwargs):
+            return self.v2_extraction(
+                patch,
+                source,
+                "project_fact",
+                [(0, len(source))],
+            )
+
+        module.KELIVO_GENERATOR = generate
+        message = module.save_message(
+            "in",
+            "user",
+            source,
+            {"channel": "web", "source": "relay"},
+        )
+        with mock.patch.object(
+            patch.memory_formation_v2_loopback,
+            "extract_v2_via_loopback",
+            side_effect=extract_v2,
+        ):
+            scheduled = module._schedule_natural_ingress_memory_formation_shadow(
+                canonical_message_id=message["id"],
+                channel="web",
+                source="relay",
+                generation_callable=generate,
+            )
+            self.assertTrue(scheduled)
+            await self.wait_for_shadow(module)
+        self.assertEqual(calls, [V1_SESSION])
 
     async def test_exact_request_replay_does_not_run_either_extractor_again(self):
         module, patch = self.load(gate="true")
@@ -353,24 +447,37 @@ class MemoryFormationV2RuntimeWiringTests(
             calls.append(session)
             if session == V1_SESSION:
                 return {"text": v1_output("project_fact", 0, len(source))}
-            if session == V2_SESSION:
-                return {"text": v2_output("project_fact", [(0, len(source))])}
             return {"text": "main reply", "usage": {}}
 
+        async def extract_v2(**_kwargs):
+            return self.v2_extraction(
+                patch,
+                source,
+                "project_fact",
+                [(0, len(source))],
+            )
+
         module.KELIVO_GENERATOR = generate
-        first = await self.post(module, "v2-runtime-key-0003", source)
-        self.assertEqual(first.status_code, 200)
-        await self.wait_for_shadow(module)
-        calls_after_fresh = tuple(calls)
-        replay = await self.post(module, "v2-runtime-key-0003", source)
-        self.assertEqual(replay.status_code, 200)
-        await asyncio.sleep(0)
-        self.assertEqual(tuple(calls), calls_after_fresh)
+        with mock.patch.object(
+            patch.memory_formation_v2_loopback,
+            "extract_v2_via_loopback",
+            side_effect=extract_v2,
+        ) as v2_call:
+            first = await self.post(module, "v2-runtime-key-0003", source)
+            self.assertEqual(first.status_code, 200)
+            await self.wait_for_shadow(module)
+            calls_after_fresh = tuple(calls)
+            v2_after_fresh = v2_call.await_count
+            replay = await self.post(module, "v2-runtime-key-0003", source)
+            self.assertEqual(replay.status_code, 200)
+            await asyncio.sleep(0)
+            self.assertEqual(tuple(calls), calls_after_fresh)
+            self.assertEqual(v2_call.await_count, v2_after_fresh)
         self.assertEqual(calls_after_fresh, (
             "shared-test-session",
             V1_SESSION,
-            V2_SESSION,
         ))
+        self.assertEqual(v2_after_fresh, 1)
 
 
 if __name__ == "__main__":
