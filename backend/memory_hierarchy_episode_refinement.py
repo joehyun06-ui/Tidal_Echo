@@ -18,7 +18,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Final
 
-from backend import memory_hierarchy_projection as hierarchy
+from backend import (
+    memory_hierarchy_baseline as baseline,
+    memory_hierarchy_projection as hierarchy,
+)
 
 
 EPISODE_REFINEMENT_CONTRACT_VERSION: Final = "memory-hierarchy-episode-refinement-v1"
@@ -124,8 +127,15 @@ def _validated_topics(
         )
     except hierarchy.MemoryHierarchyProjectionError:
         _raise("invalid_topics")
+    atomic_by_key = {item.memory_key: item for item in atomics}
     owner: dict[str, str] = {}
     for topic in validated:
+        broad_domains = {
+            baseline.TOPIC_BY_KIND.get(atomic_by_key[memory_key].kind)
+            for memory_key in topic.atomic_keys
+        }
+        if None in broad_domains or len(broad_domains) != 1:
+            _raise("invalid_topics")
         for memory_key in topic.atomic_keys:
             owner[memory_key] = topic.topic_key
     return validated, owner
