@@ -41,9 +41,10 @@ class MemoryFormationV2AuthorityTests(
         return module
 
     def reload_v2(self):
+        # Keep the foundational V2 proposal/extraction class modules stable for
+        # the whole unittest process. Only reload modules that must bind to the
+        # freshly imported V1 store/service/review/decision graph from load_app.
         names = (
-            "backend.memory_formation_v2",
-            "backend.memory_formation_extractor_v2",
             "backend.memory_candidate_persistence_v2",
             "backend.memory_candidate_integrity_v2",
             "backend.memory_candidate_review_v2",
