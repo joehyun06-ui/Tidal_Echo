@@ -4,11 +4,12 @@
 With Codex entrypoints disabled, the reviewed production supervisor is preserved
 except that the localhost API-loop target is wrapped by
 ``examples.api_loop_provider_guard:app`` and the public relay target is wrapped by
-``backend.p3_relay_app:app`` for a read-only provider capability projection.
+``backend.p3_relay_app:app`` for the P3 provider/session contract.
 
-A later explicit Codex rollout can enable the existing alternate Codex api-loop and
-relay behind the same strict canary/generation gates. This file does not itself
-change provider authority or enable Codex.
+When explicit Codex entrypoints are enabled, the qualified Codex api-loop is paired
+with the production P3 Codex relay. The production relay keeps Codex queued-ack and
+completion integration but does not expose qualification-era canary admin routes.
+This file does not itself change provider authority or enable Codex.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ GUARD_API_LOOP = "examples.api_loop_provider_guard:app"
 CODEX_API_LOOP = "examples.api_loop_codex_canary:app"
 LEGACY_RELAY = "backend.legacy_chat_bridge_app:app"
 P3_RELAY = "backend.p3_relay_app:app"
-CODEX_RELAY = "backend.codex_canary_relay_app:app"
+CODEX_RELAY = "backend.p3_codex_relay_app:app"
 
 
 def codex_entrypoints_enabled(environ: Mapping[str, str] | None = None) -> bool:
