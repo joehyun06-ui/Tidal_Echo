@@ -36,6 +36,18 @@ def _safe_message_id(value: object) -> int:
     return value
 
 
+def _safe_private_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 160
+        or not value.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in value)
+    ):
+        raise ValueError("codex_generation_observability_invalid")
+    return value
+
+
 def _safe_timestamp(value: object) -> str:
     if not isinstance(value, str) or not value or len(value) > _MAX_TIMESTAMP or not value.isascii():
         raise ValueError("codex_generation_observability_invalid")
@@ -148,6 +160,104 @@ def recent_ingress_receipt(
     return {"state": "present", "rows": projected}
 
 
+def recent_codex_continuity_receipt(
+    store_path: str | Path,
+    *,
+    limit: int = 3,
+) -> dict[str, object]:
+    """Project whether recent Codex jobs share one durable session/thread.
+
+    Actual session/thread identifiers are used only for equality checks and are never
+    returned.  Canonical message ids are retained solely for correlation with the
+    already bounded provider receipt.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 2 <= limit <= _MAX_RECEIPT_ROWS:
+        return {"state": "unavailable"}
+    try:
+        with closing(store.connect(store_path)) as conn:
+            rows = conn.execute(
+                """SELECT canonical_message_id,api_session,thread_attempt_id,thread_id,
+                          status,created_at
+                   FROM codex_generation_jobs ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            rows = list(reversed(rows))
+            if not rows:
+                return {"state": "empty", "job_count": 0}
+            if len(rows) < 2:
+                return {"state": "insufficient", "job_count": len(rows)}
+
+            canonical_ids: list[int] = []
+            sessions: list[str] = []
+            thread_ids: list[str | None] = []
+            thread_attempt_ids: list[str | None] = []
+            for row in rows:
+                canonical_ids.append(_safe_message_id(row["canonical_message_id"]))
+                sessions.append(_safe_private_id(row["api_session"]))
+                status = row["status"]
+                if status not in store.JOB_STATUSES:
+                    raise ValueError("codex_generation_observability_invalid")
+                _safe_timestamp(row["created_at"])
+                thread_ids.append(
+                    None if row["thread_id"] is None else _safe_private_id(row["thread_id"])
+                )
+                thread_attempt_ids.append(
+                    None
+                    if row["thread_attempt_id"] is None
+                    else _safe_private_id(row["thread_attempt_id"])
+                )
+
+            same_session = len(set(sessions)) == 1
+            all_thread_bound = all(value is not None for value in thread_ids)
+            same_thread = all_thread_bound and len(set(thread_ids)) == 1
+            all_thread_attempt_bound = all(value is not None for value in thread_attempt_ids)
+            same_thread_attempt = (
+                all_thread_attempt_bound and len(set(thread_attempt_ids)) == 1
+            )
+            session_active = False
+            current_thread_matches = False
+            if same_session:
+                session = conn.execute(
+                    """SELECT status,thread_attempt_id,thread_id
+                       FROM codex_sessions WHERE api_session=?""",
+                    (sessions[-1],),
+                ).fetchone()
+                if session is None or session["status"] not in {"active", "retired"}:
+                    raise ValueError("codex_generation_observability_invalid")
+                session_active = session["status"] == "active"
+                session_thread_id = (
+                    None
+                    if session["thread_id"] is None
+                    else _safe_private_id(session["thread_id"])
+                )
+                session_attempt_id = (
+                    None
+                    if session["thread_attempt_id"] is None
+                    else _safe_private_id(session["thread_attempt_id"])
+                )
+                current_thread_matches = bool(
+                    all_thread_bound
+                    and all_thread_attempt_bound
+                    and session_thread_id == thread_ids[-1]
+                    and session_attempt_id == thread_attempt_ids[-1]
+                )
+    except Exception:
+        return {"state": "unavailable"}
+
+    return {
+        "state": "present",
+        "job_count": len(rows),
+        "canonical_message_ids": canonical_ids,
+        "same_session": same_session,
+        "all_thread_bound": all_thread_bound,
+        "same_thread": same_thread,
+        "all_thread_attempt_bound": all_thread_attempt_bound,
+        "same_thread_attempt": same_thread_attempt,
+        "session_active": session_active,
+        "current_thread_matches": current_thread_matches,
+    }
+
+
 def format_latest_job_snapshot(snapshot: Mapping[str, object]) -> str:
     state = snapshot.get("state")
     if state == "empty":
@@ -195,6 +305,53 @@ def format_ingress_receipt(receipt: Mapping[str, object]) -> list[str]:
     return lines
 
 
+def format_codex_continuity_receipt(receipt: Mapping[str, object]) -> str:
+    state = receipt.get("state")
+    if state == "empty":
+        return "[codex-continuity] state=empty jobs=0"
+    if state == "insufficient":
+        count = _safe_count(receipt.get("job_count"))
+        return f"[codex-continuity] state=insufficient jobs={count}"
+    if state != "present":
+        return "[codex-continuity] state=unavailable"
+
+    count = _safe_count(receipt.get("job_count"))
+    canonical_ids = receipt.get("canonical_message_ids")
+    if (
+        not isinstance(canonical_ids, list)
+        or len(canonical_ids) != count
+        or not 2 <= count <= _MAX_RECEIPT_ROWS
+    ):
+        return "[codex-continuity] state=unavailable"
+    ids = ",".join(str(_safe_message_id(value)) for value in canonical_ids)
+    bool_fields = (
+        "same_session",
+        "all_thread_bound",
+        "same_thread",
+        "all_thread_attempt_bound",
+        "same_thread_attempt",
+        "session_active",
+        "current_thread_matches",
+    )
+    values: dict[str, bool] = {}
+    for field in bool_fields:
+        value = receipt.get(field)
+        if not isinstance(value, bool):
+            return "[codex-continuity] state=unavailable"
+        values[field] = value
+    return (
+        "[codex-continuity] state=present "
+        f"jobs={count} canonical_message_ids={ids} "
+        f"same_session={'true' if values['same_session'] else 'false'} "
+        f"all_thread_bound={'true' if values['all_thread_bound'] else 'false'} "
+        f"same_thread={'true' if values['same_thread'] else 'false'} "
+        f"all_thread_attempt_bound={'true' if values['all_thread_attempt_bound'] else 'false'} "
+        f"same_thread_attempt={'true' if values['same_thread_attempt'] else 'false'} "
+        f"session_active={'true' if values['session_active'] else 'false'} "
+        f"current_thread_matches={'true' if values['current_thread_matches'] else 'false'}"
+    )
+
+
 def log_latest_job_snapshot(
     store_path: str | Path,
     *,
@@ -220,3 +377,10 @@ def log_recent_ingress_receipt(
         recent_ingress_receipt(relay_db, store_path, limit=limit)
     ):
         print(line, file=target, flush=True)
+    print(
+        format_codex_continuity_receipt(
+            recent_codex_continuity_receipt(store_path, limit=3)
+        ),
+        file=target,
+        flush=True,
+    )
