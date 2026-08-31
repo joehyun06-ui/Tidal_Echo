@@ -15,7 +15,15 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class P3ProductionCodexRelayTests(unittest.TestCase):
     def _base_env(self, root: Path) -> dict[str, str]:
-        env = dict(os.environ)
+        # This subprocess validates the P3 production relay shape, not the
+        # caller's currently deployed optional Memory feature graph. Keep the
+        # fixture hermetic so newly enabled MEMORY_* gates in CI/production do
+        # not combine with the synthetic MEMORY_CORE_ENABLED=false setting.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("MEMORY_")
+        }
         brain = root / "brain_target"
         brain.write_text("desktop", encoding="utf-8")
         env.update({
@@ -43,6 +51,20 @@ class P3ProductionCodexRelayTests(unittest.TestCase):
             "LEGACY_CHAT_BRIDGE_TOKEN": "test-legacy-bridge-token-1234567890",
         })
         return env
+
+    def test_subprocess_fixture_drops_host_memory_feature_gates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "MEMORY_FORMATION_V2_AUTHORITY_ENABLED": "true",
+                    "MEMORY_FUTURE_OPTIONAL_GATE": "true",
+                },
+            ):
+                env = self._base_env(Path(temp))
+        self.assertEqual(env["MEMORY_CORE_ENABLED"], "false")
+        self.assertNotIn("MEMORY_FORMATION_V2_AUTHORITY_ENABLED", env)
+        self.assertNotIn("MEMORY_FUTURE_OPTIONAL_GATE", env)
 
     def test_supervisor_selects_production_not_qualification_relay(self):
         self.assertEqual(
