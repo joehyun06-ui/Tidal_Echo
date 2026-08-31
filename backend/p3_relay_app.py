@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from backend import legacy_chat_bridge_app as bridge
 from backend import (
+    memory_formation_v2_authority,
     memory_formation_v2_runtime_patch,
     p3_provider_status,
     p3_session_retire,
@@ -23,7 +24,8 @@ from backend import (
 
 relay_app = bridge.relay_app
 app = bridge.app
-memory_formation_v2_runtime_patch.install(relay_app)
+if not memory_formation_v2_authority.install(relay_app):
+    memory_formation_v2_runtime_patch.install(relay_app)
 
 
 def _fixed_status_error() -> JSONResponse:
