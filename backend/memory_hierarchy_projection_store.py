@@ -1,9 +1,9 @@
 """Disposable SQLite materialization for Phase 4D-B hierarchy manifests.
 
-The sidecar is a rebuildable projection only.  It stores node/member references,
+The sidecar is a rebuildable projection only. It stores node/member references,
 digests, dirty state, and a generation watermark; it never stores Atomic Memory
 content, provenance text, suppression authority, approval state, or any other
-Memory truth.  The authoritative relay database is neither opened nor modified
+Memory truth. The authoritative relay database is neither opened nor modified
 by this module.
 """
 
@@ -141,7 +141,7 @@ class ProjectionStoreSnapshotV1:
 
 
 def _validated_path(raw_path: object, *, must_exist: bool) -> Path:
-    if type(raw_path) not in (str, Path):
+    if not isinstance(raw_path, (str, Path)):
         _raise("invalid_projection_store_path")
     try:
         path = Path(raw_path)
@@ -288,12 +288,8 @@ def _validate_schema(conn: sqlite3.Connection) -> sqlite3.Row:
             or type(generation) is not int
             or generation < 0
             or type(digest) is not str
-            or (
-                generation == 0 and digest != ""
-            )
-            or (
-                generation > 0 and _DIGEST_PATTERN.fullmatch(digest) is None
-            )
+            or (generation == 0 and digest != "")
+            or (generation > 0 and _DIGEST_PATTERN.fullmatch(digest) is None)
         ):
             _raise("projection_schema_invalid")
         return meta
@@ -345,7 +341,6 @@ def _validate_plan(raw_plan: object) -> hierarchy.HierarchyProjectionPlanV1:
         _raise("invalid_projection_plan")
 
     nodes_by_key: dict[str, hierarchy.ProjectionNodePlanV1] = {}
-    topic_keys: set[str] = set()
     states_by_parent: dict[str, int] = {}
     for node in raw_plan.nodes:
         if type(node) is not hierarchy.ProjectionNodePlanV1:
@@ -355,10 +350,7 @@ def _validate_plan(raw_plan: object) -> hierarchy.HierarchyProjectionPlanV1:
             or type(node.node_key) is not str
             or _NODE_KEY_PATTERN.fullmatch(node.node_key) is None
             or type(node.parent_key) is not str
-            or (
-                node.parent_key
-                and _NODE_KEY_PATTERN.fullmatch(node.parent_key) is None
-            )
+            or (node.parent_key and _NODE_KEY_PATTERN.fullmatch(node.parent_key) is None)
             or type(node.atomic_keys) is not tuple
             or type(node.projection_digest) is not str
             or _DIGEST_PATTERN.fullmatch(node.projection_digest) is None
@@ -377,7 +369,6 @@ def _validate_plan(raw_plan: object) -> hierarchy.HierarchyProjectionPlanV1:
         if node.node_type == "topic":
             if node.parent_key:
                 _raise("invalid_projection_plan")
-            topic_keys.add(node.node_key)
         elif not node.parent_key:
             _raise("invalid_projection_plan")
         if node.node_type == "canonical_state":
@@ -523,10 +514,7 @@ def load_projection_snapshot(raw_path: object) -> ProjectionStoreSnapshotV1:
             if (
                 row["node_type"] not in _NODE_TYPES
                 or _NODE_KEY_PATTERN.fullmatch(str(row["node_key"])) is None
-                or (
-                    row["parent_key"]
-                    and _NODE_KEY_PATTERN.fullmatch(str(row["parent_key"])) is None
-                )
+                or (row["parent_key"] and _NODE_KEY_PATTERN.fullmatch(str(row["parent_key"])) is None)
                 or _DIGEST_PATTERN.fullmatch(str(row["projection_digest"])) is None
                 or row["dirty"] not in (0, 1)
                 or len(set(atomic_keys)) != len(atomic_keys)
