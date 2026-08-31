@@ -112,20 +112,16 @@ def _validated_inputs(
     dict[str, str],
 ]:
     try:
-        validated_atomics, _ = hierarchy._validate_atomics(atomics)
-    except hierarchy.MemoryHierarchyProjectionError:
+        validated_atomics, _ = episode_refinement._validated_atomics(atomics)
+    except episode_refinement.MemoryHierarchyEpisodeRefinementError:
         _raise("invalid_atomics")
     try:
-        validated_topics = hierarchy._validate_topics(
+        validated_topics, topic_by_atomic = episode_refinement._validated_topics(
             topics,
-            frozenset(item.memory_key for item in validated_atomics),
+            validated_atomics,
         )
-    except hierarchy.MemoryHierarchyProjectionError:
+    except episode_refinement.MemoryHierarchyEpisodeRefinementError:
         _raise("invalid_topics")
-    topic_by_atomic: dict[str, str] = {}
-    for topic in validated_topics:
-        for memory_key in topic.atomic_keys:
-            topic_by_atomic[memory_key] = topic.topic_key
     return validated_atomics, validated_topics, topic_by_atomic
 
 
