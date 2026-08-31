@@ -206,18 +206,18 @@ def _user_tables(conn: sqlite3.Connection) -> tuple[str, ...]:
 
 
 def _create_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE projection_meta(
+    conn.execute(
+        """CREATE TABLE projection_meta(
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             schema_version INTEGER NOT NULL CHECK(schema_version=1),
             contract_version TEXT NOT NULL,
             projection_contract_version TEXT NOT NULL,
             generation INTEGER NOT NULL CHECK(generation>=0),
             atomic_snapshot_digest TEXT NOT NULL
-        );
-
-        CREATE TABLE projection_nodes(
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE projection_nodes(
             node_key TEXT PRIMARY KEY,
             node_type TEXT NOT NULL CHECK(
                 node_type IN ('topic','episode','canonical_state')
@@ -226,22 +226,25 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             projection_digest TEXT NOT NULL,
             dirty INTEGER NOT NULL CHECK(dirty IN (0,1)),
             generation INTEGER NOT NULL CHECK(generation>0)
-        );
-
-        CREATE TABLE projection_members(
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE projection_members(
             node_key TEXT NOT NULL REFERENCES projection_nodes(node_key)
                 ON DELETE CASCADE,
             ordinal INTEGER NOT NULL CHECK(ordinal>=0),
             memory_key TEXT NOT NULL,
             PRIMARY KEY(node_key, ordinal),
             UNIQUE(node_key, memory_key)
-        );
-
-        CREATE INDEX projection_nodes_parent_idx
-            ON projection_nodes(parent_key, node_type, node_key);
-        CREATE INDEX projection_members_memory_idx
-            ON projection_members(memory_key, node_key);
-        """
+        )"""
+    )
+    conn.execute(
+        """CREATE INDEX projection_nodes_parent_idx
+            ON projection_nodes(parent_key, node_type, node_key)"""
+    )
+    conn.execute(
+        """CREATE INDEX projection_members_memory_idx
+            ON projection_members(memory_key, node_key)"""
     )
     conn.execute(
         """INSERT INTO projection_meta
