@@ -102,7 +102,7 @@ class MemoryHierarchySummaryRebuildTests(unittest.IsolatedAsyncioTestCase):
         self.reader = memory_hierarchy_snapshot.MemoryHierarchySnapshotReader(
             self.relay,
             fingerprint_key_id="summary-rebuild-key",
-            fingerprint_hmac_secret="s" * 64,
+            fingerprint_hmac_secret="SummaryRebuild-HMAC-0123456789-abcdef-XYZ!",
             max_item_chars=4096,
             sensitive_storage_enabled=False,
         )
