@@ -233,7 +233,8 @@ class MemoryFormationV2AuthorityTests(
                     ORDER BY span_start""",
                 (item["memory_key"],),
             ).fetchall()
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            module.channel_store.validate_memory_candidate_persistence_schema(conn)
+            module.channel_store.validate_memory_candidate_decision_schema_v1_v10(conn)
         self.assertEqual(
             tuple(run),
             ("memory-formation-v2", "memory-formation-extractor-v2", 1, 1),
@@ -247,7 +248,6 @@ class MemoryFormationV2AuthorityTests(
             and row["extractor_contract_version"] == "memory-formation-extractor-v2"
             for row in sources
         ))
-        self.assertEqual(version, 10)
 
         detail = module.MEMORY_CANDIDATE_REVIEW_OPERATOR.get_candidate(
             item["memory_key"]
