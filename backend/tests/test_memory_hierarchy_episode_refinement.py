@@ -146,7 +146,7 @@ class MemoryHierarchyEpisodeRefinementTests(unittest.TestCase):
             episode.refine_episodes_v1,
             atomics(),
             topics(),
-            (proposal(A1, A2), proposal(A2, A1)),
+            (proposal(A1, A2), proposal(A2, B1)),
         )
         self.assert_error(
             "unknown_atomic_key",
@@ -329,6 +329,33 @@ class MemoryHierarchyEpisodeRefinementExtractorTests(unittest.IsolatedAsyncioTes
         self.assertFalse(result.provider_called)
         self.assertFalse(result.applied)
         self.assertEqual(result.proposals, ())
+        self.assertEqual(calls, [])
+
+    async def test_invalid_broad_domain_topic_fails_before_provider_skip_or_call(self):
+        forged_topics = (
+            hierarchy.TopicGroupingV1("topic.forged", tuple(sorted((A1, R1)))),
+            hierarchy.TopicGroupingV1("topic.project.alpha", tuple(sorted((A2, A3)))),
+            hierarchy.TopicGroupingV1("topic.project.beta", tuple(sorted((B1, B2)))),
+            hierarchy.TopicGroupingV1("topic.relationship", (R2,)),
+            hierarchy.TopicGroupingV1("topic.user", (U1,)),
+        )
+        calls = []
+
+        async def forbidden(*_args):
+            calls.append(1)
+            return {"text": output([])}
+
+        with self.assertRaises(
+            extractor.MemoryHierarchyEpisodeRefinementExtractorError
+        ) as raised:
+            await extractor.extract_episode_refinement_v1(
+                forbidden,
+                atomics(),
+                forged_topics,
+                provider_model="test-model",
+                provider_prompt_contract_version="test-prompt-v1",
+            )
+        self.assertEqual(raised.exception.category, "invalid_topics")
         self.assertEqual(calls, [])
 
     async def test_empty_provider_groups_are_safe_no_episode(self):
