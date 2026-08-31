@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from backend import codex_generation_observability, codex_generation_store
+from backend import memory_formation_v2_loopback
 from backend import web_session_delete, web_session_provider_authority
 from backend.codex_canary_loop_integration import (
     CodexCanaryLoopIntegrationError,
@@ -223,6 +224,11 @@ async def loop_ingest(request: Request):
             status_code=504 if result.get("dispatch_uncertain") else 502,
         )
     return result
+
+
+@app.post(memory_formation_v2_loopback.ENDPOINT)
+async def loop_memory_formation_v2(request: Request):
+    return await memory_formation_v2_loopback.handle_request(legacy, request)
 
 
 @app.post("/loop/provider/canary/create")
