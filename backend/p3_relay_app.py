@@ -13,11 +13,17 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from backend import legacy_chat_bridge_app as bridge
-from backend import p3_provider_status, p3_session_retire, web_provider_capabilities
+from backend import (
+    memory_formation_v2_runtime_patch,
+    p3_provider_status,
+    p3_session_retire,
+    web_provider_capabilities,
+)
 
 
 relay_app = bridge.relay_app
 app = bridge.app
+memory_formation_v2_runtime_patch.install(relay_app)
 
 
 def _fixed_status_error() -> JSONResponse:
