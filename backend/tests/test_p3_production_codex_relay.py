@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import render_start_p3
 
@@ -54,7 +55,7 @@ class P3ProductionCodexRelayTests(unittest.TestCase):
 
     def test_subprocess_fixture_drops_host_memory_feature_gates(self):
         with tempfile.TemporaryDirectory() as temp:
-            with unittest.mock.patch.dict(
+            with mock.patch.dict(
                 os.environ,
                 {
                     "MEMORY_FORMATION_V2_AUTHORITY_ENABLED": "true",
