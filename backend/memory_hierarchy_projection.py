@@ -1,8 +1,8 @@
 """Pure rebuildable hierarchy projection planning for Phase 4D-B.
 
-This module never owns Memory truth.  It accepts already-read active atomic
+This module never owns Memory truth. It accepts already-read active atomic
 Memory snapshots plus opaque grouping proposals and produces only structural
-Topic / Episode / Canonical-State manifests.  It performs no I/O, persistence,
+Topic / Episode / Canonical-State manifests. It performs no I/O, persistence,
 provider calls, summarization, retrieval, or mutation of canonical Memory.
 
 Projection nodes contain Memory keys and digests only; normalized atomic content
@@ -29,6 +29,7 @@ MAX_EPISODES: Final = 128
 MAX_ATOMIC_CONTENT_CHARS: Final = 4096
 MAX_SCOPE_REF_CHARS: Final = 256
 MAX_NODE_KEY_CHARS: Final = 128
+_STATE_PREFIX: Final = "state:"
 
 _KINDS: Final = frozenset({
     "user_preference",
@@ -346,6 +347,8 @@ def _validate_topics(
         if type(raw) is not TopicGroupingV1 or type(raw.atomic_keys) is not tuple:
             _raise("invalid_topic")
         topic_key = _valid_node_key(raw.topic_key, "invalid_topic")
+        if topic_key.startswith(_STATE_PREFIX) or len(topic_key) + len(_STATE_PREFIX) > MAX_NODE_KEY_CHARS:
+            _raise("invalid_topic")
         if topic_key in seen_topics:
             _raise("duplicate_topic")
         seen_topics.add(topic_key)
@@ -385,6 +388,8 @@ def _validate_episodes(
             _raise("invalid_episode")
         episode_key = _valid_node_key(raw.episode_key, "invalid_episode")
         topic_key = _valid_node_key(raw.topic_key, "invalid_episode")
+        if episode_key.startswith(_STATE_PREFIX):
+            _raise("invalid_groupings")
         if episode_key in seen_episode_keys:
             _raise("duplicate_episode")
         if episode_key in topic_keys or topic_key not in topic_keys:
@@ -499,9 +504,9 @@ def plan_hierarchy_projection_v1(
 ) -> HierarchyProjectionPlanV1:
     """Plan a complete rebuildable hierarchy from authoritative active atomics.
 
-    Every active atomic must belong to exactly one topic.  Episode membership is
+    Every active atomic must belong to exactly one topic. Episode membership is
     optional but an atomic may belong to at most one episode and that episode
-    must be under the atomic's topic.  Canonical-state nodes are structural
+    must be under the atomic's topic. Canonical-state nodes are structural
     manifests over the topic's active atomics; this function never summarizes
     or rewrites their content.
     """
@@ -571,9 +576,7 @@ def plan_hierarchy_projection_v1(
             projection_digest=topic_digest,
         ))
 
-        state_key = f"state:{topic.topic_key}"
-        if len(state_key) > MAX_NODE_KEY_CHARS or _NODE_KEY_PATTERN.fullmatch(state_key) is None:
-            _raise("invalid_topic")
+        state_key = f"{_STATE_PREFIX}{topic.topic_key}"
         state_digest = _node_digest(
             node_type="canonical_state",
             node_key=state_key,
@@ -593,6 +596,8 @@ def plan_hierarchy_projection_v1(
     order = {"topic": 0, "episode": 1, "canonical_state": 2}
     nodes.sort(key=lambda node: (node.parent_key, order[node.node_type], node.node_key))
     current_keys = {node.node_key for node in nodes}
+    if len(current_keys) != len(nodes):
+        _raise("invalid_groupings")
     obsolete = tuple(sorted(set(previous) - current_keys))
     atomic_snapshot_digest = _json_digest(
         "active-atomic-snapshot-v1",
