@@ -63,6 +63,10 @@ async def lifespan(_app: FastAPI):
                 codex_generation_observability.log_latest_job_snapshot(
                     GENERATION_CONFIG.store_path
                 )
+                codex_generation_observability.log_recent_ingress_receipt(
+                    legacy.RELAY_DB,
+                    GENERATION_CONFIG.store_path,
+                )
             yield
         finally:
             await RUNTIME.close()
