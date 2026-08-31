@@ -3,12 +3,10 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 from backend import channel_store, deployment_config
 from backend.tests._support import NoNetworkMixin
@@ -85,11 +83,17 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
                 self.runtime.candidate_persistence
             )
         )
-        self.review_v2 = self.review_v2_module.compose_candidate_review_capabilities_v2(
-            deployment_for(self.path)
-        )
+        # Review deliberately is not composed here. The fingerprint profile is
+        # initialized lazily by the first successful authorized Memory write,
+        # and review must fail closed while that profile is absent.
         self.writer_v2 = self.decision_v2_module.bind_candidate_decision_writer_v2(
             self.runtime.candidate_decisions
+        )
+
+    def review_capabilities(self):
+        """Compose review only after a test has initialized the Memory profile."""
+        return self.review_v2_module.compose_candidate_review_capabilities_v2(
+            deployment_for(self.path)
         )
 
     def message(self, text: str) -> int:
@@ -218,13 +222,14 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
             "Project Atlas uses PostgreSQL 16.",
             "The project runs on port 5432.",
         )
-        listed = self.review_v2.operator_cli.list_candidates()
+        review_v2 = self.review_capabilities()
+        listed = review_v2.operator_cli.list_candidates()
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0].candidate_key, key)
         self.assertEqual(listed[0].kind, "project")
         self.assertEqual(listed[0].provenance_count, 2)
 
-        detail = self.review_v2.operator_cli.get_candidate(key)
+        detail = review_v2.operator_cli.get_candidate(key)
         self.assertEqual(
             detail.content,
             "Project Atlas uses PostgreSQL 16. The project runs on port 5432.",
@@ -304,6 +309,9 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
             "Project Atlas uses Python.",
             "The project runs on Render.",
         )
+        # Compose while the durable profile/evidence are valid; the reader is
+        # dynamic, so later corruption must still be detected on the next read.
+        review_v2 = self.review_capabilities()
         with self.channel_store.connect(self.path) as conn:
             conn.execute("DROP TRIGGER memory_candidate_sources_immutable_delete")
             source_id = conn.execute(
@@ -323,7 +331,7 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
         with self.assertRaises(
             self.memory_candidate_review.MemoryCandidateReviewError
         ) as review_error:
-            self.review_v2.operator_cli.get_candidate(key)
+            review_v2.operator_cli.get_candidate(key)
         self.assertEqual(
             review_error.exception.category,
             "candidate_review_state_invalid",
@@ -342,7 +350,8 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
 
     def test_v2_review_and_decision_paths_remain_backward_compatible_with_v1(self):
         key = self.persist_v1("Project Atlas uses Python.")
-        detail = self.review_v2.operator_cli.get_candidate(key)
+        review_v2 = self.review_capabilities()
+        detail = review_v2.operator_cli.get_candidate(key)
         self.assertEqual(detail.content, "Project Atlas uses Python.")
         self.assertEqual(detail.provenance_count, 1)
         result = self.writer_v2.decide(
@@ -396,10 +405,15 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(self.state(), before)
 
     def test_v2_capabilities_are_not_present_on_runtime_without_explicit_wiring(self):
+        # Initialize the fingerprint profile through the real V1 write boundary;
+        # readiness is intentionally false before any successful Memory write.
+        self.persist_v1("Project Atlas uses Python.")
+        review_v2 = self.review_capabilities()
         self.assertFalse(hasattr(self.runtime, "candidate_persistence_v2"))
         self.assertFalse(hasattr(self.runtime, "candidate_review_v2"))
         self.assertFalse(hasattr(self.runtime, "candidate_decisions_v2"))
         self.assertIsNot(self.writer_v2, self.runtime.candidate_decisions)
+        self.assertIsNot(review_v2.service, None)
         self.assertEqual(self.writer_v2.readiness(), (True, ""))
 
 
