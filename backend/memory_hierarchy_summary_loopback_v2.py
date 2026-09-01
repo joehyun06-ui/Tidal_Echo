@@ -1,10 +1,10 @@
 """Strict localhost-only generation adapter for hierarchy summary v2.
 
 The public relay may call this adapter only with the exact two-message payload
-constructed by ``memory_hierarchy_summary_extractor_v2``.  The api-loop rechecks
+constructed by ``memory_hierarchy_summary_extractor_v2``. The api-loop rechecks
 the extractor session, developer instruction, bounded untrusted-data schema,
 provider model, temperature/token limits, and context before dispatching to the
-frozen primary provider.  It is not a generic prompt proxy.
+frozen primary provider. It is not a generic prompt proxy.
 """
 
 from __future__ import annotations
@@ -116,7 +116,11 @@ def _validate_user_payload(raw: object, expected_node_type: str) -> None:
             _raise("loopback_invalid_request")
 
 
-def _validate_dispatch_body(body: object, provider_model: str) -> tuple[tuple[dict[str, str], ...], dict]:
+def _validate_dispatch_body(
+    body: object,
+    provider_model: str,
+    prompt_contract_version: str,
+) -> tuple[tuple[dict[str, str], ...], dict]:
     if type(body) is not dict or set(body) != {
         "messages", "session_id", "provider_model", "temperature", "max_tokens", "context"
     }:
@@ -134,7 +138,11 @@ def _validate_dispatch_body(body: object, provider_model: str) -> tuple[tuple[di
         _raise("loopback_invalid_request")
     if messages[0] != {"role": "developer", "content": extractor.EXTRACTOR_INSTRUCTION}:
         _raise("loopback_invalid_request")
-    if type(messages[1]) is not dict or set(messages[1]) != {"role", "content"} or messages[1]["role"] != "user":
+    if (
+        type(messages[1]) is not dict
+        or set(messages[1]) != {"role", "content"}
+        or messages[1]["role"] != "user"
+    ):
         _raise("loopback_invalid_request")
     context = body["context"]
     if type(context) is not dict or set(context) != {
@@ -145,7 +153,8 @@ def _validate_dispatch_body(body: object, provider_model: str) -> tuple[tuple[di
     }:
         _raise("loopback_invalid_request")
     if (
-        context["memory_hierarchy_summary_extractor"] != extractor.EXTRACTOR_CONTRACT_VERSION
+        context["prompt_contract_version"] != prompt_contract_version
+        or context["memory_hierarchy_summary_extractor"] != extractor.EXTRACTOR_CONTRACT_VERSION
         or context["memory_hierarchy_summary_contract"] != summary.SUMMARY_CONTRACT_VERSION_V2
         or context["summary_target_type"] not in {"topic", "episode", "canonical_state"}
     ):
@@ -163,7 +172,16 @@ async def handle_request(legacy: object, request: Request):
             os.environ,
             legacy.LOOP_CONFIG,
         )
-        messages, _context = _validate_dispatch_body(body, defaults.provider_model)
+        prompt_contract_version = (
+            legacy.kelivo_service.PROMPT_CONTRACT_VERSION
+            if hasattr(legacy, "kelivo_service")
+            else "kelivo-provider-prompt-v1"
+        )
+        messages, _context = _validate_dispatch_body(
+            body,
+            defaults.provider_model,
+            prompt_contract_version,
+        )
         out = await legacy.run_kelivo_provider_contract(
             defaults.provider_model,
             list(messages),
@@ -251,7 +269,11 @@ async def generate_v2_via_loopback(
         payload = json.loads(bytes(data))
     except (json.JSONDecodeError, UnicodeError, ValueError):
         _raise("loopback_invalid_response")
-    if type(payload) is not dict or set(payload) != {"ok", "text"} or payload.get("ok") is not True:
+    if (
+        type(payload) is not dict
+        or set(payload) != {"ok", "text"}
+        or payload.get("ok") is not True
+    ):
         _raise("loopback_invalid_response")
     text = payload.get("text")
     if type(text) is not str or not text or len(text) > extractor.MAX_RESPONSE_CHARS:
