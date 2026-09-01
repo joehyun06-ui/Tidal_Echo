@@ -16,6 +16,7 @@ from backend import legacy_chat_bridge_app as bridge
 from backend import (
     memory_formation_v2_authority,
     memory_formation_v2_runtime_patch,
+    memory_hierarchy_summary_runtime_shadow,
     p3_provider_status,
     p3_session_retire,
     web_provider_capabilities,
@@ -26,6 +27,7 @@ relay_app = bridge.relay_app
 app = bridge.app
 if not memory_formation_v2_authority.install(relay_app):
     memory_formation_v2_runtime_patch.install(relay_app)
+memory_hierarchy_summary_runtime_shadow.install(relay_app)
 
 
 def _fixed_status_error() -> JSONResponse:
@@ -80,8 +82,6 @@ def _install_provider_status_route() -> None:
         ):
             return _fixed_status_error()
         except Exception:
-            # Localhost loop failures and malformed upstream state are deliberately
-            # collapsed to one data-free public category.
             return _fixed_status_error()
 
     relay_app._P3_PROVIDER_STATUS_INSTALLED = True
@@ -115,9 +115,6 @@ def _install_session_retire_route() -> None:
         except p3_session_retire.P3SessionRetireError as error:
             return _retire_error(error)
         except HTTPException:
-            # A localhost loop failure outside the bounded retire error projection
-            # is uncertain. Never expose raw loop details and never continue to
-            # deletion from the browser.
             return _retire_error(
                 p3_session_retire.P3SessionRetireError(
                     p3_session_retire.RETIRE_UNAVAILABLE
