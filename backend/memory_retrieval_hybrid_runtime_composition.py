@@ -436,37 +436,57 @@ def _unlink_disposable(path: Path, config: HybridRuntimeConfigV1) -> None:
 
 
 def _initialize_bm25(config: HybridRuntimeConfigV1) -> None:
+    if not _paths_are_separate(
+        config.authority_path,
+        config.bm25_path,
+        config.vector_path,
+        config.persistent_root,
+    ):
+        _raise("hybrid_runtime_configuration_invalid")
     try:
+        if config.bm25_path.exists():
+            try:
+                bm25_store.load_bm25_store_snapshot(config.bm25_path)
+                return
+            except bm25_store.MemoryRetrievalBM25StoreError:
+                _unlink_disposable(config.bm25_path, config)
         bm25_store.initialize_bm25_store(
             config.bm25_path,
             forbidden_paths=(config.authority_path, config.vector_path),
         )
+    except MemoryRetrievalHybridRuntimeCompositionError:
+        raise
     except bm25_store.MemoryRetrievalBM25StoreError:
-        _unlink_disposable(config.bm25_path, config)
-        try:
-            bm25_store.initialize_bm25_store(
-                config.bm25_path,
-                forbidden_paths=(config.authority_path, config.vector_path),
-            )
-        except bm25_store.MemoryRetrievalBM25StoreError:
-            _raise("hybrid_runtime_rebuild_failed")
+        _raise("hybrid_runtime_rebuild_failed")
+    except OSError:
+        _raise("hybrid_runtime_rebuild_failed")
 
 
 def _initialize_vector(config: HybridRuntimeConfigV1) -> None:
+    if not _paths_are_separate(
+        config.authority_path,
+        config.bm25_path,
+        config.vector_path,
+        config.persistent_root,
+    ):
+        _raise("hybrid_runtime_configuration_invalid")
     try:
+        if config.vector_path.exists():
+            try:
+                vector_store.load_vector_store_snapshot(config.vector_path)
+                return
+            except vector_store.MemoryRetrievalVectorStoreError:
+                _unlink_disposable(config.vector_path, config)
         vector_store.initialize_vector_store(
             config.vector_path,
             forbidden_paths=(config.authority_path, config.bm25_path),
         )
+    except MemoryRetrievalHybridRuntimeCompositionError:
+        raise
     except vector_store.MemoryRetrievalVectorStoreError:
-        _unlink_disposable(config.vector_path, config)
-        try:
-            vector_store.initialize_vector_store(
-                config.vector_path,
-                forbidden_paths=(config.authority_path, config.bm25_path),
-            )
-        except vector_store.MemoryRetrievalVectorStoreError:
-            _raise("hybrid_runtime_rebuild_failed")
+        _raise("hybrid_runtime_rebuild_failed")
+    except OSError:
+        _raise("hybrid_runtime_rebuild_failed")
 
 
 def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan) -> None:
