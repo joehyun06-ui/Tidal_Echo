@@ -123,10 +123,10 @@ def _record_report(tracker: object, report: object) -> None:
 async def _run_shadow(
     relay_app: object,
     runner: object,
-    tracker: object,
     *,
     query_text: str,
     authoritative_memory_keys: tuple[str, ...],
+    tracker: object = None,
 ) -> None:
     try:
         produced = runner(query_text=query_text)
@@ -157,9 +157,9 @@ async def _run_shadow(
 def _spawn_shadow(
     relay_app: object,
     runner: object,
-    tracker: object,
     query_text: str,
     authoritative_memory_keys: tuple[str, ...],
+    tracker: object = None,
 ) -> None:
     try:
         active = getattr(relay_app, TASK_MARKER, None)
@@ -171,9 +171,9 @@ def _spawn_shadow(
             _run_shadow(
                 relay_app,
                 runner,
-                tracker,
                 query_text=query_text,
                 authoritative_memory_keys=authoritative_memory_keys,
+                tracker=tracker,
             )
         )
         _record_started(tracker)
@@ -196,10 +196,10 @@ def _spawn_shadow(
 def _submit_shadow_from_worker(
     relay_app: object,
     runner: object,
-    tracker: object,
     *,
     query_text: object,
     authoritative_memory_keys: object,
+    tracker: object = None,
 ) -> None:
     try:
         if (
@@ -220,9 +220,9 @@ def _submit_shadow_from_worker(
             _spawn_shadow,
             relay_app,
             runner,
-            tracker,
             query_text,
             keys,
+            tracker,
         )
     except BaseException:
         report = memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed()
@@ -319,9 +319,9 @@ def install(relay_app: object, *, runner: object = None) -> bool:
                 _submit_shadow_from_worker(
                     relay_app,
                     runner,
-                    tracker,
                     query_text=query_text,
                     authoritative_memory_keys=keys,
+                    tracker=tracker,
                 )
         except BaseException:
             report = memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed()
