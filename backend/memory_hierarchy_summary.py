@@ -1,15 +1,16 @@
-"""Source-bound derived text contract for Phase 4D-B6.
+"""Source-bound derived text contracts for Phase 4D-B6.
 
 Hierarchy summaries are disposable routing/compression text, never Memory truth.
 The caller/model may author only clause text plus supporting Atomic Memory keys.
-The server independently re-proves the hierarchy plan, binds the target node and
-projection digest, requires complete Atomic coverage, validates every clause
+The server independently re-proves the hierarchy plan, including B4 Topic key /
+broad-domain constraints and B5 Episode evidence guards, binds the target node
+and projection digest, requires complete Atomic coverage, validates every clause
 through MemoryPolicy, and derives the summary digest itself.
 
-Only Topic and Canonical-State nodes are summarizable in this phase.  Episode
-structure may be supplied as organization hints for Topic summaries, but Episode
-text is not generated here.  A summary whose projection digest no longer matches
-its hierarchy node is stale by definition and must not be used.
+The merged v1 contract remains Topic + Canonical-State only. Contract v2 adds
+Episode targets without changing v1 function semantics. A summary whose
+projection digest no longer matches its hierarchy node is stale by definition
+and must not be used.
 """
 
 from __future__ import annotations
@@ -21,18 +22,22 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from backend import (
+    memory_hierarchy_episode_refinement as episode_refinement,
     memory_hierarchy_projection as hierarchy,
+    memory_hierarchy_refinement as topic_refinement,
     memory_policy,
 )
 
 
 SUMMARY_CONTRACT_VERSION: Final = "memory-hierarchy-summary-v1"
+SUMMARY_CONTRACT_VERSION_V2: Final = "memory-hierarchy-summary-v2"
 SUMMARY_AUTHORITY: Final = "derived_routing_only"
 MAX_SUMMARY_ATOMICS: Final = 32
 MAX_SUMMARY_CLAUSES: Final = 12
 MAX_CLAUSE_CHARS: Final = 400
 MAX_TOTAL_SUMMARY_CHARS: Final = 1_600
-_SUPPORTED_NODE_TYPES: Final = frozenset({"topic", "canonical_state"})
+_SUPPORTED_NODE_TYPES_V1: Final = frozenset({"topic", "canonical_state"})
+_SUPPORTED_NODE_TYPES_V2: Final = frozenset({"topic", "episode", "canonical_state"})
 _DIGEST_PATTERN: Final = re.compile(r"[0-9a-f]{64}\Z")
 
 _ERROR_CATEGORIES: Final = frozenset({
@@ -191,6 +196,7 @@ def _reprove_plan(
             )
         elif node.node_type != "canonical_state":
             _raise("invalid_hierarchy_plan")
+
     try:
         rebuilt = hierarchy.plan_hierarchy_projection_v1(
             atomics,
@@ -205,22 +211,50 @@ def _reprove_plan(
         != tuple(_node_signature(node) for node in rebuilt.nodes)
     ):
         _raise("invalid_hierarchy_plan")
+
+    try:
+        topic_proposals = tuple(
+            topic_refinement.TopicMembershipProposalV1(topic.atomic_keys)
+            for topic in topics
+        )
+        refined_topics = topic_refinement.refine_topics_v1(
+            atomics,
+            topic_proposals,
+        ).topics
+    except topic_refinement.MemoryHierarchyRefinementError:
+        _raise("invalid_hierarchy_plan")
+    if tuple(sorted(topics, key=lambda item: item.topic_key)) != refined_topics:
+        _raise("invalid_hierarchy_plan")
+
+    try:
+        episode_proposals = tuple(
+            episode_refinement.EpisodeMembershipProposalV1(item.atomic_keys)
+            for item in episodes
+        )
+        refined_episodes = episode_refinement.refine_episodes_v1(
+            atomics,
+            refined_topics,
+            episode_proposals,
+        ).episodes
+    except episode_refinement.MemoryHierarchyEpisodeRefinementError:
+        _raise("invalid_hierarchy_plan")
+    if tuple(sorted(episodes, key=lambda item: (item.topic_key, item.episode_key))) != refined_episodes:
+        _raise("invalid_hierarchy_plan")
     return raw_plan
 
 
-def prepare_summary_target_v1(
+def _prepare_summary_target(
     atomics: object,
     plan: object,
     node_key: object,
+    supported_node_types: frozenset[str],
 ) -> SummaryTargetV1:
-    """Re-prove one current Topic/Canonical-State target before model access."""
-
     validated_atomics, atomics_by_key = _validated_atomics(atomics)
     proved = _reprove_plan(validated_atomics, plan)
     if type(node_key) is not str or not node_key:
         _raise("invalid_summary_target")
     target = next((node for node in proved.nodes if node.node_key == node_key), None)
-    if target is None or target.node_type not in _SUPPORTED_NODE_TYPES:
+    if target is None or target.node_type not in supported_node_types:
         _raise("invalid_summary_target")
     if len(target.atomic_keys) > MAX_SUMMARY_ATOMICS:
         _raise("too_many_summary_atomics")
@@ -252,12 +286,43 @@ def prepare_summary_target_v1(
     )
 
 
-def _summary_digest(
+def prepare_summary_target_v1(
+    atomics: object,
+    plan: object,
+    node_key: object,
+) -> SummaryTargetV1:
+    """Re-prove one current v1 Topic/Canonical-State target."""
+
+    return _prepare_summary_target(
+        atomics,
+        plan,
+        node_key,
+        _SUPPORTED_NODE_TYPES_V1,
+    )
+
+
+def prepare_summary_target_v2(
+    atomics: object,
+    plan: object,
+    node_key: object,
+) -> SummaryTargetV1:
+    """Re-prove one current v2 Topic/Episode/Canonical-State target."""
+
+    return _prepare_summary_target(
+        atomics,
+        plan,
+        node_key,
+        _SUPPORTED_NODE_TYPES_V2,
+    )
+
+
+def _summary_digest_for_version(
+    contract_version: str,
     target: SummaryTargetV1,
     clauses: tuple[SummaryClauseProposalV1, ...],
 ) -> str:
     payload = {
-        "contract_version": SUMMARY_CONTRACT_VERSION,
+        "contract_version": contract_version,
         "node_key": target.node_key,
         "node_type": target.node_type,
         "projection_digest": target.projection_digest,
@@ -275,13 +340,32 @@ def _summary_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def validate_summary_clauses_v1(
+def _summary_digest(
+    target: SummaryTargetV1,
+    clauses: tuple[SummaryClauseProposalV1, ...],
+) -> str:
+    """Legacy v1 digest retained for the merged v1 cache."""
+
+    return _summary_digest_for_version(SUMMARY_CONTRACT_VERSION, target, clauses)
+
+
+def _summary_digest_v2(
+    target: SummaryTargetV1,
+    clauses: tuple[SummaryClauseProposalV1, ...],
+) -> str:
+    return _summary_digest_for_version(SUMMARY_CONTRACT_VERSION_V2, target, clauses)
+
+
+def _validate_summary_clauses(
     target: object,
     clauses: object,
+    *,
+    contract_version: str,
+    supported_node_types: frozenset[str],
 ) -> DerivedNodeSummaryV1:
-    """Validate full Atomic coverage and policy-safe routing-only clauses."""
-
     if type(target) is not SummaryTargetV1:
+        _raise("invalid_summary_target")
+    if target.node_type not in supported_node_types:
         _raise("invalid_summary_target")
     if type(clauses) not in (list, tuple):
         _raise("invalid_summary_clauses")
@@ -327,15 +411,43 @@ def validate_summary_clauses_v1(
     total_chars = sum(len(clause.text) for clause in canonical) + max(0, len(canonical) - 1)
     if total_chars > MAX_TOTAL_SUMMARY_CHARS:
         _raise("summary_too_long")
-    digest = _summary_digest(target, canonical)
+    digest = _summary_digest_for_version(contract_version, target, canonical)
     if _DIGEST_PATTERN.fullmatch(digest) is None:
         _raise("invalid_summary_clauses")
     return DerivedNodeSummaryV1(
-        contract_version=SUMMARY_CONTRACT_VERSION,
+        contract_version=contract_version,
         authority=SUMMARY_AUTHORITY,
         node_type=target.node_type,
         node_key=target.node_key,
         projection_digest=target.projection_digest,
         summary_digest=digest,
         clauses=canonical,
+    )
+
+
+def validate_summary_clauses_v1(
+    target: object,
+    clauses: object,
+) -> DerivedNodeSummaryV1:
+    """Validate merged v1 Topic/State source-bound clauses."""
+
+    return _validate_summary_clauses(
+        target,
+        clauses,
+        contract_version=SUMMARY_CONTRACT_VERSION,
+        supported_node_types=_SUPPORTED_NODE_TYPES_V1,
+    )
+
+
+def validate_summary_clauses_v2(
+    target: object,
+    clauses: object,
+) -> DerivedNodeSummaryV1:
+    """Validate v2 Topic/Episode/State source-bound clauses."""
+
+    return _validate_summary_clauses(
+        target,
+        clauses,
+        contract_version=SUMMARY_CONTRACT_VERSION_V2,
+        supported_node_types=_SUPPORTED_NODE_TYPES_V2,
     )
