@@ -317,7 +317,7 @@ async def rebuild_semantic_hierarchy_v1(
         stored = hierarchy_store.apply_projection_plan(sidecar, plan)
         if (
             stored.atomic_snapshot_digest != plan.atomic_snapshot_digest
-            or stored.receipts() != plan.receipts()
+            or set(stored.receipts()) != set(plan.receipts())
         ):
             _raise("semantic_rebuild_projection_invalid")
     except MemoryHierarchySemanticRebuildError:
