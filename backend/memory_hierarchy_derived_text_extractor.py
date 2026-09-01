@@ -1,13 +1,15 @@
 """Strict provider-agnostic derived-text extractor for Phase 4D-B6.
 
 The provider sees only the authoritative Atomic Memory members of one hierarchy
-node, marked as UNTRUSTED DATA.  It may return short sentences and Atomic support
-keys only.  Node identity and projection digest must be echoed exactly and are
+node, marked as UNTRUSTED DATA. It may return short sentences and Atomic support
+keys only. Node identity and projection digest must be echoed exactly and are
 revalidated server-side; the final document text and content digest are built by
 ``memory_hierarchy_derived_text``.
 
-An empty sentence list means "no safe summary" and is not a failure.  This
-module has no persistence, runtime wiring, retrieval authority, or Memory write.
+An empty sentence list means "no safe summary" and is not a failure. Sensitive
+or restricted Atomic Memory content is never sent to the provider by this
+contract. This module has no persistence, runtime wiring, retrieval authority,
+or Memory write.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ _ERROR_CATEGORIES: Final = frozenset({
     "invalid_provider_model",
     "invalid_provider_prompt_contract_version",
     "memory_hierarchy_derived_text_extractor_error",
+    "sensitive_input_disabled",
 })
 
 EXTRACTOR_INSTRUCTION: Final = """You are a deterministic derived-text compressor for a disposable Memory hierarchy projection.
@@ -118,6 +121,8 @@ def _validated_inputs(
         if error.category == "invalid_atomics":
             _raise("invalid_atomics")
         _raise("invalid_node_binding")
+    if any(item.sensitivity != "normal" for item in atomics):
+        _raise("sensitive_input_disabled")
     if len(atomics) > MAX_EXTRACTOR_ATOMICS:
         _raise("extractor_input_too_large")
     return binding, atomics
