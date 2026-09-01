@@ -165,8 +165,9 @@ def _paths_are_separate(
         for path in (bm25_path, vector_path):
             if path.is_symlink():
                 return False
-            if path.exists() and not path.is_file():
-                return False
+            if path.exists():
+                if not path.is_file() or path.stat().st_nlink != 1:
+                    return False
         if authority.exists():
             for path in (bm25_path, vector_path):
                 if path.exists() and os.path.samefile(authority, path):
