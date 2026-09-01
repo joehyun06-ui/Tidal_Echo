@@ -74,12 +74,67 @@ class TransientMemoryDispatch:
     retrieval_v2_active_report: (
         memory_retrieval_v2_active.MemoryRetrievalV2ActiveReport | None
     ) = field(default=None, repr=False)
+    # Internal-only comparison handle for later shadow retrieval. These keys are
+    # derived from the exact provider-visible authority selection and are never
+    # rendered into provider messages, repr, or telemetry.
+    authoritative_memory_keys: tuple[str, ...] | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __repr__(self) -> str:
         return (
             "<TransientMemoryDispatch "
             f"memory_applied={self.memory_applied}>"
         )
+
+
+def _valid_shadow_memory_key(value: object) -> bool:
+    return (
+        type(value) is str
+        and value.isascii()
+        and 16 <= len(value) <= 128
+        and all(character.isalnum() or character in "_-" for character in value)
+    )
+
+
+def _shadow_memory_keys_from_dicts(items: object) -> tuple[str, ...] | None:
+    """Best-effort internal key projection; never changes context authority."""
+
+    try:
+        if type(items) not in (list, tuple) or len(items) > SMART_FINAL_MAX_ITEMS:
+            return None
+        keys: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if type(item) is not dict:
+                return None
+            key = item.get("memory_key")
+            if not _valid_shadow_memory_key(key) or key in seen:
+                return None
+            seen.add(key)
+            keys.append(key)
+        return tuple(keys)
+    except BaseException:
+        return None
+
+
+def _shadow_memory_keys_from_v2(selection: object) -> tuple[str, ...] | None:
+    """Project V2 selected candidate keys without invoking caller hooks."""
+
+    try:
+        items = object.__getattribute__(selection, "items")
+        if type(items) is not tuple or len(items) > SMART_FINAL_MAX_ITEMS:
+            return None
+        candidates: list[dict] = []
+        for item in items:
+            candidate = object.__getattribute__(item, "candidate")
+            if type(candidate) is not dict:
+                return None
+            candidates.append(candidate)
+        return _shadow_memory_keys_from_dicts(tuple(candidates))
+    except BaseException:
+        return None
 
 
 def _validate_base_messages(base_messages: object) -> tuple[dict[str, str], ...]:
@@ -202,6 +257,7 @@ def prepare_transient_memory_dispatch(
     try:
         shadow_report = None
         active_report = None
+        authoritative_memory_keys = None
         if smart_retrieval_enabled:
             safe_items = read_service.get_active_memories(
                 scope_type="global_user",
@@ -221,6 +277,9 @@ def prepare_transient_memory_dispatch(
                         candidate_snapshot,
                         query_text=messages[-1]["content"],
                     )
+                )
+                authoritative_memory_keys = _shadow_memory_keys_from_v2(
+                    active_selection
                 )
                 developer_message = (
                     memory_context_v2.render_memory_developer_message_v2(
@@ -245,6 +304,9 @@ def prepare_transient_memory_dispatch(
                 render_items = _validated_selection_items(
                     selection,
                     candidates=candidate_snapshot,
+                )
+                authoritative_memory_keys = _shadow_memory_keys_from_dicts(
+                    render_items
                 )
                 if retrieval_v2_shadow_enabled:
                     try:
@@ -275,6 +337,7 @@ def prepare_transient_memory_dispatch(
                 character_budget=LEGACY_RETRIEVAL_CHARACTER_BUDGET,
                 include_sensitive=False,
             )
+            authoritative_memory_keys = _shadow_memory_keys_from_dicts(render_items)
             developer_message = memory_context.render_memory_developer_message(
                 render_items,
                 scope_type="global_user",
@@ -282,11 +345,14 @@ def prepare_transient_memory_dispatch(
                 character_budget=SMART_FINAL_CHARACTER_BUDGET,
             )
         if developer_message is None:
+            # No Memory developer message means provider-visible authority selected
+            # no effective Memory, even if an upstream selector object was non-empty.
             return TransientMemoryDispatch(
                 messages,
                 False,
                 shadow_report,
                 active_report,
+                (),
             )
         if (
             type(developer_message) is not dict
@@ -313,6 +379,7 @@ def prepare_transient_memory_dispatch(
             True,
             shadow_report,
             active_report,
+            authoritative_memory_keys,
         )
     except MemoryContextIntegrationError:
         raise
