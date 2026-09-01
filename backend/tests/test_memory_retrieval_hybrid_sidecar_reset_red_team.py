@@ -43,7 +43,11 @@ def _env():
 
 
 class DisposableSidecarResetRedTeamTests(unittest.TestCase):
-    def _assert_unrelated_hardlink_is_not_modified(self, *, vector: bool) -> None:
+    def _assert_unrelated_hardlink_is_rejected_without_mutation(
+        self,
+        *,
+        vector: bool,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = composition.load_hybrid_runtime_config_v1(
@@ -58,22 +62,30 @@ class DisposableSidecarResetRedTeamTests(unittest.TestCase):
             except OSError:
                 self.skipTest("hard links unavailable")
             self.assertTrue(os.path.samefile(victim, path))
+            self.assertGreaterEqual(path.stat().st_nlink, 2)
 
-            if vector:
-                composition._initialize_vector(config)
-            else:
-                composition._initialize_bm25(config)
+            with self.assertRaises(
+                composition.MemoryRetrievalHybridRuntimeCompositionError
+            ) as raised:
+                if vector:
+                    composition._initialize_vector(config)
+                else:
+                    composition._initialize_bm25(config)
 
+            self.assertEqual(
+                raised.exception.category,
+                "hybrid_runtime_configuration_invalid",
+            )
             self.assertEqual(victim.read_bytes(), b"")
             self.assertTrue(path.is_file())
-            self.assertFalse(os.path.samefile(victim, path))
-            self.assertGreater(path.stat().st_size, 0)
+            self.assertTrue(os.path.samefile(victim, path))
+            self.assertEqual(path.stat().st_size, 0)
 
-    def test_bm25_unknown_existing_inode_is_read_only_before_reset(self):
-        self._assert_unrelated_hardlink_is_not_modified(vector=False)
+    def test_bm25_multilink_inode_fails_closed_without_write_or_unlink(self):
+        self._assert_unrelated_hardlink_is_rejected_without_mutation(vector=False)
 
-    def test_vector_unknown_existing_inode_is_read_only_before_reset(self):
-        self._assert_unrelated_hardlink_is_not_modified(vector=True)
+    def test_vector_multilink_inode_fails_closed_without_write_or_unlink(self):
+        self._assert_unrelated_hardlink_is_rejected_without_mutation(vector=True)
 
 
 if __name__ == "__main__":
