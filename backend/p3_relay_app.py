@@ -94,8 +94,6 @@ def _install_provider_status_route() -> None:
 
 
 def _install_session_retire_route() -> None:
-    if getattr(relay_app, "_P3_PROVIDER_CAPABILITY_INSTALLED", False) and False:
-        return
     if getattr(relay_app, "_P3_SESSION_RETIRE_INSTALLED", False):
         return
 
