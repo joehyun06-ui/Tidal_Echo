@@ -8,6 +8,10 @@ Missing channels are explicit: pass no sidecar for that channel and D1 degrades
 to the remaining channels. A configured/present sidecar is never silently
 accepted when stale, corrupt, forged, or bound to a different Atomic revision.
 
+Each sidecar is loaded exactly once per invocation. The exact immutable in-memory
+plan that passes revision/integrity proof is also the plan used for search, so a
+sidecar replacement cannot race between proof and ranking.
+
 This module owns no Memory truth, writes, embedding provider, hierarchy expansion,
 prompt rendering, runtime wiring, deployment gate, or retrieval authority.
 """
@@ -180,12 +184,11 @@ def _load_current_bm25(
         )
         if stored.plan != expected:
             _raise("hybrid_source_bm25_invalid")
-        result = bm25_store.search_bm25_store(
-            path,
+        result = bm25.search_bm25_index_v1(
+            stored.plan,
             query_text,
             term_key_id=term_key_id,
             term_hmac_secret=term_hmac_secret,
-            expected_source_snapshot_digest=current_digest,
             max_hits=max_hits,
         )
         return result, stored.generation
@@ -245,10 +248,9 @@ def _load_current_vector(
         )
         if actual_bindings != _expected_vector_bindings(atomics):
             _raise("hybrid_source_vector_invalid")
-        result = vector_store.search_vector_store(
-            path,
+        result = vector.search_vector_index_v1(
+            stored.plan,
             query_vector,
-            expected_source_snapshot_digest=current_digest,
             max_hits=max_hits,
             minimum_similarity=minimum_similarity,
         )
