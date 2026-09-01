@@ -2,14 +2,14 @@
 
 Hierarchy summaries are disposable routing/compression text, never Memory truth.
 The caller/model may author only clause text plus supporting Atomic Memory keys.
-The server independently re-proves the hierarchy plan, binds the target node and
-projection digest, requires complete Atomic coverage, validates every clause
+The server independently re-proves the hierarchy plan, including B4 Topic key /
+broad-domain constraints and B5 Episode evidence guards, binds the target node
+and projection digest, requires complete Atomic coverage, validates every clause
 through MemoryPolicy, and derives the summary digest itself.
 
-Only Topic and Canonical-State nodes are summarizable in this phase.  Episode
-structure may be supplied as organization hints for Topic summaries, but Episode
-text is not generated here.  A summary whose projection digest no longer matches
-its hierarchy node is stale by definition and must not be used.
+Topic, Episode, and Canonical-State nodes are summarizable in contract v2.  A
+summary whose projection digest no longer matches its hierarchy node is stale by
+definition and must not be used.
 """
 
 from __future__ import annotations
@@ -21,18 +21,20 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from backend import (
+    memory_hierarchy_episode_refinement as episode_refinement,
     memory_hierarchy_projection as hierarchy,
+    memory_hierarchy_refinement as topic_refinement,
     memory_policy,
 )
 
 
-SUMMARY_CONTRACT_VERSION: Final = "memory-hierarchy-summary-v1"
+SUMMARY_CONTRACT_VERSION: Final = "memory-hierarchy-summary-v2"
 SUMMARY_AUTHORITY: Final = "derived_routing_only"
 MAX_SUMMARY_ATOMICS: Final = 32
 MAX_SUMMARY_CLAUSES: Final = 12
 MAX_CLAUSE_CHARS: Final = 400
 MAX_TOTAL_SUMMARY_CHARS: Final = 1_600
-_SUPPORTED_NODE_TYPES: Final = frozenset({"topic", "canonical_state"})
+_SUPPORTED_NODE_TYPES: Final = frozenset({"topic", "episode", "canonical_state"})
 _DIGEST_PATTERN: Final = re.compile(r"[0-9a-f]{64}\Z")
 
 _ERROR_CATEGORIES: Final = frozenset({
@@ -191,6 +193,7 @@ def _reprove_plan(
             )
         elif node.node_type != "canonical_state":
             _raise("invalid_hierarchy_plan")
+
     try:
         rebuilt = hierarchy.plan_hierarchy_projection_v1(
             atomics,
@@ -205,6 +208,40 @@ def _reprove_plan(
         != tuple(_node_signature(node) for node in rebuilt.nodes)
     ):
         _raise("invalid_hierarchy_plan")
+
+    # Re-prove B4's server-owned broad-domain and derived-key constraints.  The
+    # semantic grouping decision itself is not re-inferred; only its deterministic
+    # safety envelope is rechecked.
+    try:
+        topic_proposals = tuple(
+            topic_refinement.TopicMembershipProposalV1(topic.atomic_keys)
+            for topic in topics
+        )
+        refined_topics = topic_refinement.refine_topics_v1(
+            atomics,
+            topic_proposals,
+        ).topics
+    except topic_refinement.MemoryHierarchyRefinementError:
+        _raise("invalid_hierarchy_plan")
+    if tuple(sorted(topics, key=lambda item: item.topic_key)) != refined_topics:
+        _raise("invalid_hierarchy_plan")
+
+    # Re-prove B5 event-capable kinds, same refined Topic, deterministic Episode
+    # keys, disjoint membership, and bounded co-observation evidence.
+    try:
+        episode_proposals = tuple(
+            episode_refinement.EpisodeMembershipProposalV1(item.atomic_keys)
+            for item in episodes
+        )
+        refined_episodes = episode_refinement.refine_episodes_v1(
+            atomics,
+            refined_topics,
+            episode_proposals,
+        ).episodes
+    except episode_refinement.MemoryHierarchyEpisodeRefinementError:
+        _raise("invalid_hierarchy_plan")
+    if tuple(sorted(episodes, key=lambda item: (item.topic_key, item.episode_key))) != refined_episodes:
+        _raise("invalid_hierarchy_plan")
     return raw_plan
 
 
@@ -213,7 +250,7 @@ def prepare_summary_target_v1(
     plan: object,
     node_key: object,
 ) -> SummaryTargetV1:
-    """Re-prove one current Topic/Canonical-State target before model access."""
+    """Re-prove one current Topic/Episode/Canonical-State target."""
 
     validated_atomics, atomics_by_key = _validated_atomics(atomics)
     proved = _reprove_plan(validated_atomics, plan)
@@ -282,6 +319,8 @@ def validate_summary_clauses_v1(
     """Validate full Atomic coverage and policy-safe routing-only clauses."""
 
     if type(target) is not SummaryTargetV1:
+        _raise("invalid_summary_target")
+    if target.node_type not in _SUPPORTED_NODE_TYPES:
         _raise("invalid_summary_target")
     if type(clauses) not in (list, tuple):
         _raise("invalid_summary_clauses")
