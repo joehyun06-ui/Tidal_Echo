@@ -190,9 +190,9 @@ def install(relay_app: object, *, runner: object = None) -> bool:
         return bool(getattr(relay_app, ENABLED_MARKER, False))
 
     enabled = enabled_from_environment(os.environ)
-    setattr(relay_app, INSTALL_MARKER, True)
-    setattr(relay_app, ENABLED_MARKER, enabled)
     if not enabled:
+        setattr(relay_app, INSTALL_MARKER, True)
+        setattr(relay_app, ENABLED_MARKER, False)
         return False
 
     try:
@@ -268,6 +268,10 @@ def install(relay_app: object, *, runner: object = None) -> bool:
                 setattr(relay_app, LOOP_MARKER, None)
 
     app.router.lifespan_context = shadow_lifespan
+    # Enabled/install markers are committed last so every validation and patch
+    # above must succeed before the relay can report an installed shadow hook.
+    setattr(relay_app, ENABLED_MARKER, True)
+    setattr(relay_app, INSTALL_MARKER, True)
     return True
 
 
