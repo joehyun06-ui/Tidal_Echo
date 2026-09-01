@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -296,7 +297,7 @@ class HybridSourceCompositionTests(unittest.TestCase):
         )
         self.assertNotIn(str(self.authority), repr(raised.exception))
 
-    def test_d2_remains_unwired_to_context_runtime_and_render(self):
+    def test_d2_remains_unwired_while_later_shadow_gate_stays_default_off(self):
         root = Path(__file__).resolve().parents[2]
         context_source = (
             root / "backend" / "memory_context_integration.py"
@@ -305,9 +306,38 @@ class HybridSourceCompositionTests(unittest.TestCase):
             root / "backend" / "p3_relay_app.py"
         ).read_text(encoding="utf-8")
         render_source = (root / "render.yaml").read_text(encoding="utf-8")
+
+        # D2 remains a pure lower-level source composition: later D3 wiring may
+        # exist, but no current runtime surface imports D2 directly.
         for text in (context_source, relay_source, render_source):
             self.assertNotIn("memory_retrieval_hybrid_source", text)
+        for text in (context_source, relay_source):
             self.assertNotIn("MEMORY_HYBRID_RETRIEVAL", text)
+
+        # Later D3 may declare a deployment gate, but the repository may expose
+        # only the reviewed shadow gate and it must remain default OFF. Active
+        # Hybrid authority is still a separate future rollout contract.
+        blueprint = json.loads(render_source)
+        services = blueprint.get("services")
+        self.assertIsInstance(services, list)
+        self.assertEqual(len(services), 1)
+        env = {
+            item["key"]: item
+            for item in services[0].get("envVars", [])
+            if isinstance(item, dict) and isinstance(item.get("key"), str)
+        }
+        hybrid_retrieval_keys = {
+            name for name in env
+            if name.startswith("MEMORY_HYBRID_RETRIEVAL_")
+        }
+        self.assertEqual(
+            hybrid_retrieval_keys,
+            {"MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"},
+        )
+        self.assertEqual(
+            env["MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"].get("value"),
+            "false",
+        )
 
 
 if __name__ == "__main__":
