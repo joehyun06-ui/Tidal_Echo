@@ -12,6 +12,7 @@ from backend import (
     memory_hierarchy_snapshot,
     memory_retrieval_bm25 as bm25,
     memory_retrieval_bm25_store as bm25_store,
+    memory_retrieval_hybrid_fusion as fusion,
     memory_retrieval_hybrid_query as query,
     memory_retrieval_vector as vector,
     memory_retrieval_vector_store as vector_store,
@@ -56,10 +57,14 @@ def atomics():
     )
 
 
-def digest():
+def snapshot_digest(items):
     return memory_hierarchy_baseline.build_baseline_hierarchy_plan_v1(
-        atomics()
+        items
     ).atomic_snapshot_digest
+
+
+def digest():
+    return snapshot_digest(atomics())
 
 
 def vector_plan(*, source_digest=None, forged_revision=False):
@@ -197,14 +202,13 @@ class HybridQueryCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.fusion_result.vector_available)
         self.assertEqual(result.fusion_result.hits[0].memory_key, K1)
 
-    async def test_all_local_proof_precedes_provider_call(self):
+    async def test_all_local_source_proof_precedes_provider_call(self):
         self.install_bm25(source_digest="b" * 64)
         self.install_vector()
         embedder = RecordingEmbedder()
         await self.assert_query_error("hybrid_query_stale", embedder)
         self.assertEqual(embedder.calls, [])
 
-        # Fresh BM25 but forged vector binding must also fail before provider I/O.
         self.bm25_path.unlink()
         self.vector_path.unlink()
         self.install_bm25()
@@ -212,6 +216,78 @@ class HybridQueryCompositionTests(unittest.IsolatedAsyncioTestCase):
         embedder = RecordingEmbedder()
         await self.assert_query_error("hybrid_query_vector_invalid", embedder)
         self.assertEqual(embedder.calls, [])
+
+    async def test_all_local_control_validation_precedes_provider_call(self):
+        self.install_bm25()
+        self.install_vector()
+        embedder = RecordingEmbedder()
+        await self.assert_query_error(
+            "hybrid_query_input_invalid",
+            embedder,
+            max_vector_hits=0,
+        )
+        self.assertEqual(embedder.calls, [])
+
+        embedder = RecordingEmbedder()
+        await self.assert_query_error(
+            "hybrid_query_input_invalid",
+            embedder,
+            minimum_vector_similarity=float("nan"),
+        )
+        self.assertEqual(embedder.calls, [])
+
+        embedder = RecordingEmbedder()
+        await self.assert_query_error(
+            "hybrid_query_input_invalid",
+            embedder,
+            touch_hints=(
+                fusion.TouchHintV1(
+                    memory_key="unknown_touch_memory_000001",
+                    recall_count=1,
+                ),
+            ),
+        )
+        self.assertEqual(embedder.calls, [])
+
+    async def test_empty_current_vector_plan_skips_provider_call(self):
+        sensitive = (
+            atomic(
+                "hybrid_query_sensitive_0001",
+                "private only",
+                sensitivity="sensitive",
+            ),
+        )
+        sensitive_snapshot = memory_hierarchy_snapshot.HierarchyAtomicSnapshotV1(
+            atomics=sensitive
+        )
+        empty_plan = vector.validate_vector_index_plan_v1(vector.VectorIndexPlanV1(
+            contract_version=vector.VECTOR_CONTRACT_VERSION,
+            embedding_contract_version=vector.EMBEDDING_CONTRACT_VERSION,
+            source_snapshot_digest=snapshot_digest(sensitive),
+            embedding_model=MODEL,
+            dimensions=DIMS,
+            documents=(),
+        ))
+        vector_store.initialize_vector_store(self.vector_path)
+        stored = vector_store.apply_vector_index_plan(self.vector_path, empty_plan)
+        embedder = RecordingEmbedder()
+        with mock.patch.object(
+            memory_hierarchy_snapshot.MemoryHierarchySnapshotReader,
+            "load_active_snapshot",
+            return_value=sensitive_snapshot,
+        ):
+            result = await query.fuse_current_hybrid_query_v1(
+                self.reader,
+                embedder,
+                query_text="private",
+                reference_time=REFERENCE_TIME,
+                vector_sidecar_path=self.vector_path,
+            )
+        self.assertEqual(embedder.calls, [])
+        self.assertFalse(result.query_embedding_performed)
+        self.assertEqual(result.vector_generation, stored.generation)
+        self.assertTrue(result.fusion_result.vector_available)
+        self.assertEqual(result.fusion_result.hits, ())
 
     async def test_embedding_failure_is_bounded_and_data_free(self):
         self.install_bm25()
