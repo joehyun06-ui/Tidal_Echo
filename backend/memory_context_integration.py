@@ -74,7 +74,7 @@ class TransientMemoryDispatch:
     retrieval_v2_active_report: (
         memory_retrieval_v2_active.MemoryRetrievalV2ActiveReport | None
     ) = field(default=None, repr=False)
-    # Internal-only comparison handle for later shadow retrieval.  These keys are
+    # Internal-only comparison handle for later shadow retrieval. These keys are
     # derived from the exact provider-visible authority selection and are never
     # rendered into provider messages, repr, or telemetry.
     authoritative_memory_keys: tuple[str, ...] | None = field(
@@ -345,12 +345,14 @@ def prepare_transient_memory_dispatch(
                 character_budget=SMART_FINAL_CHARACTER_BUDGET,
             )
         if developer_message is None:
+            # No Memory developer message means provider-visible authority selected
+            # no effective Memory, even if an upstream selector object was non-empty.
             return TransientMemoryDispatch(
                 messages,
                 False,
                 shadow_report,
                 active_report,
-                authoritative_memory_keys,
+                (),
             )
         if (
             type(developer_message) is not dict
