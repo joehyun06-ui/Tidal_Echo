@@ -56,6 +56,18 @@ def _retire_error(error: p3_session_retire.P3SessionRetireError) -> JSONResponse
     )
 
 
+def _install_hybrid_shadow_status_route() -> None:
+    if getattr(relay_app, "_P3_HYBRID_SHADOW_STATUS_INSTALLED", False):
+        return
+
+    @app.get("/app/memory/hybrid-shadow/status")
+    async def app_memory_hybrid_shadow_status(request: Request):
+        relay_app.check_auth(request)
+        return memory_retrieval_hybrid_runtime_shadow.status_payload_v1(relay_app)
+
+    relay_app._P3_HYBRID_SHADOW_STATUS_INSTALLED = True
+
+
 def _install_capability_route() -> None:
     if getattr(relay_app, "_P3_PROVIDER_CAPABILITY_INSTALLED", False):
         return
@@ -158,6 +170,7 @@ def _install_session_delete_route() -> None:
     relay_app._P3_SESSION_DELETE_INSTALLED = True
 
 
+_install_hybrid_shadow_status_route()
 _install_capability_route()
 _install_provider_status_route()
 _install_session_retire_route()
