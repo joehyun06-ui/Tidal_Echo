@@ -16,6 +16,7 @@ from backend import legacy_chat_bridge_app as bridge
 from backend import (
     memory_formation_v2_authority,
     memory_formation_v2_runtime_patch,
+    memory_hierarchy_live_refresh_shadow,
     memory_hierarchy_summary_runtime_shadow,
     p3_provider_status,
     p3_session_retire,
@@ -28,6 +29,7 @@ app = bridge.app
 if not memory_formation_v2_authority.install(relay_app):
     memory_formation_v2_runtime_patch.install(relay_app)
 memory_hierarchy_summary_runtime_shadow.install(relay_app)
+memory_hierarchy_live_refresh_shadow.install(relay_app)
 
 
 def _fixed_status_error() -> JSONResponse:
