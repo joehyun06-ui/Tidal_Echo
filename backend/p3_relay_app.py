@@ -18,6 +18,7 @@ from backend import (
     memory_formation_v2_runtime_patch,
     memory_hierarchy_live_refresh_shadow,
     memory_hierarchy_summary_runtime_shadow,
+    memory_retrieval_hybrid_runtime_composition,
     memory_retrieval_hybrid_runtime_shadow,
     p3_provider_status,
     p3_session_retire,
@@ -31,9 +32,14 @@ if not memory_formation_v2_authority.install(relay_app):
     memory_formation_v2_runtime_patch.install(relay_app)
 memory_hierarchy_summary_runtime_shadow.install(relay_app)
 memory_hierarchy_live_refresh_shadow.install(relay_app)
-# D3B1 installs no retrieval resources. The gate defaults OFF; if enabled
-# before D3B2 supplies the server-owned runner, installation fails closed.
-memory_retrieval_hybrid_runtime_shadow.install(relay_app)
+hybrid_retrieval_shadow_runner = (
+    memory_retrieval_hybrid_runtime_composition
+    .compose_hybrid_retrieval_shadow_runner_v1(relay_app)
+)
+memory_retrieval_hybrid_runtime_shadow.install(
+    relay_app,
+    runner=hybrid_retrieval_shadow_runner,
+)
 
 
 def _fixed_status_error() -> JSONResponse:
