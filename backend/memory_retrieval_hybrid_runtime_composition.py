@@ -1,19 +1,27 @@
 """Server-owned Hybrid Retrieval shadow composition for Phase 4D-D3B2.
 
-D3B2 supplies the real runner that D3B1 deliberately left unconfigured.  The
+D3B2 supplies the real runner that D3B1 deliberately left unconfigured. The
 runner owns only disposable BM25/vector sidecars plus a dedicated embedding
-adapter.  It never changes provider-visible Memory context or Memory truth.
+adapter. It never changes provider-visible Memory context or Memory truth.
 
 When sidecars are absent, corrupt, stale, or bound to a previous configured
 index identity, one shadow invocation may rebuild both projections from one
-proved authoritative Atomic snapshot.  All vector embeddings must complete
-before either sidecar is written.  D3A then independently re-proves the stored
+proved authoritative Atomic snapshot. All vector embeddings must complete
+before either sidecar is written. D3A then independently re-proves the stored
 sidecars before the current query may reach the embedding provider.
+
+The C3 vector store records only an embedding model identity and dimensions. To
+prevent an endpoint change from silently reusing vectors produced in a different
+vector space, D3B2 stores a server-derived synthetic model identity over the
+adapter contract + normalized provider base + provider model. The provider still
+receives only its original model id; the synthetic identity never leaves the
+server.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import os
 import re
@@ -48,6 +56,7 @@ EMBEDDING_DIMENSIONS_ENV: Final = "MEMORY_HYBRID_EMBEDDING_DIMENSIONS"
 
 _IDENTIFIER_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _MODEL_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+_EMBEDDING_IDENTITY_DOMAIN: Final = b"memory-hybrid-embedding-provider-v1\x00"
 _REBUILDABLE_QUERY_FAILURES: Final = frozenset({
     "hybrid_query_bm25_invalid",
     "hybrid_query_stale",
@@ -105,7 +114,10 @@ def _same_secret(left: str, right: str) -> bool:
         return left == right
 
 
-def _protected_secrets(env: Mapping[str, str], fingerprint_secret: str) -> tuple[str, ...]:
+def _protected_secrets(
+    env: Mapping[str, str],
+    fingerprint_secret: str,
+) -> tuple[str, ...]:
     names = (
         "RELAY_SECRET",
         "KELIVO_API_KEY",
@@ -138,12 +150,10 @@ def _paths_are_separate(
     root: Path,
 ) -> bool:
     try:
-        resolved = tuple(path.resolve(strict=False) for path in (
-            authority,
-            bm25_path,
-            vector_path,
-            root,
-        ))
+        resolved = tuple(
+            path.resolve(strict=False)
+            for path in (authority, bm25_path, vector_path, root)
+        )
         authority_resolved, bm25_resolved, vector_resolved, root_resolved = resolved
         if (
             bm25_resolved == vector_resolved
@@ -161,13 +171,52 @@ def _paths_are_separate(
             for path in (bm25_path, vector_path):
                 if path.exists() and os.path.samefile(authority, path):
                     return False
-        if bm25_path.exists() and vector_path.exists() and os.path.samefile(
-            bm25_path, vector_path
+        if (
+            bm25_path.exists()
+            and vector_path.exists()
+            and os.path.samefile(bm25_path, vector_path)
         ):
             return False
         return True
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+def _embedding_model_identity(api_base: str, provider_model: str) -> str:
+    try:
+        material = (
+            _EMBEDDING_IDENTITY_DOMAIN
+            + embedding_openai.EMBEDDING_ADAPTER_CONTRACT_VERSION.encode("ascii")
+            + b"\x00"
+            + api_base.encode("ascii")
+            + b"\x00"
+            + provider_model.encode("ascii")
+        )
+    except (AttributeError, UnicodeError):
+        _raise("hybrid_runtime_configuration_invalid")
+    return "hybrid-embed-" + hashlib.sha256(material).hexdigest()[:40]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _BoundEmbeddingCallableV1:
+    adapter: embedding_openai.OpenAICompatibleEmbeddingAdapterV1 = field(repr=False)
+    provider_model: str = field(repr=False)
+    model_identity: str
+
+    def __repr__(self) -> str:
+        return "<_BoundEmbeddingCallableV1>"
+
+    async def __call__(
+        self,
+        texts: tuple[str, ...],
+        model: str,
+        dimensions: int,
+    ) -> object:
+        if model != self.model_identity:
+            raise embedding_openai.MemoryRetrievalEmbeddingAdapterError(
+                "embedding_adapter_configuration_invalid"
+            )
+        return await self.adapter(texts, self.provider_model, dimensions)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -182,11 +231,10 @@ class HybridRuntimeConfigV1:
     sensitive_storage_enabled: bool
     term_key_id: str = field(repr=False)
     term_hmac_secret: str = field(repr=False)
-    embedding_model: str
+    embedding_model: str = field(repr=False)
+    provider_embedding_model: str = field(repr=False)
     embedding_dimensions: int
-    embedding_adapter: embedding_openai.OpenAICompatibleEmbeddingAdapterV1 = field(
-        repr=False
-    )
+    embedding_adapter: _BoundEmbeddingCallableV1 = field(repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -243,8 +291,8 @@ def load_hybrid_runtime_config_v1(
 
         embedding_base = _exact_env(env, EMBEDDING_API_BASE_ENV)
         embedding_key = _exact_env(env, EMBEDDING_API_KEY_ENV)
-        embedding_model = _exact_env(env, EMBEDDING_MODEL_ENV)
-        if _MODEL_PATTERN.fullmatch(embedding_model) is None:
+        provider_embedding_model = _exact_env(env, EMBEDDING_MODEL_ENV)
+        if _MODEL_PATTERN.fullmatch(provider_embedding_model) is None:
             _raise("hybrid_runtime_configuration_invalid")
         dimensions = deployment_config.parse_bounded_int(
             env.get(EMBEDDING_DIMENSIONS_ENV, ""),
@@ -253,7 +301,7 @@ def load_hybrid_runtime_config_v1(
             "invalid_memory_hybrid_embedding_dimensions",
         )
         try:
-            adapter = embedding_openai.OpenAICompatibleEmbeddingAdapterV1(
+            network_adapter = embedding_openai.OpenAICompatibleEmbeddingAdapterV1(
                 embedding_base,
                 embedding_key,
             )
@@ -268,6 +316,16 @@ def load_hybrid_runtime_config_v1(
         if _same_secret(term_secret, embedding_key):
             _raise("hybrid_runtime_configuration_invalid")
 
+        embedding_model = _embedding_model_identity(
+            network_adapter.api_base,
+            provider_embedding_model,
+        )
+        bound_adapter = _BoundEmbeddingCallableV1(
+            adapter=network_adapter,
+            provider_model=provider_embedding_model,
+            model_identity=embedding_model,
+        )
+
         return HybridRuntimeConfigV1(
             authority_path=authority,
             persistent_root=root,
@@ -280,8 +338,9 @@ def load_hybrid_runtime_config_v1(
             term_key_id=term_key_id,
             term_hmac_secret=term_secret,
             embedding_model=embedding_model,
+            provider_embedding_model=provider_embedding_model,
             embedding_dimensions=dimensions,
-            embedding_adapter=adapter,
+            embedding_adapter=bound_adapter,
         )
     except MemoryRetrievalHybridRuntimeCompositionError:
         raise
@@ -291,7 +350,9 @@ def load_hybrid_runtime_config_v1(
         _raise("hybrid_runtime_configuration_invalid")
 
 
-def _reader(config: HybridRuntimeConfigV1) -> memory_hierarchy_snapshot.MemoryHierarchySnapshotReader:
+def _reader(
+    config: HybridRuntimeConfigV1,
+) -> memory_hierarchy_snapshot.MemoryHierarchySnapshotReader:
     try:
         return memory_hierarchy_snapshot.MemoryHierarchySnapshotReader(
             config.authority_path,
@@ -315,7 +376,10 @@ def _identity_matches(config: HybridRuntimeConfigV1) -> bool:
     try:
         sparse = bm25_store.load_bm25_store_snapshot(config.bm25_path)
         semantic = vector_store.load_vector_store_snapshot(config.vector_path)
-    except (bm25_store.MemoryRetrievalBM25StoreError, vector_store.MemoryRetrievalVectorStoreError):
+    except (
+        bm25_store.MemoryRetrievalBM25StoreError,
+        vector_store.MemoryRetrievalVectorStoreError,
+    ):
         return False
     return (
         sparse.plan.term_key_id == config.term_key_id
@@ -421,7 +485,10 @@ def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan) -> Non
             _raise("hybrid_runtime_rebuild_failed")
     except MemoryRetrievalHybridRuntimeCompositionError:
         raise
-    except (bm25_store.MemoryRetrievalBM25StoreError, vector_store.MemoryRetrievalVectorStoreError):
+    except (
+        bm25_store.MemoryRetrievalBM25StoreError,
+        vector_store.MemoryRetrievalVectorStoreError,
+    ):
         _raise("hybrid_runtime_rebuild_failed")
     except Exception:
         _raise("hybrid_runtime_rebuild_failed")
@@ -430,7 +497,9 @@ def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan) -> Non
 @dataclass(frozen=True, slots=True, repr=False)
 class HybridRetrievalShadowRunnerV1:
     config: HybridRuntimeConfigV1 = field(repr=False)
-    reader: memory_hierarchy_snapshot.MemoryHierarchySnapshotReader = field(repr=False)
+    reader: memory_hierarchy_snapshot.MemoryHierarchySnapshotReader = field(
+        repr=False
+    )
 
     def __repr__(self) -> str:
         return "<HybridRetrievalShadowRunnerV1>"
