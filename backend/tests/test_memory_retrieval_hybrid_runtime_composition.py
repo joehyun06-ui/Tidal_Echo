@@ -19,6 +19,7 @@ from backend import (
 FINGERPRINT_SECRET = "Fingerprint-Secret-0123456789-AbCd!"
 TERM_SECRET = "Hybrid-Term-Secret-0123456789-XyZ!"
 EMBEDDING_KEY = "Embedding-Key-0123456789-AbCdEfGh!"
+PROVIDER_MODEL = "text-embedding-test-v1"
 
 
 def relay(root: Path):
@@ -47,7 +48,7 @@ def enabled_env(**overrides):
         composition.TERM_SECRET_ENV: TERM_SECRET,
         composition.EMBEDDING_API_BASE_ENV: "https://embedding.example/v1",
         composition.EMBEDDING_API_KEY_ENV: EMBEDDING_KEY,
-        composition.EMBEDDING_MODEL_ENV: "text-embedding-test-v1",
+        composition.EMBEDDING_MODEL_ENV: PROVIDER_MODEL,
         composition.EMBEDDING_DIMENSIONS_ENV: "8",
     }
     env.update(overrides)
@@ -114,8 +115,12 @@ class EmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter(("first", "second"), "embed-v1", 2)
         self.assertEqual(result, ([1.0, 0.0], [0.0, 1.0]))
         self.assertEqual(capture["method"], "POST")
-        self.assertEqual(capture["endpoint"], "https://embedding.example/v1/embeddings")
+        self.assertEqual(
+            capture["endpoint"],
+            "https://embedding.example/v1/embeddings",
+        )
         self.assertEqual(capture["request"]["json"]["input"], ["first", "second"])
+        self.assertEqual(capture["request"]["json"]["model"], "embed-v1")
         self.assertEqual(capture["request"]["json"]["dimensions"], 2)
         self.assertFalse(capture["client_kwargs"]["follow_redirects"])
         self.assertFalse(capture["client_kwargs"]["trust_env"])
@@ -136,7 +141,11 @@ class EmbeddingAdapterTests(unittest.IsolatedAsyncioTestCase):
             (
                 FakeResponse(
                     {"data": []},
-                    headers={"content-length": str(embedding_openai.MAX_RESPONSE_BYTES + 1)},
+                    headers={
+                        "content-length": str(
+                            embedding_openai.MAX_RESPONSE_BYTES + 1
+                        )
+                    },
                 ),
                 "embedding_adapter_response_invalid",
             ),
@@ -194,15 +203,41 @@ class CompositionConfigTests(unittest.TestCase):
             self.assertIsNotNone(config)
             self.assertEqual(config.bm25_path, root / composition.BM25_FILENAME)
             self.assertEqual(config.vector_path, root / composition.VECTOR_FILENAME)
-            self.assertEqual(config.embedding_model, "text-embedding-test-v1")
+            self.assertEqual(config.provider_embedding_model, PROVIDER_MODEL)
+            self.assertRegex(config.embedding_model, r"^hybrid-embed-[0-9a-f]{40}$")
+            self.assertNotEqual(config.embedding_model, PROVIDER_MODEL)
+            self.assertEqual(config.embedding_adapter.model_identity, config.embedding_model)
             self.assertEqual(config.embedding_dimensions, 8)
             for private in (
                 FINGERPRINT_SECRET,
                 TERM_SECRET,
                 EMBEDDING_KEY,
                 "embedding.example",
+                PROVIDER_MODEL,
             ):
                 self.assertNotIn(private, repr(config))
+                self.assertNotIn(private, repr(config.embedding_adapter))
+
+    def test_provider_base_and_model_are_part_of_vector_space_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = relay(Path(tmp))
+            first = composition.load_hybrid_runtime_config_v1(app, enabled_env())
+            base_changed = composition.load_hybrid_runtime_config_v1(
+                app,
+                enabled_env(**{
+                    composition.EMBEDDING_API_BASE_ENV:
+                        "https://other-embedding.example/v1"
+                }),
+            )
+            model_changed = composition.load_hybrid_runtime_config_v1(
+                app,
+                enabled_env(**{
+                    composition.EMBEDDING_MODEL_ENV: "text-embedding-test-v2"
+                }),
+            )
+            self.assertNotEqual(first.embedding_model, base_changed.embedding_model)
+            self.assertNotEqual(first.embedding_model, model_changed.embedding_model)
+            self.assertNotEqual(base_changed.embedding_model, model_changed.embedding_model)
 
     def test_term_and_embedding_secrets_must_not_reuse_existing_credentials(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -246,6 +281,57 @@ class CompositionConfigTests(unittest.TestCase):
                 raised.exception.category,
                 "hybrid_runtime_configuration_invalid",
             )
+
+
+class BoundEmbeddingIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_synthetic_identity_never_reaches_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = composition.load_hybrid_runtime_config_v1(
+                relay(Path(tmp)),
+                enabled_env(),
+            )
+        capture = {}
+
+        async def raw_adapter(texts, model, dimensions):
+            capture["texts"] = texts
+            capture["model"] = model
+            capture["dimensions"] = dimensions
+            return ([1.0, 0.0],)
+
+        bound = composition._BoundEmbeddingCallableV1(
+            adapter=raw_adapter,
+            provider_model=PROVIDER_MODEL,
+            model_identity=config.embedding_model,
+        )
+        result = await bound(("query",), config.embedding_model, 2)
+        self.assertEqual(result, ([1.0, 0.0],))
+        self.assertEqual(capture["texts"], ("query",))
+        self.assertEqual(capture["model"], PROVIDER_MODEL)
+        self.assertEqual(capture["dimensions"], 2)
+        self.assertNotEqual(capture["model"], config.embedding_model)
+
+    async def test_wrong_synthetic_identity_is_rejected_before_provider_call(self):
+        calls = 0
+
+        async def raw_adapter(*_args):
+            nonlocal calls
+            calls += 1
+            return ([1.0, 0.0],)
+
+        bound = composition._BoundEmbeddingCallableV1(
+            adapter=raw_adapter,
+            provider_model=PROVIDER_MODEL,
+            model_identity="hybrid-embed-" + "a" * 40,
+        )
+        with self.assertRaises(
+            embedding_openai.MemoryRetrievalEmbeddingAdapterError
+        ) as raised:
+            await bound(("query",), "hybrid-embed-" + "b" * 40, 2)
+        self.assertEqual(
+            raised.exception.category,
+            "embedding_adapter_configuration_invalid",
+        )
+        self.assertEqual(calls, 0)
 
 
 class RunnerLifecycleTests(unittest.IsolatedAsyncioTestCase):
