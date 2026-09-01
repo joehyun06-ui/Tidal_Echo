@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from backend import codex_generation_observability, codex_generation_store
 from backend import memory_formation_v2_loopback
+from backend import memory_hierarchy_refinement_loopback
 from backend import memory_hierarchy_summary_loopback_v2
 from backend import web_session_delete, web_session_provider_authority
 from backend.codex_canary_loop_integration import (
@@ -230,6 +231,11 @@ async def loop_ingest(request: Request):
 @app.post(memory_formation_v2_loopback.ENDPOINT)
 async def loop_memory_formation_v2(request: Request):
     return await memory_formation_v2_loopback.handle_request(legacy, request)
+
+
+@app.post(memory_hierarchy_refinement_loopback.ENDPOINT)
+async def loop_memory_hierarchy_refinement(request: Request):
+    return await memory_hierarchy_refinement_loopback.handle_request(legacy, request)
 
 
 @app.post(memory_hierarchy_summary_loopback_v2.ENDPOINT)
