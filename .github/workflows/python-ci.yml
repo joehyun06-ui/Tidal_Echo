@@ -72,6 +72,18 @@ jobs:
           assert env["CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS"].get("value") == "10"
           assert env["MEMORY_RETRIEVAL_V2_SHADOW_ENABLED"].get("value") == "false"
           assert env["MEMORY_RETRIEVAL_V2_ACTIVE_ENABLED"].get("value") == "false"
+          assert env["MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"].get("value") == "false"
+          hybrid_manual = (
+              "MEMORY_HYBRID_BM25_TERM_KEY_ID",
+              "MEMORY_HYBRID_BM25_TERM_HMAC_SECRET",
+              "MEMORY_HYBRID_EMBEDDING_API_BASE",
+              "MEMORY_HYBRID_EMBEDDING_API_KEY",
+              "MEMORY_HYBRID_EMBEDDING_MODEL",
+              "MEMORY_HYBRID_EMBEDDING_DIMENSIONS",
+          )
+          for name in hybrid_manual:
+              assert env[name].get("sync") is False
+              assert "value" not in env[name]
           assert env["KELIVO_AUTO_IDEMPOTENCY_ENABLED"].get("value") == "false"
           assert env["KELIVO_AUTO_IDEMPOTENCY_REPLAY_SECONDS"].get("value") == "300"
           assert env["KELIVO_API_KEY"].get("sync") is False
