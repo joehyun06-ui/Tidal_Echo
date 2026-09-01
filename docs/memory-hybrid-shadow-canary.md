@@ -14,7 +14,21 @@ This runbook enables only the already-reviewed Hybrid Retrieval **shadow** path.
 - Hybrid sidecars are disposable projections under the persistent root. They are never Memory truth, correction authority, forget authority, or approval authority.
 - `/readyz` deliberately does not gate on Hybrid shadow health. Canary health is read from the authenticated status endpoint.
 
-## Required server-only configuration
+## Required pre-existing Memory state
+
+Before a Hybrid canary can be enabled, the deployed service must already have the existing Memory path healthy with:
+
+- `MEMORY_CORE_ENABLED=true`
+- `MEMORY_CONTEXT_INJECTION_ENABLED=true`
+- `MEMORY_SMART_RETRIEVAL_ENABLED=true`
+- a valid `MEMORY_FINGERPRINT_KEY_ID`
+- a valid strong `MEMORY_FINGERPRINT_HMAC_SECRET` and matching pinned fingerprint profile
+
+D3B1 fails closed if Core / Context Injection / Smart Retrieval are not enabled. D3B2 separately requires the fingerprint identity/secret because its authoritative Atomic snapshot reader re-proves active Memory rows before any sidecar rank can participate.
+
+Do not enable or repair those preconditions as part of the Hybrid rollout itself. If they are not already healthy, stop the canary and handle the underlying Memory rollout as a separate gate.
+
+## Required server-only Hybrid configuration
 
 Populate these Render environment variables while the Hybrid gate is still `false`:
 
@@ -35,11 +49,12 @@ Before enabling the shadow:
 
 1. Confirm the deployed branch is `feat/render-telegram-deployment` and includes the reviewed D3B3 observability merge plus this D3B4 configuration contract.
 2. Confirm Render Auto-Deploy is OFF.
-3. Confirm `MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED=false` in the service environment.
-4. Populate all six dedicated Hybrid settings above.
-5. Perform one manual deployment with the gate still OFF.
-6. Verify normal `/healthz`, `/readyz`, Telegram/Kelivo behavior, and current Memory context behavior are unchanged.
-7. Query the authenticated `GET /app/memory/hybrid-shadow/status` endpoint. With the gate OFF it should report `enabled=false`, no in-flight shadow, and zero process-local counters.
+3. Confirm the pre-existing Memory state above is already healthy.
+4. Confirm `MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED=false` in the service environment.
+5. Populate all six dedicated Hybrid settings above.
+6. Perform one manual deployment with the gate still OFF.
+7. Verify normal `/healthz`, `/readyz`, Telegram/Kelivo behavior, and current Memory context behavior are unchanged.
+8. Query the authenticated `GET /app/memory/hybrid-shadow/status` endpoint. With the gate OFF it should report `enabled=false`, no in-flight shadow, and zero process-local counters.
 
 This stage proves the rollout scaffolding itself is harmless. It does not validate the embedding provider because D3B2 deliberately does not read Hybrid provider credentials while the gate is OFF.
 
