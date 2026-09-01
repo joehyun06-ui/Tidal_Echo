@@ -2,14 +2,16 @@
 
 This independently gated runtime layer waits for the B6E startup pass, then runs
 semantic B4/B5 hierarchy refinement followed by the existing B6 v2 derived-text
-rebuild.  After startup it listens only to already-committed active-Memory
-terminal mutation boundaries.  Pending candidate creation/review/reject paths do
+rebuild. After startup it listens only to already-committed active-Memory
+terminal mutation boundaries. Pending candidate creation/review/reject paths do
 not trigger it.
 
-Triggers are coalesced through one event-loop worker.  Before any semantic
+Triggers are coalesced through one event-loop worker. Before any semantic
 provider call, the worker recomputes the authoritative active Atomic snapshot
-digest; if it equals the last successfully processed digest the pass is skipped.
-No hierarchy or summary output is exposed to retrieval/context authority.
+digest; if it equals the last fully processed digest the pass is skipped. A pass
+with refinement-provider fallback or summary failures is not marked complete, so
+the same revision remains retryable on a later trigger. No hierarchy or summary
+output is exposed to retrieval/context authority.
 """
 
 from __future__ import annotations
@@ -154,9 +156,14 @@ async def _run_refresh_pass(relay_app: object):
 
 
 def _log_completed(semantic, summaries, *, trigger_count: int) -> None:
+    status = (
+        "completed"
+        if not semantic.provider_failed and summaries.failed_count == 0
+        else "completed_with_failures"
+    )
     print(
         "[memory-hierarchy-live-refresh-shadow] "
-        "status=completed "
+        f"status={status} "
         f"triggers={_bounded(trigger_count)} "
         f"atomics={_bounded(semantic.atomic_count)} "
         f"topics={_bounded(semantic.topic_count)} "
@@ -208,7 +215,6 @@ async def _await_b6e_startup(relay_app: object) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            # B6E itself is shadow-only and logs its own fixed failure category.
             pass
 
 
@@ -217,7 +223,7 @@ async def _worker(
     event: asyncio.Event,
     pending: set[str],
 ) -> None:
-    last_successful_digest: str | None = None
+    last_fully_processed_digest: str | None = None
     await _await_b6e_startup(relay_app)
     while True:
         await event.wait()
@@ -226,11 +232,15 @@ async def _worker(
         pending.clear()
         try:
             current_digest = await asyncio.to_thread(_snapshot_digest, relay_app)
-            if last_successful_digest is not None and current_digest == last_successful_digest:
+            if (
+                last_fully_processed_digest is not None
+                and current_digest == last_fully_processed_digest
+            ):
                 _log_unchanged(trigger_count=trigger_count)
                 continue
             semantic, summaries = await _run_refresh_pass(relay_app)
-            last_successful_digest = semantic.atomic_snapshot_digest
+            if not semantic.provider_failed and summaries.failed_count == 0:
+                last_fully_processed_digest = semantic.atomic_snapshot_digest
             _log_completed(semantic, summaries, trigger_count=trigger_count)
         except asyncio.CancelledError:
             raise
