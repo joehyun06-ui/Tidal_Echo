@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -180,6 +179,40 @@ class HybridSourceCompositionTests(unittest.TestCase):
         rendered = repr(result)
         self.assertNotIn(K1, rendered)
         self.assertNotIn("CODEX_GENERATION_ENABLED", rendered)
+
+    def test_proved_sidecar_plan_is_the_exact_plan_used_for_search(self):
+        self.install_bm25()
+        self.install_vector()
+        original_bm25_load = bm25_store.load_bm25_store_snapshot
+        original_vector_load = vector_store.load_vector_store_snapshot
+        with (
+            mock.patch.object(
+                bm25_store,
+                "load_bm25_store_snapshot",
+                wraps=original_bm25_load,
+            ) as bm25_load,
+            mock.patch.object(
+                vector_store,
+                "load_vector_store_snapshot",
+                wraps=original_vector_load,
+            ) as vector_load,
+            mock.patch.object(
+                bm25_store,
+                "search_bm25_store",
+                side_effect=AssertionError("second BM25 DB read is forbidden"),
+            ) as old_bm25_search,
+            mock.patch.object(
+                vector_store,
+                "search_vector_store",
+                side_effect=AssertionError("second vector DB read is forbidden"),
+            ) as old_vector_search,
+        ):
+            result = self.call()
+        self.assertEqual(result.fusion_result.hits[0].memory_key, K1)
+        self.assertEqual(bm25_load.call_count, 1)
+        self.assertEqual(vector_load.call_count, 1)
+        old_bm25_search.assert_not_called()
+        old_vector_search.assert_not_called()
 
     def test_explicitly_missing_sidecars_degrade_to_exact_and_lexical(self):
         with mock.patch.object(
