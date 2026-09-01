@@ -1,15 +1,10 @@
-"""Default-off per-query runtime hook for Phase 4D-D3B1.
+"""Default-off per-query runtime hook for Phase 4D-D3B Hybrid Retrieval shadow.
 
-D3B1 installs a non-authoritative shadow hook around the existing synchronous
-Memory context preparation boundary.  The original context dispatch completes
-first and remains the sole provider-visible authority.  Only its hidden exact
-selected Memory keys plus the already-validated user query are handed back to
-the main event loop for one best-effort asynchronous shadow comparison.
-
-The hook owns no retrieval resources yet.  A later D3B2 composition supplies the
-server-owned hybrid query runner (sidecars, term secret, embedding adapter).  If
-this gate is enabled without that runner, startup fails closed rather than
-silently running a partial pseudo-hybrid configuration.
+The existing synchronous Memory context preparation remains the sole
+provider-visible authority. Only its hidden exact selected Memory keys plus the
+already-validated user query are handed to one best-effort asynchronous shadow.
+D3B3 adds only process-local structural observability; it never changes prompt
+context, Memory truth, readiness, or retrieval authority.
 """
 
 from __future__ import annotations
@@ -23,6 +18,7 @@ from typing import Final
 
 from backend import (
     deployment_config,
+    memory_retrieval_hybrid_observability,
     memory_retrieval_hybrid_query,
     memory_retrieval_hybrid_shadow,
 )
@@ -34,6 +30,7 @@ ENABLED_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"
 LOOP_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_LOOP"
 TASK_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_TASK"
 ORIGINAL_PREPARE_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_ORIGINAL_PREPARE"
+OBSERVABILITY_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_OBSERVABILITY"
 
 
 class MemoryHybridRetrievalRuntimeShadowError(RuntimeError):
@@ -88,12 +85,48 @@ def _log_skipped(reason: str) -> None:
     )
 
 
+def _record_attempt(tracker: object) -> None:
+    try:
+        tracker.record_attempt()
+    except BaseException:
+        pass
+
+
+def _record_started(tracker: object) -> None:
+    try:
+        tracker.record_started()
+    except BaseException:
+        pass
+
+
+def _record_skipped(tracker: object, reason: str) -> None:
+    try:
+        tracker.record_skipped(reason)
+    except BaseException:
+        pass
+
+
+def _record_cancelled(tracker: object) -> None:
+    try:
+        tracker.record_cancelled()
+    except BaseException:
+        pass
+
+
+def _record_report(tracker: object, report: object) -> None:
+    try:
+        tracker.record_report(report)
+    except BaseException:
+        pass
+
+
 async def _run_shadow(
     relay_app: object,
     runner: object,
     *,
     query_text: str,
     authoritative_memory_keys: tuple[str, ...],
+    tracker: object = None,
 ) -> None:
     try:
         produced = runner(query_text=query_text)
@@ -106,17 +139,19 @@ async def _run_shadow(
             raise MemoryHybridRetrievalRuntimeShadowError(
                 "memory_hybrid_retrieval_shadow_configuration_invalid"
             )
-        report = (
-            memory_retrieval_hybrid_shadow.compare_hybrid_retrieval_shadow_v1(
-                authoritative_memory_keys,
-                hybrid_result,
-            )
+        report = memory_retrieval_hybrid_shadow.compare_hybrid_retrieval_shadow_v1(
+            authoritative_memory_keys,
+            hybrid_result,
         )
+        _record_report(tracker, report)
         _log_report(report)
     except asyncio.CancelledError:
+        _record_cancelled(tracker)
         raise
     except BaseException:
-        _log_report(memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed())
+        report = memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed()
+        _record_report(tracker, report)
+        _log_report(report)
 
 
 def _spawn_shadow(
@@ -124,10 +159,12 @@ def _spawn_shadow(
     runner: object,
     query_text: str,
     authoritative_memory_keys: tuple[str, ...],
+    tracker: object = None,
 ) -> None:
     try:
         active = getattr(relay_app, TASK_MARKER, None)
         if active is not None and not active.done():
+            _record_skipped(tracker, "busy")
             _log_skipped("busy")
             return
         task = asyncio.create_task(
@@ -136,8 +173,10 @@ def _spawn_shadow(
                 runner,
                 query_text=query_text,
                 authoritative_memory_keys=authoritative_memory_keys,
+                tracker=tracker,
             )
         )
+        _record_started(tracker)
         setattr(relay_app, TASK_MARKER, task)
 
         def clear(completed: asyncio.Task) -> None:
@@ -149,7 +188,9 @@ def _spawn_shadow(
 
         task.add_done_callback(clear)
     except BaseException:
-        _log_report(memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed())
+        report = memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed()
+        _record_report(tracker, report)
+        _log_report(report)
 
 
 def _submit_shadow_from_worker(
@@ -158,6 +199,7 @@ def _submit_shadow_from_worker(
     *,
     query_text: object,
     authoritative_memory_keys: object,
+    tracker: object = None,
 ) -> None:
     try:
         if (
@@ -165,10 +207,12 @@ def _submit_shadow_from_worker(
             or not query_text.strip()
             or type(authoritative_memory_keys) is not tuple
         ):
+            _record_skipped(tracker, "authority_keys_unavailable")
             _log_skipped("authority_keys_unavailable")
             return
         loop = getattr(relay_app, LOOP_MARKER, None)
         if not isinstance(loop, asyncio.AbstractEventLoop) or loop.is_closed():
+            _record_skipped(tracker, "loop_unavailable")
             _log_skipped("loop_unavailable")
             return
         keys = tuple(authoritative_memory_keys)
@@ -178,13 +222,47 @@ def _submit_shadow_from_worker(
             runner,
             query_text,
             keys,
+            tracker,
         )
     except BaseException:
-        _log_report(memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed())
+        report = memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed()
+        _record_report(tracker, report)
+        _log_report(report)
+
+
+def status_payload_v1(relay_app: object) -> dict:
+    """Return process-local structural shadow status; never inspect Memory content."""
+
+    try:
+        installed = bool(getattr(relay_app, INSTALL_MARKER, False))
+        enabled = bool(getattr(relay_app, ENABLED_MARKER, False))
+        task = getattr(relay_app, TASK_MARKER, None)
+        in_flight = bool(task is not None and not task.done())
+        tracker = getattr(relay_app, OBSERVABILITY_MARKER, None)
+        available = type(tracker) is memory_retrieval_hybrid_observability.HybridShadowObservabilityV1
+        if not available:
+            tracker = memory_retrieval_hybrid_observability.HybridShadowObservabilityV1()
+        snapshot = tracker.snapshot()
+        return memory_retrieval_hybrid_observability.project_status_payload_v1(
+            snapshot,
+            enabled=enabled,
+            installed=installed,
+            in_flight=in_flight,
+            observability_available=(available or not enabled),
+        )
+    except BaseException:
+        tracker = memory_retrieval_hybrid_observability.HybridShadowObservabilityV1()
+        return memory_retrieval_hybrid_observability.project_status_payload_v1(
+            tracker.snapshot(),
+            enabled=False,
+            installed=False,
+            in_flight=False,
+            observability_available=False,
+        )
 
 
 def install(relay_app: object, *, runner: object = None) -> bool:
-    """Install a busy-drop shadow hook; gate OFF leaves all callables unchanged."""
+    """Install a busy-drop shadow hook; gate OFF leaves callables/lifespan unchanged."""
 
     if getattr(relay_app, INSTALL_MARKER, False):
         return bool(getattr(relay_app, ENABLED_MARKER, False))
@@ -218,6 +296,7 @@ def install(relay_app: object, *, runner: object = None) -> bool:
             )
         app = relay_app.app
         original_lifespan = app.router.lifespan_context
+        tracker = memory_retrieval_hybrid_observability.HybridShadowObservabilityV1()
     except MemoryHybridRetrievalRuntimeShadowError:
         raise
     except BaseException:
@@ -229,9 +308,11 @@ def install(relay_app: object, *, runner: object = None) -> bool:
 
     def shadow_prepare(read_service, base_messages, **kwargs):
         dispatch = original_prepare(read_service, base_messages, **kwargs)
+        _record_attempt(tracker)
         try:
             keys = object.__getattribute__(dispatch, "authoritative_memory_keys")
             if keys is None:
+                _record_skipped(tracker, "authority_keys_unavailable")
                 _log_skipped("authority_keys_unavailable")
             else:
                 query_text = base_messages[-1]["content"]
@@ -240,9 +321,12 @@ def install(relay_app: object, *, runner: object = None) -> bool:
                     runner,
                     query_text=query_text,
                     authoritative_memory_keys=keys,
+                    tracker=tracker,
                 )
         except BaseException:
-            _log_report(memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed())
+            report = memory_retrieval_hybrid_shadow.HybridRetrievalShadowReportV1.failed()
+            _record_report(tracker, report)
+            _log_report(report)
         return dispatch
 
     context_module.prepare_transient_memory_dispatch = shadow_prepare
@@ -268,8 +352,9 @@ def install(relay_app: object, *, runner: object = None) -> bool:
                 setattr(relay_app, LOOP_MARKER, None)
 
     app.router.lifespan_context = shadow_lifespan
-    # Enabled/install markers are committed last so every validation and patch
-    # above must succeed before the relay can report an installed shadow hook.
+    # Commit state last: failed installation leaves no observability marker and
+    # no enabled/install marker, preserving D3B1's installation atomicity.
+    setattr(relay_app, OBSERVABILITY_MARKER, tracker)
     setattr(relay_app, ENABLED_MARKER, True)
     setattr(relay_app, INSTALL_MARKER, True)
     return True
@@ -280,4 +365,5 @@ __all__ = (
     "MemoryHybridRetrievalRuntimeShadowError",
     "enabled_from_environment",
     "install",
+    "status_payload_v1",
 )
