@@ -5,6 +5,11 @@ Atomic snapshot revision: the current hierarchy sidecar, the C1 BM25 sidecar,
 and the query result produced from that BM25 sidecar.  It then delegates to the
 pure C2 router.  Stale or forged hierarchy structure is rejected before routing.
 
+The BM25 sidecar is also rebuilt in memory from the current authoritative
+snapshot and the supplied term secret, then compared exactly with the stored
+plan.  This turns a same-key-id/wrong-secret mistake into a fixed failure instead
+of a silent zero-hit query.
+
 No Atomic content, hierarchy summary text, or provider-visible Memory context is
 returned by this module.
 """
@@ -199,6 +204,14 @@ def route_current_hierarchy_candidates_v1(
         index_snapshot = bm25_store.load_bm25_store_snapshot(bm25_sidecar_path)
         if index_snapshot.plan.source_snapshot_digest != current_digest:
             _raise("hierarchy_source_stale")
+        expected_index = bm25.build_bm25_index_v1(
+            authority_snapshot.atomics,
+            source_snapshot_digest=current_digest,
+            term_key_id=term_key_id,
+            term_hmac_secret=term_hmac_secret,
+        )
+        if index_snapshot.plan != expected_index:
+            _raise("hierarchy_source_index_invalid")
         lexical = bm25_store.search_bm25_store(
             bm25_sidecar_path,
             query_text,
@@ -209,7 +222,10 @@ def route_current_hierarchy_candidates_v1(
         )
     except MemoryRetrievalHierarchySourceError:
         raise
-    except bm25_store.MemoryRetrievalBM25StoreError:
+    except (
+        bm25.MemoryRetrievalBM25Error,
+        bm25_store.MemoryRetrievalBM25StoreError,
+    ):
         _raise("hierarchy_source_index_invalid")
     except Exception:
         _raise("hierarchy_source_index_invalid")
@@ -220,7 +236,9 @@ def route_current_hierarchy_candidates_v1(
             hierarchy_plan,
             lexical,
         )
-    except routing.MemoryRetrievalHierarchyRoutingError:
+    except routing.MemoryRetrievalHierarchyRoutingError as error:
+        if error.category == "invalid_bm25_result":
+            _raise("hierarchy_source_index_invalid")
         _raise("hierarchy_source_projection_invalid")
     except Exception:
         _raise("hierarchy_source_unavailable")
