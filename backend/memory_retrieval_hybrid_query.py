@@ -1,14 +1,16 @@
 """Server-owned query embedding composition for Phase 4D-D3A.
 
 D3A removes the arbitrary QueryVector injection boundary left intentionally open
-by D2.  Callers provide the exact query text and, only when a current vector
-sidecar is configured, a server-owned/injected C3 EmbeddingCallable.  The
+by D2. Callers provide the exact query text and, only when a current vector
+sidecar is configured, a server-owned/injected C3 EmbeddingCallable. The
 embedding model and dimensions are taken from the already-proved current vector
 sidecar; callers cannot choose a different vector identity for the query.
 
-All local authority/sidecar proof completes before query text is sent to an
-embedding provider.  The proved immutable in-memory vector plan is then searched
-directly, so provider latency cannot open a proof/search sidecar race.
+All local input, authority, and sidecar proof completes before query text is sent
+to an embedding provider. The proved immutable in-memory vector plan is then
+searched directly, so provider latency cannot open a proof/search sidecar race.
+An empty current vector plan performs no query embedding because no semantic
+candidate can be produced.
 
 This module is still unwired: it owns no runtime/app route, prompt context,
 deployment gate, Memory truth/write authority, hierarchy expansion, or provider
@@ -17,6 +19,7 @@ selection policy.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -106,15 +109,40 @@ class HybridQueryResultV1:
         )
 
 
-def _validate_input(query_text: object, reference_time: object) -> str:
+def _validate_input(
+    query_text: object,
+    reference_time: object,
+    *,
+    max_hits: object,
+    max_bm25_hits: object,
+    max_vector_hits: object,
+    minimum_vector_similarity: object,
+) -> str:
     try:
         query = fusion._validated_query(query_text)
         fusion._parse_reference_time(reference_time)
-        return query
     except fusion.MemoryRetrievalHybridFusionError:
         _raise("hybrid_query_input_invalid")
     except Exception:
         _raise("hybrid_query_input_invalid")
+
+    if (
+        type(max_hits) is not int
+        or isinstance(max_hits, bool)
+        or not 1 <= max_hits <= fusion.MAX_HITS
+        or type(max_bm25_hits) is not int
+        or isinstance(max_bm25_hits, bool)
+        or not 1 <= max_bm25_hits <= bm25.MAX_HITS
+        or type(max_vector_hits) is not int
+        or isinstance(max_vector_hits, bool)
+        or not 1 <= max_vector_hits <= vector.MAX_VECTOR_HITS
+        or isinstance(minimum_vector_similarity, bool)
+        or not isinstance(minimum_vector_similarity, (int, float))
+        or not math.isfinite(float(minimum_vector_similarity))
+        or not -1.0 <= float(minimum_vector_similarity) <= 1.0
+    ):
+        _raise("hybrid_query_input_invalid")
+    return query
 
 
 def _validate_configuration(
@@ -166,6 +194,19 @@ def _validate_configuration(
     return authority, bm25_path, vector_path
 
 
+def _validate_touch_hints(
+    atomics: tuple[hierarchy.AtomicMemoryProjectionInputV1, ...],
+    touch_hints: object,
+) -> None:
+    try:
+        _, by_key = fusion._validated_atomics(atomics)
+        fusion._validated_touch_hints(touch_hints, frozenset(by_key))
+    except fusion.MemoryRetrievalHybridFusionError:
+        _raise("hybrid_query_input_invalid")
+    except Exception:
+        _raise("hybrid_query_input_invalid")
+
+
 def _load_current_vector_plan(
     atomics: tuple[hierarchy.AtomicMemoryProjectionInputV1, ...],
     current_digest: str,
@@ -210,7 +251,14 @@ async def fuse_current_hybrid_query_v1(
 ) -> HybridQueryResultV1:
     """Embed the exact proved query server-side, then run same-revision fusion."""
 
-    query = _validate_input(query_text, reference_time)
+    query = _validate_input(
+        query_text,
+        reference_time,
+        max_hits=max_hits,
+        max_bm25_hits=max_bm25_hits,
+        max_vector_hits=max_vector_hits,
+        minimum_vector_similarity=minimum_vector_similarity,
+    )
     _, bm25_path, vector_path = _validate_configuration(
         reader,
         bm25_sidecar_path,
@@ -224,6 +272,10 @@ async def fuse_current_hybrid_query_v1(
         snapshot, current_digest = source._load_authoritative_snapshot(reader)
     except source.MemoryRetrievalHybridSourceError as error:
         _raise_source(error)
+
+    # Touch metadata is local ranking input. Validate it against the exact proved
+    # eligible Atomic set before any sidecar/provider work can use the query.
+    _validate_touch_hints(snapshot.atomics, touch_hints)
 
     sparse: bm25.BM25SearchResultV1 | None = None
     bm25_generation: int | None = None
@@ -250,35 +302,41 @@ async def fuse_current_hybrid_query_v1(
         )
 
     # No query text reaches an embedding provider until every configured local
-    # source above has passed current-revision/integrity proof.
+    # input/source above has passed validation and current-revision proof.
     semantic: vector.VectorSearchResultV1 | None = None
     vector_generation: int | None = None
     query_embedding_performed = False
     if vector_snapshot is not None:
-        try:
-            query_vector = await vector.embed_query_vector_v1(
-                embedding_callable,
-                query,
-                embedding_model=vector_snapshot.plan.embedding_model,
-                dimensions=vector_snapshot.plan.dimensions,
-            )
-        except vector.MemoryRetrievalVectorError:
-            _raise("hybrid_query_embedding_failed")
-        except Exception:
-            _raise("hybrid_query_embedding_failed")
-        query_embedding_performed = True
-        try:
-            semantic = vector.search_vector_index_v1(
-                vector_snapshot.plan,
-                query_vector,
-                max_hits=max_vector_hits,
-                minimum_similarity=minimum_vector_similarity,
-            )
-        except vector.MemoryRetrievalVectorError:
-            _raise("hybrid_query_vector_invalid")
-        except Exception:
-            _raise("hybrid_query_vector_invalid")
         vector_generation = vector_snapshot.generation
+        if vector_snapshot.plan.document_count == 0:
+            semantic = vector.VectorSearchResultV1(
+                hits=(),
+                indexed_document_count=0,
+            )
+        else:
+            try:
+                query_vector = await vector.embed_query_vector_v1(
+                    embedding_callable,
+                    query,
+                    embedding_model=vector_snapshot.plan.embedding_model,
+                    dimensions=vector_snapshot.plan.dimensions,
+                )
+            except vector.MemoryRetrievalVectorError:
+                _raise("hybrid_query_embedding_failed")
+            except Exception:
+                _raise("hybrid_query_embedding_failed")
+            query_embedding_performed = True
+            try:
+                semantic = vector.search_vector_index_v1(
+                    vector_snapshot.plan,
+                    query_vector,
+                    max_hits=max_vector_hits,
+                    minimum_similarity=minimum_vector_similarity,
+                )
+            except vector.MemoryRetrievalVectorError:
+                _raise("hybrid_query_vector_invalid")
+            except Exception:
+                _raise("hybrid_query_vector_invalid")
 
     try:
         fused = fusion.fuse_hybrid_retrieval_v1(
