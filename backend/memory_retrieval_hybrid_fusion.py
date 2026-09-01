@@ -60,7 +60,7 @@ MAX_EXACT_TERM_CHARS: Final = 128
 
 _MEMORY_KEY_PATTERN: Final = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 _TECHNICAL_TOKEN_PATTERN: Final = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._:/_-]{3,127}"
+    r"[A-Za-z0-9_]+(?:[.:/-]+[A-Za-z0-9_]+)*"
 )
 _ERROR_CATEGORIES: Final = frozenset({
     "invalid_atomics",
@@ -235,7 +235,11 @@ def _exact_terms(query_text: str) -> tuple[str, ...]:
     terms: list[str] = []
     for match in _TECHNICAL_TOKEN_PATTERN.finditer(normalized):
         token = match.group(0)
-        if len(token) > MAX_EXACT_TERM_CHARS or not _looks_technical_literal(token):
+        if (
+            len(token) < 4
+            or len(token) > MAX_EXACT_TERM_CHARS
+            or not _looks_technical_literal(token)
+        ):
             continue
         folded = token.casefold()
         if folded not in seen:
@@ -248,13 +252,13 @@ def _exact_terms(query_text: str) -> tuple[str, ...]:
 
 def _content_has_exact_term(content: str, term: str) -> bool:
     try:
-        folded = unicodedata.normalize("NFC", content).casefold()
+        normalized = unicodedata.normalize("NFC", content)
     except Exception:
         _raise("invalid_atomics")
-    pattern = re.compile(
-        r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])"
+    return any(
+        match.group(0).casefold() == term
+        for match in _TECHNICAL_TOKEN_PATTERN.finditer(normalized)
     )
-    return pattern.search(folded) is not None
 
 
 def _exact_channel(
