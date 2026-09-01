@@ -1,11 +1,10 @@
 """Bounded in-process observability for Phase 4D-D3B3 Hybrid Retrieval shadow.
 
-This module accepts only already-structural shadow reports, fixed skip reasons,
-and rebuild lifecycle events.  It has no API for query text, Memory keys,
-Atomic plaintext, vectors, provider payloads, paths, models, or credentials.
-State is process-local and intentionally non-durable: a restart resets all
-counters.  Nothing here participates in Memory truth, readiness, or retrieval
-authority.
+This module accepts only already-structural shadow reports and fixed runtime
+outcomes. It has no API for query text, Memory keys, Atomic plaintext, vectors,
+provider payloads, paths, models, or credentials. State is process-local and
+intentionally non-durable: a restart resets all counters. Nothing here
+participates in Memory truth, readiness, or retrieval authority.
 """
 
 from __future__ import annotations
@@ -34,14 +33,7 @@ _SKIP_REASONS: Final = (
     "loop_unavailable",
     "shadow_unavailable",
 )
-_LAST_STATUSES: Final = frozenset({
-    "none",
-    "completed",
-    "failed",
-    "skipped",
-    "cancelled",
-})
-_REBUILD_STATUSES: Final = frozenset({"none", "completed", "failed", "cancelled"})
+_LAST_STATUSES: Final = frozenset({"none", "completed", "failed", "skipped", "cancelled"})
 
 
 def _inc(value: int) -> int:
@@ -69,10 +61,6 @@ class HybridShadowObservabilitySnapshotV1:
     bm25_available_count: int
     vector_available_count: int
     query_embedding_performed_count: int
-    rebuild_started_count: int
-    rebuild_completed_count: int
-    rebuild_failed_count: int
-    rebuild_cancelled_count: int
     last_status: str
     last_skip_reason: str
     last_relation: str
@@ -86,7 +74,6 @@ class HybridShadowObservabilitySnapshotV1:
     last_bm25_available: bool
     last_vector_available: bool
     last_query_embedding_performed: bool
-    last_rebuild_status: str
 
     def __post_init__(self) -> None:
         _validate_snapshot(self)
@@ -109,35 +96,16 @@ def _validate_snapshot(snapshot: object) -> None:
     if snapshot.contract_version != OBSERVABILITY_CONTRACT_VERSION:
         raise ValueError("invalid_hybrid_shadow_observability_snapshot")
     integer_names = (
-        "attempt_count",
-        "started_count",
-        "completed_count",
-        "failed_count",
-        "cancelled_count",
-        "skipped_busy_count",
-        "skipped_authority_keys_unavailable_count",
-        "skipped_loop_unavailable_count",
-        "skipped_shadow_unavailable_count",
-        "relation_both_empty_count",
-        "relation_identical_count",
-        "relation_reordered_count",
-        "relation_hybrid_subset_count",
-        "relation_hybrid_superset_count",
-        "relation_mixed_count",
-        "bm25_available_count",
-        "vector_available_count",
-        "query_embedding_performed_count",
-        "rebuild_started_count",
-        "rebuild_completed_count",
-        "rebuild_failed_count",
-        "rebuild_cancelled_count",
-        "last_authority_selected_count",
-        "last_hybrid_selected_count",
-        "last_overlap_count",
-        "last_exact_hit_count",
-        "last_lexical_hit_count",
-        "last_bm25_hit_count",
-        "last_vector_hit_count",
+        "attempt_count", "started_count", "completed_count", "failed_count",
+        "cancelled_count", "skipped_busy_count",
+        "skipped_authority_keys_unavailable_count", "skipped_loop_unavailable_count",
+        "skipped_shadow_unavailable_count", "relation_both_empty_count",
+        "relation_identical_count", "relation_reordered_count",
+        "relation_hybrid_subset_count", "relation_hybrid_superset_count",
+        "relation_mixed_count", "bm25_available_count", "vector_available_count",
+        "query_embedding_performed_count", "last_authority_selected_count",
+        "last_hybrid_selected_count", "last_overlap_count", "last_exact_hit_count",
+        "last_lexical_hit_count", "last_bm25_hit_count", "last_vector_hit_count",
     )
     for name in integer_names:
         value = getattr(snapshot, name)
@@ -148,8 +116,6 @@ def _validate_snapshot(snapshot: object) -> None:
     if snapshot.last_skip_reason not in {*_SKIP_REASONS, ""}:
         raise ValueError("invalid_hybrid_shadow_observability_snapshot")
     if snapshot.last_relation not in {*_RELATIONS, ""}:
-        raise ValueError("invalid_hybrid_shadow_observability_snapshot")
-    if snapshot.last_rebuild_status not in _REBUILD_STATUSES:
         raise ValueError("invalid_hybrid_shadow_observability_snapshot")
     for name in (
         "last_bm25_available",
@@ -199,10 +165,6 @@ class HybridShadowObservabilityV1:
             "bm25_available": 0,
             "vector_available": 0,
             "query_embedding_performed": 0,
-            "rebuild_started": 0,
-            "rebuild_completed": 0,
-            "rebuild_failed": 0,
-            "rebuild_cancelled": 0,
         }
         self._relations = {relation: 0 for relation in _RELATIONS}
         self._last = {
@@ -219,7 +181,6 @@ class HybridShadowObservabilityV1:
             "bm25_available": False,
             "vector_available": False,
             "embedding": False,
-            "rebuild_status": "none",
         }
 
     def __repr__(self) -> str:
@@ -227,17 +188,9 @@ class HybridShadowObservabilityV1:
 
     def _clear_last_comparison(self) -> None:
         self._last.update({
-            "relation": "",
-            "authority": 0,
-            "hybrid": 0,
-            "overlap": 0,
-            "exact": 0,
-            "lexical": 0,
-            "bm25": 0,
-            "vector": 0,
-            "bm25_available": False,
-            "vector_available": False,
-            "embedding": False,
+            "relation": "", "authority": 0, "hybrid": 0, "overlap": 0,
+            "exact": 0, "lexical": 0, "bm25": 0, "vector": 0,
+            "bm25_available": False, "vector_available": False, "embedding": False,
         })
 
     def record_attempt(self) -> None:
@@ -303,25 +256,6 @@ class HybridShadowObservabilityV1:
                 "embedding": values[14],
             })
 
-    def record_rebuild_started(self) -> None:
-        with self._lock:
-            self._counts["rebuild_started"] = _inc(self._counts["rebuild_started"])
-
-    def record_rebuild_completed(self) -> None:
-        with self._lock:
-            self._counts["rebuild_completed"] = _inc(self._counts["rebuild_completed"])
-            self._last["rebuild_status"] = "completed"
-
-    def record_rebuild_failed(self) -> None:
-        with self._lock:
-            self._counts["rebuild_failed"] = _inc(self._counts["rebuild_failed"])
-            self._last["rebuild_status"] = "failed"
-
-    def record_rebuild_cancelled(self) -> None:
-        with self._lock:
-            self._counts["rebuild_cancelled"] = _inc(self._counts["rebuild_cancelled"])
-            self._last["rebuild_status"] = "cancelled"
-
     def snapshot(self) -> HybridShadowObservabilitySnapshotV1:
         with self._lock:
             snapshot = HybridShadowObservabilitySnapshotV1(
@@ -332,9 +266,7 @@ class HybridShadowObservabilityV1:
                 failed_count=self._counts["failed"],
                 cancelled_count=self._counts["cancelled"],
                 skipped_busy_count=self._counts["skip_busy"],
-                skipped_authority_keys_unavailable_count=(
-                    self._counts["skip_authority_keys_unavailable"]
-                ),
+                skipped_authority_keys_unavailable_count=self._counts["skip_authority_keys_unavailable"],
                 skipped_loop_unavailable_count=self._counts["skip_loop_unavailable"],
                 skipped_shadow_unavailable_count=self._counts["skip_shadow_unavailable"],
                 relation_both_empty_count=self._relations["both_empty"],
@@ -345,13 +277,7 @@ class HybridShadowObservabilityV1:
                 relation_mixed_count=self._relations["mixed"],
                 bm25_available_count=self._counts["bm25_available"],
                 vector_available_count=self._counts["vector_available"],
-                query_embedding_performed_count=(
-                    self._counts["query_embedding_performed"]
-                ),
-                rebuild_started_count=self._counts["rebuild_started"],
-                rebuild_completed_count=self._counts["rebuild_completed"],
-                rebuild_failed_count=self._counts["rebuild_failed"],
-                rebuild_cancelled_count=self._counts["rebuild_cancelled"],
+                query_embedding_performed_count=self._counts["query_embedding_performed"],
                 last_status=self._last["status"],
                 last_skip_reason=self._last["skip_reason"],
                 last_relation=self._last["relation"],
@@ -365,7 +291,6 @@ class HybridShadowObservabilityV1:
                 last_bm25_available=self._last["bm25_available"],
                 last_vector_available=self._last["vector_available"],
                 last_query_embedding_performed=self._last["embedding"],
-                last_rebuild_status=self._last["rebuild_status"],
             )
         _validate_snapshot(snapshot)
         return snapshot
@@ -377,16 +302,20 @@ def project_status_payload_v1(
     enabled: object,
     installed: object,
     in_flight: object,
+    observability_available: object,
 ) -> dict:
     """Project only bounded structural rollout state for an authenticated route."""
 
     _validate_snapshot(snapshot)
-    if type(enabled) is not bool or type(installed) is not bool or type(in_flight) is not bool:
+    if any(type(value) is not bool for value in (
+        enabled, installed, in_flight, observability_available,
+    )):
         raise ValueError("invalid_hybrid_shadow_observability_state")
     return {
         "contract_version": OBSERVABILITY_CONTRACT_VERSION,
         "enabled": enabled,
         "installed": installed,
+        "observability_available": observability_available,
         "in_flight": in_flight,
         "attempts": snapshot.attempt_count,
         "started": snapshot.started_count,
@@ -413,13 +342,6 @@ def project_status_payload_v1(
             "bm25_available": snapshot.bm25_available_count,
             "vector_available": snapshot.vector_available_count,
             "query_embedding_performed": snapshot.query_embedding_performed_count,
-        },
-        "rebuilds": {
-            "started": snapshot.rebuild_started_count,
-            "completed": snapshot.rebuild_completed_count,
-            "failed": snapshot.rebuild_failed_count,
-            "cancelled": snapshot.rebuild_cancelled_count,
-            "last_status": snapshot.last_rebuild_status,
         },
         "last": {
             "status": snapshot.last_status,
