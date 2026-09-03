@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """P3 production supervisor with durable Web-provider rollback protection.
 
-With Codex entrypoints disabled, the reviewed production supervisor is preserved
-except that the localhost API-loop target is wrapped by
-``examples.api_loop_provider_guard:app`` and the public relay target is wrapped by
-``backend.p3_relay_app:app`` for the P3 provider/session contract.
+With Codex entrypoints disabled, the reviewed production relay is already the
+``backend.p3_relay_app:app`` wrapper. This module adds the localhost
+``examples.api_loop_provider_guard:app`` provider/session guard while validating
+that the public relay remains on the P3 contract.
 
 When explicit Codex entrypoints are enabled, the qualified Codex api-loop is paired
 with the production P3 Codex relay. The production relay keeps Codex queued-ack and
@@ -33,7 +33,6 @@ GENERATION_FLAG = "CODEX_GENERATION_ENABLED"
 BASE_API_LOOP = "examples.api_loop:app"
 GUARD_API_LOOP = "examples.api_loop_provider_guard:app"
 CODEX_API_LOOP = "examples.api_loop_codex_canary:app"
-LEGACY_RELAY = "backend.legacy_chat_bridge_app:app"
 P3_RELAY = "backend.p3_relay_app:app"
 CODEX_RELAY = "backend.p3_codex_relay_app:app"
 
@@ -63,6 +62,14 @@ def _replace_target(command: list[str], expected: str, replacement: str) -> list
     return [replacement if item == expected else item for item in command]
 
 
+def _require_target(command: list[str], expected: str) -> list[str]:
+    if command.count(expected) != 1:
+        raise deployment_config.DeploymentConfigError(
+            "p3_provider_supervisor_contract_invalid"
+        )
+    return command
+
+
 def _select_child_commands(
     base_selector: Callable[..., dict[str, list[str]]],
     config: render_start.SupervisorConfig,
@@ -76,9 +83,8 @@ def _select_child_commands(
         BASE_API_LOOP,
         GUARD_API_LOOP,
     )
-    commands["relay"] = _replace_target(
+    commands["relay"] = _require_target(
         list(commands["relay"]),
-        LEGACY_RELAY,
         P3_RELAY,
     )
     if not codex_entrypoints_enabled(environ):

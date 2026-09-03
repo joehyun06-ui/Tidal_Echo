@@ -9,10 +9,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CodexCanaryEntrypointsInactiveTest(unittest.TestCase):
-    def test_supervisor_still_uses_legacy_production_entrypoints(self):
+    def test_supervisor_uses_p3_production_relay_while_codex_canary_is_inactive(self):
         source = (ROOT / "scripts" / "render_start.py").read_text(encoding="utf-8")
         self.assertIn('"examples.api_loop:app"', source)
-        self.assertIn('"backend.legacy_chat_bridge_app:app"', source)
+        self.assertIn('"backend.p3_relay_app:app"', source)
+        self.assertNotIn('"backend.legacy_chat_bridge_app:app"', source)
         self.assertNotIn("examples.api_loop_codex_canary:app", source)
         self.assertNotIn("backend.codex_canary_relay_app:app", source)
 
