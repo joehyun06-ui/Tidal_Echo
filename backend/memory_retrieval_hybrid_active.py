@@ -349,9 +349,7 @@ async def plan_hybrid_active_selection_v1(
     max_items, character_budget = _validated_budget(max_items, character_budget)
     try:
         raw_result = await active_runner(query_text=query)
-    except BaseException as error:
-        if isinstance(error, (KeyboardInterrupt, SystemExit)):
-            raise
+    except Exception:
         _raise("hybrid_active_query_failed")
     result = _validated_query_result(raw_result)
     snapshot = _reprove_query_revision(active_runner, query, result)
