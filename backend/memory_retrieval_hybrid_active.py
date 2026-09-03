@@ -84,7 +84,7 @@ class HybridActiveSelectionV1:
     total_chars: int
     query_embedding_performed: bool
     memory_keys: tuple[str, ...] = field(repr=False)
-    items: tuple[dict, ...] = field(repr=False)
+    atomics: tuple[hierarchy.AtomicMemoryProjectionInputV1, ...] = field(repr=False)
 
     def __new__(cls, *_args: object, **_kwargs: object):
         _raise("hybrid_active_selection_invalid")
@@ -277,7 +277,7 @@ def _selection_from_result(
         if type(hits) is not tuple or len(hits) > fusion.MAX_HITS:
             _raise("hybrid_active_selection_invalid")
 
-        selected_items: list[dict] = []
+        selected_atomics: list[hierarchy.AtomicMemoryProjectionInputV1] = []
         selected_keys: list[str] = []
         seen: set[str] = set()
         total_chars = 0
@@ -288,24 +288,27 @@ def _selection_from_result(
             if key in seen or key not in by_key:
                 _raise("hybrid_active_selection_invalid")
             seen.add(key)
-            if len(selected_items) >= max_items:
+            if len(selected_atomics) >= max_items:
                 break
             atomic = by_key[key]
             next_chars = total_chars + len(atomic.normalized_content)
             if next_chars > character_budget:
                 break
             selected_keys.append(key)
-            selected_items.append(_atomic_context_item(atomic))
+            selected_atomics.append(atomic)
             total_chars = next_chars
 
+        transient_items = tuple(
+            _atomic_context_item(item) for item in selected_atomics
+        )
         bundle = memory_context.build_memory_context_bundle(
-            tuple(selected_items),
+            transient_items,
             scope_type="global_user",
             max_items=max_items,
             character_budget=character_budget,
         )
         if (
-            bundle.item_count != len(selected_items)
+            bundle.item_count != len(selected_atomics)
             or bundle.total_chars != total_chars
         ):
             _raise("hybrid_active_selection_invalid")
@@ -317,7 +320,7 @@ def _selection_from_result(
             HYBRID_ACTIVE_CONTRACT_VERSION,
         )
         object.__setattr__(selection, "source_atomic_count", snapshot.count)
-        object.__setattr__(selection, "selected_count", len(selected_items))
+        object.__setattr__(selection, "selected_count", len(selected_atomics))
         object.__setattr__(selection, "total_chars", total_chars)
         object.__setattr__(
             selection,
@@ -325,7 +328,7 @@ def _selection_from_result(
             result.query_embedding_performed,
         )
         object.__setattr__(selection, "memory_keys", tuple(selected_keys))
-        object.__setattr__(selection, "items", tuple(selected_items))
+        object.__setattr__(selection, "atomics", tuple(selected_atomics))
         return selection
     except MemoryRetrievalHybridActiveError:
         raise
@@ -369,6 +372,7 @@ def render_hybrid_active_developer_message_v1(
     if type(selection) is not HybridActiveSelectionV1:
         _raise("hybrid_active_render_failed")
     try:
+        atomics = selection.atomics
         if (
             selection.contract_version != HYBRID_ACTIVE_CONTRACT_VERSION
             or type(selection.selected_count) is not int
@@ -379,19 +383,32 @@ def render_hybrid_active_developer_message_v1(
             or type(selection.memory_keys) is not tuple
             or len(selection.memory_keys) != selection.selected_count
             or len(set(selection.memory_keys)) != len(selection.memory_keys)
-            or type(selection.items) is not tuple
-            or len(selection.items) != selection.selected_count
+            or type(atomics) is not tuple
+            or len(atomics) != selection.selected_count
+            or any(
+                type(item) is not hierarchy.AtomicMemoryProjectionInputV1
+                for item in atomics
+            )
+            or tuple(item.memory_key for item in atomics) != selection.memory_keys
+            or sum(len(item.normalized_content) for item in atomics)
+            != selection.total_chars
         ):
             _raise("hybrid_active_render_failed")
+        eligible, _by_key = fusion._validated_atomics(atomics)
+        if len(eligible) != len(atomics):
+            _raise("hybrid_active_render_failed")
         return memory_context.render_memory_developer_message(
-            selection.items,
+            tuple(_atomic_context_item(item) for item in atomics),
             scope_type="global_user",
             max_items=ACTIVE_MAX_ITEMS,
             character_budget=ACTIVE_CHARACTER_BUDGET,
         )
     except MemoryRetrievalHybridActiveError:
         raise
-    except memory_context.MemoryContextError:
+    except (
+        fusion.MemoryRetrievalHybridFusionError,
+        memory_context.MemoryContextError,
+    ):
         _raise("hybrid_active_render_failed")
     except BaseException:
         _raise("hybrid_active_render_failed")
