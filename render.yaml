@@ -66,6 +66,7 @@
         {"key": "MEMORY_RETRIEVAL_V2_SHADOW_ENABLED", "value": "false"},
         {"key": "MEMORY_RETRIEVAL_V2_ACTIVE_ENABLED", "value": "false"},
         {"key": "MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED", "value": "false"},
+        {"key": "MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED", "value": "false"},
         {"key": "MEMORY_HYBRID_BM25_TERM_KEY_ID", "sync": false},
         {"key": "MEMORY_HYBRID_BM25_TERM_HMAC_SECRET", "sync": false},
         {"key": "MEMORY_HYBRID_EMBEDDING_API_BASE", "sync": false},
