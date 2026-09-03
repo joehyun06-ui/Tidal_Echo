@@ -96,8 +96,12 @@ class HybridActiveRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def test_gate_defaults_off_and_strict_boolean_parser_is_reused(self):
         self.assertFalse(runtime_active.enabled_from_environment({}))
         self.assertTrue(runtime_active.enabled_from_environment({runtime_active.ENV_GATE: "true"}))
-        with self.assertRaises(deployment_config.DeploymentConfigError):
-            runtime_active.enabled_from_environment({runtime_active.ENV_GATE: "1"})
+        self.assertTrue(runtime_active.enabled_from_environment({runtime_active.ENV_GATE: "1"}))
+        for invalid in (" true ", "maybe", "１"):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                deployment_config.DeploymentConfigError
+            ):
+                runtime_active.enabled_from_environment({runtime_active.ENV_GATE: invalid})
 
     def test_gate_off_is_exact_prepare_and_generator_noop(self):
         def original_prepare(*_args, **_kwargs):
