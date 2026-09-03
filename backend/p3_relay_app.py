@@ -18,6 +18,7 @@ from backend import (
     memory_formation_v2_runtime_patch,
     memory_hierarchy_live_refresh_shadow,
     memory_hierarchy_summary_runtime_shadow,
+    memory_retrieval_hybrid_runtime_active,
     memory_retrieval_hybrid_runtime_composition,
     memory_retrieval_hybrid_runtime_shadow,
     p3_provider_status,
@@ -32,6 +33,10 @@ if not memory_formation_v2_authority.install(relay_app):
     memory_formation_v2_runtime_patch.install(relay_app)
 memory_hierarchy_summary_runtime_shadow.install(relay_app)
 memory_hierarchy_live_refresh_shadow.install(relay_app)
+# Active installs first so active+shadow=true fails before any shadow callable
+# can be patched.  With the active gate OFF this is an exact no-op apart from
+# process-local install markers used by the authenticated status route.
+memory_retrieval_hybrid_runtime_active.install(relay_app)
 hybrid_retrieval_shadow_runner = (
     memory_retrieval_hybrid_runtime_composition
     .compose_hybrid_retrieval_shadow_runner_v1(relay_app)
@@ -54,6 +59,18 @@ def _retire_error(error: p3_session_retire.P3SessionRetireError) -> JSONResponse
         {"ok": False, "error": error.category},
         status_code=error.status_code,
     )
+
+
+def _install_hybrid_active_status_route() -> None:
+    if getattr(relay_app, "_P3_HYBRID_ACTIVE_STATUS_INSTALLED", False):
+        return
+
+    @app.get("/app/memory/hybrid-active/status")
+    async def app_memory_hybrid_active_status(request: Request):
+        relay_app.check_auth(request)
+        return memory_retrieval_hybrid_runtime_active.status_payload_v1(relay_app)
+
+    relay_app._P3_HYBRID_ACTIVE_STATUS_INSTALLED = True
 
 
 def _install_hybrid_shadow_status_route() -> None:
@@ -170,6 +187,7 @@ def _install_session_delete_route() -> None:
     relay_app._P3_SESSION_DELETE_INSTALLED = True
 
 
+_install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_capability_route()
 _install_provider_status_route()
