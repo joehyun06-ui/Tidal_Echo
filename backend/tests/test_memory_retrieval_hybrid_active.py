@@ -103,7 +103,7 @@ class HybridActiveAuthorityTests(unittest.IsolatedAsyncioTestCase):
             sparse_plan,
         )
 
-        vectors = {K1: (1.0, 0.0), K2: (0.6, 0.8)}
+        vectors = {K1: (1.0, 0.0), K2: (0.0, 1.0)}
         documents = tuple(
             sorted(
                 (
