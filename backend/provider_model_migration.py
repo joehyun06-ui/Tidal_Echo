@@ -2,7 +2,7 @@
 
 This module exists so an authenticated operator can change only the provider
 model identifier without ever round-tripping the existing provider key through
-the browser.  The current LOOP_CONFIG remains the sole authority: URL, key, and
+the browser. The current LOOP_CONFIG remains the sole authority: URL, key, and
 all unrelated config fields are preserved, the complete candidate config is
 revalidated, and writes use the repository's atomic text helper.
 """
@@ -37,7 +37,11 @@ class ProviderModelMigrationError(RuntimeError):
     __slots__ = ("category", "status_code")
 
     def __init__(self, category: object):
-        safe = category if type(category) is str and category in _ALLOWED_ERRORS else CONFIG_UNAVAILABLE
+        safe = (
+            category
+            if type(category) is str and category in _ALLOWED_ERRORS
+            else CONFIG_UNAVAILABLE
+        )
         self.category = safe
         self.status_code = 400 if safe == INVALID_REQUEST else 503
         super().__init__(safe)
@@ -56,13 +60,47 @@ def _raise(category: str) -> None:
     raise ProviderModelMigrationError(category)
 
 
+def decode_model_request_body(
+    raw: object,
+    *,
+    content_length: object = None,
+    content_encoding: object = "",
+) -> object:
+    """Decode one bounded JSON body without accepting compression or ambiguity."""
+
+    encoding = str(content_encoding if content_encoding is not None else "").strip().lower()
+    if encoding not in {"", "identity"}:
+        _raise(INVALID_REQUEST)
+    if content_length not in (None, ""):
+        length_text = str(content_length)
+        if (
+            not length_text.isascii()
+            or not length_text.isdecimal()
+            or int(length_text) > MAX_REQUEST_BYTES
+        ):
+            _raise(INVALID_REQUEST)
+    if type(raw) is not bytes or not raw or len(raw) > MAX_REQUEST_BYTES:
+        _raise(INVALID_REQUEST)
+    if content_length not in (None, "") and int(str(content_length)) != len(raw):
+        _raise(INVALID_REQUEST)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        _raise(INVALID_REQUEST)
+
+
 def validate_model_request(payload: object) -> str:
     """Accept exactly ``{"model": <non-empty string>}`` and nothing else."""
 
     if type(payload) is not dict or set(payload) != {"model"}:
         _raise(INVALID_REQUEST)
     model = payload.get("model")
-    if type(model) is not str or not model or model != model.strip() or len(model) > MAX_MODEL_CHARS:
+    if (
+        type(model) is not str
+        or not model
+        or model != model.strip()
+        or len(model) > MAX_MODEL_CHARS
+    ):
         _raise(INVALID_REQUEST)
     try:
         model.encode("utf-8", errors="strict")
@@ -75,7 +113,12 @@ def validate_model_request(payload: object) -> str:
 
 def _load_authoritative_config(path: Path) -> tuple[str, dict]:
     try:
-        if not path.is_absolute() or not path.exists() or not path.is_file() or path.is_symlink():
+        if (
+            not path.is_absolute()
+            or not path.exists()
+            or not path.is_file()
+            or path.is_symlink()
+        ):
             _raise(CONFIG_UNAVAILABLE)
         size = path.stat().st_size
         if size <= 0 or size > deployment_config.LOOP_CONFIG_MAX_BYTES:
@@ -94,14 +137,25 @@ def _load_authoritative_config(path: Path) -> tuple[str, dict]:
         return raw, payload
     except ProviderModelMigrationError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError, deployment_config.DeploymentConfigError):
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        deployment_config.DeploymentConfigError,
+    ):
         _raise(CONFIG_UNAVAILABLE)
 
 
-def _verified_projection(payload: object, *, model: str, original_route: dict) -> None:
+def _verified_projection(
+    payload: object,
+    *,
+    model: str,
+    original_route: dict,
+    expected_payload: dict,
+) -> None:
     try:
         deployment_config.validate_loop_config_payload(payload, render_mvp=True)
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or payload != expected_payload:
             _raise(WRITE_FAILED)
         chain = payload.get("main_chain")
         if not isinstance(chain, list) or len(chain) != 1 or not isinstance(chain[0], dict):
@@ -119,10 +173,13 @@ def _verified_projection(payload: object, *, model: str, original_route: dict) -
         _raise(WRITE_FAILED)
 
 
-def migrate_primary_provider_model(loop_config: str | Path, payload: object) -> dict[str, object]:
+def migrate_primary_provider_model(
+    loop_config: str | Path,
+    payload: object,
+) -> dict[str, object]:
     """Atomically replace only ``main_chain[0].model`` in the authoritative config.
 
-    The existing URL and key never leave the server.  On post-write verification
+    The existing URL and key never leave the server. On post-write verification
     failure, the original file contents are restored atomically on a best-effort
     basis before returning a fixed error category.
     """
@@ -146,12 +203,20 @@ def migrate_primary_provider_model(loop_config: str | Path, payload: object) -> 
     try:
         deployment_config.validate_loop_config_payload(candidate, render_mvp=True)
         encoded = json.dumps(candidate, ensure_ascii=False, indent=2) + "\n"
-        if len(encoded.encode("utf-8", errors="strict")) > deployment_config.LOOP_CONFIG_MAX_BYTES:
+        if (
+            len(encoded.encode("utf-8", errors="strict"))
+            > deployment_config.LOOP_CONFIG_MAX_BYTES
+        ):
             _raise(WRITE_FAILED)
         deployment_config.atomic_write_text(path, encoded)
         verify_raw = path.read_text(encoding="utf-8")
         verify_payload = json.loads(verify_raw)
-        _verified_projection(verify_payload, model=model, original_route=route)
+        _verified_projection(
+            verify_payload,
+            model=model,
+            original_route=route,
+            expected_payload=candidate,
+        )
     except ProviderModelMigrationError:
         try:
             deployment_config.atomic_write_text(path, original_raw)
@@ -181,6 +246,7 @@ __all__ = (
     "MAX_REQUEST_BYTES",
     "ProviderModelMigrationError",
     "WRITE_FAILED",
+    "decode_model_request_body",
     "migrate_primary_provider_model",
     "validate_model_request",
 )
