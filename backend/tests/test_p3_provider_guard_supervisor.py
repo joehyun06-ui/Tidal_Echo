@@ -30,7 +30,7 @@ def supervisor_config(*, autonomous_wake_enabled: bool = False):
 
 
 class P3ProviderGuardSupervisorTests(unittest.TestCase):
-    def test_default_selection_wraps_only_api_loop_and_relay(self):
+    def test_default_selection_wraps_api_loop_and_preserves_p3_relay(self):
         config = supervisor_config(autonomous_wake_enabled=True)
         base = render_start.child_commands(config, executable="python-test")
         actual = render_start_p3.child_commands(
@@ -41,18 +41,13 @@ class P3ProviderGuardSupervisorTests(unittest.TestCase):
         self.assertIn(render_start_p3.GUARD_API_LOOP, actual["api_loop"])
         self.assertNotIn(render_start_p3.BASE_API_LOOP, actual["api_loop"])
         self.assertIn(render_start_p3.P3_RELAY, actual["relay"])
-        self.assertNotIn(render_start_p3.LEGACY_RELAY, actual["relay"])
+        self.assertEqual(actual["relay"], base["relay"])
         self.assertEqual(actual["autonomous_wake"], base["autonomous_wake"])
         normalized = {name: list(command) for name, command in actual.items()}
         normalized["api_loop"] = [
             render_start_p3.BASE_API_LOOP
             if item == render_start_p3.GUARD_API_LOOP else item
             for item in normalized["api_loop"]
-        ]
-        normalized["relay"] = [
-            render_start_p3.LEGACY_RELAY
-            if item == render_start_p3.P3_RELAY else item
-            for item in normalized["relay"]
         ]
         self.assertEqual(normalized, base)
 

@@ -24,9 +24,9 @@ from scripts import render_start
 
 CANARY_FLAG = "CODEX_CANARY_ENTRYPOINTS_ENABLED"
 GENERATION_FLAG = "CODEX_GENERATION_ENABLED"
-LEGACY_API_LOOP = "examples.api_loop:app"
+BASE_API_LOOP = "examples.api_loop:app"
 CANARY_API_LOOP = "examples.api_loop_codex_canary:app"
-LEGACY_RELAY = "backend.legacy_chat_bridge_app:app"
+BASE_RELAY = "backend.p3_relay_app:app"
 CANARY_RELAY = "backend.codex_canary_relay_app:app"
 
 
@@ -69,10 +69,10 @@ def _select_child_commands(
         return commands
     commands = dict(commands)
     commands["api_loop"] = _replace_target(
-        list(commands["api_loop"]), LEGACY_API_LOOP, CANARY_API_LOOP
+        list(commands["api_loop"]), BASE_API_LOOP, CANARY_API_LOOP
     )
     commands["relay"] = _replace_target(
-        list(commands["relay"]), LEGACY_RELAY, CANARY_RELAY
+        list(commands["relay"]), BASE_RELAY, CANARY_RELAY
     )
     return commands
 
@@ -83,7 +83,7 @@ def child_commands(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
-    """Return legacy commands by default, or swap only the two reviewed entrypoints."""
+    """Return production commands by default, or swap only the two reviewed entrypoints."""
     return _select_child_commands(
         render_start.child_commands,
         config,

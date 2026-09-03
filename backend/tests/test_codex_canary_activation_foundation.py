@@ -42,7 +42,7 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
             ):
                 canary_start.canary_entrypoints_enabled(env)
 
-    def test_generation_cannot_claim_enabled_while_legacy_entrypoints_are_selected(self):
+    def test_generation_cannot_claim_enabled_while_canary_entrypoints_are_off(self):
         with self.assertRaisesRegex(
             deployment_config.DeploymentConfigError,
             "codex_generation_requires_canary_entrypoints",
@@ -58,7 +58,7 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
             canary_start.GENERATION_FLAG: "false",
         }))
 
-    def test_default_commands_are_byte_for_byte_legacy_selection(self):
+    def test_default_commands_are_byte_for_byte_production_selection(self):
         config = supervisor_config()
         expected = render_start.child_commands(config, executable="python-test")
         actual = canary_start.child_commands(
@@ -67,12 +67,12 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
             environ={},
         )
         self.assertEqual(actual, expected)
-        self.assertIn(canary_start.LEGACY_API_LOOP, actual["api_loop"])
-        self.assertIn(canary_start.LEGACY_RELAY, actual["relay"])
+        self.assertIn(canary_start.BASE_API_LOOP, actual["api_loop"])
+        self.assertIn(canary_start.BASE_RELAY, actual["relay"])
 
     def test_enabled_gate_swaps_only_api_loop_and_relay_targets(self):
         config = supervisor_config(autonomous_wake_enabled=True)
-        legacy = render_start.child_commands(config, executable="python-test")
+        base = render_start.child_commands(config, executable="python-test")
         actual = canary_start.child_commands(
             config,
             executable="python-test",
@@ -82,21 +82,21 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
             },
         )
         self.assertIn(canary_start.CANARY_API_LOOP, actual["api_loop"])
-        self.assertNotIn(canary_start.LEGACY_API_LOOP, actual["api_loop"])
+        self.assertNotIn(canary_start.BASE_API_LOOP, actual["api_loop"])
         self.assertIn(canary_start.CANARY_RELAY, actual["relay"])
-        self.assertNotIn(canary_start.LEGACY_RELAY, actual["relay"])
-        self.assertEqual(actual["autonomous_wake"], legacy["autonomous_wake"])
+        self.assertNotIn(canary_start.BASE_RELAY, actual["relay"])
+        self.assertEqual(actual["autonomous_wake"], base["autonomous_wake"])
 
         normalized = {name: list(command) for name, command in actual.items()}
         normalized["api_loop"] = [
-            canary_start.LEGACY_API_LOOP if item == canary_start.CANARY_API_LOOP else item
+            canary_start.BASE_API_LOOP if item == canary_start.CANARY_API_LOOP else item
             for item in normalized["api_loop"]
         ]
         normalized["relay"] = [
-            canary_start.LEGACY_RELAY if item == canary_start.CANARY_RELAY else item
+            canary_start.BASE_RELAY if item == canary_start.CANARY_RELAY else item
             for item in normalized["relay"]
         ]
-        self.assertEqual(normalized, legacy)
+        self.assertEqual(normalized, base)
 
     def test_wrapper_main_selector_executes_without_recursion_and_restores_original(self):
         original = render_start.child_commands
@@ -120,7 +120,7 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
         self.assertIn(canary_start.CANARY_RELAY, observed["commands"]["relay"])
         self.assertIs(render_start.child_commands, original)
 
-    def test_current_render_blueprint_still_uses_legacy_supervisor_and_has_no_activation_flags(self):
+    def test_current_render_blueprint_still_uses_base_supervisor_and_has_no_activation_flags(self):
         payload = json.loads((ROOT / "render.yaml").read_text(encoding="utf-8"))
         service = payload["services"][0]
         self.assertEqual(service["startCommand"], "python scripts/render_start.py")
