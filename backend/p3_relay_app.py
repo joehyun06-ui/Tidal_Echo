@@ -7,6 +7,7 @@ relay integrations are still installed only by the alternate Codex relay entrypo
 
 from __future__ import annotations
 
+import json
 import urllib.parse
 
 from fastapi import HTTPException, Request
@@ -24,6 +25,7 @@ from backend import (
     memory_retrieval_hybrid_runtime_shadow,
     p3_provider_status,
     p3_session_retire,
+    provider_model_migration,
     web_provider_capabilities,
 )
 
@@ -61,6 +63,54 @@ def _retire_error(error: p3_session_retire.P3SessionRetireError) -> JSONResponse
         {"ok": False, "error": error.category},
         status_code=error.status_code,
     )
+
+
+def _provider_model_error(
+    error: provider_model_migration.ProviderModelMigrationError,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": error.category},
+        status_code=error.status_code,
+    )
+
+
+async def _read_provider_model_request(request: Request) -> object:
+    try:
+        encoding = request.headers.get("content-encoding", "").strip().lower()
+        if encoding not in {"", "identity"}:
+            raise provider_model_migration.ProviderModelMigrationError(
+                provider_model_migration.INVALID_REQUEST
+            )
+        content_length = request.headers.get("content-length")
+        if content_length:
+            if not content_length.isascii() or not content_length.isdecimal():
+                raise provider_model_migration.ProviderModelMigrationError(
+                    provider_model_migration.INVALID_REQUEST
+                )
+            if int(content_length) > provider_model_migration.MAX_REQUEST_BYTES:
+                raise provider_model_migration.ProviderModelMigrationError(
+                    provider_model_migration.INVALID_REQUEST
+                )
+        raw = await request.body()
+        if (
+            not raw
+            or len(raw) > provider_model_migration.MAX_REQUEST_BYTES
+            or (content_length and int(content_length) != len(raw))
+        ):
+            raise provider_model_migration.ProviderModelMigrationError(
+                provider_model_migration.INVALID_REQUEST
+            )
+        return json.loads(raw)
+    except provider_model_migration.ProviderModelMigrationError:
+        raise
+    except (json.JSONDecodeError, UnicodeError, ValueError):
+        raise provider_model_migration.ProviderModelMigrationError(
+            provider_model_migration.INVALID_REQUEST
+        ) from None
+    except Exception:
+        raise provider_model_migration.ProviderModelMigrationError(
+            provider_model_migration.INVALID_REQUEST
+        ) from None
 
 
 def _install_hybrid_active_status_route() -> None:
@@ -130,6 +180,31 @@ def _install_provider_status_route() -> None:
     relay_app._P3_PROVIDER_STATUS_INSTALLED = True
 
 
+def _install_provider_model_migration_route() -> None:
+    if getattr(relay_app, "_P3_PROVIDER_MODEL_MIGRATION_INSTALLED", False):
+        return
+
+    @app.post("/app/provider/model")
+    async def app_provider_model_migration(request: Request):
+        relay_app.check_auth(request)
+        try:
+            payload = await _read_provider_model_request(request)
+            return provider_model_migration.migrate_primary_provider_model(
+                relay_app.DEPLOYMENT.loop_config,
+                payload,
+            )
+        except provider_model_migration.ProviderModelMigrationError as error:
+            return _provider_model_error(error)
+        except Exception:
+            return _provider_model_error(
+                provider_model_migration.ProviderModelMigrationError(
+                    provider_model_migration.CONFIG_UNAVAILABLE
+                )
+            )
+
+    relay_app._P3_PROVIDER_MODEL_MIGRATION_INSTALLED = True
+
+
 def _install_session_retire_route() -> None:
     if getattr(relay_app, "_P3_SESSION_RETIRE_INSTALLED", False):
         return
@@ -193,5 +268,6 @@ _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_capability_route()
 _install_provider_status_route()
+_install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
