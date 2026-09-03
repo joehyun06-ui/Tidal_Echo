@@ -7,7 +7,6 @@ relay integrations are still installed only by the alternate Codex relay entrypo
 
 from __future__ import annotations
 
-import json
 import urllib.parse
 
 from fastapi import HTTPException, Request
@@ -75,42 +74,12 @@ def _provider_model_error(
 
 
 async def _read_provider_model_request(request: Request) -> object:
-    try:
-        encoding = request.headers.get("content-encoding", "").strip().lower()
-        if encoding not in {"", "identity"}:
-            raise provider_model_migration.ProviderModelMigrationError(
-                provider_model_migration.INVALID_REQUEST
-            )
-        content_length = request.headers.get("content-length")
-        if content_length:
-            if not content_length.isascii() or not content_length.isdecimal():
-                raise provider_model_migration.ProviderModelMigrationError(
-                    provider_model_migration.INVALID_REQUEST
-                )
-            if int(content_length) > provider_model_migration.MAX_REQUEST_BYTES:
-                raise provider_model_migration.ProviderModelMigrationError(
-                    provider_model_migration.INVALID_REQUEST
-                )
-        raw = await request.body()
-        if (
-            not raw
-            or len(raw) > provider_model_migration.MAX_REQUEST_BYTES
-            or (content_length and int(content_length) != len(raw))
-        ):
-            raise provider_model_migration.ProviderModelMigrationError(
-                provider_model_migration.INVALID_REQUEST
-            )
-        return json.loads(raw)
-    except provider_model_migration.ProviderModelMigrationError:
-        raise
-    except (json.JSONDecodeError, UnicodeError, ValueError):
-        raise provider_model_migration.ProviderModelMigrationError(
-            provider_model_migration.INVALID_REQUEST
-        ) from None
-    except Exception:
-        raise provider_model_migration.ProviderModelMigrationError(
-            provider_model_migration.INVALID_REQUEST
-        ) from None
+    raw = await request.body()
+    return provider_model_migration.decode_model_request_body(
+        raw,
+        content_length=request.headers.get("content-length"),
+        content_encoding=request.headers.get("content-encoding", ""),
+    )
 
 
 def _install_hybrid_active_status_route() -> None:
