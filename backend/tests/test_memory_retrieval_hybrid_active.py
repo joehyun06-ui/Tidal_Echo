@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import tempfile
 import unittest
@@ -166,7 +167,11 @@ class HybridActiveAuthorityTests(unittest.IsolatedAsyncioTestCase):
         )
         semantic = vector.search_vector_index_v1(
             self.semantic.plan,
-            (1.0, 0.0),
+            vector.QueryVectorV1(
+                embedding_model=EMBEDDING_MODEL,
+                dimensions=DIMS,
+                vector=(1.0, 0.0),
+            ),
             max_hits=vector.MAX_VECTOR_HITS,
             minimum_similarity=0.0,
         )
@@ -215,6 +220,13 @@ class HybridActiveAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(selection.selected_count, active.ACTIVE_MAX_ITEMS)
         self.assertLessEqual(selection.total_chars, active.ACTIVE_CHARACTER_BUDGET)
         self.assertTrue(selection.query_embedding_performed)
+        self.assertEqual(type(selection.atomics), tuple)
+        self.assertTrue(
+            all(
+                type(item) is hierarchy.AtomicMemoryProjectionInputV1
+                for item in selection.atomics
+            )
+        )
 
         message = active.render_hybrid_active_developer_message_v1(selection)
         self.assertIsNotNone(message)
@@ -297,6 +309,18 @@ class HybridActiveAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.category, "hybrid_active_query_failed")
         self.assertNotIn("private provider payload", repr(raised.exception))
         self.assertNotIn(QUERY, repr(raised.exception))
+
+    async def test_query_cancellation_propagates(self):
+        with mock.patch.object(
+            runtime_composition.HybridRetrievalShadowRunnerV1,
+            "__call__",
+            new=mock.AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await active.plan_hybrid_active_selection_v1(
+                    self.runner,
+                    query_text=QUERY,
+                )
 
     def test_budget_stops_in_rank_order_without_skipping(self):
         items = (
