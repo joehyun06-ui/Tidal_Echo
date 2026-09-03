@@ -297,7 +297,7 @@ class HybridSourceCompositionTests(unittest.TestCase):
         )
         self.assertNotIn(str(self.authority), repr(raised.exception))
 
-    def test_d2_remains_unwired_while_later_shadow_gate_stays_default_off(self):
+    def test_d2_remains_unwired_while_later_runtime_gates_stay_default_off(self):
         root = Path(__file__).resolve().parents[2]
         context_source = (
             root / "backend" / "memory_context_integration.py"
@@ -314,9 +314,8 @@ class HybridSourceCompositionTests(unittest.TestCase):
         for text in (context_source, relay_source):
             self.assertNotIn("MEMORY_HYBRID_RETRIEVAL", text)
 
-        # Later D3 may declare a deployment gate, but the repository may expose
-        # only the reviewed shadow gate and it must remain default OFF. Active
-        # Hybrid authority is still a separate future rollout contract.
+        # Later D3 may declare reviewed deployment gates, but both shadow and
+        # active authority must remain repository-default OFF.
         blueprint = json.loads(render_source)
         services = blueprint.get("services")
         self.assertIsInstance(services, list)
@@ -332,10 +331,17 @@ class HybridSourceCompositionTests(unittest.TestCase):
         }
         self.assertEqual(
             hybrid_retrieval_keys,
-            {"MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"},
+            {
+                "MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED",
+                "MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED",
+            },
         )
         self.assertEqual(
             env["MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"].get("value"),
+            "false",
+        )
+        self.assertEqual(
+            env["MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED"].get("value"),
             "false",
         )
 
