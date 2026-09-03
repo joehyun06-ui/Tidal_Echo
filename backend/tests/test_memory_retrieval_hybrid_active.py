@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -359,7 +360,7 @@ class HybridActiveAuthorityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(active.MemoryRetrievalHybridActiveError):
             active.render_hybrid_active_developer_message_v1(object())
 
-    def test_foundation_remains_unwired_and_has_no_active_deployment_gate(self):
+    def test_d3c1_is_wired_only_through_reviewed_d3c2_runtime_and_default_off_gate(self):
         root = Path(__file__).resolve().parents[2]
         context_source = (
             root / "backend" / "memory_context_integration.py"
@@ -368,9 +369,27 @@ class HybridActiveAuthorityTests(unittest.IsolatedAsyncioTestCase):
             root / "backend" / "p3_relay_app.py"
         ).read_text(encoding="utf-8")
         render_source = (root / "render.yaml").read_text(encoding="utf-8")
-        for text in (context_source, relay_source, render_source):
-            self.assertNotIn("memory_retrieval_hybrid_active", text)
-            self.assertNotIn("MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED", text)
+
+        # The existing synchronous context module still has no Hybrid-active
+        # dependency. P3 imports only the reviewed D3C2 runtime wrapper, never
+        # the D3C1 selection module directly.
+        self.assertNotIn("memory_retrieval_hybrid_active", context_source)
+        self.assertNotIn("from backend import memory_retrieval_hybrid_active", relay_source)
+        self.assertIn("memory_retrieval_hybrid_runtime_active", relay_source)
+
+        blueprint = json.loads(render_source)
+        env = {
+            item["key"]: item
+            for item in blueprint["services"][0].get("envVars", [])
+        }
+        self.assertEqual(
+            env["MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED"].get("value"),
+            "false",
+        )
+        self.assertEqual(
+            env["MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"].get("value"),
+            "false",
+        )
 
 
 if __name__ == "__main__":
