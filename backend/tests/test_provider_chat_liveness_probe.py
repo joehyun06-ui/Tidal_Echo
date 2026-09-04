@@ -119,7 +119,7 @@ class ProviderChatLivenessProbeTests(unittest.IsolatedAsyncioTestCase):
             429: probe.RATE_LIMITED,
             500: probe.UPSTREAM_UNAVAILABLE,
             503: probe.UPSTREAM_UNAVAILABLE,
-            501: probe.UPSTREAM_UNAVAILABLE,
+            501: probe.ENDPOINT_UNSUPPORTED,
         }
         for status, capability in cases.items():
             with self.subTest(status=status):
