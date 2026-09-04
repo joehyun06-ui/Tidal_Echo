@@ -27,6 +27,7 @@ from backend import (
     provider_chat_liveness_probe,
     provider_model_capability_probe,
     provider_model_migration,
+    provider_route_classification_probe,
     web_provider_capabilities,
 )
 
@@ -86,6 +87,15 @@ def _provider_chat_liveness_probe_error(
 
 def _provider_model_probe_error(
     error: provider_model_capability_probe.ProviderModelCapabilityProbeError,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": error.category},
+        status_code=error.status_code,
+    )
+
+
+def _provider_route_classification_probe_error(
+    error: provider_route_classification_probe.ProviderRouteClassificationProbeError,
 ) -> JSONResponse:
     return JSONResponse(
         {"ok": False, "error": error.category},
@@ -227,6 +237,35 @@ def _install_provider_model_capability_probe_route() -> None:
     relay_app._P3_PROVIDER_MODEL_CAPABILITY_PROBE_INSTALLED = True
 
 
+def _install_provider_route_classification_probe_route() -> None:
+    if getattr(relay_app, "_P3_PROVIDER_ROUTE_CLASSIFICATION_PROBE_INSTALLED", False):
+        return
+
+    @app.post("/app/provider/route-classification-probe")
+    async def app_provider_route_classification_probe(request: Request):
+        relay_app.check_auth(request)
+        try:
+            raw = await request.body()
+            provider_route_classification_probe.validate_empty_probe_request(
+                raw,
+                content_length=request.headers.get("content-length"),
+                content_encoding=request.headers.get("content-encoding", ""),
+            )
+            return provider_route_classification_probe.classify_authoritative_provider_route(
+                relay_app.DEPLOYMENT.loop_config,
+            )
+        except provider_route_classification_probe.ProviderRouteClassificationProbeError as error:
+            return _provider_route_classification_probe_error(error)
+        except Exception:
+            return _provider_route_classification_probe_error(
+                provider_route_classification_probe.ProviderRouteClassificationProbeError(
+                    provider_route_classification_probe.UNAVAILABLE
+                )
+            )
+
+    relay_app._P3_PROVIDER_ROUTE_CLASSIFICATION_PROBE_INSTALLED = True
+
+
 def _install_provider_model_migration_route() -> None:
     if getattr(relay_app, "_P3_PROVIDER_MODEL_MIGRATION_INSTALLED", False):
         return
@@ -317,6 +356,7 @@ _install_capability_route()
 _install_provider_status_route()
 _install_provider_chat_liveness_probe_route()
 _install_provider_model_capability_probe_route()
+_install_provider_route_classification_probe_route()
 _install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
