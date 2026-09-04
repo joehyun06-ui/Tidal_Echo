@@ -114,6 +114,8 @@ if len(API_LOOP_INTERNAL_TOKEN) < 32:
     raise SystemExit("invalid deployment configuration: api_loop_internal_token_missing")
 deployment_config.validate_loop_config_file(LOOP_CONFIG, render_mvp=RENDER_TELEGRAM_MVP)
 SAFE_FALLBACK_ERROR_CODES = {"model_not_found", "model_not_supported", "unsupported_model"}
+PROVIDER_ERROR_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
+
 
 def env_routes() -> list[dict[str, str]]:
     routes: list[dict[str, str]] = []
@@ -471,51 +473,107 @@ def _safe_provider_http_status(value: object) -> int | None:
     return value if type(value) is int and 400 <= value <= 599 else None
 
 
+def _safe_provider_error_identifier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    identifier = value.strip()
+    if not identifier or len(identifier) > 64 or not identifier.isascii():
+        return None
+    if PROVIDER_ERROR_IDENTIFIER_RE.fullmatch(identifier) is None:
+        return None
+    return identifier.lower()
+
+
+def _provider_error_metadata(raw: bytes | bytearray | memoryview) -> tuple[str | None, str | None]:
+    try:
+        payload = json.loads(bytes(raw))
+    except (json.JSONDecodeError, UnicodeError, RecursionError, TypeError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None, None
+    return (
+        _safe_provider_error_identifier(error.get("code")),
+        _safe_provider_error_identifier(error.get("type")),
+    )
+
+
+async def _read_provider_error_metadata(resp: httpx.Response) -> tuple[str | None, str | None]:
+    raw = bytearray()
+    try:
+        async for chunk in resp.aiter_bytes():
+            raw.extend(chunk)
+            if len(raw) > LOOP_PROVIDER_RESPONSE_MAX_BYTES:
+                return None, None
+    except Exception:
+        return None, None
+    return _provider_error_metadata(raw)
+
+
 class ModelRouteError(Exception):
     def __init__(
         self,
         category: str,
         outcome: str,
         provider_http_status: int | None = None,
+        provider_error_code: object = None,
+        provider_error_type: object = None,
     ):
         super().__init__(category)
         self.category = category
         self.outcome = outcome
         self.provider_http_status = _safe_provider_http_status(provider_http_status)
+        self.provider_error_code = _safe_provider_error_identifier(provider_error_code)
+        self.provider_error_type = _safe_provider_error_identifier(provider_error_type)
 
 
-def _safe_log(category: str, provider_http_status: object = None) -> None:
+def _safe_log(
+    category: str,
+    provider_http_status: object = None,
+    provider_error_code: object = None,
+    provider_error_type: object = None,
+) -> None:
+    fields = [f"[api-loop] model_dispatch={category}"]
     status = _safe_provider_http_status(provider_http_status)
-    suffix = f" provider_http_status={status}" if status is not None else ""
-    print(f"[api-loop] model_dispatch={category}{suffix}", file=sys.stderr, flush=True)
+    code = _safe_provider_error_identifier(provider_error_code)
+    error_type = _safe_provider_error_identifier(provider_error_type)
+    if status is not None:
+        fields.append(f"provider_http_status={status}")
+    if code is not None:
+        fields.append(f"provider_error_code={code}")
+    if error_type is not None:
+        fields.append(f"provider_error_type={error_type}")
+    print(" ".join(fields), file=sys.stderr, flush=True)
 
 
 async def _check_provider_response(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
-    if resp.status_code == 404:
-        try:
-            await resp.aread()
-            payload = resp.json()
-            code = str((payload.get("error") or {}).get("code") or "").strip().lower()
-        except Exception:
-            code = ""
-        if code in SAFE_FALLBACK_ERROR_CODES:
-            raise ModelRouteError(
-                "model_unsupported",
-                "safe_to_fallback",
-                resp.status_code,
-            )
+    code, error_type = await _read_provider_error_metadata(resp)
+    if resp.status_code == 404 and code in SAFE_FALLBACK_ERROR_CODES:
+        raise ModelRouteError(
+            "model_unsupported",
+            "safe_to_fallback",
+            resp.status_code,
+            code,
+            error_type,
+        )
     if resp.status_code in {408, 429} or resp.status_code >= 500:
         raise ModelRouteError(
             "provider_response_uncertain",
             "dispatch_uncertain",
             resp.status_code,
+            code,
+            error_type,
         )
     raise ModelRouteError(
         "provider_explicit_rejection",
         "explicit_failed",
         resp.status_code,
+        code,
+        error_type,
     )
 
 
@@ -610,28 +668,29 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *
                     if len(raw) > LOOP_PROVIDER_RESPONSE_MAX_BYTES:
                         raise ModelRouteError("provider_response_too_large", "dispatch_uncertain")
                 if resp.status_code >= 400:
-                    code = ""
-                    if resp.status_code == 404:
-                        try:
-                            code = str(((json.loads(bytes(raw)).get("error") or {}).get("code") or "")).lower()
-                        except Exception:
-                            pass
-                    if code in SAFE_FALLBACK_ERROR_CODES:
+                    code, error_type = _provider_error_metadata(raw)
+                    if code in SAFE_FALLBACK_ERROR_CODES and resp.status_code == 404:
                         raise ModelRouteError(
                             "model_unsupported",
                             "safe_to_fallback",
                             resp.status_code,
+                            code,
+                            error_type,
                         )
                     if resp.status_code in {408, 429} or resp.status_code >= 500:
                         raise ModelRouteError(
                             "provider_response_uncertain",
                             "dispatch_uncertain",
                             resp.status_code,
+                            code,
+                            error_type,
                         )
                     raise ModelRouteError(
                         "provider_explicit_rejection",
                         "explicit_failed",
                         resp.status_code,
+                        code,
+                        error_type,
                     )
                 data = json.loads(bytes(raw))
     except asyncio.CancelledError:
@@ -679,7 +738,12 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
             except ModelRouteError as exc:
                 if exc.outcome == "safe_to_fallback" and allow_fallback:
                     continue
-                _safe_log(exc.category, exc.provider_http_status)
+                _safe_log(
+                    exc.category,
+                    exc.provider_http_status,
+                    exc.provider_error_code,
+                    exc.provider_error_type,
+                )
                 outcome = "explicit_failed" if exc.outcome == "safe_to_fallback" else exc.outcome
                 return {"outcome": outcome, "error": exc.category, "tried": tried}
             except Exception:
@@ -720,7 +784,12 @@ async def run_kelivo_provider_contract(
     except TimeoutError:
         return {"outcome": "dispatch_uncertain", "error": "model_timeout", "tried": [provider_model]}
     except ModelRouteError as exc:
-        _safe_log(exc.category, exc.provider_http_status)
+        _safe_log(
+            exc.category,
+            exc.provider_http_status,
+            exc.provider_error_code,
+            exc.provider_error_type,
+        )
         outcome = "explicit_failed" if exc.outcome == "safe_to_fallback" else exc.outcome
         return {"outcome": outcome, "error": exc.category, "tried": [provider_model]}
     except Exception:
