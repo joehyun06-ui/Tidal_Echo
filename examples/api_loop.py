@@ -592,7 +592,7 @@ def _chat_completion_body(
         "model": route["model"],
         "messages": messages,
     }
-    if route["model"] == "gpt-5.6-sol":
+    if route["model"] in {"gpt-5.6-sol", "[Pro按量]gpt-5.6-sol"}:
         body["max_completion_tokens"] = resolved_max_tokens
     else:
         body["temperature"] = TEMPERATURE if temperature is None else temperature
