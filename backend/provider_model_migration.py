@@ -2,14 +2,18 @@
 
 This module exists so an authenticated operator can change only the provider
 model identifier without ever round-tripping the existing provider key through
-the browser. The current LOOP_CONFIG remains the sole authority: URL, key, and
-all unrelated config fields are preserved, the complete candidate config is
-revalidated, and writes use the repository's atomic text helper.
+the browser. A materialized LOOP_CONFIG remains authoritative. When that file
+is absent, or is valid but has no materialized primary route, the already
+validated Render primary LLM environment route may be used to materialize one.
+URL, key, and all unrelated config fields stay server-side, the complete
+candidate config is revalidated, and writes use the repository's atomic helper.
 """
 
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
@@ -111,14 +115,15 @@ def validate_model_request(payload: object) -> str:
     return model
 
 
-def _load_authoritative_config(path: Path) -> tuple[str, dict]:
+def _load_config_state(path: Path) -> tuple[str | None, dict]:
+    """Load an existing valid config or represent an absent file as empty state."""
+
     try:
-        if (
-            not path.is_absolute()
-            or not path.exists()
-            or not path.is_file()
-            or path.is_symlink()
-        ):
+        if not path.is_absolute() or path.is_symlink():
+            _raise(CONFIG_UNAVAILABLE)
+        if not path.exists():
+            return None, {}
+        if not path.is_file():
             _raise(CONFIG_UNAVAILABLE)
         size = path.stat().st_size
         if size <= 0 or size > deployment_config.LOOP_CONFIG_MAX_BYTES:
@@ -126,13 +131,7 @@ def _load_authoritative_config(path: Path) -> tuple[str, dict]:
         raw = path.read_text(encoding="utf-8")
         payload = json.loads(raw)
         deployment_config.validate_loop_config_payload(payload, render_mvp=True)
-        chain = payload.get("main_chain")
-        if (
-            not isinstance(chain, list)
-            or len(chain) != 1
-            or not isinstance(chain[0], dict)
-            or set(chain[0]) != {"url", "key", "model"}
-        ):
+        if not isinstance(payload, dict):
             _raise(CONFIG_UNAVAILABLE)
         return raw, payload
     except ProviderModelMigrationError:
@@ -144,6 +143,69 @@ def _load_authoritative_config(path: Path) -> tuple[str, dict]:
         deployment_config.DeploymentConfigError,
     ):
         _raise(CONFIG_UNAVAILABLE)
+
+
+def _load_environment_primary_route(
+    environ: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Resolve exactly one primary env route without exposing it to the caller."""
+
+    env = os.environ if environ is None else environ
+    if not isinstance(env, Mapping):
+        _raise(CONFIG_UNAVAILABLE)
+    try:
+        names = ("LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL")
+        values: dict[str, str] = {}
+        for name in names:
+            value = env.get(name, "")
+            if (
+                type(value) is not str
+                or not value
+                or value != value.strip()
+            ):
+                _raise(CONFIG_UNAVAILABLE)
+            values[name] = value
+
+        for suffix in ("_2", "_3", "_4"):
+            if any(
+                env.get(f"LLM_{field}{suffix}", "") != ""
+                for field in ("API_BASE", "API_KEY", "MODEL")
+            ):
+                _raise(CONFIG_UNAVAILABLE)
+
+        route = {
+            "url": values["LLM_API_BASE"],
+            "key": values["LLM_API_KEY"],
+            "model": values["LLM_MODEL"],
+        }
+        deployment_config.validate_loop_config_payload(
+            {"main_chain": [route]},
+            render_mvp=True,
+        )
+        return route
+    except ProviderModelMigrationError:
+        raise
+    except (TypeError, ValueError, deployment_config.DeploymentConfigError):
+        _raise(CONFIG_UNAVAILABLE)
+
+
+def _load_authoritative_route(
+    path: Path,
+    environ: Mapping[str, str] | None,
+) -> tuple[str | None, dict, dict[str, str]]:
+    original_raw, current = _load_config_state(path)
+    chain = current.get("main_chain")
+    if isinstance(chain, list) and len(chain) == 1:
+        route = chain[0]
+        if (
+            not isinstance(route, dict)
+            or set(route) != {"url", "key", "model"}
+        ):
+            _raise(CONFIG_UNAVAILABLE)
+        return original_raw, current, dict(route)
+    if chain is None or chain == []:
+        return original_raw, current, _load_environment_primary_route(environ)
+    _raise(CONFIG_UNAVAILABLE)
 
 
 def _verified_projection(
@@ -173,21 +235,36 @@ def _verified_projection(
         _raise(WRITE_FAILED)
 
 
+def _restore_original(path: Path, original_raw: str | None) -> None:
+    """Best-effort rollback to exact prior file bytes or prior file absence."""
+
+    try:
+        if original_raw is None:
+            path.unlink(missing_ok=True)
+        else:
+            deployment_config.atomic_write_text(path, original_raw)
+    except BaseException:
+        pass
+
+
 def migrate_primary_provider_model(
     loop_config: str | Path,
     payload: object,
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
-    """Atomically replace only ``main_chain[0].model`` in the authoritative config.
+    """Atomically replace only the authoritative primary provider model.
 
-    The existing URL and key never leave the server. On post-write verification
-    failure, the original file contents are restored atomically on a best-effort
-    basis before returning a fixed error category.
+    A materialized ``main_chain`` wins. If the config file is absent, or is
+    valid but does not materialize a primary route, the primary Render LLM env
+    route is used server-side to create one. Existing URL/key values never leave
+    the server. Verification failure restores exact prior bytes, or restores
+    prior file absence when the migration created the file.
     """
 
     model = validate_model_request(payload)
     path = Path(loop_config)
-    original_raw, current = _load_authoritative_config(path)
-    route = dict(current["main_chain"][0])
+    original_raw, current, route = _load_authoritative_route(path, environ)
     if route["model"] == model:
         return {
             "ok": True,
@@ -218,16 +295,10 @@ def migrate_primary_provider_model(
             expected_payload=candidate,
         )
     except ProviderModelMigrationError:
-        try:
-            deployment_config.atomic_write_text(path, original_raw)
-        except BaseException:
-            pass
+        _restore_original(path, original_raw)
         raise
     except BaseException:
-        try:
-            deployment_config.atomic_write_text(path, original_raw)
-        except BaseException:
-            pass
+        _restore_original(path, original_raw)
         _raise(WRITE_FAILED)
 
     return {
