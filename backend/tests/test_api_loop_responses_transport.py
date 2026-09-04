@@ -98,6 +98,49 @@ class ApiLoopResponsesTransportTests(NoNetworkMixin, unittest.IsolatedAsyncioTes
         self.assertNotIn("max_tokens", seen["body"])
         self.assertNotIn("max_completion_tokens", seen["body"])
 
+    async def test_gpt56_alias_nonstream_uses_same_responses_wire_contract(self):
+        self.module.main_chain = lambda: [{
+            "url": "https://provider.invalid/v1",
+            "key": "invalid-key",
+            "model": "gpt-5.6",
+        }]
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "id": "resp_alias",
+                "object": "response",
+                "status": "completed",
+                "output_text": "alias ok",
+                "output": [],
+                "usage": {},
+            })
+
+        with mock.patch.object(
+            self.module,
+            "_provider_client",
+            side_effect=lambda **kwargs: self._client_factory(handler)(**kwargs),
+        ):
+            out = await self.module.run_model(self.messages, emit_stream=False)
+
+        self.assertEqual(out["outcome"], "success")
+        self.assertEqual(out["text"], "alias ok")
+        self.assertEqual(out["model"], "gpt-5.6")
+        self.assertEqual(seen["path"], "/v1/responses")
+        self.assertEqual(seen["body"], {
+            "model": "gpt-5.6",
+            "input": self.messages,
+            "max_output_tokens": 2000,
+            "stream": False,
+            "store": False,
+        })
+        self.assertNotIn("temperature", seen["body"])
+        self.assertNotIn("messages", seen["body"])
+        self.assertNotIn("max_tokens", seen["body"])
+        self.assertNotIn("max_completion_tokens", seen["body"])
+
     async def test_gpt56_stream_routes_to_responses_and_emits_text_deltas(self):
         seen = {}
         emitted = []
@@ -178,6 +221,47 @@ class ApiLoopResponsesTransportTests(NoNetworkMixin, unittest.IsolatedAsyncioTes
         self.assertEqual(seen["path"], "/v1/responses")
         self.assertEqual(seen["body"]["max_output_tokens"], 321)
         self.assertNotIn("temperature", seen["body"])
+
+    async def test_kelivo_gpt56_alias_uses_same_responses_wire_contract(self):
+        seen = {}
+
+        def handler(request):
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "id": "resp_kelivo_alias",
+                "object": "response",
+                "status": "completed",
+                "output_text": "[]",
+                "output": [],
+                "usage": {},
+            })
+
+        with mock.patch.dict(os.environ, {"LLM_MODEL": "gpt-5.6"}, clear=False), mock.patch.object(
+            self.module,
+            "_provider_client",
+            side_effect=lambda **kwargs: self._client_factory(handler)(**kwargs),
+        ), mock.patch.object(
+            self.module.deployment_config,
+            "resolve_kelivo_provider_contract_defaults",
+            return_value=mock.Mock(provider_model="gpt-5.6"),
+        ):
+            out = await self.module.run_kelivo_provider_contract(
+                "gpt-5.6",
+                [{"role": "developer", "content": "extract"}, {"role": "user", "content": "source"}],
+                temperature=0.0,
+                max_tokens=321,
+            )
+
+        self.assertEqual(out["outcome"], "success")
+        self.assertEqual(out["text"], "[]")
+        self.assertEqual(out["model"], "gpt-5.6")
+        self.assertEqual(seen["path"], "/v1/responses")
+        self.assertEqual(seen["body"]["model"], "gpt-5.6")
+        self.assertEqual(seen["body"]["max_output_tokens"], 321)
+        self.assertNotIn("temperature", seen["body"])
+        self.assertNotIn("messages", seen["body"])
+        self.assertNotIn("max_tokens", seen["body"])
 
     async def test_legacy_model_still_uses_chat_completions(self):
         self.module.main_chain = lambda: [{
