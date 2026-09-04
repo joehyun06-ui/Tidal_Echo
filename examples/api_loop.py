@@ -519,14 +519,31 @@ async def _check_provider_response(resp: httpx.Response) -> None:
     )
 
 
-async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
-    body = {
+def _chat_completion_body(
+    route: dict[str, str],
+    messages: list[dict[str, str]],
+    *,
+    stream: bool,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Build an outbound Chat Completions body without changing legacy routes."""
+    resolved_max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
+    body: dict[str, Any] = {
         "model": route["model"],
         "messages": messages,
-        "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
-        "stream": True,
     }
+    if route["model"] == "gpt-5.6-sol":
+        body["max_completion_tokens"] = resolved_max_tokens
+    else:
+        body["temperature"] = TEMPERATURE if temperature is None else temperature
+        body["max_tokens"] = resolved_max_tokens
+    body["stream"] = stream
+    return body
+
+
+async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
+    body = _chat_completion_body(route, messages, stream=True)
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
     model_work_started = False
@@ -574,13 +591,13 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
 
 async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *,
                         temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
-    body = {
-        "model": route["model"],
-        "messages": messages,
-        "temperature": TEMPERATURE if temperature is None else temperature,
-        "max_tokens": MAX_TOKENS if max_tokens is None else max_tokens,
-        "stream": False,
-    }
+    body = _chat_completion_body(
+        route,
+        messages,
+        stream=False,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
     try:
         async with _provider_client(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
             async with client.stream(
