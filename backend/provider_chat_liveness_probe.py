@@ -131,10 +131,10 @@ def _classify_status(status: int) -> str:
         return PROVIDER_TIMEOUT
     if status == 429:
         return RATE_LIMITED
-    if status >= 500:
-        return UPSTREAM_UNAVAILABLE
     if status in {404, 405, 501}:
         return ENDPOINT_UNSUPPORTED
+    if status >= 500:
+        return UPSTREAM_UNAVAILABLE
     if 200 <= status < 300:
         return UNEXPECTED_ACCEPTANCE
     if 300 <= status < 400:
