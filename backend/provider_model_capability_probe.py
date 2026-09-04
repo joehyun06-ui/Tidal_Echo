@@ -115,7 +115,7 @@ def _authoritative_route(
         }
     except ProviderModelCapabilityProbeError:
         raise
-    except BaseException:
+    except Exception:
         _raise(UNAVAILABLE)
 
 
@@ -130,10 +130,10 @@ def _classify_status(status: int) -> str:
         return PROVIDER_TIMEOUT
     if status == 429:
         return RATE_LIMITED
-    if status >= 500:
-        return UPSTREAM_UNAVAILABLE
     if status in {405, 501} or 300 <= status < 400:
         return PROBE_UNSUPPORTED
+    if status >= 500:
+        return UPSTREAM_UNAVAILABLE
     return EXPLICIT_REJECTION
 
 
@@ -231,7 +231,7 @@ async def probe_authoritative_primary_model(
         raise
     except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
         _raise(UNAVAILABLE)
-    except BaseException:
+    except Exception:
         _raise(UNAVAILABLE)
 
 
