@@ -114,7 +114,7 @@ if len(API_LOOP_INTERNAL_TOKEN) < 32:
     raise SystemExit("invalid deployment configuration: api_loop_internal_token_missing")
 deployment_config.validate_loop_config_file(LOOP_CONFIG, render_mvp=RENDER_TELEGRAM_MVP)
 SAFE_FALLBACK_ERROR_CODES = {"model_not_found", "model_not_supported", "unsupported_model"}
-RESPONSES_API_MODELS = {"gpt-5.6-sol"}
+RESPONSES_API_MODELS = {"gpt-5.6-sol", "gpt-5.6"}
 PROVIDER_ERROR_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
 
 
@@ -1064,7 +1064,8 @@ async def handle_ingest(
         ok, body, uncertain = await relay_out({
             "type": "reply", "text": reply, "api": meta, "api_session": session_id,
             "stream_id": stream_id, "generation_id": generation_id, "reply_to": reply_to,
-            "channel": channel, "channel_account": channel_account,
+            "channel": channel,
+            "channel_account": channel_account,
             "channel_conversation": channel_conversation,
         })
     return {"ok": ok, "callback_delivered": ok, "dispatch_uncertain": uncertain,
