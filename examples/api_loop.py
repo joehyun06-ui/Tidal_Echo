@@ -1064,8 +1064,7 @@ async def handle_ingest(
         ok, body, uncertain = await relay_out({
             "type": "reply", "text": reply, "api": meta, "api_session": session_id,
             "stream_id": stream_id, "generation_id": generation_id, "reply_to": reply_to,
-            "channel": channel,
-            "channel_account": channel_account,
+            "channel": channel, "channel_account": channel_account,
             "channel_conversation": channel_conversation,
         })
     return {"ok": ok, "callback_delivered": ok, "dispatch_uncertain": uncertain,
