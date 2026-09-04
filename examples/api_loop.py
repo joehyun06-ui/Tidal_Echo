@@ -41,6 +41,7 @@ from backend import (
     continuity_context,
     deployment_config,
     memory_formation_extractor,
+    memory_formation_v2_loopback,
 )
 
 
@@ -1133,6 +1134,14 @@ async def healthz():
         "service": "api_loop",
         "instance_nonce": API_LOOP_INSTANCE_NONCE,
     }
+
+
+@app.post(memory_formation_v2_loopback.ENDPOINT)
+async def loop_memory_formation_v2(request: Request):
+    return await memory_formation_v2_loopback.handle_request(
+        sys.modules[__name__],
+        request,
+    )
 
 
 @app.get("/loop/config")
