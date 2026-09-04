@@ -1,10 +1,9 @@
-"""Data-free, prompt-free capability probe for the authoritative provider model.
+"""Data-free, prompt-free capability probes for the authoritative provider model.
 
-The probe is intentionally narrow: the browser supplies no model, URL, key,
-prompt, or messages. The server resolves the current authoritative primary route
-using the same migration authority as the model-only write path, then performs a
-bodyless OpenAI-compatible Models API check. Upstream response bodies are never
-read, logged, returned, or persisted.
+The browser supplies no model, URL, key, prompt, or messages. The server resolves
+the current authoritative primary route using the same migration authority as the
+model-only write path, then performs bodyless OpenAI-compatible Models API checks.
+Upstream response bodies are never read, logged, returned, or persisted.
 """
 
 from __future__ import annotations
@@ -24,12 +23,16 @@ from backend import provider_model_migration
 CONTRACT_VERSION: Final = 1
 PROBE_VERSION: Final = "openai-model-retrieve-v1"
 PROBE_TIMEOUT_SECONDS: Final = 10.0
+ALIAS_PROBE_VERSION: Final = "openai-gpt56-alias-retrieve-v1"
+ALIAS_MODEL: Final = "gpt-5.6"
 
 INVALID_REQUEST: Final = "provider_model_capability_probe_invalid_request"
 UNAVAILABLE: Final = "provider_model_capability_probe_unavailable"
 
 MODEL_VISIBLE: Final = "model_visible"
 MODEL_NOT_VISIBLE: Final = "model_not_visible"
+ALIAS_VISIBLE: Final = "alias_visible"
+ALIAS_NOT_VISIBLE: Final = "alias_not_visible"
 PROBE_UNSUPPORTED: Final = "probe_unsupported"
 AUTH_REJECTED: Final = "provider_auth_rejected"
 PROVIDER_TIMEOUT: Final = "provider_timeout"
@@ -41,6 +44,16 @@ _ALLOWED_ERRORS: Final = frozenset({INVALID_REQUEST, UNAVAILABLE})
 _ALLOWED_CAPABILITIES: Final = frozenset({
     MODEL_VISIBLE,
     MODEL_NOT_VISIBLE,
+    PROBE_UNSUPPORTED,
+    AUTH_REJECTED,
+    PROVIDER_TIMEOUT,
+    RATE_LIMITED,
+    UPSTREAM_UNAVAILABLE,
+    EXPLICIT_REJECTION,
+})
+_ALLOWED_ALIAS_CAPABILITIES: Final = frozenset({
+    ALIAS_VISIBLE,
+    ALIAS_NOT_VISIBLE,
     PROBE_UNSUPPORTED,
     AUTH_REJECTED,
     PROVIDER_TIMEOUT,
@@ -159,6 +172,19 @@ def _result(
     return payload
 
 
+def _alias_result(capability: str, provider_http_status: int) -> dict[str, object]:
+    if capability not in _ALLOWED_ALIAS_CAPABILITIES:
+        _raise(UNAVAILABLE)
+    return {
+        "ok": True,
+        "contract_version": CONTRACT_VERSION,
+        "probe": ALIAS_PROBE_VERSION,
+        "alias_model": ALIAS_MODEL,
+        "capability": capability,
+        "provider_http_status": provider_http_status,
+    }
+
+
 async def _status_only_get(client: httpx.AsyncClient, url: str, key: str) -> int:
     """Issue a bodyless GET and inspect only the HTTP status."""
 
@@ -235,7 +261,47 @@ async def probe_authoritative_primary_model(
         _raise(UNAVAILABLE)
 
 
+async def probe_gpt56_alias_visibility(
+    loop_config: str | Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Check only whether the fixed public alias ``gpt-5.6`` is exposed by Models API."""
+
+    route = _authoritative_route(loop_config, environ)
+    base = route["url"].rstrip("/")
+    encoded_alias = urllib.parse.quote(ALIAS_MODEL, safe="")
+    exact_url = f"{base}/models/{encoded_alias}"
+    try:
+        async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
+            async with httpx.AsyncClient(
+                timeout=PROBE_TIMEOUT_SECONDS,
+                trust_env=False,
+                follow_redirects=False,
+            ) as client:
+                status = await _status_only_get(client, exact_url, route["key"])
+                if 200 <= status < 300:
+                    capability = ALIAS_VISIBLE
+                elif status == 404:
+                    capability = ALIAS_NOT_VISIBLE
+                else:
+                    capability = _classify_status(status)
+                return _alias_result(capability, status)
+    except asyncio.CancelledError:
+        raise
+    except ProviderModelCapabilityProbeError:
+        raise
+    except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+        _raise(UNAVAILABLE)
+    except Exception:
+        _raise(UNAVAILABLE)
+
+
 __all__ = (
+    "ALIAS_MODEL",
+    "ALIAS_NOT_VISIBLE",
+    "ALIAS_PROBE_VERSION",
+    "ALIAS_VISIBLE",
     "AUTH_REJECTED",
     "CONTRACT_VERSION",
     "EXPLICIT_REJECTION",
@@ -251,5 +317,6 @@ __all__ = (
     "UNAVAILABLE",
     "UPSTREAM_UNAVAILABLE",
     "probe_authoritative_primary_model",
+    "probe_gpt56_alias_visibility",
     "validate_empty_probe_request",
 )
