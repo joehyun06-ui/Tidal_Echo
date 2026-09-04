@@ -24,6 +24,7 @@ from backend import (
     memory_retrieval_hybrid_runtime_shadow,
     p3_provider_status,
     p3_session_retire,
+    provider_model_capability_probe,
     provider_model_migration,
     web_provider_capabilities,
 )
@@ -66,6 +67,15 @@ def _retire_error(error: p3_session_retire.P3SessionRetireError) -> JSONResponse
 
 def _provider_model_error(
     error: provider_model_migration.ProviderModelMigrationError,
+) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": error.category},
+        status_code=error.status_code,
+    )
+
+
+def _provider_model_probe_error(
+    error: provider_model_capability_probe.ProviderModelCapabilityProbeError,
 ) -> JSONResponse:
     return JSONResponse(
         {"ok": False, "error": error.category},
@@ -147,6 +157,35 @@ def _install_provider_status_route() -> None:
             return _fixed_status_error()
 
     relay_app._P3_PROVIDER_STATUS_INSTALLED = True
+
+
+def _install_provider_model_capability_probe_route() -> None:
+    if getattr(relay_app, "_P3_PROVIDER_MODEL_CAPABILITY_PROBE_INSTALLED", False):
+        return
+
+    @app.post("/app/provider/model-capability-probe")
+    async def app_provider_model_capability_probe(request: Request):
+        relay_app.check_auth(request)
+        try:
+            raw = await request.body()
+            provider_model_capability_probe.validate_empty_probe_request(
+                raw,
+                content_length=request.headers.get("content-length"),
+                content_encoding=request.headers.get("content-encoding", ""),
+            )
+            return await provider_model_capability_probe.probe_authoritative_primary_model(
+                relay_app.DEPLOYMENT.loop_config,
+            )
+        except provider_model_capability_probe.ProviderModelCapabilityProbeError as error:
+            return _provider_model_probe_error(error)
+        except Exception:
+            return _provider_model_probe_error(
+                provider_model_capability_probe.ProviderModelCapabilityProbeError(
+                    provider_model_capability_probe.UNAVAILABLE
+                )
+            )
+
+    relay_app._P3_PROVIDER_MODEL_CAPABILITY_PROBE_INSTALLED = True
 
 
 def _install_provider_model_migration_route() -> None:
@@ -237,6 +276,7 @@ _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_capability_route()
 _install_provider_status_route()
+_install_provider_model_capability_probe_route()
 _install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
