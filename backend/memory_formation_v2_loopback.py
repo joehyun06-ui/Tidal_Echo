@@ -10,6 +10,8 @@ this boundary.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import json
 import os
 import urllib.parse
@@ -30,6 +32,14 @@ from backend import (
 ENDPOINT: Final = "/loop/memory/formation-v2"
 CLIENT_RESPONSE_MAX_BYTES: Final = 16 * 1024
 CLIENT_TIMEOUT_SECONDS: Final = memory_formation_extractor_v2.EXTRACTOR_TIMEOUT_SECONDS + 5.0
+_GPT56_CHAT_REASONING_NONE_MODELS: Final = frozenset({
+    "[Pro按量]gpt-5.6-sol",
+})
+_REASONING_EFFORT_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "memory_formation_v2_reasoning_effort",
+    default=None,
+)
+_REASONING_PATCH_MARKER: Final = "_MEMORY_FORMATION_V2_REASONING_EFFORT_PATCHED"
 
 _ERROR_CATEGORIES: Final = frozenset({
     "extractor_invalid_output",
@@ -71,6 +81,45 @@ def _endpoint_from_ingest(ingest_url: object) -> str:
     ):
         _raise("loopback_unavailable")
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, ENDPOINT, "", ""))
+
+
+def _install_reasoning_effort_hook(legacy: object) -> None:
+    """Add one context-local Chat Completions hint for the V2 extractor only."""
+
+    if getattr(legacy, _REASONING_PATCH_MARKER, False):
+        return
+    original = getattr(legacy, "_chat_completion_body", None)
+    if not callable(original):
+        return
+
+    @functools.wraps(original)
+    def wrapped(
+        route,
+        messages,
+        *,
+        stream,
+        temperature=None,
+        max_tokens=None,
+    ):
+        body = original(
+            route,
+            messages,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if (
+            _REASONING_EFFORT_CONTEXT.get() == "none"
+            and isinstance(route, dict)
+            and route.get("model") in _GPT56_CHAT_REASONING_NONE_MODELS
+            and isinstance(body, dict)
+        ):
+            body = dict(body)
+            body["reasoning_effort"] = "none"
+        return body
+
+    legacy._chat_completion_body = wrapped
+    setattr(legacy, _REASONING_PATCH_MARKER, True)
 
 
 def _serialize_extraction(
@@ -140,6 +189,8 @@ async def run_server_extraction(
     except Exception:
         _raise("extractor_unavailable")
 
+    _install_reasoning_effort_hook(legacy)
+
     async def generation_callable(
         messages,
         session_id,
@@ -165,12 +216,21 @@ async def run_server_extraction(
             }
         ):
             raise RuntimeError("invalid v2 extractor dispatch")
-        out = await legacy.run_kelivo_provider_contract(
-            provider_model,
-            list(messages),
-            temperature=float(temperature),
-            max_tokens=int(max_tokens),
+        effort = (
+            "none"
+            if provider_model in _GPT56_CHAT_REASONING_NONE_MODELS
+            else None
         )
+        token = _REASONING_EFFORT_CONTEXT.set(effort)
+        try:
+            out = await legacy.run_kelivo_provider_contract(
+                provider_model,
+                list(messages),
+                temperature=float(temperature),
+                max_tokens=int(max_tokens),
+            )
+        finally:
+            _REASONING_EFFORT_CONTEXT.reset(token)
         if not isinstance(out, dict) or out.get("outcome") != "success":
             if isinstance(out, dict) and out.get("error") == "model_timeout":
                 raise TimeoutError
