@@ -921,7 +921,11 @@ async def _complete_provider(
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
     if _uses_responses_api(route):
+        if max_tokens is None:
+            return await complete_responses(route, messages)
         return await complete_responses(route, messages, max_tokens=max_tokens)
+    if temperature is None and max_tokens is None:
+        return await complete_chat(route, messages)
     return await complete_chat(route, messages, temperature=temperature, max_tokens=max_tokens)
 
 
@@ -1060,8 +1064,7 @@ async def handle_ingest(
         ok, body, uncertain = await relay_out({
             "type": "reply", "text": reply, "api": meta, "api_session": session_id,
             "stream_id": stream_id, "generation_id": generation_id, "reply_to": reply_to,
-            "channel": channel,
-            "channel_account": channel_account,
+            "channel": channel, "channel_account": channel_account,
             "channel_conversation": channel_conversation,
         })
     return {"ok": ok, "callback_delivered": ok, "dispatch_uncertain": uncertain,
