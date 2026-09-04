@@ -467,15 +467,27 @@ async def relay_out(payload: dict[str, Any]) -> tuple[bool, Any, bool]:
     return ok, body, False
 
 
+def _safe_provider_http_status(value: object) -> int | None:
+    return value if type(value) is int and 400 <= value <= 599 else None
+
+
 class ModelRouteError(Exception):
-    def __init__(self, category: str, outcome: str):
+    def __init__(
+        self,
+        category: str,
+        outcome: str,
+        provider_http_status: int | None = None,
+    ):
         super().__init__(category)
         self.category = category
         self.outcome = outcome
+        self.provider_http_status = _safe_provider_http_status(provider_http_status)
 
 
-def _safe_log(category: str) -> None:
-    print(f"[api-loop] model_dispatch={category}", file=sys.stderr, flush=True)
+def _safe_log(category: str, provider_http_status: object = None) -> None:
+    status = _safe_provider_http_status(provider_http_status)
+    suffix = f" provider_http_status={status}" if status is not None else ""
+    print(f"[api-loop] model_dispatch={category}{suffix}", file=sys.stderr, flush=True)
 
 
 async def _check_provider_response(resp: httpx.Response) -> None:
@@ -489,10 +501,22 @@ async def _check_provider_response(resp: httpx.Response) -> None:
         except Exception:
             code = ""
         if code in SAFE_FALLBACK_ERROR_CODES:
-            raise ModelRouteError("model_unsupported", "safe_to_fallback")
+            raise ModelRouteError(
+                "model_unsupported",
+                "safe_to_fallback",
+                resp.status_code,
+            )
     if resp.status_code in {408, 429} or resp.status_code >= 500:
-        raise ModelRouteError("provider_response_uncertain", "dispatch_uncertain")
-    raise ModelRouteError("provider_explicit_rejection", "explicit_failed")
+        raise ModelRouteError(
+            "provider_response_uncertain",
+            "dispatch_uncertain",
+            resp.status_code,
+        )
+    raise ModelRouteError(
+        "provider_explicit_rejection",
+        "explicit_failed",
+        resp.status_code,
+    )
 
 
 async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
@@ -576,10 +600,22 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *
                         except Exception:
                             pass
                     if code in SAFE_FALLBACK_ERROR_CODES:
-                        raise ModelRouteError("model_unsupported", "safe_to_fallback")
+                        raise ModelRouteError(
+                            "model_unsupported",
+                            "safe_to_fallback",
+                            resp.status_code,
+                        )
                     if resp.status_code in {408, 429} or resp.status_code >= 500:
-                        raise ModelRouteError("provider_response_uncertain", "dispatch_uncertain")
-                    raise ModelRouteError("provider_explicit_rejection", "explicit_failed")
+                        raise ModelRouteError(
+                            "provider_response_uncertain",
+                            "dispatch_uncertain",
+                            resp.status_code,
+                        )
+                    raise ModelRouteError(
+                        "provider_explicit_rejection",
+                        "explicit_failed",
+                        resp.status_code,
+                    )
                 data = json.loads(bytes(raw))
     except asyncio.CancelledError:
         raise
@@ -626,7 +662,7 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
             except ModelRouteError as exc:
                 if exc.outcome == "safe_to_fallback" and allow_fallback:
                     continue
-                _safe_log(exc.category)
+                _safe_log(exc.category, exc.provider_http_status)
                 outcome = "explicit_failed" if exc.outcome == "safe_to_fallback" else exc.outcome
                 return {"outcome": outcome, "error": exc.category, "tried": tried}
             except Exception:
@@ -667,6 +703,7 @@ async def run_kelivo_provider_contract(
     except TimeoutError:
         return {"outcome": "dispatch_uncertain", "error": "model_timeout", "tried": [provider_model]}
     except ModelRouteError as exc:
+        _safe_log(exc.category, exc.provider_http_status)
         outcome = "explicit_failed" if exc.outcome == "safe_to_fallback" else exc.outcome
         return {"outcome": outcome, "error": exc.category, "tried": [provider_model]}
     except Exception:
