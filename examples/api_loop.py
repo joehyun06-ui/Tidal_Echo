@@ -114,6 +114,7 @@ if len(API_LOOP_INTERNAL_TOKEN) < 32:
     raise SystemExit("invalid deployment configuration: api_loop_internal_token_missing")
 deployment_config.validate_loop_config_file(LOOP_CONFIG, render_mvp=RENDER_TELEGRAM_MVP)
 SAFE_FALLBACK_ERROR_CODES = {"model_not_found", "model_not_supported", "unsupported_model"}
+RESPONSES_API_MODELS = {"gpt-5.6-sol"}
 PROVIDER_ERROR_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
 
 
@@ -600,6 +601,200 @@ def _chat_completion_body(
     return body
 
 
+def _uses_responses_api(route: dict[str, str]) -> bool:
+    return route.get("model") in RESPONSES_API_MODELS
+
+
+def _responses_body(
+    route: dict[str, str],
+    messages: list[dict[str, str]],
+    *,
+    stream: bool,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    resolved_max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
+    return {
+        "model": route["model"],
+        "input": messages,
+        "max_output_tokens": resolved_max_tokens,
+        "stream": stream,
+        "store": False,
+    }
+
+
+def _responses_text(data: dict[str, Any]) -> str:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    parts: list[str] = []
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "output_text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    parts.append(part["text"])
+    return "".join(parts).strip()
+
+
+def _responses_event_error_metadata(event: dict[str, Any]) -> tuple[str | None, str | None]:
+    response = event.get("response")
+    error: object = response.get("error") if isinstance(response, dict) else event.get("error")
+    if not isinstance(error, dict):
+        return None, None
+    return (
+        _safe_provider_error_identifier(error.get("code")),
+        _safe_provider_error_identifier(error.get("type")),
+    )
+
+
+async def stream_responses(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
+    body = _responses_body(route, messages, stream=True)
+    text_parts: list[str] = []
+    usage: dict[str, Any] = {}
+    model_work_started = False
+    completed = False
+    try:
+        async with httpx.AsyncClient(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with client.stream(
+                "POST", route["url"].rstrip("/") + "/responses",
+                headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
+            ) as resp:
+                await _check_provider_response(resp)
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    raw_event = line[5:].strip()
+                    if not raw_event:
+                        continue
+                    try:
+                        event = json.loads(raw_event)
+                    except json.JSONDecodeError:
+                        raise ModelRouteError("invalid_stream_response", "dispatch_uncertain") from None
+                    if not isinstance(event, dict):
+                        raise ModelRouteError("invalid_stream_response", "dispatch_uncertain")
+                    event_type = str(event.get("type") or "")
+                    if event_type == "response.output_text.delta":
+                        chunk = event.get("delta")
+                        if not isinstance(chunk, str):
+                            raise ModelRouteError("invalid_stream_response", "dispatch_uncertain")
+                        if chunk:
+                            model_work_started = True
+                            text_parts.append(chunk)
+                            await sink(chunk)
+                        continue
+                    if event_type == "response.completed":
+                        response = event.get("response")
+                        if isinstance(response, dict):
+                            if isinstance(response.get("usage"), dict):
+                                usage = response["usage"]
+                            if not text_parts:
+                                fallback_text = _responses_text(response)
+                                if fallback_text:
+                                    text_parts.append(fallback_text)
+                        completed = True
+                        break
+                    if event_type in {"response.failed", "response.incomplete", "error"}:
+                        code, error_type = _responses_event_error_metadata(event)
+                        raise ModelRouteError(
+                            "provider_response_uncertain",
+                            "dispatch_uncertain",
+                            None,
+                            code,
+                            error_type,
+                        )
+    except asyncio.CancelledError:
+        raise
+    except ModelRouteError:
+        raise
+    except Exception:
+        category = "model_stream_interrupted" if model_work_started else "model_transport_uncertain"
+        raise ModelRouteError(category, "dispatch_uncertain") from None
+    if not completed or not text_parts:
+        raise ModelRouteError("incomplete_stream_response", "dispatch_uncertain")
+    return {"text": "".join(text_parts).strip(), "usage": usage}
+
+
+async def complete_responses(
+    route: dict[str, str],
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    body = _responses_body(route, messages, stream=False, max_tokens=max_tokens)
+    try:
+        async with _provider_client(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with client.stream(
+                "POST", route["url"].rstrip("/") + "/responses",
+                headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
+            ) as resp:
+                raw = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > LOOP_PROVIDER_RESPONSE_MAX_BYTES:
+                        raise ModelRouteError("provider_response_too_large", "dispatch_uncertain")
+                if resp.status_code >= 400:
+                    code, error_type = _provider_error_metadata(raw)
+                    if code in SAFE_FALLBACK_ERROR_CODES and resp.status_code == 404:
+                        raise ModelRouteError(
+                            "model_unsupported",
+                            "safe_to_fallback",
+                            resp.status_code,
+                            code,
+                            error_type,
+                        )
+                    if resp.status_code in {408, 429} or resp.status_code >= 500:
+                        raise ModelRouteError(
+                            "provider_response_uncertain",
+                            "dispatch_uncertain",
+                            resp.status_code,
+                            code,
+                            error_type,
+                        )
+                    raise ModelRouteError(
+                        "provider_explicit_rejection",
+                        "explicit_failed",
+                        resp.status_code,
+                        code,
+                        error_type,
+                    )
+                data = json.loads(bytes(raw))
+    except asyncio.CancelledError:
+        raise
+    except ModelRouteError:
+        raise
+    except Exception:
+        raise ModelRouteError("model_transport_uncertain", "dispatch_uncertain") from None
+    if not isinstance(data, dict):
+        raise ModelRouteError("invalid_model_response", "dispatch_uncertain")
+    if data.get("status") not in {None, "completed"}:
+        error = data.get("error")
+        code = _safe_provider_error_identifier(error.get("code")) if isinstance(error, dict) else None
+        error_type = _safe_provider_error_identifier(error.get("type")) if isinstance(error, dict) else None
+        raise ModelRouteError(
+            "provider_response_uncertain",
+            "dispatch_uncertain",
+            None,
+            code,
+            error_type,
+        )
+    text = _responses_text(data)
+    if not text:
+        raise ModelRouteError("empty_model_response", "dispatch_uncertain")
+    if len(text) > LOOP_ASSISTANT_MAX_CHARS:
+        raise ModelRouteError("assistant_response_too_large", "dispatch_uncertain")
+    return {"text": text, "usage": data.get("usage") or {}}
+
+
 async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
     body = _chat_completion_body(route, messages, stream=True)
     text_parts: list[str] = []
@@ -712,6 +907,24 @@ def _provider_client(**kwargs):
     return httpx.AsyncClient(**kwargs)
 
 
+async def _stream_provider(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
+    if _uses_responses_api(route):
+        return await stream_responses(route, messages, sink)
+    return await stream_chat(route, messages, sink)
+
+
+async def _complete_provider(
+    route: dict[str, str],
+    messages: list[dict[str, str]],
+    *,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    if _uses_responses_api(route):
+        return await complete_responses(route, messages, max_tokens=max_tokens)
+    return await complete_chat(route, messages, temperature=temperature, max_tokens=max_tokens)
+
+
 async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", session_id: str = "",
                     emit_stream: bool = False, allow_fallback: bool = True,
                     temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
@@ -725,12 +938,12 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
                     async def sink(chunk: str) -> None:
                         await relay_out({"type": "reply_delta", "stream_id": stream_id, "text": chunk,
                                          "done": False, "api_session": session_id})
-                    out = await stream_chat(route, messages, sink)
+                    out = await _stream_provider(route, messages, sink)
                 else:
                     if temperature is None and max_tokens is None:
-                        out = await complete_chat(route, messages)
+                        out = await _complete_provider(route, messages)
                     else:
-                        out = await complete_chat(
+                        out = await _complete_provider(
                             route, messages, temperature=temperature, max_tokens=max_tokens
                         )
             except asyncio.CancelledError:
@@ -776,7 +989,7 @@ async def run_kelivo_provider_contract(
         return {"outcome": "explicit_failed", "error": "provider_model_mismatch", "tried": []}
     try:
         async with asyncio.timeout(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS):
-            out = await complete_chat(
+            out = await _complete_provider(
                 route, messages, temperature=temperature, max_tokens=max_tokens,
             )
     except asyncio.CancelledError:
@@ -847,7 +1060,8 @@ async def handle_ingest(
         ok, body, uncertain = await relay_out({
             "type": "reply", "text": reply, "api": meta, "api_session": session_id,
             "stream_id": stream_id, "generation_id": generation_id, "reply_to": reply_to,
-            "channel": channel, "channel_account": channel_account,
+            "channel": channel,
+            "channel_account": channel_account,
             "channel_conversation": channel_conversation,
         })
     return {"ok": ok, "callback_delivered": ok, "dispatch_uncertain": uncertain,
