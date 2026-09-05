@@ -122,7 +122,9 @@ def _endpoint_from_ingest(ingest_url: object) -> str:
 
 
 def _safe_chat_finish_reason(value: object) -> str:
-    if type(value) is str and value in _SAFE_CHAT_FINISH_REASONS:
+    if type(value) is str and (
+        value in _SAFE_CHAT_FINISH_REASONS or value in {"missing", "other"}
+    ):
         return value
     if value is None:
         return "missing"
