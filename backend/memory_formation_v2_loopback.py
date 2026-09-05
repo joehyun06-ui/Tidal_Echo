@@ -43,6 +43,18 @@ _SAFE_CHAT_FINISH_REASONS: Final = frozenset({
     "tool_calls",
     "function_call",
 })
+_PROVIDER_CALL_STATES: Final = frozenset({
+    "not_started",
+    "in_flight",
+    "returned",
+})
+_TIMEOUT_STAGES: Final = frozenset({
+    "pre_provider",
+    "provider_connect_or_headers",
+    "provider_response_body",
+    "post_provider",
+    "unknown",
+})
 _REASONING_EFFORT_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "memory_formation_v2_reasoning_effort",
     default=None,
@@ -59,8 +71,13 @@ _FINISH_REASON_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
     "memory_formation_v2_finish_reason",
     default="missing",
 )
+_PROVIDER_HTTP_STATUS_CONTEXT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "memory_formation_v2_provider_http_status",
+    default=None,
+)
 _REASONING_PATCH_MARKER: Final = "_MEMORY_FORMATION_V2_REASONING_EFFORT_PATCHED"
 _JSON_DIAGNOSTIC_PATCH_MARKER: Final = "_MEMORY_FORMATION_V2_JSON_DIAGNOSTIC_PATCHED"
+_PROVIDER_CLIENT_PATCH_MARKER: Final = "_MEMORY_FORMATION_V2_PROVIDER_CLIENT_DIAGNOSTIC_PATCHED"
 
 _ERROR_CATEGORIES: Final = frozenset({
     "extractor_invalid_output",
@@ -112,6 +129,12 @@ def _safe_chat_finish_reason(value: object) -> str:
     return "other"
 
 
+def _safe_provider_http_status(value: object) -> int | None:
+    if type(value) is int and 100 <= value <= 599:
+        return value
+    return None
+
+
 class _JsonLoadsDiagnosticProxy:
     """Observe only safe Chat Completions metadata while V2 extraction is active."""
 
@@ -133,6 +156,52 @@ class _JsonLoadsDiagnosticProxy:
 
     def __getattr__(self, name: str):
         return getattr(self._target, name)
+
+
+class _ProviderStreamDiagnosticContext:
+    """Observe only the bounded HTTP status after provider response headers arrive."""
+
+    __slots__ = ("_target",)
+
+    def __init__(self, target: object):
+        self._target = target
+
+    async def __aenter__(self):
+        response = await self._target.__aenter__()
+        if _DIAGNOSTIC_ACTIVE_CONTEXT.get():
+            _PROVIDER_HTTP_STATUS_CONTEXT.set(
+                _safe_provider_http_status(getattr(response, "status_code", None))
+            )
+        return response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._target.__aexit__(exc_type, exc, tb)
+
+
+class _ProviderClientDiagnosticProxy:
+    """Delegate the provider client while wrapping only its stream context."""
+
+    __slots__ = ("_target", "_entered")
+
+    def __init__(self, target: object):
+        self._target = target
+        self._entered = None
+
+    async def __aenter__(self):
+        entered = await self._target.__aenter__()
+        self._entered = entered if entered is not None else self._target
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._target.__aexit__(exc_type, exc, tb)
+
+    def stream(self, *args, **kwargs):
+        target = self._entered if self._entered is not None else self._target
+        return _ProviderStreamDiagnosticContext(target.stream(*args, **kwargs))
+
+    def __getattr__(self, name: str):
+        target = self._entered if self._entered is not None else self._target
+        return getattr(target, name)
 
 
 def _install_reasoning_effort_hook(legacy: object) -> None:
@@ -191,6 +260,23 @@ def _install_finish_reason_hook(legacy: object) -> None:
     setattr(legacy, _JSON_DIAGNOSTIC_PATCH_MARKER, True)
 
 
+def _install_provider_http_status_hook(legacy: object) -> None:
+    """Observe provider HTTP status context-locally without changing requests."""
+
+    if getattr(legacy, _PROVIDER_CLIENT_PATCH_MARKER, False):
+        return
+    original = getattr(legacy, "_provider_client", None)
+    if not callable(original):
+        return
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        return _ProviderClientDiagnosticProxy(original(*args, **kwargs))
+
+    legacy._provider_client = wrapped
+    setattr(legacy, _PROVIDER_CLIENT_PATCH_MARKER, True)
+
+
 def _log_extractor_diagnostic(
     failure_stage: object,
     finish_reason: object,
@@ -208,6 +294,46 @@ def _log_extractor_diagnostic(
         "[memory-formation-v2-extractor-diagnostic] "
         "status=failed category=extractor_invalid_output "
         f"failure_stage={stage} finish_reason={safe_finish_reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _timeout_stage(provider_call_state: object, provider_http_status: object) -> str:
+    state = (
+        provider_call_state
+        if type(provider_call_state) is str and provider_call_state in _PROVIDER_CALL_STATES
+        else "unknown"
+    )
+    status = _safe_provider_http_status(provider_http_status)
+    if state == "not_started":
+        return "pre_provider"
+    if state == "returned":
+        return "post_provider"
+    if state == "in_flight":
+        return "provider_response_body" if status is not None else "provider_connect_or_headers"
+    return "unknown"
+
+
+def _log_extractor_timeout_diagnostic(
+    provider_call_state: object,
+    provider_http_status: object,
+    finish_reason: object,
+) -> None:
+    stage = _timeout_stage(provider_call_state, provider_http_status)
+    if stage not in _TIMEOUT_STAGES:
+        stage = "unknown"
+    returned = provider_call_state == "returned"
+    status = _safe_provider_http_status(provider_http_status)
+    status_value = str(status) if status is not None else "missing"
+    safe_finish_reason = _safe_chat_finish_reason(finish_reason)
+    print(
+        "[memory-formation-v2-timeout-diagnostic] "
+        "status=failed category=extractor_timeout "
+        f"timeout_stage={stage} "
+        f"provider_returned={'true' if returned else 'false'} "
+        f"provider_http_status={status_value} "
+        f"finish_reason={safe_finish_reason}",
         file=sys.stderr,
         flush=True,
     )
@@ -282,7 +408,10 @@ async def run_server_extraction(
 
     _install_reasoning_effort_hook(legacy)
     _install_finish_reason_hook(legacy)
+    _install_provider_http_status_hook(legacy)
     provider_finish_reason = "missing"
+    provider_http_status: int | None = None
+    provider_call_state = "not_started"
 
     async def generation_callable(
         messages,
@@ -292,7 +421,7 @@ async def run_server_extraction(
         max_tokens,
         context,
     ):
-        nonlocal provider_finish_reason
+        nonlocal provider_call_state, provider_finish_reason, provider_http_status
         if (
             session_id != memory_formation_extractor_v2.EXTRACTOR_SESSION_ID
             or provider_model != provider_defaults.provider_model
@@ -316,6 +445,8 @@ async def run_server_extraction(
         json_object_token = _JSON_OBJECT_MODE_CONTEXT.set(memory_chat_hints)
         diagnostic_token = _DIAGNOSTIC_ACTIVE_CONTEXT.set(True)
         finish_token = _FINISH_REASON_CONTEXT.set("missing")
+        status_token = _PROVIDER_HTTP_STATUS_CONTEXT.set(None)
+        provider_call_state = "in_flight"
         try:
             out = await legacy.run_kelivo_provider_contract(
                 provider_model,
@@ -323,8 +454,11 @@ async def run_server_extraction(
                 temperature=float(temperature),
                 max_tokens=int(max_tokens),
             )
+            provider_call_state = "returned"
         finally:
             provider_finish_reason = _FINISH_REASON_CONTEXT.get()
+            provider_http_status = _PROVIDER_HTTP_STATUS_CONTEXT.get()
+            _PROVIDER_HTTP_STATUS_CONTEXT.reset(status_token)
             _FINISH_REASON_CONTEXT.reset(finish_token)
             _DIAGNOSTIC_ACTIVE_CONTEXT.reset(diagnostic_token)
             _JSON_OBJECT_MODE_CONTEXT.reset(json_object_token)
@@ -347,6 +481,12 @@ async def run_server_extraction(
     except memory_formation_extractor_v2.MemoryFormationExtractorV2Error as error:
         if error.category == "extractor_invalid_output":
             _log_extractor_diagnostic(error.stage, provider_finish_reason)
+        elif error.category == "extractor_timeout":
+            _log_extractor_timeout_diagnostic(
+                provider_call_state,
+                provider_http_status,
+                provider_finish_reason,
+            )
         if error.category in {
             "extractor_invalid_output",
             "extractor_timeout",
