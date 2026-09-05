@@ -38,6 +38,14 @@ _ERROR_CATEGORIES: Final = frozenset({
     "invalid_source_text",
     "memory_formation_extractor_v2_error",
 })
+_FAILURE_STAGES: Final = frozenset({
+    "response_text",
+    "json_decode",
+    "envelope",
+    "proposal_shape",
+    "span_bounds",
+    "semantic_validation",
+})
 
 EXTRACTOR_INSTRUCTION: Final = """You are a deterministic atomic durable-memory source-range extractor.
 Return JSON only, with exactly this shape:
@@ -55,15 +63,25 @@ Use an empty proposals list when uncertain. Exclude roleplay, fiction, jokes, hy
 class MemoryFormationExtractorV2Error(ValueError):
     """Stable data-free extractor V2 failure."""
 
-    __slots__ = ("category",)
+    __slots__ = ("category", "stage")
 
-    def __init__(self, category: object):
+    def __init__(self, category: object, *, stage: object = None):
         safe_category = (
             category
             if type(category) is str and category in _ERROR_CATEGORIES
             else "memory_formation_extractor_v2_error"
         )
+        safe_stage = (
+            stage
+            if (
+                safe_category == "extractor_invalid_output"
+                and type(stage) is str
+                and stage in _FAILURE_STAGES
+            )
+            else None
+        )
         self.category = safe_category
+        self.stage = safe_stage
         super().__init__(safe_category)
 
     def __str__(self) -> str:
@@ -97,8 +115,8 @@ GenerationCallable = Callable[
 ]
 
 
-def _raise(category: str) -> None:
-    raise MemoryFormationExtractorV2Error(category)
+def _raise(category: str, *, stage: str | None = None) -> None:
+    raise MemoryFormationExtractorV2Error(category, stage=stage)
 
 
 def _parse_model_output(
@@ -110,7 +128,7 @@ def _parse_model_output(
         or len(raw_output) > EXTRACTOR_RESPONSE_MAX_CHARS
         or memory_formation_extractor._has_invalid_unicode(raw_output)
     ):
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="response_text")
     try:
         payload = json.loads(
             raw_output,
@@ -118,14 +136,14 @@ def _parse_model_output(
             parse_constant=memory_formation_extractor._reject_json_constant,
         )
     except (json.JSONDecodeError, UnicodeError, ValueError, RecursionError):
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="json_decode")
     if type(payload) is not dict or set(payload) != {"version", "proposals"}:
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="envelope")
     if payload["version"] != EXTRACTOR_CONTRACT_VERSION:
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="envelope")
     raw_proposals = payload["proposals"]
     if type(raw_proposals) is not list or len(raw_proposals) > MAX_PROPOSALS:
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="envelope")
 
     proposals: list[memory_formation_v2.AutoMemoryProposalV2] = []
     for raw_proposal in raw_proposals:
@@ -133,7 +151,7 @@ def _parse_model_output(
             type(raw_proposal) is not dict
             or set(raw_proposal) != {"signal_type", "spans"}
         ):
-            _raise("extractor_invalid_output")
+            _raise("extractor_invalid_output", stage="proposal_shape")
         signal_type = raw_proposal["signal_type"]
         raw_spans = raw_proposal["spans"]
         if (
@@ -142,17 +160,17 @@ def _parse_model_output(
             or type(raw_spans) is not list
             or not 1 <= len(raw_spans) <= MAX_SPANS_PER_PROPOSAL
         ):
-            _raise("extractor_invalid_output")
+            _raise("extractor_invalid_output", stage="proposal_shape")
         spans: list[memory_formation_v2.AutoMemorySourceSpanV2] = []
         for raw_span in raw_spans:
             if type(raw_span) is not dict or set(raw_span) != {"start", "end"}:
-                _raise("extractor_invalid_output")
+                _raise("extractor_invalid_output", stage="proposal_shape")
             start = raw_span["start"]
             end = raw_span["end"]
             if type(start) is not int or type(end) is not int:
-                _raise("extractor_invalid_output")
+                _raise("extractor_invalid_output", stage="proposal_shape")
             if not 0 <= start < end <= source_length:
-                _raise("extractor_invalid_output")
+                _raise("extractor_invalid_output", stage="span_bounds")
             spans.append(memory_formation_v2.AutoMemorySourceSpanV2(start, end))
         proposals.append(
             memory_formation_v2.AutoMemoryProposalV2(
@@ -167,7 +185,7 @@ def _parse_model_output(
             source_length=source_length,
         )
     except memory_formation_v2.MemoryFormationV2Error:
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="semantic_validation")
     return AutoMemoryExtractionV2(validated)
 
 
@@ -232,5 +250,5 @@ async def extract_auto_memory_proposals_v2(
     except Exception:
         _raise("extractor_unavailable")
     if type(response) is not dict:
-        _raise("extractor_invalid_output")
+        _raise("extractor_invalid_output", stage="response_text")
     return _parse_model_output(response.get("text"), len(source_text))

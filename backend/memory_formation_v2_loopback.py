@@ -14,6 +14,7 @@ import contextvars
 import functools
 import json
 import os
+import sys
 import urllib.parse
 from dataclasses import asdict
 from typing import Final
@@ -35,11 +36,27 @@ CLIENT_TIMEOUT_SECONDS: Final = memory_formation_extractor_v2.EXTRACTOR_TIMEOUT_
 _GPT56_CHAT_REASONING_NONE_MODELS: Final = frozenset({
     "[Pro按量]gpt-5.6-sol",
 })
+_SAFE_CHAT_FINISH_REASONS: Final = frozenset({
+    "stop",
+    "length",
+    "content_filter",
+    "tool_calls",
+    "function_call",
+})
 _REASONING_EFFORT_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "memory_formation_v2_reasoning_effort",
     default=None,
 )
+_DIAGNOSTIC_ACTIVE_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "memory_formation_v2_diagnostic_active",
+    default=False,
+)
+_FINISH_REASON_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "memory_formation_v2_finish_reason",
+    default="missing",
+)
 _REASONING_PATCH_MARKER: Final = "_MEMORY_FORMATION_V2_REASONING_EFFORT_PATCHED"
+_JSON_DIAGNOSTIC_PATCH_MARKER: Final = "_MEMORY_FORMATION_V2_JSON_DIAGNOSTIC_PATCHED"
 
 _ERROR_CATEGORIES: Final = frozenset({
     "extractor_invalid_output",
@@ -83,6 +100,37 @@ def _endpoint_from_ingest(ingest_url: object) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, ENDPOINT, "", ""))
 
 
+def _safe_chat_finish_reason(value: object) -> str:
+    if type(value) is str and value in _SAFE_CHAT_FINISH_REASONS:
+        return value
+    if value is None:
+        return "missing"
+    return "other"
+
+
+class _JsonLoadsDiagnosticProxy:
+    """Observe only safe Chat Completions metadata while V2 extraction is active."""
+
+    __slots__ = ("_target",)
+
+    def __init__(self, target: object):
+        self._target = target
+
+    def loads(self, *args, **kwargs):
+        payload = self._target.loads(*args, **kwargs)
+        if _DIAGNOSTIC_ACTIVE_CONTEXT.get() and isinstance(payload, dict):
+            choices = payload.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else None
+            if isinstance(first, dict) and "finish_reason" in first:
+                _FINISH_REASON_CONTEXT.set(
+                    _safe_chat_finish_reason(first.get("finish_reason"))
+                )
+        return payload
+
+    def __getattr__(self, name: str):
+        return getattr(self._target, name)
+
+
 def _install_reasoning_effort_hook(legacy: object) -> None:
     """Add one context-local Chat Completions hint for the V2 extractor only."""
 
@@ -120,6 +168,40 @@ def _install_reasoning_effort_hook(legacy: object) -> None:
 
     legacy._chat_completion_body = wrapped
     setattr(legacy, _REASONING_PATCH_MARKER, True)
+
+
+def _install_finish_reason_hook(legacy: object) -> None:
+    """Observe a bounded finish_reason without retaining provider response text."""
+
+    if getattr(legacy, _JSON_DIAGNOSTIC_PATCH_MARKER, False):
+        return
+    target = getattr(legacy, "json", None)
+    if not callable(getattr(target, "loads", None)):
+        return
+    legacy.json = _JsonLoadsDiagnosticProxy(target)
+    setattr(legacy, _JSON_DIAGNOSTIC_PATCH_MARKER, True)
+
+
+def _log_extractor_diagnostic(
+    failure_stage: object,
+    finish_reason: object,
+) -> None:
+    stage = (
+        failure_stage
+        if (
+            type(failure_stage) is str
+            and failure_stage in memory_formation_extractor_v2._FAILURE_STAGES
+        )
+        else "unknown"
+    )
+    safe_finish_reason = _safe_chat_finish_reason(finish_reason)
+    print(
+        "[memory-formation-v2-extractor-diagnostic] "
+        "status=failed category=extractor_invalid_output "
+        f"failure_stage={stage} finish_reason={safe_finish_reason}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _serialize_extraction(
@@ -190,6 +272,8 @@ async def run_server_extraction(
         _raise("extractor_unavailable")
 
     _install_reasoning_effort_hook(legacy)
+    _install_finish_reason_hook(legacy)
+    provider_finish_reason = "missing"
 
     async def generation_callable(
         messages,
@@ -199,6 +283,7 @@ async def run_server_extraction(
         max_tokens,
         context,
     ):
+        nonlocal provider_finish_reason
         if (
             session_id != memory_formation_extractor_v2.EXTRACTOR_SESSION_ID
             or provider_model != provider_defaults.provider_model
@@ -221,7 +306,9 @@ async def run_server_extraction(
             if provider_model in _GPT56_CHAT_REASONING_NONE_MODELS
             else None
         )
-        token = _REASONING_EFFORT_CONTEXT.set(effort)
+        effort_token = _REASONING_EFFORT_CONTEXT.set(effort)
+        diagnostic_token = _DIAGNOSTIC_ACTIVE_CONTEXT.set(True)
+        finish_token = _FINISH_REASON_CONTEXT.set("missing")
         try:
             out = await legacy.run_kelivo_provider_contract(
                 provider_model,
@@ -230,7 +317,10 @@ async def run_server_extraction(
                 max_tokens=int(max_tokens),
             )
         finally:
-            _REASONING_EFFORT_CONTEXT.reset(token)
+            provider_finish_reason = _FINISH_REASON_CONTEXT.get()
+            _FINISH_REASON_CONTEXT.reset(finish_token)
+            _DIAGNOSTIC_ACTIVE_CONTEXT.reset(diagnostic_token)
+            _REASONING_EFFORT_CONTEXT.reset(effort_token)
         if not isinstance(out, dict) or out.get("outcome") != "success":
             if isinstance(out, dict) and out.get("error") == "model_timeout":
                 raise TimeoutError
@@ -247,6 +337,8 @@ async def run_server_extraction(
     except asyncio.CancelledError:
         raise
     except memory_formation_extractor_v2.MemoryFormationExtractorV2Error as error:
+        if error.category == "extractor_invalid_output":
+            _log_extractor_diagnostic(error.stage, provider_finish_reason)
         if error.category in {
             "extractor_invalid_output",
             "extractor_timeout",
