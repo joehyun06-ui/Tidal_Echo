@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -80,6 +81,31 @@ class MemoryFormationV2ParserStageTests(unittest.TestCase):
                 self.assert_invalid_stage(raw_output, expected_stage)
 
 
+class _FakeProviderResponseContext:
+    def __init__(self, status_code: object):
+        self.response = SimpleNamespace(status_code=status_code)
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeProviderClient:
+    def __init__(self, status_code: object):
+        self.status_code = status_code
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, *args, **kwargs):
+        return _FakeProviderResponseContext(self.status_code)
+
+
 class MemoryFormationV2SafeDiagnosticTests(
     NoNetworkMixin,
     unittest.IsolatedAsyncioTestCase,
@@ -133,6 +159,26 @@ class MemoryFormationV2SafeDiagnosticTests(
         self.assertEqual(failure.exception.category, "extractor_invalid_output")
         return stderr.getvalue()
 
+    async def _run_timeout(self, legacy: object) -> str:
+        stderr = io.StringIO()
+        with mock.patch.object(
+            loopback.deployment_config,
+            "resolve_kelivo_provider_contract_defaults",
+            return_value=SimpleNamespace(provider_model=MODEL),
+        ), mock.patch.object(
+            extractor,
+            "EXTRACTOR_TIMEOUT_SECONDS",
+            0.02,
+        ):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(loopback.MemoryFormationV2LoopbackError) as failure:
+                    await loopback.run_server_extraction(legacy, SOURCE)
+        self.assertEqual(failure.exception.category, "extractor_timeout")
+        self.assertFalse(loopback._DIAGNOSTIC_ACTIVE_CONTEXT.get())
+        self.assertIsNone(loopback._PROVIDER_HTTP_STATUS_CONTEXT.get())
+        self.assertEqual(loopback._FINISH_REASON_CONTEXT.get(), "missing")
+        return stderr.getvalue()
+
     async def test_finish_reason_and_parser_stage_are_logged_without_body(self):
         secret_output = "```json\n{\"secret\":\"DO_NOT_LOG_ME\"}\n```"
         log = await self._run_invalid("length", model_text=secret_output)
@@ -181,6 +227,85 @@ class MemoryFormationV2SafeDiagnosticTests(
 
         self.assertEqual(result.proposals, ())
         self.assertNotIn("memory-formation-v2-extractor-diagnostic", stderr.getvalue())
+        self.assertNotIn("memory-formation-v2-timeout-diagnostic", stderr.getvalue())
+
+    async def test_timeout_before_provider_headers_is_classified_without_data(self):
+        legacy = SimpleNamespace(
+            LOOP_CONFIG=Path(self.temp.name) / "loop.json",
+            json=json,
+        )
+        secret = "PRIVATE_PROVIDER_CONTENT_MUST_NOT_LOG"
+
+        async def run_kelivo_provider_contract(*args, **kwargs):
+            _ = secret
+            await asyncio.Event().wait()
+
+        legacy.run_kelivo_provider_contract = run_kelivo_provider_contract
+        log = await self._run_timeout(legacy)
+
+        self.assertIn(
+            "[memory-formation-v2-timeout-diagnostic] "
+            "status=failed category=extractor_timeout ",
+            log,
+        )
+        self.assertIn("timeout_stage=provider_connect_or_headers", log)
+        self.assertIn("provider_returned=false", log)
+        self.assertIn("provider_http_status=missing", log)
+        self.assertIn("finish_reason=missing", log)
+        self.assertNotIn(secret, log)
+        self.assertNotIn(SOURCE, log)
+
+    async def test_timeout_after_provider_headers_reports_safe_http_status(self):
+        legacy = SimpleNamespace(
+            LOOP_CONFIG=Path(self.temp.name) / "loop.json",
+            json=json,
+            _provider_client=lambda **kwargs: _FakeProviderClient(200),
+        )
+
+        async def run_kelivo_provider_contract(*args, **kwargs):
+            async with legacy._provider_client(timeout=999) as client:
+                async with client.stream("POST", "https://provider.invalid"):
+                    await asyncio.Event().wait()
+
+        legacy.run_kelivo_provider_contract = run_kelivo_provider_contract
+        log = await self._run_timeout(legacy)
+
+        self.assertIn("timeout_stage=provider_response_body", log)
+        self.assertIn("provider_returned=false", log)
+        self.assertIn("provider_http_status=200", log)
+        self.assertIn("finish_reason=missing", log)
+        self.assertNotIn("https://provider.invalid", log)
+        self.assertNotIn(SOURCE, log)
+
+    async def test_provider_returned_timeout_outcome_is_distinguished(self):
+        legacy = SimpleNamespace(
+            LOOP_CONFIG=Path(self.temp.name) / "loop.json",
+            json=json,
+        )
+
+        async def run_kelivo_provider_contract(*args, **kwargs):
+            return {
+                "outcome": "dispatch_uncertain",
+                "error": "model_timeout",
+            }
+
+        legacy.run_kelivo_provider_contract = run_kelivo_provider_contract
+        stderr = io.StringIO()
+        with mock.patch.object(
+            loopback.deployment_config,
+            "resolve_kelivo_provider_contract_defaults",
+            return_value=SimpleNamespace(provider_model=MODEL),
+        ):
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(loopback.MemoryFormationV2LoopbackError) as failure:
+                    await loopback.run_server_extraction(legacy, SOURCE)
+
+        self.assertEqual(failure.exception.category, "extractor_timeout")
+        log = stderr.getvalue()
+        self.assertIn("timeout_stage=post_provider", log)
+        self.assertIn("provider_returned=true", log)
+        self.assertIn("provider_http_status=missing", log)
+        self.assertIn("finish_reason=missing", log)
 
 
 if __name__ == "__main__":
