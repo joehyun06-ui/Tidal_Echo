@@ -90,7 +90,7 @@ class MemoryFormationV2Gpt56ReasoningTests(
         legacy.run_kelivo_provider_contract = run_kelivo_provider_contract
         return legacy
 
-    async def test_exact_pro_metered_model_gets_reasoning_none_only_in_v2_call(self):
+    async def test_exact_pro_metered_model_gets_v2_chat_hints_only_in_v2_call(self):
         seen: list[dict] = []
         legacy = self._legacy(MODEL, seen)
 
@@ -110,6 +110,10 @@ class MemoryFormationV2Gpt56ReasoningTests(
         )
         self.assertEqual(seen[0]["temperature_input"], 0.0)
         self.assertEqual(seen[0]["reasoning_effort"], "none")
+        self.assertEqual(
+            seen[0]["response_format"],
+            {"type": "json_object"},
+        )
 
         ordinary = legacy._chat_completion_body(
             {"model": MODEL},
@@ -119,6 +123,7 @@ class MemoryFormationV2Gpt56ReasoningTests(
             max_tokens=256,
         )
         self.assertNotIn("reasoning_effort", ordinary)
+        self.assertNotIn("response_format", ordinary)
 
     async def test_neighboring_model_is_not_modified(self):
         seen: list[dict] = []
@@ -134,8 +139,9 @@ class MemoryFormationV2Gpt56ReasoningTests(
         self.assertEqual(extraction.proposals, ())
         self.assertEqual(len(seen), 1)
         self.assertNotIn("reasoning_effort", seen[0])
+        self.assertNotIn("response_format", seen[0])
 
-    async def test_reasoning_context_resets_after_provider_failure(self):
+    async def test_chat_hint_context_resets_after_provider_failure(self):
         seen: list[dict] = []
         legacy = self._legacy(MODEL, seen, fail=True)
 
@@ -149,6 +155,10 @@ class MemoryFormationV2Gpt56ReasoningTests(
 
         self.assertEqual(failure.exception.category, "extractor_unavailable")
         self.assertEqual(seen[0]["reasoning_effort"], "none")
+        self.assertEqual(
+            seen[0]["response_format"],
+            {"type": "json_object"},
+        )
 
         ordinary = legacy._chat_completion_body(
             {"model": MODEL},
@@ -158,8 +168,9 @@ class MemoryFormationV2Gpt56ReasoningTests(
             max_tokens=256,
         )
         self.assertNotIn("reasoning_effort", ordinary)
+        self.assertNotIn("response_format", ordinary)
 
-    async def test_actual_api_loop_wire_body_gets_reasoning_none(self):
+    async def test_actual_api_loop_wire_body_gets_v2_chat_hints(self):
         root = Path(self.temp.name)
         env = {
             "LOOP_CONFIG": str(root / "loop.json"),
@@ -190,7 +201,10 @@ class MemoryFormationV2Gpt56ReasoningTests(
                     200,
                     json={
                         "choices": [
-                            {"message": {"content": extractor_output()}},
+                            {
+                                "message": {"content": extractor_output()},
+                                "finish_reason": "stop",
+                            },
                         ],
                         "usage": {},
                     },
@@ -226,6 +240,10 @@ class MemoryFormationV2Gpt56ReasoningTests(
             loopback.memory_formation_extractor_v2.EXTRACTOR_MAX_TOKENS,
         )
         self.assertEqual(seen["body"]["reasoning_effort"], "none")
+        self.assertEqual(
+            seen["body"]["response_format"],
+            {"type": "json_object"},
+        )
         self.assertFalse(seen["body"]["stream"])
         self.assertNotIn("temperature", seen["body"])
         self.assertNotIn("max_tokens", seen["body"])

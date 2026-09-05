@@ -47,6 +47,10 @@ _REASONING_EFFORT_CONTEXT: contextvars.ContextVar[str | None] = contextvars.Cont
     "memory_formation_v2_reasoning_effort",
     default=None,
 )
+_JSON_OBJECT_MODE_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "memory_formation_v2_json_object_mode",
+    default=False,
+)
 _DIAGNOSTIC_ACTIVE_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "memory_formation_v2_diagnostic_active",
     default=False,
@@ -132,7 +136,7 @@ class _JsonLoadsDiagnosticProxy:
 
 
 def _install_reasoning_effort_hook(legacy: object) -> None:
-    """Add one context-local Chat Completions hint for the V2 extractor only."""
+    """Add context-local Chat Completions hints for the V2 extractor only."""
 
     if getattr(legacy, _REASONING_PATCH_MARKER, False):
         return
@@ -157,13 +161,18 @@ def _install_reasoning_effort_hook(legacy: object) -> None:
             max_tokens=max_tokens,
         )
         if (
-            _REASONING_EFFORT_CONTEXT.get() == "none"
-            and isinstance(route, dict)
+            isinstance(route, dict)
             and route.get("model") in _GPT56_CHAT_REASONING_NONE_MODELS
             and isinstance(body, dict)
         ):
-            body = dict(body)
-            body["reasoning_effort"] = "none"
+            reasoning_effort = _REASONING_EFFORT_CONTEXT.get()
+            json_object_mode = _JSON_OBJECT_MODE_CONTEXT.get()
+            if reasoning_effort == "none" or json_object_mode:
+                body = dict(body)
+                if reasoning_effort == "none":
+                    body["reasoning_effort"] = "none"
+                if json_object_mode:
+                    body["response_format"] = {"type": "json_object"}
         return body
 
     legacy._chat_completion_body = wrapped
@@ -301,12 +310,10 @@ async def run_server_extraction(
             }
         ):
             raise RuntimeError("invalid v2 extractor dispatch")
-        effort = (
-            "none"
-            if provider_model in _GPT56_CHAT_REASONING_NONE_MODELS
-            else None
-        )
+        memory_chat_hints = provider_model in _GPT56_CHAT_REASONING_NONE_MODELS
+        effort = "none" if memory_chat_hints else None
         effort_token = _REASONING_EFFORT_CONTEXT.set(effort)
+        json_object_token = _JSON_OBJECT_MODE_CONTEXT.set(memory_chat_hints)
         diagnostic_token = _DIAGNOSTIC_ACTIVE_CONTEXT.set(True)
         finish_token = _FINISH_REASON_CONTEXT.set("missing")
         try:
@@ -320,6 +327,7 @@ async def run_server_extraction(
             provider_finish_reason = _FINISH_REASON_CONTEXT.get()
             _FINISH_REASON_CONTEXT.reset(finish_token)
             _DIAGNOSTIC_ACTIVE_CONTEXT.reset(diagnostic_token)
+            _JSON_OBJECT_MODE_CONTEXT.reset(json_object_token)
             _REASONING_EFFORT_CONTEXT.reset(effort_token)
         if not isinstance(out, dict) or out.get("outcome") != "success":
             if isinstance(out, dict) and out.get("error") == "model_timeout":
