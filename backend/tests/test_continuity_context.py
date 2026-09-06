@@ -502,7 +502,7 @@ class ContinuityContextTests(unittest.TestCase):
             before,
         )
 
-    def test_full_schema_remains_migration_010_and_reader_changes_nothing(self):
+    def test_full_schema_remains_migration_011_and_reader_changes_nothing(self):
         full_path = Path(self.temp.name) / "full.sqlite3"
         with closing(sqlite3.connect(full_path)) as connection:
             connection.execute(channel_store.RELAY_TABLE_DDL["messages"])
@@ -551,15 +551,15 @@ class ContinuityContextTests(unittest.TestCase):
             maximum = connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-            migration_11 = connection.execute(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version>=11"
+            migration_12 = connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version>=12"
             ).fetchone()[0]
         self.assertEqual(after_schema, before_schema)
         self.assertEqual(after_migrations, before_migrations)
         self.assertEqual(after_messages, before_messages)
-        self.assertEqual(maximum, 10)
-        self.assertEqual(migration_11, 0)
-        self.assertEqual(channel_store.MIGRATIONS[-1][0], 10)
+        self.assertEqual(maximum, 11)
+        self.assertEqual(migration_12, 0)
+        self.assertEqual(channel_store.MIGRATIONS[-1][0], 11)
 
 
 class ContinuityFlagStartupTests(NoNetworkMixin, unittest.TestCase):

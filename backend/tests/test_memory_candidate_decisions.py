@@ -175,6 +175,7 @@ class CandidateDecisionTests(unittest.TestCase):
             "memory_action_requests",
             "memory_evidence_events",
             "memory_sources",
+            "memory_index_outbox",
         )
         return {table: self.table_rows(table) for table in tables}
 
@@ -267,6 +268,13 @@ class CandidateDecisionTests(unittest.TestCase):
             self.assertEqual(after[field], before[field], field)
         for table, rows in protected.items():
             self.assertEqual(self.table_rows(table), rows, table)
+        outbox = self.table_rows("memory_index_outbox")
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(
+            outbox[0][1],
+            channel_store.MEMORY_INDEX_DIRTY_EVENT_KIND,
+        )
+        self.assertIsNone(outbox[0][3])
         active = self.runtime.read_service.get_active_memories(
             scope_type="global_user",
             scope_ref="",
@@ -325,6 +333,7 @@ class CandidateDecisionTests(unittest.TestCase):
             self.assertEqual(after[field], before[field], field)
         for table, rows in protected.items():
             self.assertEqual(self.table_rows(table), rows, table)
+        self.assertEqual(self.table_rows("memory_index_outbox"), ())
         suppressions = self.table_rows("memory_suppressions")
         self.assertEqual(len(suppressions), 1)
         self.assertEqual(suppressions[0][6], "user_reject")
@@ -377,6 +386,7 @@ class CandidateDecisionTests(unittest.TestCase):
                 self.assertEqual(self.state(), before_replay)
         self.assertEqual(len(self.table_rows("memory_candidate_decisions")), 2)
         self.assertEqual(len(self.table_rows("memory_suppressions")), 1)
+        self.assertEqual(len(self.table_rows("memory_index_outbox")), 1)
 
     def test_request_conflict_precedes_target_resolution_and_new_request_is_not_replay(self):
         first = self.persist("Project Atlas uses Python.")
@@ -450,6 +460,28 @@ class CandidateDecisionTests(unittest.TestCase):
                     )
                 self.assertEqual(self.state(), before)
                 self.assertEqual(self.row(key)["status"], "candidate")
+
+    def test_approve_rolls_back_if_dirty_enqueue_fails_after_insert(self):
+        key = self.persist("Project Atlas uses Python.")
+        before = self.state()
+        original = channel_store.enqueue_memory_index_dirty
+
+        def enqueue_then_fail(conn, *, created_at=None):
+            original(conn, created_at=created_at)
+            raise sqlite3.OperationalError("synthetic outbox failure")
+
+        with mock.patch.object(
+            channel_store,
+            "enqueue_memory_index_dirty",
+            new=enqueue_then_fail,
+        ):
+            self.assert_error(
+                "storage_unavailable",
+                self.writer.decide,
+                binding=self.binding(key, request_number=52),
+            )
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.row(key)["status"], "candidate")
 
     def test_schema_and_profile_failures_do_not_bootstrap_or_mutate(self):
         key = self.persist("Project Atlas uses Python.")

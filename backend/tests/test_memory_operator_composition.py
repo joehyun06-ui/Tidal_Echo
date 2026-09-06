@@ -465,9 +465,21 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
                 "UPDATE schema_migrations SET status='pending' WHERE version=10",
             ),
             (
-                "extra-v11",
+                "missing-v11",
+                "DELETE FROM schema_migrations WHERE version=11",
+            ),
+            (
+                "wrong-v11-name",
+                "UPDATE schema_migrations SET name='wrong' WHERE version=11",
+            ),
+            (
+                "wrong-v11-status",
+                "UPDATE schema_migrations SET status='pending' WHERE version=11",
+            ),
+            (
+                "extra-v12",
                 """INSERT INTO schema_migrations
-                   VALUES(11,'unknown','applied','x','x')""",
+                   VALUES(12,'unknown','applied','x','x')""",
             ),
             ("core-table", "DROP TABLE channel_accounts"),
             ("relay-table", "DROP TABLE push_subscriptions"),
@@ -530,6 +542,15 @@ class MemoryOperatorCompositionTests(NoNetworkMixin, unittest.TestCase):
             (
                 "v10-trigger",
                 "DROP TRIGGER memory_candidate_decisions_immutable_update",
+            ),
+            ("v11-table", "DROP TABLE memory_index_outbox"),
+            (
+                "v11-index",
+                "DROP INDEX idx_memory_index_outbox_pending",
+            ),
+            (
+                "v11-trigger",
+                "DROP TRIGGER memory_index_outbox_identity_immutable_update",
             ),
         )
         for name, script in corruptions:

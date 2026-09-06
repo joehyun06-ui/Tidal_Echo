@@ -139,7 +139,7 @@ def decide_memory_candidate_v2(
                 store._require_candidate_decision_runtime()
                 verifier = _verifier_for(store)
                 try:
-                    channel_store.validate_memory_candidate_decision_schema_v1_v10(
+                    channel_store.validate_memory_index_outbox_schema_v1_v11(
                         conn
                     )
                 except (sqlite3.Error, TypeError, ValueError):
@@ -279,6 +279,11 @@ def decide_memory_candidate_v2(
                     valid_binding,
                     replayed=False,
                 )
+                if valid_binding.decision == "approve":
+                    channel_store.enqueue_memory_index_dirty(
+                        conn,
+                        created_at=stamp,
+                    )
                 conn.execute("COMMIT")
                 return result
             except BaseException:

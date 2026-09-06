@@ -3,10 +3,12 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from backend import channel_store, deployment_config
 from backend.tests._support import NoNetworkMixin
@@ -193,6 +195,7 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
             "memory_candidate_decisions",
             "memory_suppressions",
             "memory_auto_formation_runs",
+            "memory_index_outbox",
         )
         with self.channel_store.connect(self.path) as conn:
             return {
@@ -269,6 +272,11 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(after["memory_candidate_sources"], before_sources)
         self.assertEqual(len(after["memory_candidate_decisions"]), 1)
         self.assertEqual(len(after["memory_suppressions"]), 0)
+        self.assertEqual(len(after["memory_index_outbox"]), 1)
+        self.assertEqual(
+            after["memory_index_outbox"][0][1],
+            self.channel_store.MEMORY_INDEX_DIRTY_EVENT_KIND,
+        )
 
         snapshot = self.state()
         replay = self.writer_v2.decide(binding=binding)
@@ -298,6 +306,43 @@ class CandidateReviewDecisionV2Tests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(state["memory_candidate_sources"], before_sources)
         self.assertEqual(len(state["memory_candidate_decisions"]), 1)
         self.assertEqual(len(state["memory_suppressions"]), 1)
+        self.assertEqual(state["memory_index_outbox"], ())
+
+    def test_v2_approve_rolls_back_if_dirty_enqueue_fails_after_insert(self):
+        source = (
+            "Project Atlas uses Python. filler. "
+            "The project runs on Render."
+        )
+        key = self.persist_v2(
+            source,
+            "Project Atlas uses Python.",
+            "The project runs on Render.",
+        )
+        before = self.state()
+        original = self.channel_store.enqueue_memory_index_dirty
+
+        def enqueue_then_fail(conn, *, created_at=None):
+            original(conn, created_at=created_at)
+            raise sqlite3.OperationalError("synthetic outbox failure")
+
+        with mock.patch.object(
+            self.channel_store,
+            "enqueue_memory_index_dirty",
+            new=enqueue_then_fail,
+        ):
+            with self.assertRaises(
+                self.memory_candidate_decision_ledger.MemoryCandidateDecisionLedgerError
+            ) as error:
+                self.writer_v2.decide(
+                    binding=self.binding(
+                        key,
+                        request_number=21,
+                        decision="approve",
+                    )
+                )
+        self.assertEqual(error.exception.category, "storage_unavailable")
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.row(key)["status"], "candidate")
 
     def test_corrupt_v2_evidence_fails_review_and_decision_without_mutation(self):
         source = (

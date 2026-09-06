@@ -516,7 +516,7 @@ class MemoryCandidatePersistenceV2Tests(NoNetworkMixin, unittest.TestCase):
             "memory-formation-v1",
         )
 
-    def test_existing_schema_is_reused_without_new_migration_or_group_table(self):
+    def test_current_schema_is_reused_without_candidate_group_tables(self):
         with channel_store.connect(self.path) as conn:
             versions = [
                 int(row[0])
@@ -530,7 +530,7 @@ class MemoryCandidatePersistenceV2Tests(NoNetworkMixin, unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-        self.assertEqual(max(versions), 10)
+        self.assertEqual(max(versions), 11)
         self.assertIn("memory_candidate_sources", tables)
         self.assertNotIn("memory_candidate_source_groups", tables)
         self.assertNotIn("memory_candidate_spans_v2", tables)

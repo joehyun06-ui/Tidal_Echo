@@ -797,6 +797,12 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 )
             }
 
+    def outbox_count(self, path: str | None = None) -> int:
+        with channel_store.connect(path or self.path) as conn:
+            return int(conn.execute(
+                "SELECT count(*) FROM memory_index_outbox"
+            ).fetchone()[0])
+
     def execute_remember(
         self,
         binding: memory_action_ledger.MemoryActionRequestBinding,
@@ -1471,6 +1477,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 "memory_suppressions": 0,
             },
         )
+        self.assertEqual(self.outbox_count(), 1)
 
     def test_complete_request_has_no_caller_selected_terminal_parameters(self):
         signature = inspect.signature(
@@ -1803,11 +1810,13 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
             request_id="C" * 32,
             content=content,
         )
+        outbox_before_suppressed = self.outbox_count(path)
         foreign = self.committed_suppressed_outcome(
             store=store,
             authority=authority,
             binding=foreign_binding,
         )
+        self.assertEqual(self.outbox_count(path), outbox_before_suppressed)
 
         after_defer_binding = self.binding(
             request_id="D" * 32,
@@ -1892,6 +1901,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         )
         self.assertTrue(was_replay)
         self.assertEqual(replay.result_category, "suppressed")
+        self.assertEqual(self.outbox_count(path), outbox_before_suppressed)
 
     def test_suppressed_outcome_rejects_cross_store_transplant(self):
         fixed_stamp = "2030-01-02T03:04:05+00:00"
@@ -2269,6 +2279,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         )
         self.assertTrue(replay)
         self.assertEqual(first, second)
+        self.assertEqual(self.outbox_count(_correct_path), 2)
 
         (
             _forget_path,
@@ -2302,6 +2313,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         )
         self.assertTrue(replay)
         self.assertEqual(first, second)
+        self.assertEqual(self.outbox_count(_forget_path), 2)
 
     def test_replay_and_changed_payload_binding(self):
         binding = self.binding()
@@ -3242,6 +3254,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                 self.assertTrue(
                     all(value == 0 for value in self.counts(path).values())
                 )
+                self.assertEqual(self.outbox_count(path), 0)
 
     def test_concurrent_same_request_has_one_writer_and_stable_replays(self):
         binding = self.binding()
@@ -3262,6 +3275,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
         self.assertEqual(counts["memory_evidence_events"], 1)
         self.assertEqual(counts["memory_items"], 1)
         self.assertEqual(counts["memory_sources"], 1)
+        self.assertEqual(self.outbox_count(), 1)
 
     def test_deterministic_input_failure_has_no_ledger_or_other_state(self):
         with self.assertRaisesRegex(
@@ -3274,6 +3288,30 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     "invalid_content"
                 )
         self.assertTrue(all(value == 0 for value in self.counts().values()))
+        self.assertEqual(self.outbox_count(), 0)
+
+    def test_dirty_enqueue_failure_rolls_back_the_explicit_action(self):
+        before = self.counts()
+        original = channel_store.enqueue_memory_index_dirty
+
+        def enqueue_then_fail(conn, *, created_at=None):
+            original(conn, created_at=created_at)
+            raise sqlite3.OperationalError("synthetic outbox failure")
+
+        with (
+            mock.patch.object(
+                channel_store,
+                "enqueue_memory_index_dirty",
+                new=enqueue_then_fail,
+            ),
+            self.assertRaisesRegex(
+                memory_action_ledger.MemoryActionLedgerError,
+                "storage_unavailable",
+            ),
+        ):
+            self.execute_remember(self.binding())
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(self.outbox_count(), 0)
 
     def test_faults_at_claim_canonical_store_and_terminal_boundaries_rollback(self):
         stages = ("after_claim", "after_canonical", "inside_store", "after_store", "after_terminal")
@@ -3394,6 +3432,7 @@ class MemoryActionUnitOfWorkTests(unittest.TestCase):
                     self.counts(path)["memory_action_requests"],
                     expected_rows,
                 )
+                self.assertEqual(self.outbox_count(path), expected_rows)
 
     def test_uow_rejects_arbitrary_context_and_nested_store(self):
         with self.assertRaises(TypeError):
