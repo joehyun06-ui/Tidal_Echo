@@ -739,10 +739,13 @@ class ActiveSourceBoundaryTests(unittest.TestCase):
                 ).strip()
                 self.assertEqual(actual, expected)
 
-    def test_no_migration_011_and_schema_maximum_is_010(self):
-        self.assertEqual(max(version for version, _name, _apply in channel_store.MIGRATIONS), 10)
+    def test_schema_baseline_is_c4_outbox_v11_and_no_v12_exists(self):
+        self.assertEqual(
+            channel_store.MIGRATIONS[-1][:2],
+            (11, "memory_index_dirty_outbox_foundation"),
+        )
         repo_root = Path(__file__).resolve().parents[2]
-        self.assertEqual(tuple(repo_root.glob("backend/**/*011*")), ())
+        self.assertEqual(tuple(repo_root.glob("backend/**/*012*")), ())
 
     def test_source_baselines_pin_active_and_shadow_false(self):
         repo_root = Path(__file__).resolve().parents[2]

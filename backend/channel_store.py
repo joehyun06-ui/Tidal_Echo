@@ -1007,6 +1007,79 @@ def _migration_010(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+MEMORY_INDEX_DIRTY_EVENT_KIND = "active_atomic_snapshot_dirty"
+
+MEMORY_INDEX_OUTBOX_TABLE_DDL = """CREATE TABLE memory_index_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_kind TEXT NOT NULL
+            CHECK(event_kind='active_atomic_snapshot_dirty'),
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        CHECK(
+            length(created_at) BETWEEN 25 AND 40
+            AND created_at NOT GLOB '*[^0-9T:+.-]*'
+            AND substr(created_at,5,1)='-'
+            AND substr(created_at,8,1)='-'
+            AND substr(created_at,11,1)='T'
+            AND substr(created_at,14,1)=':'
+            AND substr(created_at,17,1)=':'
+            AND substr(created_at,-6)='+00:00'
+        ),
+        CHECK(
+            completed_at IS NULL OR (
+                length(completed_at) BETWEEN 25 AND 40
+                AND completed_at NOT GLOB '*[^0-9T:+.-]*'
+                AND substr(completed_at,5,1)='-'
+                AND substr(completed_at,8,1)='-'
+                AND substr(completed_at,11,1)='T'
+                AND substr(completed_at,14,1)=':'
+                AND substr(completed_at,17,1)=':'
+                AND substr(completed_at,-6)='+00:00'
+                AND completed_at>=created_at
+            )
+        ))"""
+
+MEMORY_INDEX_OUTBOX_INDEX_DDL: dict[str, str] = {
+    "idx_memory_index_outbox_pending":
+        "CREATE INDEX idx_memory_index_outbox_pending "
+        "ON memory_index_outbox(id) WHERE completed_at IS NULL",
+}
+
+MEMORY_INDEX_OUTBOX_TRIGGER_DDL: dict[str, str] = {
+    "memory_index_outbox_identity_immutable_update":
+        """CREATE TRIGGER memory_index_outbox_identity_immutable_update
+           BEFORE UPDATE OF id,event_kind,created_at ON memory_index_outbox
+           BEGIN
+             SELECT RAISE(ABORT,'memory_index_outbox_identity_immutable');
+           END""",
+    "memory_index_outbox_completion_monotonic":
+        """CREATE TRIGGER memory_index_outbox_completion_monotonic
+           BEFORE UPDATE OF completed_at ON memory_index_outbox
+           WHEN OLD.completed_at IS NOT NULL OR NEW.completed_at IS NULL
+           BEGIN
+             SELECT RAISE(ABORT,'memory_index_outbox_completion_invalid');
+           END""",
+    "memory_index_outbox_pending_delete_guard":
+        """CREATE TRIGGER memory_index_outbox_pending_delete_guard
+           BEFORE DELETE ON memory_index_outbox
+           WHEN OLD.completed_at IS NULL
+           BEGIN
+             SELECT RAISE(ABORT,'memory_index_outbox_pending_delete');
+           END""",
+}
+
+
+def _migration_011(conn: sqlite3.Connection) -> None:
+    """Add a content-free durable dirty signal for derived Memory indexes."""
+    validate_memory_candidate_decision_schema_v1_v10(conn)
+    conn.execute(MEMORY_INDEX_OUTBOX_TABLE_DDL)
+    for statement in (
+        *MEMORY_INDEX_OUTBOX_INDEX_DDL.values(),
+        *MEMORY_INDEX_OUTBOX_TRIGGER_DDL.values(),
+    ):
+        conn.execute(statement)
+
+
 def _index_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
     rows = conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall()
     return tuple(row["name"] for row in rows if row["key"] == 1 and row["cid"] >= 0)
@@ -1065,11 +1138,11 @@ def _sql_fingerprint(sql: str) -> tuple[str, ...]:
             tokens.append(operator)
             index += 2
             continue
-        if char in "(),=><+-*/;":
+        if char in "(),.=><+-*/;":
             tokens.append(char)
             index += 1
             continue
-        # Current migration deliberately uses no quoted identifiers or expressions.
+        # Current migrations deliberately use no quoted identifiers.
         raise sqlite3.DatabaseError("invalid kelivo schema SQL")
     return tuple(tokens)
 
@@ -2445,13 +2518,14 @@ def validate_memory_candidate_persistence_schema(
 def validate_memory_candidate_decision_schema_v1_v10(
     conn: sqlite3.Connection,
 ) -> None:
-    """Validate the exact v1-v10 markers and terminal decision ledger."""
+    """Validate the exact v1-v10 prefix and terminal decision ledger."""
     validate_memory_candidate_persistence_schema(conn)
 
     actual_markers = [
         tuple(row)
         for row in conn.execute(
             """SELECT version,name,status FROM schema_migrations
+               WHERE version<=10
                ORDER BY version"""
         ).fetchall()
     ]
@@ -2601,6 +2675,186 @@ def validate_memory_candidate_decision_schema_v1_v10(
         )
 
 
+def validate_memory_index_outbox_schema_v1_v11(
+    conn: sqlite3.Connection,
+) -> None:
+    """Validate the exact additive v11 content-free index dirty outbox."""
+    validate_memory_candidate_decision_schema_v1_v10(conn)
+
+    actual_markers = [
+        tuple(row)
+        for row in conn.execute(
+            """SELECT version,name,status FROM schema_migrations
+               ORDER BY version"""
+        ).fetchall()
+    ]
+    expected_markers = [
+        (version, name, "applied")
+        for version, name, _apply in MIGRATIONS[:11]
+    ]
+    if actual_markers != expected_markers:
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox migration markers"
+        )
+
+    rows = conn.execute(
+        "PRAGMA table_xinfo(memory_index_outbox)"
+    ).fetchall()
+    if any(int(row["hidden"]) != 0 for row in rows):
+        raise sqlite3.DatabaseError(
+            "invalid hidden memory index outbox column"
+        )
+    actual_columns = tuple(
+        (
+            row["name"], str(row["type"]).upper(), int(row["notnull"]),
+            row["dflt_value"], int(row["pk"]),
+        )
+        for row in rows
+    )
+    expected_columns = (
+        ("id", "INTEGER", 0, None, 1),
+        ("event_kind", "TEXT", 1, None, 0),
+        ("created_at", "TEXT", 1, None, 0),
+        ("completed_at", "TEXT", 0, None, 0),
+    )
+    if actual_columns != expected_columns:
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox columns"
+        )
+
+    actual_indexes = {
+        row["name"]: row
+        for row in conn.execute(
+            "PRAGMA index_list(memory_index_outbox)"
+        )
+    }
+    expected_indexes = {
+        "idx_memory_index_outbox_pending": (
+            False, "c", True, ("id",),
+        ),
+    }
+    if set(actual_indexes) != set(expected_indexes):
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox index set"
+        )
+    for name, (unique, origin, partial, columns) in expected_indexes.items():
+        row = actual_indexes[name]
+        if (
+            bool(row["unique"]), row["origin"], bool(row["partial"]),
+        ) != (unique, origin, partial):
+            raise sqlite3.DatabaseError(
+                "invalid memory index outbox index attributes"
+            )
+        _validate_index_xinfo(conn, name, columns)
+        schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if (
+            schema_row is None
+            or _sql_fingerprint(str(schema_row["sql"]))
+            != _sql_fingerprint(MEMORY_INDEX_OUTBOX_INDEX_DDL[name])
+        ):
+            raise sqlite3.DatabaseError(
+                "invalid memory index outbox index fingerprint"
+            )
+
+    if conn.execute(
+        "PRAGMA foreign_key_list(memory_index_outbox)"
+    ).fetchall():
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox foreign keys"
+        )
+
+    table = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type='table' AND name='memory_index_outbox'"""
+    ).fetchone()
+    if (
+        table is None
+        or _sql_fingerprint(str(table["sql"]))
+        != _sql_fingerprint(MEMORY_INDEX_OUTBOX_TABLE_DDL)
+    ):
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox table fingerprint"
+        )
+
+    actual_triggers = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            """SELECT name,sql FROM sqlite_master
+               WHERE type='trigger' AND tbl_name='memory_index_outbox'"""
+        )
+    }
+    if set(actual_triggers) != set(MEMORY_INDEX_OUTBOX_TRIGGER_DDL):
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox trigger set"
+        )
+    for name, expected_sql in MEMORY_INDEX_OUTBOX_TRIGGER_DDL.items():
+        if (
+            _sql_fingerprint(str(actual_triggers[name]))
+            != _sql_fingerprint(expected_sql)
+        ):
+            raise sqlite3.DatabaseError(
+                "invalid memory index outbox trigger fingerprint"
+            )
+
+    actual_objects = {
+        (row["type"], row["name"])
+        for row in conn.execute(
+            """SELECT type,name FROM sqlite_master
+               WHERE (name LIKE 'memory_index_outbox%'
+                      OR name LIKE 'idx_memory_index_outbox%'
+                      OR tbl_name='memory_index_outbox')
+                 AND name NOT LIKE 'sqlite_autoindex_%'"""
+        )
+    }
+    expected_objects = {
+        ("table", "memory_index_outbox"),
+        ("index", "idx_memory_index_outbox_pending"),
+        *(("trigger", name) for name in MEMORY_INDEX_OUTBOX_TRIGGER_DDL),
+    }
+    if actual_objects != expected_objects:
+        raise sqlite3.DatabaseError(
+            "invalid memory index outbox object set"
+        )
+
+
+def enqueue_memory_index_dirty(
+    conn: sqlite3.Connection,
+    *,
+    created_at: str | None = None,
+) -> int:
+    """Append one identity-free dirty event inside the caller's transaction."""
+    if getattr(conn, "in_transaction", False) is not True:
+        raise sqlite3.DatabaseError(
+            "memory index outbox transaction required"
+        )
+    stamp = now_iso() if created_at is None else created_at
+    if type(stamp) is not str:
+        raise sqlite3.DatabaseError("invalid memory index outbox timestamp")
+    cursor = conn.execute(
+        """INSERT INTO memory_index_outbox(event_kind,created_at,completed_at)
+           VALUES(?,?,NULL)""",
+        (MEMORY_INDEX_DIRTY_EVENT_KIND, stamp),
+    )
+    event_id = cursor.lastrowid
+    row = conn.execute(
+        """SELECT id,event_kind,created_at,completed_at
+             FROM memory_index_outbox WHERE id=?""",
+        (event_id,),
+    ).fetchone()
+    if (
+        type(event_id) is not int
+        or event_id <= 0
+        or row is None
+        or tuple(row)
+        != (event_id, MEMORY_INDEX_DIRTY_EVENT_KIND, stamp, None)
+    ):
+        raise sqlite3.DatabaseError("invalid memory index outbox write")
+    return event_id
+
+
 def _ddl_object_name(sql: str, object_type: str) -> str:
     tokens = _sql_fingerprint(sql)
     if (
@@ -2637,6 +2891,7 @@ def _validate_memory_operator_main_schema_objects(
         _ddl_object_name(MEMORY_ACTION_REQUEST_TABLE_DDL, "table"),
         *MEMORY_CANDIDATE_PERSISTENCE_TABLE_DDL,
         _ddl_object_name(MEMORY_CANDIDATE_DECISION_TABLE_DDL, "table"),
+        _ddl_object_name(MEMORY_INDEX_OUTBOX_TABLE_DDL, "table"),
     }
     index_names = {
         *CORE_V1_INDEX_DDL,
@@ -2647,12 +2902,14 @@ def _validate_memory_operator_main_schema_objects(
         *MEMORY_INDEX_DDL,
         *MEMORY_ACTION_REQUEST_INDEX_DDL,
         *MEMORY_CANDIDATE_PERSISTENCE_INDEX_DDL,
+        *MEMORY_INDEX_OUTBOX_INDEX_DDL,
     }
     trigger_names = {
         *MEMORY_TRIGGER_DDL,
         *MEMORY_ACTION_REQUEST_TRIGGER_DDL,
         *MEMORY_CANDIDATE_PERSISTENCE_TRIGGER_DDL,
         *MEMORY_CANDIDATE_DECISION_TRIGGER_DDL,
+        *MEMORY_INDEX_OUTBOX_TRIGGER_DDL,
     }
     expected = {
         *(("table", name) for name in table_names),
@@ -2671,13 +2928,13 @@ def _validate_memory_operator_main_schema_objects(
         raise sqlite3.DatabaseError("memory_operator_schema_invalid")
 
 
-def validate_memory_operator_schema_v1_v10(
+def validate_memory_operator_schema_v1_v11(
     conn: sqlite3.Connection,
 ) -> None:
     """Validate the exact supported operator schema using data-free failures."""
     try:
         validate_core_schema_v1_v6(conn, require_relay_tables=True)
-        validate_memory_candidate_decision_schema_v1_v10(conn)
+        validate_memory_index_outbox_schema_v1_v11(conn)
         _validate_memory_operator_main_schema_objects(conn)
     except (sqlite3.Error, TypeError, ValueError):
         raise sqlite3.DatabaseError(
@@ -2685,11 +2942,18 @@ def validate_memory_operator_schema_v1_v10(
         ) from None
 
 
+def validate_memory_operator_schema_v1_v10(
+    conn: sqlite3.Connection,
+) -> None:
+    """Compatibility name; the operator contract now requires exact v1-v11."""
+    validate_memory_operator_schema_v1_v11(conn)
+
+
 def validate_memory_operator_schema_v1_v9(
     conn: sqlite3.Connection,
 ) -> None:
-    """Compatibility name; the operator contract now requires exact v1-v10."""
-    validate_memory_operator_schema_v1_v10(conn)
+    """Compatibility name; the operator contract now requires exact v1-v11."""
+    validate_memory_operator_schema_v1_v11(conn)
 
 
 MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
@@ -2710,6 +2974,11 @@ MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = 
         10,
         "memory_candidate_decision_ledger_foundation",
         _migration_010,
+    ),
+    (
+        11,
+        "memory_index_dirty_outbox_foundation",
+        _migration_011,
     ),
 )
 CORE_MIGRATIONS = MIGRATIONS[:6]
@@ -2751,6 +3020,8 @@ def run_migrations(path: str, migrations: Iterable[tuple[int, str, Callable[[sql
                 validate_memory_candidate_persistence_schema(conn)
             if requested_latest >= 10:
                 validate_memory_candidate_decision_schema_v1_v10(conn)
+            if requested_latest >= 11:
+                validate_memory_index_outbox_schema_v1_v11(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

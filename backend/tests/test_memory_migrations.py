@@ -20,7 +20,7 @@ class MemoryMigrationTests(unittest.TestCase):
                 ts TEXT NOT NULL,direction TEXT NOT NULL,kind TEXT NOT NULL,
                 text TEXT NOT NULL,meta TEXT NOT NULL DEFAULT '{}')""")
 
-    def test_empty_database_upgrades_to_v10_and_is_repeatable(self):
+    def test_empty_database_upgrades_to_v11_and_is_repeatable(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
@@ -34,8 +34,8 @@ class MemoryMigrationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            channel_store.validate_memory_schema(conn)
-        self.assertEqual(versions, list(range(1, 11)))
+            channel_store.validate_memory_index_outbox_schema_v1_v11(conn)
+        self.assertEqual(versions, list(range(1, 12)))
         self.assertTrue(
             {
                 "memory_items",
@@ -47,11 +47,12 @@ class MemoryMigrationTests(unittest.TestCase):
                 "memory_candidate_sources",
                 "memory_auto_formation_runs",
                 "memory_candidate_decisions",
+                "memory_index_outbox",
             }.issubset(tables)
         )
 
-    def test_every_synthetic_prior_version_upgrades_to_v10(self):
-        for version in range(1, 10):
+    def test_every_synthetic_prior_version_upgrades_to_v11(self):
+        for version in range(1, 11):
             with self.subTest(version=version):
                 path = str(Path(self.temp.name) / f"v{version}.sqlite3")
                 with channel_store.connect(path) as conn:
@@ -71,16 +72,18 @@ class MemoryMigrationTests(unittest.TestCase):
                 channel_store.run_migrations(path)
                 with channel_store.connect(path) as conn:
                     marker = conn.execute(
-                        "SELECT status FROM schema_migrations WHERE version=9"
+                        "SELECT status FROM schema_migrations WHERE version=11"
                     ).fetchone()
                     preserved = conn.execute(
                         "SELECT count(*) FROM channel_accounts"
                     ).fetchone()[0]
-                    channel_store.validate_memory_schema(conn)
+                    channel_store.validate_memory_index_outbox_schema_v1_v11(
+                        conn
+                    )
                 self.assertEqual(marker[0], "applied")
                 self.assertEqual(preserved, 1)
 
-    def test_concurrent_optional_v9_v10_migrations_apply_exactly_once(self):
+    def test_concurrent_optional_v9_v11_migrations_apply_exactly_once(self):
         channel_store.run_migrations(
             self.path, channel_store.MIGRATIONS[:8],
         )
@@ -102,12 +105,19 @@ class MemoryMigrationTests(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM schema_migrations WHERE version=11"
+                ).fetchone()[0],
+                1,
+            )
             channel_store.validate_memory_schema(conn)
             channel_store.validate_memory_action_schema(conn)
             channel_store.validate_memory_candidate_persistence_schema(conn)
             channel_store.validate_memory_candidate_decision_schema_v1_v10(
                 conn
             )
+            channel_store.validate_memory_index_outbox_schema_v1_v11(conn)
 
     def test_existing_v8_upgrades_additively_without_rebuilding_memory_schema(self):
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:8])
@@ -704,14 +714,14 @@ class MemoryMigrationTests(unittest.TestCase):
                     "UPDATE memory_items SET status='forgotten' WHERE id=?", (memory_id,)
                 )
 
-    def test_v10_database_remains_compatible_with_old_migration_paths(self):
+    def test_v11_database_remains_compatible_with_old_migration_paths(self):
         channel_store.run_migrations(self.path)
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:6])
         channel_store.run_migrations(self.path, channel_store.MIGRATIONS[:7])
         channel_store.run_migrations(self.path)
         with channel_store.connect(self.path) as conn:
             self.assertEqual(
-                conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 10
+                conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 11
             )
             channel_store.validate_kelivo_schema(conn)
             channel_store.validate_heartbeat_schema(conn)
@@ -722,6 +732,7 @@ class MemoryMigrationTests(unittest.TestCase):
             channel_store.validate_memory_candidate_decision_schema_v1_v10(
                 conn
             )
+            channel_store.validate_memory_index_outbox_schema_v1_v11(conn)
 
     def test_v1_through_v6_migration_identity_is_unchanged(self):
         self.assertEqual(

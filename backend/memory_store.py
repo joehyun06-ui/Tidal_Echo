@@ -522,7 +522,7 @@ class MemoryStore:
             raise MemoryStoreError("storage_unavailable") from None
         with connection as conn:
             try:
-                channel_store.validate_memory_candidate_decision_schema_v1_v10(
+                channel_store.validate_memory_index_outbox_schema_v1_v11(
                     conn
                 )
             except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -1512,7 +1512,7 @@ class MemoryStore:
                     self._require_candidate_decision_runtime()
                     verifier = self._candidate_integrity_verifier()
                     try:
-                        channel_store.validate_memory_candidate_decision_schema_v1_v10(
+                        channel_store.validate_memory_index_outbox_schema_v1_v11(
                             conn
                         )
                     except (sqlite3.Error, TypeError, ValueError):
@@ -1667,6 +1667,11 @@ class MemoryStore:
                             replayed=False,
                         )
                     )
+                    if valid_binding.decision == "approve":
+                        channel_store.enqueue_memory_index_dirty(
+                            conn,
+                            created_at=stamp,
+                        )
                     conn.execute("COMMIT")
                     return result
                 except BaseException:

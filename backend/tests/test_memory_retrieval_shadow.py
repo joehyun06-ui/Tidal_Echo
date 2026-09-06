@@ -841,10 +841,13 @@ class ShadowPurityAndFrozenContractTests(unittest.TestCase):
                 ).strip()
                 self.assertEqual(actual, expected)
 
-    def test_maximum_migration_remains_010_and_no_011_exists(self):
-        self.assertEqual(max(version for version, _name, _apply in channel_store.MIGRATIONS), 10)
+    def test_schema_baseline_is_c4_outbox_v11_and_no_v12_exists(self):
+        self.assertEqual(
+            channel_store.MIGRATIONS[-1][:2],
+            (11, "memory_index_dirty_outbox_foundation"),
+        )
         repo_root = Path(__file__).resolve().parents[2]
-        migration_files = tuple(repo_root.glob("backend/**/*011*"))
+        migration_files = tuple(repo_root.glob("backend/**/*012*"))
         self.assertEqual(migration_files, ())
 
     def test_loop_chat_and_non_memory_contract_sources_have_no_shadow(self):

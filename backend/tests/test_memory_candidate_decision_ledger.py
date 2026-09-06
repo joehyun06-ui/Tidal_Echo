@@ -120,12 +120,13 @@ class CandidateDecisionTestBase(unittest.TestCase):
 
 
 class CandidateDecisionMigrationTests(CandidateDecisionTestBase):
-    def test_fresh_database_reaches_exact_v10_schema(self):
+    def test_fresh_database_preserves_exact_v10_schema_prefix(self):
         with channel_store.connect(self.path) as conn:
             markers = [
                 tuple(row)
                 for row in conn.execute(
-                    "SELECT version,name,status FROM schema_migrations ORDER BY version"
+                    """SELECT version,name,status FROM schema_migrations
+                       WHERE version<=10 ORDER BY version"""
                 )
             ]
             columns = tuple(
@@ -372,7 +373,7 @@ class CandidateDecisionMigrationTests(CandidateDecisionTestBase):
                        WHERE name NOT LIKE 'sqlite_autoindex_%'"""
                 )
             }
-        channel_store.run_migrations(path)
+        channel_store.run_migrations(path, channel_store.MIGRATIONS[:10])
         with channel_store.connect(path) as conn:
             after = {
                 key: conn.execute(

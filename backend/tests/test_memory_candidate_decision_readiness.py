@@ -139,7 +139,7 @@ class CandidateDecisionWriterReadinessTests(unittest.TestCase):
         )
 
     def test_readiness_connection_is_read_only(self):
-        original = channel_store.validate_memory_candidate_decision_schema_v1_v10
+        original = channel_store.validate_memory_index_outbox_schema_v1_v11
         observed = []
 
         def validate(conn):
@@ -152,7 +152,7 @@ class CandidateDecisionWriterReadinessTests(unittest.TestCase):
 
         with mock.patch.object(
             channel_store,
-            "validate_memory_candidate_decision_schema_v1_v10",
+            "validate_memory_index_outbox_schema_v1_v11",
             new=validate,
         ):
             self.assertEqual(self.writer.readiness(), (True, ""))

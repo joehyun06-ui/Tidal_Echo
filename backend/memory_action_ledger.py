@@ -735,7 +735,9 @@ class _MemoryActionUnitOfWork:
             self._connection = None
             raise MemoryActionLedgerError("storage_unavailable") from None
         try:
-            channel_store.validate_memory_action_schema(self._connection)
+            channel_store.validate_memory_index_outbox_schema_v1_v11(
+                self._connection
+            )
         except (OSError, sqlite3.Error, ValueError):
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -2668,7 +2670,7 @@ class _MemoryActionUnitOfWork:
         self._deferred_actions.append(action_id)
 
     def complete_request(self) -> MemoryActionLedgerResult:
-        self._require_active()
+        conn = self._require_active()
         binding = self._binding
         outcome = self._store_outcome
         if len(self._deferred_actions) != 1:
@@ -2794,6 +2796,14 @@ class _MemoryActionUnitOfWork:
                 stamp,
             ),
         )
+        if result_category != "suppressed":
+            try:
+                channel_store.enqueue_memory_index_dirty(
+                    conn,
+                    created_at=stamp,
+                )
+            except (sqlite3.Error, TypeError, ValueError):
+                raise MemoryActionLedgerError("storage_unavailable") from None
         self._terminal = MemoryActionLedgerResult(
             request_id=binding.request_id,
             action_kind=binding.action_kind,
