@@ -10,6 +10,11 @@ proved authoritative Atomic snapshot. All vector embeddings must complete
 before either sidecar is written. D3A then independently re-proves the stored
 sidecars before the current query may reach the embedding provider.
 
+C6 selects an independent read-only runner when the durable index worker is
+enabled. That runner has no reconciliation/rebuild methods, never repairs a
+query failure, and pins identity on the exact snapshot searched by D3A. The
+legacy self-healing runner remains available only without the worker.
+
 The C3 vector store records only an embedding model identity and dimensions. To
 prevent an endpoint change from silently reusing vectors produced in a different
 vector space, D3B2 stores a server-derived synthetic model identity over the
@@ -632,6 +637,42 @@ def _refresh_receipt(
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class HybridRetrievalReadOnlyRunnerV1:
+    """Query a worker-maintained pair; no index or outbox write capability."""
+
+    config: HybridRuntimeConfigV1 = field(repr=False)
+    reader: memory_hierarchy_snapshot.MemoryHierarchySnapshotReader = field(
+        repr=False
+    )
+
+    def __repr__(self) -> str:
+        return "<HybridRetrievalReadOnlyRunnerV1>"
+
+    async def __call__(self, *, query_text: object):
+        if not _paths_are_separate(
+            self.config.authority_path,
+            self.config.bm25_path,
+            self.config.vector_path,
+            self.config.persistent_root,
+        ):
+            _raise("hybrid_runtime_configuration_invalid")
+        # A missing/stale/partial pair is a shadow-only failure. In particular,
+        # do not run the legacy identity-preflight/rebuild/retry path here.
+        return await hybrid_query.fuse_current_hybrid_query_v1(
+            self.reader,
+            self.config.embedding_adapter,
+            query_text=query_text,
+            reference_time=datetime.now(timezone.utc).isoformat(),
+            bm25_sidecar_path=self.config.bm25_path,
+            term_key_id=self.config.term_key_id,
+            term_hmac_secret=self.config.term_hmac_secret,
+            vector_sidecar_path=self.config.vector_path,
+            expected_embedding_model=self.config.embedding_model,
+            expected_embedding_dimensions=self.config.embedding_dimensions,
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class HybridRetrievalShadowRunnerV1:
     config: HybridRuntimeConfigV1 = field(repr=False)
     reader: memory_hierarchy_snapshot.MemoryHierarchySnapshotReader = field(
@@ -755,10 +796,18 @@ class HybridRetrievalShadowRunnerV1:
 def compose_hybrid_retrieval_shadow_runner_v1(
     relay_app: object,
     environ: Mapping[str, str] | None = None,
-) -> HybridRetrievalShadowRunnerV1 | None:
+) -> HybridRetrievalShadowRunnerV1 | HybridRetrievalReadOnlyRunnerV1 | None:
     config = load_hybrid_runtime_config_v1(relay_app, environ)
     if config is None:
         return None
+    # Deferred import: the worker also uses this module to compose its writer.
+    from backend import memory_index_refresh_worker as index_worker
+
+    if (
+        index_worker.enabled_from_environment(environ)
+        or bool(getattr(relay_app, index_worker.ENABLED_MARKER, False))
+    ):
+        return HybridRetrievalReadOnlyRunnerV1(config=config, reader=_reader(config))
     return HybridRetrievalShadowRunnerV1(config=config, reader=_reader(config))
 
 
@@ -778,6 +827,7 @@ __all__ = (
     "EMBEDDING_DIMENSIONS_ENV",
     "EMBEDDING_MODEL_ENV",
     "HybridIndexRefreshReceiptV1",
+    "HybridRetrievalReadOnlyRunnerV1",
     "HybridRetrievalShadowRunnerV1",
     "HybridRuntimeConfigV1",
     "INDEX_REFRESH_CONTRACT_VERSION",

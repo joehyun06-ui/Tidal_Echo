@@ -273,11 +273,17 @@ def _validate_runtime_requirements(
     environ: Mapping[str, str],
 ) -> None:
     try:
+        # A not-yet-installed shadow will be required to use C6's read-only
+        # runner by its installer. An already-installed legacy writer cannot
+        # be promoted in place. Active remains incompatible in either order.
+        runtime_shadow.enabled_from_environment(environ)
         if (
-            runtime_shadow.enabled_from_environment(environ)
-            or runtime_active.enabled_from_environment(environ)
-            or bool(getattr(relay_app, runtime_shadow.ENABLED_MARKER, False))
+            runtime_active.enabled_from_environment(environ)
             or bool(getattr(relay_app, runtime_active.ENABLED_MARKER, False))
+            or (
+                bool(getattr(relay_app, runtime_shadow.ENABLED_MARKER, False))
+                and not bool(getattr(relay_app, runtime_shadow.READONLY_MARKER, False))
+            )
         ):
             _raise("memory_index_refresh_conflicts_runtime")
         memory = relay_app.DEPLOYMENT.memory

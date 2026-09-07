@@ -12,6 +12,10 @@ searched directly, so provider latency cannot open a proof/search sidecar race.
 An empty current vector plan performs no query embedding because no semantic
 candidate can be produced.
 
+C6 may additionally pin the expected server-configured vector identity. That
+pin is checked against the same in-memory plan that will be searched, including
+empty plans, before any provider call. It does not authorize index repair.
+
 This module is still unwired: it owns no runtime/app route, prompt context,
 deployment gate, Memory truth/write authority, hierarchy expansion, or provider
 selection policy.
@@ -152,6 +156,8 @@ def _validate_configuration(
     term_hmac_secret: object,
     vector_sidecar_path: object,
     embedding_callable: object,
+    expected_embedding_model: object = None,
+    expected_embedding_dimensions: object = None,
 ) -> tuple[Path, Path | None, Path | None]:
     if type(reader) is not memory_hierarchy_snapshot.MemoryHierarchySnapshotReader:
         _raise("hybrid_query_configuration_invalid")
@@ -168,6 +174,20 @@ def _validate_configuration(
             _raise("hybrid_query_configuration_invalid")
     elif embedding_callable is not None:
         _raise("hybrid_query_configuration_invalid")
+
+    if (
+        expected_embedding_model is not None
+        or expected_embedding_dimensions is not None
+    ):
+        if not vector_enabled:
+            _raise("hybrid_query_configuration_invalid")
+        try:
+            vector._validate_model_and_dimensions(
+                expected_embedding_model,
+                expected_embedding_dimensions,
+            )
+        except vector.MemoryRetrievalVectorError:
+            _raise("hybrid_query_configuration_invalid")
 
     try:
         authority = Path(reader._database_path).resolve(strict=False)
@@ -211,11 +231,19 @@ def _load_current_vector_plan(
     atomics: tuple[hierarchy.AtomicMemoryProjectionInputV1, ...],
     current_digest: str,
     path: Path,
+    *,
+    expected_embedding_model: object = None,
+    expected_embedding_dimensions: object = None,
 ) -> vector_store.VectorStoreSnapshotV1:
     try:
         stored = vector_store.load_vector_store_snapshot(path)
         if stored.plan.source_snapshot_digest != current_digest:
             _raise("hybrid_query_stale")
+        if expected_embedding_model is not None and (
+            stored.plan.embedding_model != expected_embedding_model
+            or stored.plan.dimensions != expected_embedding_dimensions
+        ):
+            _raise("hybrid_query_vector_invalid")
         actual_bindings = tuple(
             (document.memory_key, document.atomic_revision_digest)
             for document in stored.plan.documents
@@ -243,6 +271,8 @@ async def fuse_current_hybrid_query_v1(
     term_key_id: object = None,
     term_hmac_secret: object = None,
     vector_sidecar_path: object = None,
+    expected_embedding_model: object = None,
+    expected_embedding_dimensions: object = None,
     touch_hints: object = (),
     max_hits: object = fusion.MAX_HITS,
     max_bm25_hits: object = bm25.MAX_HITS,
@@ -266,6 +296,8 @@ async def fuse_current_hybrid_query_v1(
         term_hmac_secret,
         vector_sidecar_path,
         embedding_callable,
+        expected_embedding_model,
+        expected_embedding_dimensions,
     )
 
     try:
@@ -299,6 +331,8 @@ async def fuse_current_hybrid_query_v1(
             snapshot.atomics,
             current_digest,
             vector_path,
+            expected_embedding_model=expected_embedding_model,
+            expected_embedding_dimensions=expected_embedding_dimensions,
         )
 
     # No query text reaches an embedding provider until every configured local

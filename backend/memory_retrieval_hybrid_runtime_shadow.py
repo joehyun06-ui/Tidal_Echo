@@ -31,6 +31,7 @@ LOOP_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_LOOP"
 TASK_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_TASK"
 ORIGINAL_PREPARE_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_ORIGINAL_PREPARE"
 OBSERVABILITY_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_OBSERVABILITY"
+READONLY_MARKER: Final = "_MEMORY_HYBRID_RETRIEVAL_SHADOW_READONLY"
 
 
 class MemoryHybridRetrievalRuntimeShadowError(RuntimeError):
@@ -43,6 +44,8 @@ class MemoryHybridRetrievalRuntimeShadowError(RuntimeError):
                 "memory_hybrid_retrieval_shadow_configuration_invalid",
                 "memory_hybrid_retrieval_shadow_requires_memory_context",
                 "memory_hybrid_retrieval_shadow_runner_missing",
+                "memory_hybrid_retrieval_shadow_requires_index_worker",
+                "memory_hybrid_retrieval_shadow_requires_readonly_runner",
             }
             else "memory_hybrid_retrieval_shadow_configuration_invalid"
         )
@@ -288,6 +291,27 @@ def install(relay_app: object, *, runner: object = None) -> bool:
             raise MemoryHybridRetrievalRuntimeShadowError(
                 "memory_hybrid_retrieval_shadow_runner_missing"
             )
+        # Deferred imports avoid the composition -> shadow -> worker cycle.
+        from backend import memory_index_refresh_worker as index_worker
+        from backend import memory_retrieval_hybrid_runtime_composition as composition
+
+        readonly = type(runner) is composition.HybridRetrievalReadOnlyRunnerV1
+        worker_installed = bool(
+            getattr(relay_app, index_worker.ENABLED_MARKER, False)
+            and getattr(relay_app, index_worker.INSTALL_MARKER, False)
+        )
+        worker_requested = (
+            index_worker.enabled_from_environment(os.environ)
+            or worker_installed
+        )
+        if worker_requested and not readonly:
+            raise MemoryHybridRetrievalRuntimeShadowError(
+                "memory_hybrid_retrieval_shadow_requires_readonly_runner"
+            )
+        if readonly and not worker_installed:
+            raise MemoryHybridRetrievalRuntimeShadowError(
+                "memory_hybrid_retrieval_shadow_requires_index_worker"
+            )
         context_module = relay_app.memory_context_integration
         original_prepare = context_module.prepare_transient_memory_dispatch
         if not callable(original_prepare):
@@ -355,6 +379,7 @@ def install(relay_app: object, *, runner: object = None) -> bool:
     # Commit state last: failed installation leaves no observability marker and
     # no enabled/install marker, preserving D3B1's installation atomicity.
     setattr(relay_app, OBSERVABILITY_MARKER, tracker)
+    setattr(relay_app, READONLY_MARKER, readonly)
     setattr(relay_app, ENABLED_MARKER, True)
     setattr(relay_app, INSTALL_MARKER, True)
     return True
