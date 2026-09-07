@@ -18,6 +18,7 @@ from backend import (
     memory_formation_v2_runtime_patch,
     memory_hierarchy_live_refresh_shadow,
     memory_hierarchy_summary_runtime_shadow,
+    memory_index_refresh_worker,
     memory_retrieval_hybrid_provider_wire,
     memory_retrieval_hybrid_runtime_active,
     memory_retrieval_hybrid_runtime_composition,
@@ -38,6 +39,10 @@ if not memory_formation_v2_authority.install(relay_app):
     memory_formation_v2_runtime_patch.install(relay_app)
 memory_hierarchy_summary_runtime_shadow.install(relay_app)
 memory_hierarchy_live_refresh_shadow.install(relay_app)
+# The C5 durable worker has an independent default-OFF gate and owns no
+# provider-visible retrieval authority.  While this foundation is enabled it
+# fails closed if either per-query Hybrid runtime is also enabled.
+memory_index_refresh_worker.install(relay_app)
 # Active installs first so active+shadow=true fails before any shadow callable
 # can be patched. With the active gate OFF both Active and provider-wire
 # lifecycle accounting are exact no-ops apart from process-local markers.

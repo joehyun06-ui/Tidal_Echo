@@ -38,6 +38,7 @@ from backend import (
     memory_retrieval_bm25_store as bm25_store,
     memory_retrieval_embedding_openai as embedding_openai,
     memory_retrieval_hybrid_query as hybrid_query,
+    memory_retrieval_hybrid_source as hybrid_source,
     memory_retrieval_hybrid_runtime_shadow as runtime_shadow,
     memory_retrieval_vector as vector,
     memory_retrieval_vector_store as vector_store,
@@ -45,6 +46,7 @@ from backend import (
 
 
 COMPOSITION_CONTRACT_VERSION: Final = "memory-retrieval-hybrid-runtime-composition-v1"
+INDEX_REFRESH_CONTRACT_VERSION: Final = "memory-retrieval-hybrid-index-refresh-v1"
 BM25_FILENAME: Final = "memory-retrieval-hybrid-bm25-shadow.db"
 VECTOR_FILENAME: Final = "memory-retrieval-hybrid-vector-shadow.db"
 TERM_KEY_ID_ENV: Final = "MEMORY_HYBRID_BM25_TERM_KEY_ID"
@@ -351,6 +353,31 @@ def load_hybrid_runtime_config_v1(
         _raise("hybrid_runtime_configuration_invalid")
 
 
+def load_hybrid_index_config_v1(
+    relay_app: object,
+    environ: Mapping[str, str] | None = None,
+) -> HybridRuntimeConfigV1:
+    """Load the shared disposable-index config without changing process env.
+
+    The public D3 loader is intentionally shadow-gated.  A durable refresh
+    worker has its own independent gate, so it projects only the private loader
+    gate into a copied mapping and reuses the exact same secret/path contract.
+    """
+
+    env = os.environ if environ is None else environ
+    try:
+        projected = dict(env)
+        projected[runtime_shadow.ENV_GATE] = "true"
+        config = load_hybrid_runtime_config_v1(relay_app, projected)
+        if type(config) is not HybridRuntimeConfigV1:
+            _raise("hybrid_runtime_configuration_invalid")
+        return config
+    except MemoryRetrievalHybridRuntimeCompositionError:
+        raise
+    except Exception:
+        _raise("hybrid_runtime_configuration_invalid")
+
+
 def _reader(
     config: HybridRuntimeConfigV1,
 ) -> memory_hierarchy_snapshot.MemoryHierarchySnapshotReader:
@@ -413,6 +440,53 @@ def _prepare_sparse_plan(
         _raise("hybrid_runtime_source_invalid")
     except Exception:
         _raise("hybrid_runtime_source_invalid")
+
+
+def _load_current_pair(
+    config: HybridRuntimeConfigV1,
+    snapshot: memory_hierarchy_snapshot.HierarchyAtomicSnapshotV1,
+    digest: str,
+    sparse_plan: bm25.BM25IndexPlanV1,
+):
+    """Return both proved-current sidecars, or None for a rebuildable miss."""
+
+    if not _paths_are_separate(
+        config.authority_path,
+        config.bm25_path,
+        config.vector_path,
+        config.persistent_root,
+    ):
+        _raise("hybrid_runtime_configuration_invalid")
+    try:
+        sparse = bm25_store.load_bm25_store_snapshot(config.bm25_path)
+        semantic = vector_store.load_vector_store_snapshot(config.vector_path)
+    except (
+        bm25_store.MemoryRetrievalBM25StoreError,
+        vector_store.MemoryRetrievalVectorStoreError,
+    ):
+        return None
+
+    try:
+        expected_bindings = hybrid_source._expected_vector_bindings(
+            snapshot.atomics
+        )
+    except hybrid_source.MemoryRetrievalHybridSourceError:
+        _raise("hybrid_runtime_source_invalid")
+    except Exception:
+        _raise("hybrid_runtime_source_invalid")
+    actual_bindings = tuple(
+        (document.memory_key, document.atomic_revision_digest)
+        for document in semantic.plan.documents
+    )
+    if (
+        sparse.plan != sparse_plan
+        or semantic.plan.source_snapshot_digest != digest
+        or semantic.plan.embedding_model != config.embedding_model
+        or semantic.plan.dimensions != config.embedding_dimensions
+        or actual_bindings != expected_bindings
+    ):
+        return None
+    return sparse, semantic
 
 
 def _unlink_disposable(path: Path, config: HybridRuntimeConfigV1) -> None:
@@ -490,7 +564,7 @@ def _initialize_vector(config: HybridRuntimeConfigV1) -> None:
         _raise("hybrid_runtime_rebuild_failed")
 
 
-def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan) -> None:
+def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan):
     try:
         _initialize_bm25(config)
         _initialize_vector(config)
@@ -504,6 +578,7 @@ def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan) -> Non
         )
         if sparse_stored.plan != sparse_plan or vector_stored.plan != vector_plan:
             _raise("hybrid_runtime_rebuild_failed")
+        return sparse_stored, vector_stored
     except MemoryRetrievalHybridRuntimeCompositionError:
         raise
     except (
@@ -516,6 +591,47 @@ def _commit_pair(config: HybridRuntimeConfigV1, sparse_plan, vector_plan) -> Non
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class HybridIndexRefreshReceiptV1:
+    contract_version: str
+    rebuilt: bool
+    source_atomic_count: int
+    bm25_document_count: int
+    vector_document_count: int
+    bm25_generation: int
+    vector_generation: int
+    provider_call_count: int
+
+    def __repr__(self) -> str:
+        return (
+            "<HybridIndexRefreshReceiptV1 "
+            f"rebuilt={self.rebuilt!r} atomics={self.source_atomic_count} "
+            f"bm25_documents={self.bm25_document_count} "
+            f"vector_documents={self.vector_document_count} "
+            f"provider_calls={self.provider_call_count}>"
+        )
+
+
+def _refresh_receipt(
+    snapshot: memory_hierarchy_snapshot.HierarchyAtomicSnapshotV1,
+    sparse_stored: bm25_store.BM25StoreSnapshotV1,
+    vector_stored: vector_store.VectorStoreSnapshotV1,
+    *,
+    rebuilt: bool,
+    provider_call_count: int,
+) -> HybridIndexRefreshReceiptV1:
+    return HybridIndexRefreshReceiptV1(
+        contract_version=INDEX_REFRESH_CONTRACT_VERSION,
+        rebuilt=rebuilt,
+        source_atomic_count=len(snapshot.atomics),
+        bm25_document_count=sparse_stored.plan.document_count,
+        vector_document_count=vector_stored.plan.document_count,
+        bm25_generation=sparse_stored.generation,
+        vector_generation=vector_stored.generation,
+        provider_call_count=provider_call_count,
+    )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class HybridRetrievalShadowRunnerV1:
     config: HybridRuntimeConfigV1 = field(repr=False)
     reader: memory_hierarchy_snapshot.MemoryHierarchySnapshotReader = field(
@@ -524,6 +640,59 @@ class HybridRetrievalShadowRunnerV1:
 
     def __repr__(self) -> str:
         return "<HybridRetrievalShadowRunnerV1>"
+
+    async def reconcile_index_pair_v1(self) -> HybridIndexRefreshReceiptV1:
+        """Prove or rebuild both sidecars from one authoritative snapshot."""
+
+        snapshot, digest, sparse_plan = await asyncio.to_thread(
+            _prepare_sparse_plan,
+            self.reader,
+            self.config,
+        )
+        current = await asyncio.to_thread(
+            _load_current_pair,
+            self.config,
+            snapshot,
+            digest,
+            sparse_plan,
+        )
+        if current is not None:
+            sparse_stored, vector_stored = current
+            return _refresh_receipt(
+                snapshot,
+                sparse_stored,
+                vector_stored,
+                rebuilt=False,
+                provider_call_count=0,
+            )
+
+        try:
+            semantic_build = await vector.build_vector_index_v1(
+                self.config.embedding_adapter,
+                snapshot.atomics,
+                source_snapshot_digest=digest,
+                embedding_model=self.config.embedding_model,
+                dimensions=self.config.embedding_dimensions,
+            )
+        except asyncio.CancelledError:
+            raise
+        except vector.MemoryRetrievalVectorError:
+            _raise("hybrid_runtime_rebuild_failed")
+        except Exception:
+            _raise("hybrid_runtime_rebuild_failed")
+        sparse_stored, vector_stored = await asyncio.to_thread(
+            _commit_pair,
+            self.config,
+            sparse_plan,
+            semantic_build.plan,
+        )
+        return _refresh_receipt(
+            snapshot,
+            sparse_stored,
+            vector_stored,
+            rebuilt=True,
+            provider_call_count=semantic_build.provider_call_count,
+        )
 
     async def _rebuild_pair(self) -> None:
         snapshot, digest, sparse_plan = await asyncio.to_thread(
@@ -593,6 +762,14 @@ def compose_hybrid_retrieval_shadow_runner_v1(
     return HybridRetrievalShadowRunnerV1(config=config, reader=_reader(config))
 
 
+def compose_hybrid_index_refresh_runner_v1(
+    relay_app: object,
+    environ: Mapping[str, str] | None = None,
+) -> HybridRetrievalShadowRunnerV1:
+    config = load_hybrid_index_config_v1(relay_app, environ)
+    return HybridRetrievalShadowRunnerV1(config=config, reader=_reader(config))
+
+
 __all__ = (
     "BM25_FILENAME",
     "COMPOSITION_CONTRACT_VERSION",
@@ -600,11 +777,15 @@ __all__ = (
     "EMBEDDING_API_KEY_ENV",
     "EMBEDDING_DIMENSIONS_ENV",
     "EMBEDDING_MODEL_ENV",
+    "HybridIndexRefreshReceiptV1",
     "HybridRetrievalShadowRunnerV1",
     "HybridRuntimeConfigV1",
+    "INDEX_REFRESH_CONTRACT_VERSION",
     "MemoryRetrievalHybridRuntimeCompositionError",
     "TERM_KEY_ID_ENV",
     "TERM_SECRET_ENV",
+    "compose_hybrid_index_refresh_runner_v1",
     "compose_hybrid_retrieval_shadow_runner_v1",
+    "load_hybrid_index_config_v1",
     "load_hybrid_runtime_config_v1",
 )
