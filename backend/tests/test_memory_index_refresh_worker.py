@@ -473,10 +473,15 @@ class MemoryIndexRefreshInstallTests(unittest.IsolatedAsyncioTestCase):
             composition.TERM_SECRET_ENV: "invalid secret",
             composition.EMBEDDING_API_BASE_ENV: "not a url",
         }
-        self.assertFalse(worker.install(relay, environ=env))
+        with mock.patch.object(
+            worker.observability.IndexRefreshObservabilityV1, "__init__"
+        ) as observation_init:
+            self.assertFalse(worker.install(relay, environ=env))
+            observation_init.assert_not_called()
         self.assertIs(relay.app.router.lifespan_context, original)
         self.assertFalse(getattr(relay, worker.ENABLED_MARKER))
         self.assertIsNone(getattr(relay, worker.TASK_MARKER, None))
+        self.assertNotIn(worker.OBSERVABILITY_MARKER, vars(relay))
 
     def test_enabled_worker_rejects_active_and_preinstalled_legacy_shadow(self):
         for gate, marker in (
@@ -508,7 +513,7 @@ class MemoryIndexRefreshInstallTests(unittest.IsolatedAsyncioTestCase):
         )
         started = asyncio.Event()
 
-        async def blocked(_path, _runner):
+        async def blocked(_path, _runner, _tracker=None):
             started.set()
             await asyncio.Event().wait()
 
@@ -549,7 +554,7 @@ class MemoryIndexRefreshInstallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delays, [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0])
         self.assertLessEqual(max(delays), worker.MAX_BACKOFF_SECONDS)
 
-    def test_static_wiring_is_default_off_and_exposes_no_status_route(self):
+    def test_static_wiring_remains_default_off_with_readonly_status_route(self):
         root = Path(__file__).resolve().parents[2]
         p3 = (root / "backend" / "p3_relay_app.py").read_text(encoding="utf-8")
         blueprint = json.loads((root / "render.yaml").read_text(encoding="utf-8"))
@@ -558,7 +563,7 @@ class MemoryIndexRefreshInstallTests(unittest.IsolatedAsyncioTestCase):
             for item in blueprint["services"][0]["envVars"]
         }
         self.assertIn("memory_index_refresh_worker.install(relay_app)", p3)
-        self.assertNotIn("memory-index-refresh/status", p3)
+        self.assertIn('@app.get("/app/memory/index-refresh/status")', p3)
         self.assertEqual(env[worker.ENV_GATE].get("value"), "false")
 
 

@@ -141,6 +141,18 @@ def _install_hybrid_shadow_status_route() -> None:
     relay_app._P3_HYBRID_SHADOW_STATUS_INSTALLED = True
 
 
+def _install_index_refresh_status_route() -> None:
+    if getattr(relay_app, "_P3_MEMORY_INDEX_REFRESH_STATUS_INSTALLED", False):
+        return
+
+    @app.get("/app/memory/index-refresh/status")
+    async def app_memory_index_refresh_status(request: Request):
+        relay_app.check_auth(request)
+        return memory_index_refresh_worker.status_payload_v1(relay_app)
+
+    relay_app._P3_MEMORY_INDEX_REFRESH_STATUS_INSTALLED = True
+
+
 def _install_capability_route() -> None:
     if getattr(relay_app, "_P3_PROVIDER_CAPABILITY_INSTALLED", False):
         return
@@ -386,6 +398,7 @@ def _install_session_delete_route() -> None:
 
 _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
+_install_index_refresh_status_route()
 _install_capability_route()
 _install_provider_status_route()
 _install_provider_chat_liveness_probe_route()
