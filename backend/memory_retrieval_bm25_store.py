@@ -472,6 +472,9 @@ def load_bm25_store_snapshot(raw_path: object) -> BM25StoreSnapshotV1:
     path = _validated_path(raw_path, must_exist=True)
     conn = _connect_readonly(path)
     try:
+        # C6 reads concurrently with the worker: schema, meta, documents and
+        # postings must share one SQLite read snapshot. Close releases it.
+        conn.execute("BEGIN")
         meta = _validate_schema(conn)
         if int(meta["generation"]) == 0:
             _raise("bm25_index_schema_invalid")

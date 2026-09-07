@@ -81,8 +81,9 @@ class BlockingEmbedding:
         return tuple(unit for _text in texts)
 
 
-class MemoryIndexRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class MemoryIndexRefreshFixture:
     def setUp(self):
+        super().setUp()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
@@ -205,6 +206,10 @@ class MemoryIndexRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
             reader=composition._reader(config),
         )
 
+
+class MemoryIndexRefreshIntegrationTests(
+    MemoryIndexRefreshFixture, unittest.IsolatedAsyncioTestCase
+):
     async def test_rebuild_acknowledges_then_current_pair_skips_embedding(self):
         self.seed_atomic()
         first_id = self.enqueue_dirty()
@@ -473,15 +478,20 @@ class MemoryIndexRefreshInstallTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(getattr(relay, worker.ENABLED_MARKER))
         self.assertIsNone(getattr(relay, worker.TASK_MARKER, None))
 
-    def test_enabled_worker_rejects_either_per_query_runtime(self):
-        for gate in (
-            "MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED",
-            "MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED",
+    def test_enabled_worker_rejects_active_and_preinstalled_legacy_shadow(self):
+        for gate, marker in (
+            ("MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED", None),
+            (None, "_MEMORY_HYBRID_RETRIEVAL_SHADOW_ENABLED"),
         ):
-            with self.subTest(gate=gate):
+            with self.subTest(gate=gate, marker=marker):
                 relay = self.relay()
+                if marker is not None:
+                    setattr(relay, marker, True)
                 with self.assertRaises(worker.MemoryIndexRefreshWorkerError) as raised:
-                    worker.install(relay, environ=enabled_env(**{gate: "true"}))
+                    worker.install(
+                        relay,
+                        environ=enabled_env(**({gate: "true"} if gate else {})),
+                    )
                 self.assertEqual(
                     raised.exception.category,
                     "memory_index_refresh_conflicts_runtime",

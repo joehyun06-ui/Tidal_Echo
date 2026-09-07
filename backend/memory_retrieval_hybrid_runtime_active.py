@@ -67,6 +67,7 @@ _RUNTIME_ERROR_CATEGORIES: Final = frozenset({
     "memory_hybrid_active_configuration_invalid",
     "memory_hybrid_active_conflicts_shadow",
     "memory_hybrid_active_conflicts_v2",
+    "memory_hybrid_active_conflicts_index_worker",
     "memory_hybrid_active_generator_missing",
     "memory_hybrid_active_requires_memory_context",
     "memory_hybrid_active_runner_missing",
@@ -306,6 +307,13 @@ def _compose_runner(
 
 def _validate_runtime_requirements(relay_app: object, environ: Mapping[str, str]) -> None:
     try:
+        from backend import memory_index_refresh_worker as index_worker
+
+        if (
+            index_worker.enabled_from_environment(environ)
+            or bool(getattr(relay_app, index_worker.ENABLED_MARKER, False))
+        ):
+            _raise("memory_hybrid_active_conflicts_index_worker")
         if memory_retrieval_hybrid_runtime_shadow.enabled_from_environment(environ):
             _raise("memory_hybrid_active_conflicts_shadow")
         if bool(

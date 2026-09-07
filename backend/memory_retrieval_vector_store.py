@@ -402,6 +402,9 @@ def load_vector_store_snapshot(raw_path: object) -> VectorStoreSnapshotV1:
     path = _validated_path(raw_path, must_exist=True)
     conn = _connect_readonly(path)
     try:
+        # Keep meta and document vectors in one read snapshot while C5 writes.
+        # This is per-sidecar isolation, not cross-database pair publication.
+        conn.execute("BEGIN")
         meta = _validate_schema(conn)
         if int(meta["generation"]) == 0:
             _raise("vector_index_schema_invalid")

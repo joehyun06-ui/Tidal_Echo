@@ -39,9 +39,9 @@ if not memory_formation_v2_authority.install(relay_app):
     memory_formation_v2_runtime_patch.install(relay_app)
 memory_hierarchy_summary_runtime_shadow.install(relay_app)
 memory_hierarchy_live_refresh_shadow.install(relay_app)
-# The C5 durable worker has an independent default-OFF gate and owns no
-# provider-visible retrieval authority.  While this foundation is enabled it
-# fails closed if either per-query Hybrid runtime is also enabled.
+# C5's default-OFF worker owns index refresh, never retrieval authority. C6
+# composes a read-only shadow consumer when both gates are ON; install the
+# worker first so shadow can verify ownership. Active still conflicts.
 memory_index_refresh_worker.install(relay_app)
 # Active installs first so active+shadow=true fails before any shadow callable
 # can be patched. With the active gate OFF both Active and provider-wire

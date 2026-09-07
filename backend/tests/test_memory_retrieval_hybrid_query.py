@@ -347,6 +347,40 @@ class HybridQueryCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(load_vector.call_count, 1)
         search_store.assert_not_called()
 
+    async def test_expected_identity_is_checked_on_the_same_snapshot_used_for_search(self):
+        self.install_bm25()
+        self.install_vector()
+        embedder = RecordingEmbedder()
+        with mock.patch.object(
+            vector_store, "load_vector_store_snapshot",
+            wraps=vector_store.load_vector_store_snapshot,
+        ) as load:
+            result = await self.call(
+                embedder, expected_embedding_model=MODEL,
+                expected_embedding_dimensions=DIMS,
+            )
+        self.assertTrue(result.query_embedding_performed)
+        load.assert_called_once_with(self.vector_path)
+        self.assertEqual(embedder.calls, [((QUERY,), MODEL, DIMS)])
+
+    async def test_invalid_or_incomplete_expected_identity_fails_before_authority_read(self):
+        for overrides in (
+            {"expected_embedding_model": MODEL},
+            {"expected_embedding_dimensions": DIMS},
+            {"expected_embedding_model": "", "expected_embedding_dimensions": DIMS},
+            {"expected_embedding_model": MODEL, "expected_embedding_dimensions": True},
+            {"expected_embedding_model": MODEL, "expected_embedding_dimensions": 0},
+            {"expected_embedding_model": MODEL, "expected_embedding_dimensions": DIMS,
+             "vector_sidecar_path": None},
+        ):
+            with self.subTest(overrides=overrides), mock.patch.object(
+                query.source, "_load_authoritative_snapshot"
+            ) as authority:
+                embedder = RecordingEmbedder()
+                await self.assert_query_error("hybrid_query_configuration_invalid", embedder, **overrides)
+                authority.assert_not_called()
+                self.assertEqual(embedder.calls, [])
+
     def test_contract_has_no_query_vector_injection_and_remains_unwired(self):
         signature = inspect.signature(query.fuse_current_hybrid_query_v1)
         self.assertNotIn("query_vector", signature.parameters)
