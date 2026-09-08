@@ -441,12 +441,12 @@ def initialize_client_mapping(
 
 def client_mapping_ready(path: str, client_id: str, api_session: str) -> bool:
     try:
-        with channel_store.connect(path) as conn:
+        with channel_store.connect_readiness(path) as conn:
             row = conn.execute(
                 "SELECT api_session,enabled FROM kelivo_clients WHERE client_id=?", (client_id,)
             ).fetchone()
         return bool(row and row["enabled"] == 1 and row["api_session"] == api_session)
-    except (sqlite3.Error, OSError):
+    except (sqlite3.Error, OSError, TypeError, ValueError):
         return False
 
 
