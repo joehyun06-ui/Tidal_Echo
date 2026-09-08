@@ -83,6 +83,20 @@ def connect_read_only(
         raise
 
 
+def connect_readiness(path: str | os.PathLike[str]) -> sqlite3.Connection:
+    """Open a read-only probe, retaining relative paths and a bounded busy timeout."""
+    try:
+        timeout = float(os.environ.get("SQLITE_BUSY_TIMEOUT_SECONDS", "30"))
+    except (TypeError, ValueError):
+        timeout = 30.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = 30.0
+    return connect_read_only(
+        Path(path).absolute(),
+        timeout_seconds=min(timeout, 300.0),
+    )
+
+
 SCHEMA_MIGRATIONS_DDL = """CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY,
         name TEXT NOT NULL,

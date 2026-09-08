@@ -491,12 +491,12 @@ class MemoryStore:
 
     def validate_schema(self) -> bool:
         try:
-            with channel_store.connect(self.path) as conn:
+            with channel_store.connect_readiness(self.path) as conn:
                 channel_store.validate_memory_candidate_persistence_schema(
                     conn
                 )
             return True
-        except (OSError, sqlite3.Error, ValueError):
+        except (OSError, sqlite3.Error, TypeError, ValueError):
             return False
 
     def candidate_decision_readiness(self) -> None:
@@ -872,12 +872,12 @@ class MemoryStore:
 
     def validate_runtime_profile_state(self) -> bool:
         try:
-            with channel_store.connect(self.path) as conn:
+            with channel_store.connect_readiness(self.path) as conn:
                 self._validate_or_initialize_profile(conn, initialize=False)
             return True
         except MemoryStoreError:
             raise
-        except (OSError, sqlite3.Error, ValueError):
+        except (OSError, sqlite3.Error, TypeError, ValueError):
             raise MemoryStoreError("storage_unavailable") from None
 
     @staticmethod
@@ -2822,7 +2822,7 @@ class MemoryReader:
         if expected is None:
             raise MemoryStoreError("memory_fingerprint_profile_mismatch")
         try:
-            with channel_store.connect(self.path) as conn:
+            with channel_store.connect_readiness(self.path) as conn:
                 validate_memory_fingerprint_profile(
                     conn,
                     expected_profile=expected,
@@ -2830,7 +2830,7 @@ class MemoryReader:
             return True
         except MemoryStoreError:
             raise
-        except (OSError, sqlite3.Error, ValueError):
+        except (OSError, sqlite3.Error, TypeError, ValueError):
             raise MemoryStoreError("storage_unavailable") from None
 
 
