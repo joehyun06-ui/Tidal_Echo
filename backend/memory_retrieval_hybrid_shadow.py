@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Final
 
 from backend import memory_retrieval_hybrid_query as hybrid_query
+from backend import memory_retrieval_hybrid_fusion as hybrid_fusion
+from backend import memory_retrieval_hybrid_relevance as relevance
 
 
 HYBRID_SHADOW_CONTRACT_VERSION: Final = "memory-retrieval-hybrid-shadow-v1"
@@ -54,6 +56,7 @@ class HybridRetrievalShadowReportV1:
     bm25_available: bool = False
     vector_available: bool = False
     query_embedding_performed: bool = False
+    relevance_summary: relevance.HybridRelevanceSummaryV1 | None = None
 
     def __post_init__(self) -> None:
         _validated_report(self)
@@ -88,6 +91,34 @@ class HybridRetrievalShadowReportV1:
             return "<HybridRetrievalShadowReportV1 invalid>"
 
 
+def _validated_relevance_counts(
+    summary: object,
+    *,
+    selected_count: int,
+    exact_count: int,
+    lexical_count: int,
+    bm25_count: int,
+    vector_count: int,
+) -> relevance.HybridRelevanceSummaryV1 | None:
+    if summary is None:
+        return None
+    try:
+        value = relevance.validate_hybrid_relevance_summary_v1(summary)
+        counts = (exact_count, lexical_count, bm25_count, vector_count)
+        if (
+            value.selected_count != selected_count
+            or not max(counts) <= value.raw_candidate_count <= sum(counts)
+            or not max(exact_count, lexical_count) <= value.admitted_count <= (
+                exact_count + lexical_count
+            )
+            or value.qualified_bm25_hit_count > bm25_count
+        ):
+            raise _ShadowUnavailable()
+        return value
+    except BaseException:
+        raise _ShadowUnavailable() from None
+
+
 def _validated_report(report: object) -> tuple:
     try:
         if type(report) is not HybridRetrievalShadowReportV1:
@@ -108,6 +139,7 @@ def _validated_report(report: object) -> tuple:
             object.__getattribute__(report, "bm25_available"),
             object.__getattribute__(report, "vector_available"),
             object.__getattribute__(report, "query_embedding_performed"),
+            object.__getattribute__(report, "relevance_summary"),
         )
         (
             contract_version,
@@ -125,6 +157,7 @@ def _validated_report(report: object) -> tuple:
             bm25_available,
             vector_available,
             embedding_performed,
+            relevance_summary,
         ) = values
         if (
             contract_version != HYBRID_SHADOW_CONTRACT_VERSION
@@ -158,6 +191,7 @@ def _validated_report(report: object) -> tuple:
                 or bm25_available
                 or vector_available
                 or embedding_performed
+                or relevance_summary is not None
             ):
                 raise _ShadowUnavailable()
             return values
@@ -173,6 +207,11 @@ def _validated_report(report: object) -> tuple:
             or embedding_performed and not vector_available
         ):
             raise _ShadowUnavailable()
+        _validated_relevance_counts(
+            relevance_summary, selected_count=hybrid_count,
+            exact_count=exact_count, lexical_count=lexical_count,
+            bm25_count=bm25_count, vector_count=vector_count,
+        )
         both_empty = authority_count == hybrid_count == overlap == 0
         same_set = (
             authority_count > 0
@@ -243,6 +282,22 @@ def compare_hybrid_retrieval_shadow_v1(
         hits = object.__getattribute__(fusion, "hits")
         if type(hits) is not tuple or len(hits) > MAX_SELECTED:
             raise _ShadowUnavailable()
+        relevance_summary = object.__getattribute__(hybrid_result, "relevance_summary")
+        if relevance_summary is not None:
+            summary = relevance.validate_hybrid_relevance_summary_v1(relevance_summary)
+            if (
+                hybrid_result.contract_version != hybrid_query.HYBRID_QUERY_CONTRACT_VERSION
+                or type(fusion) is not hybrid_fusion.HybridFusionResultV1
+                or fusion.contract_version != hybrid_fusion.HYBRID_FUSION_CONTRACT_VERSION
+                or summary.eligible_atomic_count != fusion.eligible_atomic_count
+                or any(
+                    type(hit) is not hybrid_fusion.HybridFusionHitV1
+                    or hit.vector_rank is not None
+                    or (hit.exact_rank is None and hit.lexical_rank is None)
+                    for hit in hits
+                )
+            ):
+                raise _ShadowUnavailable()
         hybrid = _validated_keys(tuple(
             object.__getattribute__(hit, "memory_key") for hit in hits
         ))
@@ -277,6 +332,7 @@ def compare_hybrid_retrieval_shadow_v1(
             query_embedding_performed=object.__getattribute__(
                 hybrid_result, "query_embedding_performed"
             ),
+            relevance_summary=relevance_summary,
         )
         _validated_report(report)
         return report
@@ -294,7 +350,7 @@ def render_hybrid_retrieval_shadow_telemetry_v1(report: object) -> str | None:
                 "[memory-hybrid-retrieval-shadow] status=failed "
                 "category=memory_hybrid_retrieval_shadow_unavailable"
             )
-        return (
+        line = (
             "[memory-hybrid-retrieval-shadow] status=completed "
             f"relation={values[2]} authority={values[3]} hybrid={values[4]} "
             f"overlap={values[5]} authority_only={values[6]} "
@@ -304,6 +360,17 @@ def render_hybrid_retrieval_shadow_telemetry_v1(report: object) -> str | None:
             f"vector_available={str(values[13]).lower()} "
             f"embedding={str(values[14]).lower()}"
         )
+        if values[15] is not None:
+            summary = values[15]
+            line += (
+                f" relevance_policy={summary.policy_version} "
+                f"raw_candidates={summary.raw_candidate_count} "
+                f"admitted={summary.admitted_count} rejected={summary.rejected_count} "
+                f"qualified_bm25={summary.qualified_bm25_hit_count} "
+                f"qualified_vector={summary.qualified_vector_hit_count} "
+                f"truncated={summary.truncated_count} empty_reason={summary.empty_reason}"
+            )
+        return line
     except BaseException:
         return None
 

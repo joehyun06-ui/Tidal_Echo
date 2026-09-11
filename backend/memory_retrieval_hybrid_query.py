@@ -16,7 +16,10 @@ C6 may additionally pin the expected server-configured vector identity. That
 pin is checked against the same in-memory plan that will be searched, including
 empty plans, before any provider call. It does not authorize index repair.
 
-This module is still unwired: it owns no runtime/app route, prompt context,
+The worker-backed read-only Shadow runner explicitly opts into uncalibrated
+relevance admission. Other callers keep the existing fusion policy by default.
+
+This composition owns no runtime/app route, prompt context,
 deployment gate, Memory truth/write authority, hierarchy expansion, or provider
 selection policy.
 """
@@ -33,6 +36,7 @@ from backend import (
     memory_hierarchy_snapshot,
     memory_retrieval_bm25 as bm25,
     memory_retrieval_hybrid_fusion as fusion,
+    memory_retrieval_hybrid_relevance as relevance,
     memory_retrieval_hybrid_source as source,
     memory_retrieval_vector as vector,
     memory_retrieval_vector_store as vector_store,
@@ -101,6 +105,9 @@ class HybridQueryResultV1:
     vector_generation: int | None
     query_embedding_performed: bool
     fusion_result: fusion.HybridFusionResultV1 = field(repr=False)
+    relevance_summary: relevance.HybridRelevanceSummaryV1 | None = field(
+        default=None, repr=False
+    )
 
     def __repr__(self) -> str:
         return (
@@ -278,9 +285,12 @@ async def fuse_current_hybrid_query_v1(
     max_bm25_hits: object = bm25.MAX_HITS,
     max_vector_hits: object = vector.MAX_VECTOR_HITS,
     minimum_vector_similarity: object = 0.0,
+    apply_relevance: object = False,
 ) -> HybridQueryResultV1:
     """Embed the exact proved query server-side, then run same-revision fusion."""
 
+    if type(apply_relevance) is not bool:
+        _raise("hybrid_query_input_invalid")
     query = _validate_input(
         query_text,
         reference_time,
@@ -372,8 +382,13 @@ async def fuse_current_hybrid_query_v1(
             except Exception:
                 _raise("hybrid_query_vector_invalid")
 
+    relevance_summary = None
     try:
-        fused = fusion.fuse_hybrid_retrieval_v1(
+        fuse = (
+            relevance.fuse_hybrid_retrieval_with_relevance_v1
+            if apply_relevance else fusion.fuse_hybrid_retrieval_v1
+        )
+        result = fuse(
             snapshot.atomics,
             query_text=query,
             bm25_result=sparse,
@@ -382,6 +397,10 @@ async def fuse_current_hybrid_query_v1(
             touch_hints=touch_hints,
             max_hits=max_hits,
         )
+        if apply_relevance:
+            fused, relevance_summary = result
+        else:
+            fused = result
     except fusion.MemoryRetrievalHybridFusionError:
         _raise("hybrid_query_fusion_invalid")
     except Exception:
@@ -394,6 +413,7 @@ async def fuse_current_hybrid_query_v1(
         vector_generation=vector_generation,
         query_embedding_performed=query_embedding_performed,
         fusion_result=fused,
+        relevance_summary=relevance_summary,
     )
 
 

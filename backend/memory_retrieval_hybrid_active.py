@@ -177,6 +177,9 @@ def _validated_query_result(
             or isinstance(raw.vector_generation, bool)
             or raw.vector_generation < 1
             or type(raw.query_embedding_performed) is not bool
+            # Relevance admission is currently approved for read-only Shadow.
+            # Its result must not silently become provider-visible authority.
+            or raw.relevance_summary is not None
             or type(fused) is not fusion.HybridFusionResultV1
             or fused.contract_version != fusion.HYBRID_FUSION_CONTRACT_VERSION
             or fused.bm25_available is not True
