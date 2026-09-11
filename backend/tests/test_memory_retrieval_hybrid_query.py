@@ -180,6 +180,16 @@ class HybridQueryCompositionTests(unittest.IsolatedAsyncioTestCase):
         rendered = repr(result)
         self.assertNotIn(K1, rendered)
         self.assertNotIn("CODEX_GENERATION_ENABLED", rendered)
+        self.assertIsNone(result.relevance_summary)
+
+    async def test_relevance_opt_in_requires_an_exact_boolean_before_io(self):
+        for invalid in (None, 0, 1, "true"):
+            with self.subTest(value=invalid):
+                embedder = RecordingEmbedder()
+                await self.assert_query_error(
+                    "hybrid_query_input_invalid", embedder, apply_relevance=invalid,
+                )
+                self.assertEqual(embedder.calls, [])
 
     async def test_no_vector_sidecar_performs_no_embedding(self):
         self.install_bm25()

@@ -18,13 +18,21 @@ from backend import (
     memory_index_outbox_consumer as outbox,
     memory_index_refresh_worker as worker,
     memory_policy,
+    memory_retrieval_hybrid_active as active_selection,
     memory_retrieval_hybrid_observability as observability,
     memory_retrieval_hybrid_query as query,
     memory_retrieval_hybrid_runtime_active as active,
     memory_retrieval_hybrid_runtime_composition as composition,
     memory_retrieval_hybrid_runtime_shadow as shadow,
+    memory_retrieval_hybrid_shadow as comparison,
 )
 from backend.tests._support import NoNetworkMixin
+from backend.tests.test_memory_retrieval_hybrid_relevance import (
+    CONTENT as RELEVANCE_CONTENT,
+    EXACT_QUERY,
+    PARAPHRASE_QUERY,
+    UNRELATED_QUERY,
+)
 from backend.tests.test_memory_index_refresh_worker import (
     EMBEDDING_KEY,
     FINGERPRINT_SECRET,
@@ -67,9 +75,9 @@ class WorkerReadOnlyTests(
             config=config, reader=composition._reader(config)
         )
 
-    async def current_pair(self, *, empty=False):
+    async def current_pair(self, *, empty=False, content=PRIVATE_CONTENT):
         if not empty:
-            self.seed_atomic()
+            self.seed_atomic(content)
         self.enqueue_dirty()
         writer = self.runner(RecordingEmbedding())
         await worker.drain_once_v1(self.db_path, writer)
@@ -200,6 +208,82 @@ class WorkerReadOnlyTests(
         reader = self.readonly(self.runner(RecordingEmbedding()))
         await self.fails_without_writes(reader, "hybrid_query_bm25_invalid")
 
+    async def test_relevance_queries_use_current_pair_once_and_keep_raw_counts(self):
+        writer = await self.current_pair(content=RELEVANCE_CONTENT)
+        reader = self.readonly(writer)
+        before = self.signatures(reader.config)
+        events = self.rows()
+        tracker = observability.HybridShadowObservabilityV1()
+        cases = ((EXACT_QUERY, 1), (PARAPHRASE_QUERY, 1), (UNRELATED_QUERY, 0))
+        with self.forbid_query_writes():
+            for text, selected in cases:
+                result = await reader(query_text=text)
+                self.assertTrue(result.query_embedding_performed)
+                self.assertEqual(len(result.fusion_result.hits), selected)
+                self.assertEqual(result.fusion_result.bm25_hit_count, 1)
+                self.assertEqual(result.fusion_result.vector_hit_count, 1)
+                self.assertEqual(result.relevance_summary.admitted_count, selected)
+                self.assertEqual(result.relevance_summary.qualified_vector_hit_count, 0)
+                report = comparison.compare_hybrid_retrieval_shadow_v1(
+                    (MEMORY_KEY,) if selected else (), result,
+                )
+                self.assertEqual(report.status, "completed")
+                tracker.record_report(report)
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot.completed_count, 3)
+        self.assertEqual(snapshot.failed_count, 0)
+        self.assertEqual(snapshot.relevance_admitted_total, 2)
+        self.assertEqual(snapshot.relevance_rejected_total, 1)
+        self.assertEqual(snapshot.last_relation, "both_empty")
+        self.assertEqual(snapshot.last_relevance.empty_reason, "no_relevance_evidence")
+        self.assertEqual(reader.config.embedding_adapter.calls, [
+            ((text,), reader.config.embedding_model, reader.config.embedding_dimensions)
+            for text, _selected in cases
+        ])
+        self.assertEqual(self.signatures(reader.config), before)
+        self.assertEqual(self.rows(), events)
+
+    async def test_relevance_policy_is_readonly_only_and_cannot_be_used_by_active(self):
+        writer = await self.current_pair(content=RELEVANCE_CONTENT)
+        reader = self.readonly(writer)
+        before = self.signatures(reader.config)
+        with self.forbid_query_writes():
+            filtered = await reader(query_text=UNRELATED_QUERY)
+        legacy = await writer(query_text=UNRELATED_QUERY)
+        self.assertEqual(filtered.fusion_result.hits, ())
+        self.assertIsNotNone(filtered.relevance_summary)
+        self.assertEqual(len(legacy.fusion_result.hits), 1)
+        self.assertIsNone(legacy.relevance_summary)
+        self.assertIs(active_selection._validated_query_result(legacy), legacy)
+        with self.assertRaises(active_selection.MemoryRetrievalHybridActiveError) as raised:
+            active_selection._validated_query_result(filtered)
+        self.assertEqual(raised.exception.category, "hybrid_active_channels_unavailable")
+        self.assertEqual(self.signatures(reader.config), before)
+
+    async def test_readonly_runner_limits_comparison_after_admitting_many_atomics(self):
+        for number in range(12):
+            self.seed_atomic(f"Render rollout fixture {number}")
+            with self.module.db() as conn:
+                conn.execute(
+                    "UPDATE memory_items SET memory_key=? WHERE memory_key=?",
+                    (f"relevance_many_atomic_fixture_{number:06d}", MEMORY_KEY),
+                )
+        self.enqueue_dirty()
+        writer = self.runner(RecordingEmbedding())
+        await worker.drain_once_v1(self.db_path, writer)
+        reader = self.readonly(writer)
+        before = self.signatures(reader.config)
+        with self.forbid_query_writes():
+            result = await reader(query_text="Render")
+        self.assertEqual(result.relevance_summary.admitted_count, 12)
+        self.assertEqual(result.relevance_summary.selected_count, 10)
+        self.assertEqual(result.relevance_summary.truncated_count, 2)
+        report = comparison.compare_hybrid_retrieval_shadow_v1((), result)
+        self.assertEqual(report.status, "completed")
+        self.assertEqual(report.hybrid_selected_count, comparison.MAX_SELECTED)
+        self.assertEqual(len(reader.config.embedding_adapter.calls), 1)
+        self.assertEqual(self.signatures(reader.config), before)
+
     async def test_missing_each_sidecar_is_not_repaired_by_query(self):
         writer = await self.current_pair()
         for path, category in (
@@ -264,6 +348,7 @@ class WorkerReadOnlyTests(
         self.assertFalse(result.query_embedding_performed)
         self.assertEqual(result.fusion_result.hits, ())
         self.assertEqual(reader.config.embedding_adapter.calls, [])
+        self.assertEqual(result.relevance_summary.empty_reason, "no_eligible_atomics")
 
     async def test_forged_atomic_revision_is_rejected_before_provider(self):
         writer = await self.current_pair()

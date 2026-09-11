@@ -43,6 +43,7 @@ from backend import (
     memory_retrieval_bm25_store as bm25_store,
     memory_retrieval_embedding_openai as embedding_openai,
     memory_retrieval_hybrid_query as hybrid_query,
+    memory_retrieval_hybrid_shadow as hybrid_shadow,
     memory_retrieval_hybrid_source as hybrid_source,
     memory_retrieval_hybrid_runtime_shadow as runtime_shadow,
     memory_retrieval_vector as vector,
@@ -669,6 +670,8 @@ class HybridRetrievalReadOnlyRunnerV1:
             vector_sidecar_path=self.config.vector_path,
             expected_embedding_model=self.config.embedding_model,
             expected_embedding_dimensions=self.config.embedding_dimensions,
+            apply_relevance=True,
+            max_hits=hybrid_shadow.MAX_SELECTED,
         )
 
 

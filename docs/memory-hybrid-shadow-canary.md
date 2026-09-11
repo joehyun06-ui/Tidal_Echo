@@ -96,6 +96,47 @@ In this mode, a missing, corrupt, mismatched, half-committed, or stale index pai
 
 If acceptance needs proof of the **current** outbox backlog, authoritative membership, or index generations, stop and obtain a separate scoped read-only audit. The status endpoint intentionally cannot provide those proofs. Do not mutate production Memory, force-refresh, delete sidecars, or acknowledge events to make counters green.
 
+### Relevance admission in worker-backed Shadow
+
+The read-only runner applies `exact-lexical-uncalibrated-v1` before fusion and
+the final 10-item Shadow comparison limit. A key must match the existing exact
+or lexical channel to enter the result. A BM25 rank additionally requires a
+shared usable alphanumeric term or CJK bigram, recomputed from the same proved
+Atomic snapshot and query. Single-character collisions and low-information
+words cannot add a BM25 rank. Vector search still runs for observation, but its
+uncalibrated hits contribute neither admission nor RRF rank. This policy does
+not change the default query path or legacy/Active selection; Active rejects
+results marked with this Shadow relevance policy.
+
+Original `exact_hits`, `lexical_hits`, `bm25_hits`, `vector_hits`, channel
+availability, and embedding counters retain their raw meanings. The status
+payload adds separate, bounded, process-local counters:
+
+| Field | Meaning |
+| --- | --- |
+| `relevance.evaluated` | Successfully completed comparisons with relevance admission applied. |
+| `relevance.empty` | Such comparisons with zero admitted keys. |
+| `relevance.admitted_total` / `relevance.rejected_total` | Sum of per-query key counts before the final comparison limit; repeated keys across queries count again. |
+| `last.relevance` | Versioned counts for the last completed comparison, or null for legacy/not-completed outcomes. |
+
+The last summary includes the raw candidate union, admitted/rejected counts,
+qualified BM25/vector counts, selected/truncated counts and a fixed empty
+reason. It contains no query text, Memory key/content, lexical term, vector or
+score. A valid unrelated query can report raw BM25/vector hits, available
+channels and a completed embedding while selecting zero keys. That is a normal
+completed comparison (`both_empty` when the existing authority also selected
+zero), with `empty_reason=no_relevance_evidence`. A zero-eligible-Atomic query
+uses `no_eligible_atomics` and retains the existing no-embedding behavior.
+Stale/corrupt inputs and provider errors remain failures; queries cannot repair
+indexes, retry or backfill a discarded hit to avoid an empty result.
+
+This is a conservative admission policy, not a semantic quality acceptance.
+Existing lexical false positives such as a generic shared “项目” remain, while
+correct paraphrases without lexical overlap are withheld. Independent semantic
+admission requires a separately reviewed, model/dimension-bound calibration
+with multi-Atomic positive and negative examples. A healthy comparison does not
+authorize Hybrid Active promotion.
+
 ## Legacy Stage 0 — code/deployment baseline
 
 The legacy stages require **Worker OFF throughout**, with Hybrid Active also OFF. Only this path permits query-triggered lazy repairs.

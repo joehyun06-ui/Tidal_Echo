@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from backend import memory_retrieval_hybrid_shadow as hybrid_shadow
+from backend import memory_retrieval_hybrid_relevance as relevance
 
 
 OBSERVABILITY_CONTRACT_VERSION: Final = "memory-retrieval-hybrid-observability-v1"
@@ -38,6 +39,10 @@ _LAST_STATUSES: Final = frozenset({"none", "completed", "failed", "skipped", "ca
 
 def _inc(value: int) -> int:
     return min(MAX_COUNTER, value + 1)
+
+
+def _add(value: int, increment: int) -> int:
+    return min(MAX_COUNTER, value + increment)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -74,6 +79,11 @@ class HybridShadowObservabilitySnapshotV1:
     last_bm25_available: bool
     last_vector_available: bool
     last_query_embedding_performed: bool
+    relevance_evaluated_count: int = 0
+    relevance_empty_count: int = 0
+    relevance_admitted_total: int = 0
+    relevance_rejected_total: int = 0
+    last_relevance: relevance.HybridRelevanceSummaryV1 | None = None
 
     def __post_init__(self) -> None:
         _validate_snapshot(self)
@@ -106,6 +116,8 @@ def _validate_snapshot(snapshot: object) -> None:
         "query_embedding_performed_count", "last_authority_selected_count",
         "last_hybrid_selected_count", "last_overlap_count", "last_exact_hit_count",
         "last_lexical_hit_count", "last_bm25_hit_count", "last_vector_hit_count",
+        "relevance_evaluated_count", "relevance_empty_count",
+        "relevance_admitted_total", "relevance_rejected_total",
     )
     for name in integer_names:
         value = getattr(snapshot, name)
@@ -141,8 +153,20 @@ def _validate_snapshot(snapshot: object) -> None:
             or snapshot.last_bm25_available
             or snapshot.last_vector_available
             or snapshot.last_query_embedding_performed
+            or snapshot.last_relevance is not None
         ):
             raise ValueError("invalid_hybrid_shadow_observability_snapshot")
+    try:
+        hybrid_shadow._validated_relevance_counts(
+            snapshot.last_relevance,
+            selected_count=snapshot.last_hybrid_selected_count,
+            exact_count=snapshot.last_exact_hit_count,
+            lexical_count=snapshot.last_lexical_hit_count,
+            bm25_count=snapshot.last_bm25_hit_count,
+            vector_count=snapshot.last_vector_hit_count,
+        )
+    except BaseException:
+        raise ValueError("invalid_hybrid_shadow_observability_snapshot") from None
 
 
 class HybridShadowObservabilityV1:
@@ -165,6 +189,10 @@ class HybridShadowObservabilityV1:
             "bm25_available": 0,
             "vector_available": 0,
             "query_embedding_performed": 0,
+            "relevance_evaluated": 0,
+            "relevance_empty": 0,
+            "relevance_admitted": 0,
+            "relevance_rejected": 0,
         }
         self._relations = {relation: 0 for relation in _RELATIONS}
         self._last = {
@@ -181,6 +209,7 @@ class HybridShadowObservabilityV1:
             "bm25_available": False,
             "vector_available": False,
             "embedding": False,
+            "relevance": None,
         }
 
     def __repr__(self) -> str:
@@ -191,6 +220,7 @@ class HybridShadowObservabilityV1:
             "relation": "", "authority": 0, "hybrid": 0, "overlap": 0,
             "exact": 0, "lexical": 0, "bm25": 0, "vector": 0,
             "bm25_available": False, "vector_available": False, "embedding": False,
+            "relevance": None,
         })
 
     def record_attempt(self) -> None:
@@ -240,6 +270,17 @@ class HybridShadowObservabilityV1:
                 self._counts["query_embedding_performed"] = _inc(
                     self._counts["query_embedding_performed"]
                 )
+            if values[15] is not None:
+                summary = values[15]
+                self._counts["relevance_evaluated"] = _inc(self._counts["relevance_evaluated"])
+                if summary.admitted_count == 0:
+                    self._counts["relevance_empty"] = _inc(self._counts["relevance_empty"])
+                self._counts["relevance_admitted"] = _add(
+                    self._counts["relevance_admitted"], summary.admitted_count
+                )
+                self._counts["relevance_rejected"] = _add(
+                    self._counts["relevance_rejected"], summary.rejected_count
+                )
             self._last.update({
                 "status": "completed",
                 "skip_reason": "",
@@ -254,6 +295,7 @@ class HybridShadowObservabilityV1:
                 "bm25_available": values[12],
                 "vector_available": values[13],
                 "embedding": values[14],
+                "relevance": values[15],
             })
 
     def snapshot(self) -> HybridShadowObservabilitySnapshotV1:
@@ -291,6 +333,11 @@ class HybridShadowObservabilityV1:
                 last_bm25_available=self._last["bm25_available"],
                 last_vector_available=self._last["vector_available"],
                 last_query_embedding_performed=self._last["embedding"],
+                relevance_evaluated_count=self._counts["relevance_evaluated"],
+                relevance_empty_count=self._counts["relevance_empty"],
+                relevance_admitted_total=self._counts["relevance_admitted"],
+                relevance_rejected_total=self._counts["relevance_rejected"],
+                last_relevance=self._last["relevance"],
             )
         _validate_snapshot(snapshot)
         return snapshot
@@ -343,6 +390,12 @@ def project_status_payload_v1(
             "vector_available": snapshot.vector_available_count,
             "query_embedding_performed": snapshot.query_embedding_performed_count,
         },
+        "relevance": {
+            "evaluated": snapshot.relevance_evaluated_count,
+            "empty": snapshot.relevance_empty_count,
+            "admitted_total": snapshot.relevance_admitted_total,
+            "rejected_total": snapshot.relevance_rejected_total,
+        },
         "last": {
             "status": snapshot.last_status,
             "skip_reason": snapshot.last_skip_reason,
@@ -357,6 +410,10 @@ def project_status_payload_v1(
             "bm25_available": snapshot.last_bm25_available,
             "vector_available": snapshot.last_vector_available,
             "query_embedding_performed": snapshot.last_query_embedding_performed,
+            "relevance": (
+                relevance.project_hybrid_relevance_summary_v1(snapshot.last_relevance)
+                if snapshot.last_relevance is not None else None
+            ),
         },
     }
 
