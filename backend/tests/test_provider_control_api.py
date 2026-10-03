@@ -28,6 +28,10 @@ class _FakeControl:
             "requires_openai_auth": False, "rate_limits": [],
         }
 
+    async def models(self):
+        self.calls.append("models")
+        return {"models": []}
+
     async def usage(self):
         self.calls.append("usage")
         return {"lifetime_tokens": 12, "daily_usage_buckets": []}
@@ -91,6 +95,7 @@ class InternalProviderControlTests(NoNetworkMixin, unittest.IsolatedAsyncioTestC
         for method, path in (
             ("GET", "/loop/provider/status"),
             ("GET", "/loop/provider/usage"),
+            ("GET", "/loop/provider/models"),
             ("POST", "/loop/provider/login/start"),
             ("POST", "/loop/provider/login/cancel"),
             ("POST", "/loop/provider/logout"),
@@ -115,6 +120,7 @@ class InternalProviderControlTests(NoNetworkMixin, unittest.IsolatedAsyncioTestC
     async def test_usage_login_cancel_and_logout_call_only_control_plane(self):
         cases = (
             ("GET", "/loop/provider/usage", "usage"),
+            ("GET", "/loop/provider/models", "models"),
             ("POST", "/loop/provider/login/start", "login_start"),
             ("POST", "/loop/provider/login/cancel", "login_cancel"),
             ("POST", "/loop/provider/logout", "logout"),
@@ -161,6 +167,7 @@ class ExternalProviderControlTests(NoNetworkMixin, unittest.IsolatedAsyncioTestC
         for method, path in (
             ("GET", "/provider/status"),
             ("GET", "/provider/usage"),
+            ("GET", "/provider/models"),
             ("POST", "/provider/login/start"),
             ("POST", "/provider/login/cancel"),
             ("POST", "/provider/logout"),
@@ -174,6 +181,7 @@ class ExternalProviderControlTests(NoNetworkMixin, unittest.IsolatedAsyncioTestC
         cases = (
             ("GET", "/provider/status", "/loop/provider/status", "GET"),
             ("GET", "/provider/usage", "/loop/provider/usage", "GET"),
+            ("GET", "/provider/models", "/loop/provider/models", "GET"),
             ("POST", "/provider/login/start", "/loop/provider/login/start", "POST"),
             ("POST", "/provider/login/cancel", "/loop/provider/login/cancel", "POST"),
             ("POST", "/provider/logout", "/loop/provider/logout", "POST"),

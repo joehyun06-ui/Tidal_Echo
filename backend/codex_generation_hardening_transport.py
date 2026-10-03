@@ -1,7 +1,7 @@
-"""Pinned Codex 0.147.0 generation hardening at the transport boundary.
+"""Pinned Codex 0.160.0 generation hardening at the transport boundary.
 
 The deny-list mirrors OpenAI Codex's own temporary structured thread profile for
-0.147.0. Keeping the rewrite at the scoped-transport boundary means even a caller
+0.160.0. Keeping the rewrite at the scoped-transport boundary means even a caller
 that accidentally omits one of these settings cannot widen the companion thread.
 """
 
@@ -14,10 +14,11 @@ from pathlib import Path
 from .codex_app_server_shared_transport import CodexScopedTransport, CodexTransportError
 
 
-OFFICIAL_0147_DENY_CONFIG: Mapping[str, object] = {
+OFFICIAL_0160_DENY_CONFIG: Mapping[str, object] = {
     "features.apps": False,
     "features.code_mode": False,
     "features.code_mode_only": False,
+    "features.context_management": False,
     "features.current_time_reminder": False,
     "features.deferred_executor": False,
     "features.enable_fanout": False,
@@ -36,12 +37,13 @@ OFFICIAL_0147_DENY_CONFIG: Mapping[str, object] = {
     "features.tool_suggest": False,
     "features.unified_exec": False,
     "features.view_image": False,
-    "orchestrator.skills.enabled": False,
+    "cloud.skills.enabled": False,
     "skills.include_instructions": False,
     "token_budget.use_history_notes_extension": False,
     "tools.experimental_request_user_input.enabled": False,
     "tools.update_plan.enabled": False,
     "web_search": "disabled",
+    "default_permissions": ":read-only",
 }
 
 _MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
@@ -50,7 +52,7 @@ _MAX_MCP_SERVERS = 128
 
 
 def _effective_mcp_server_names(result: object) -> set[str]:
-    """Project only MCP names from the pinned ConfigReadResponse wire shape."""
+    """Project only MCP names from raw JSON-RPC or older SDK fixtures."""
     if not isinstance(result, dict):
         raise CodexTransportError("codex_app_server_protocol_error")
     config = result.get("config")
@@ -61,21 +63,24 @@ def _effective_mcp_server_names(result: object) -> set[str]:
         additional = {}
     if not isinstance(additional, dict):
         raise CodexTransportError("codex_app_server_protocol_error")
-    raw_mcp = additional.get("mcp_servers", {})
-    if raw_mcp is None:
-        raw_mcp = {}
-    if not isinstance(raw_mcp, dict) or len(raw_mcp) > _MAX_MCP_SERVERS:
-        raise CodexTransportError("codex_app_server_protocol_error")
     names: set[str] = set()
-    for name in raw_mcp:
-        if not isinstance(name, str) or _MCP_NAME.fullmatch(name) is None:
+    # Raw JSON-RPC flattens Config.additional. Also accept older SDK fixtures.
+    for raw_mcp in (config.get("mcp_servers", {}), additional.get("mcp_servers", {})):
+        if raw_mcp is None:
+            continue
+        if not isinstance(raw_mcp, dict) or len(raw_mcp) > _MAX_MCP_SERVERS:
             raise CodexTransportError("codex_app_server_protocol_error")
-        names.add(name)
+        for name in raw_mcp:
+            if not isinstance(name, str) or _MCP_NAME.fullmatch(name) is None:
+                raise CodexTransportError("codex_app_server_protocol_error")
+            names.add(name)
+    if len(names) > _MAX_MCP_SERVERS:
+        raise CodexTransportError("codex_app_server_protocol_error")
     return names
 
 
 class CodexGenerationHardeningTransport:
-    """Generation-only scoped transport that force-applies the 0.147.0 isolation profile."""
+    """Generation-only scoped transport that force-applies the 0.160.0 isolation profile."""
 
     def __init__(self, transport: CodexScopedTransport) -> None:
         self._transport = transport
@@ -115,13 +120,19 @@ class CodexGenerationHardeningTransport:
                     mcp_names.add(match.group(1))
         if len(mcp_names) > _MAX_MCP_SERVERS:
             raise CodexTransportError("codex_app_server_protocol_error")
-        hardened = dict(OFFICIAL_0147_DENY_CONFIG)
+        hardened = dict(OFFICIAL_0160_DENY_CONFIG)
+        if isinstance(supplied_config, dict) and "model_reasoning_effort" in supplied_config:
+            effort = supplied_config["model_reasoning_effort"]
+            if not isinstance(effort, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,31}", effort) is None:
+                raise CodexTransportError("codex_app_server_protocol_error")
+            hardened["model_reasoning_effort"] = effort
         hardened["mcp_servers"] = {
             name: {"enabled": False} for name in sorted(mcp_names)
         }
         rewritten["config"] = hardened
         rewritten["runtimeWorkspaceRoots"] = []
         rewritten["approvalPolicy"] = "never"
+        rewritten.pop("permissions", None)
         rewritten["sandbox"] = "read-only"
         if method == "thread/start":
             rewritten["environments"] = []
@@ -130,4 +141,9 @@ class CodexGenerationHardeningTransport:
             rewritten["experimentalRawEvents"] = False
         else:
             rewritten.pop("environments", None)
-        return await self._transport.request(method, rewritten)
+        result = await self._transport.request(method, rewritten)
+        if (not isinstance(result, dict) or not isinstance(result.get("sandbox"), dict)
+                or result["sandbox"].get("type") != "readOnly"
+                or result.get("approvalPolicy") != "never"):
+            raise CodexTransportError("codex_app_server_protocol_error")
+        return result

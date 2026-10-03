@@ -313,4 +313,7 @@ async def retire_canary(session_id: str, request: Request):
     }
 
 
+from backend import codex_session_model
+codex_session_model.install(app, legacy, RUNTIME, INTEGRATION)
+
 app.mount("/", legacy.app)

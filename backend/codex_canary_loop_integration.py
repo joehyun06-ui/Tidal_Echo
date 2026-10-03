@@ -42,6 +42,9 @@ class LegacyControlAdapter:
     async def status(self):
         return await self._call("status")
 
+    async def models(self):
+        return await self._call("models")
+
     async def usage(self):
         return await self._call("usage")
 

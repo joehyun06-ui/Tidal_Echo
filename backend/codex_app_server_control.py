@@ -46,7 +46,7 @@ class CodexAppServerControl(_base.CodexAppServerControl):
                 return
             completed_id = _base._bounded_text(params.get("loginId"), maximum=256)
             success = params.get("success")
-            # 0.147.0 guarantees both fields. A malformed completion must not clear
+            # A correlated device login requires both fields. A malformed completion must not clear
             # the retained login id or poison the reader with upstream data.
             if not completed_id or type(success) is not bool:
                 return

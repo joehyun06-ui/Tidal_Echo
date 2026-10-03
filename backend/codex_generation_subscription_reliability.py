@@ -61,7 +61,7 @@ class ResubscribingCodexGenerationWorker(ReliableCodexGenerationWorker):
                 return
 
             # The previous successful delivery unsubscribed this connection from the
-            # durable thread.  Resume is the 0.147 contract for rejoining it and makes
+            # durable thread.  Resume is the pinned App Server contract for rejoining it and makes
             # subsequent turn notifications observable again.
             try:
                 await self.protocol.resume_thread(

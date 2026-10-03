@@ -30,7 +30,7 @@ class FakeProtocol:
         self.calls = []
         self.resume_error = None
 
-    async def start_thread(self, *, api_session, attempt_id, persona):
+    async def start_thread(self, *, api_session, attempt_id, persona, selection=None):
         self.calls.append(("thread/start", api_session, attempt_id, persona))
         return ThreadStartResult(
             thread_id="thr-1",

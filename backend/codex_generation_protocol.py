@@ -296,7 +296,7 @@ def require_chatgpt_account(account_result: object) -> None:
 
 
 def final_answer_from_turn(turn: Mapping[str, object]) -> str | None:
-    """Project the pinned Codex 0.147 AgentMessageThreadItem wire shape."""
+    """Project Codex 0.160 final text, accepting the historical fixture spelling."""
     items = turn.get("items")
     if not isinstance(items, list):
         return None
@@ -309,7 +309,7 @@ def final_answer_from_turn(turn: Mapping[str, object]) -> str | None:
         if not isinstance(text, str) or not text or len(text) > MAX_ASSISTANT_TEXT_CHARS:
             continue
         phase = item.get("phase")
-        if phase == "finalAnswer":
+        if phase in {"final_answer", "finalAnswer"}:
             final = text
         elif phase is None:
             fallback = text
@@ -418,9 +418,25 @@ class CodexGenerationProtocol:
         except Exception:
             raise CodexGenerationError("codex_generation_unavailable") from None
 
-    async def qualify(self) -> ModelSelection:
+    async def qualify(self, model: str | None = None, reasoning_effort: str | None = None) -> ModelSelection:
         require_chatgpt_account(await self._request("account/read", {"refreshToken": False}))
-        return resolve_model(await self._request("model/list", {}), self.config.model_policy)
+        if model is None:
+            return resolve_model(await self._request("model/list", {}), self.config.model_policy)
+        from .codex_model_catalog import read_models
+        _safe_model(model)
+        try:
+            catalog = await read_models(self._request)
+        except CodexGenerationError:
+            raise
+        except Exception:
+            raise CodexGenerationError("codex_generation_model_unavailable") from None
+        row = next((item for item in catalog if item["model"] == model), None)
+        if row is None:
+            raise CodexGenerationError("codex_generation_model_unavailable")
+        effort = reasoning_effort if reasoning_effort is not None else row["default_reasoning_effort"]
+        if effort is not None and effort not in row["reasoning_efforts"]:
+            raise CodexGenerationError("codex_generation_effort_invalid")
+        return ModelSelection(model, effort)
 
     async def start_thread(
         self,
@@ -428,10 +444,13 @@ class CodexGenerationProtocol:
         api_session: str,
         attempt_id: str,
         persona: str,
+        selection: ModelSelection | None = None,
     ) -> ThreadStartResult:
         if not isinstance(persona, str) or not persona.strip() or len(persona) > 131_072:
             raise CodexGenerationError("codex_generation_persona_invalid")
-        selection = await self.qualify()
+        selection = await self.qualify() if selection is None else await self.qualify(
+            selection.model, selection.reasoning_effort
+        )
         cwd = deterministic_workspace(self.config.workspace_root, api_session, attempt_id)
         params: dict[str, object] = {
             "model": selection.model,
@@ -440,6 +459,8 @@ class CodexGenerationProtocol:
             "ephemeral": False,
             "historyMode": "paginated",
         }
+        if selection.reasoning_effort is not None:
+            params["config"] = {"model_reasoning_effort": selection.reasoning_effort}
         raw = _mapping(
             await self._request("thread/start", params),
             "codex_generation_thread_start_failed",
@@ -492,7 +513,7 @@ class CodexGenerationProtocol:
             },
         }
         if reasoning_effort is not None:
-            params["effort"] = reasoning_effort
+            params["config"] = {"model_reasoning_effort": reasoning_effort}
         result = _mapping(
             await self._request("thread/resume", params),
             "codex_generation_thread_resume_failed",

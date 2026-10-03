@@ -4,7 +4,7 @@ import unittest
 
 from backend.codex_app_server_shared_transport import CodexTransportError
 from backend.codex_generation_hardening_transport import (
-    OFFICIAL_0147_DENY_CONFIG,
+    OFFICIAL_0160_DENY_CONFIG,
     CodexGenerationHardeningTransport,
 )
 
@@ -24,10 +24,22 @@ class CaptureTransport:
                     }
                 }
             }
-        return {}
+        return {"sandbox": {"type": "readOnly"}, "approvalPolicy": "never"}
 
 
 class HardeningTransportTest(unittest.IsolatedAsyncioTestCase):
+    async def test_flattened_mcp_and_read_only_response_are_required(self):
+        class Flat(CaptureTransport):
+            async def request(self, method, params):
+                self.calls.append((method, params))
+                if method == "config/read":
+                    return {"config": {"mcp_servers": {"flat": {"enabled": True}}}}
+                return {"sandbox": {"type": "workspaceWrite"}, "approvalPolicy": "never"}
+        inner = Flat()
+        with self.assertRaisesRegex(CodexTransportError, "protocol_error"):
+            await CodexGenerationHardeningTransport(inner).request("thread/start", {"cwd": "/tmp/fixture"})
+        self.assertEqual(inner.calls[-1][1]["config"]["mcp_servers"], {"flat": {"enabled": False}})
+
     async def test_thread_start_reads_effective_cwd_and_disables_all_mcp_servers(self):
         inner = CaptureTransport({
             "project_mcp": {"command": "PRIVATE"},
@@ -57,7 +69,7 @@ class HardeningTransportTest(unittest.IsolatedAsyncioTestCase):
         ))
         method, params = inner.calls[-1]
         self.assertEqual(method, "thread/start")
-        for key, value in OFFICIAL_0147_DENY_CONFIG.items():
+        for key, value in OFFICIAL_0160_DENY_CONFIG.items():
             self.assertEqual(params["config"][key], value)
         self.assertNotIn("unreviewed", params["config"])
         self.assertEqual(params["config"]["mcp_servers"], {

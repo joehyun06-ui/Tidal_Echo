@@ -38,16 +38,17 @@ class FakeProtocol:
             }]
         }
 
-    async def start_thread(self, *, api_session, attempt_id, persona):
+    async def start_thread(self, *, api_session, attempt_id, persona, selection=None):
         self.calls.append(("thread/start", api_session, attempt_id, persona))
+        self.selected = selection
         if self.start_thread_error:
             raise self.start_thread_error
         cwd = self.config.workspace_root / "sessions" / api_session / attempt_id
         return ThreadStartResult(
             thread_id="thr-1",
-            model="gpt-5.6-sol",
+            model=selection.model if selection else "gpt-5.6-sol",
             model_provider="openai",
-            reasoning_effort="high",
+            reasoning_effort=selection.reasoning_effort if selection else "high",
             cwd=cwd,
         )
 
@@ -144,6 +145,18 @@ class CodexGenerationWorkerTest(unittest.IsolatedAsyncioTestCase):
         methods = [call[0] for call in self.protocol.calls]
         self.assertEqual(methods[:3], ["thread/start", "turn/start", "thread/resume"])
         self.assertIn("thread/unsubscribe", methods)
+
+    async def test_worker_uses_saved_model_for_first_thread_and_every_turn(self):
+        # This represents a choice saved before the user enqueued their first message.
+        with store.connect(self.store_path) as conn:
+            conn.execute("UPDATE codex_sessions SET model='selected-model',reasoning_effort='low'")
+        await self.seed_completed_event()
+        await self.worker().run_once()
+        self.assertEqual(self.protocol.selected.model, "selected-model")
+        self.assertEqual(self.protocol.selected.reasoning_effort, "low")
+        turn = next(call[1] for call in self.protocol.calls if call[0] == "turn/start")
+        self.assertEqual((turn["model"], turn["reasoning_effort"]), ("selected-model", "low"))
+        self.assertEqual(store.get_job(self.store_path, self.job["id"])["status"], "completed")
 
     async def test_turn_start_failure_is_uncertain_and_never_calls_completion(self):
         self.protocol.start_turn_error = RuntimeError("ambiguous transport failure")

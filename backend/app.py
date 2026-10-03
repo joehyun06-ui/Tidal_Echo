@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import sqlite3
 import urllib.error
 import urllib.request
@@ -94,9 +95,8 @@ PORT = deployment_config.parse_port(os.environ.get("RELAY_PORT", "3011"), "inval
 UPLOAD_DIR = Path(os.environ.get("RELAY_UPLOAD_DIR", str(Path(__file__).parent / "uploads")))
 PUBLIC_PREFIX = os.environ.get("RELAY_PUBLIC_PREFIX", "/relay").rstrip("/")
 APP_PATH = os.environ.get("RELAY_APP_PATH", "/")  # where a push-notification tap opens the PWA
-ALLOW_ORIGINS = [o.strip() for o in os.environ.get(
-    "RELAY_ALLOW_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080"
-).split(",") if o.strip()]
+from backend.cors_config import allowed_origins
+ALLOW_ORIGINS = allowed_origins()
 MAX_UPLOAD_BYTES = int(os.environ.get("RELAY_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 VOICE_MAX_BYTES = int(os.environ.get("RELAY_VOICE_MAX_BYTES", str(8 * 1024 * 1024)))
 VOICE_TRANSCRIBE_CMD = os.environ.get("RELAY_VOICE_TRANSCRIBE_CMD", "")
@@ -979,6 +979,8 @@ def loop_json(path: str, method: str = "GET", body=None):
 
 
 _PROVIDER_CONTROL_ERROR_CATEGORIES = frozenset({
+    "codex_models_unavailable",
+    "codex_generation_busy",
     "codex_control_disabled",
     "codex_app_server_unavailable",
     "codex_app_server_protocol_error",
@@ -2992,6 +2994,12 @@ async def provider_status(request: Request):
     return {**result, "generation_provider": "api"}
 
 
+@app.get("/provider/models")
+async def provider_models(request: Request):
+    check_auth(request)
+    return provider_loop_json("/loop/provider/models")
+
+
 @app.get("/provider/usage")
 async def provider_usage(request: Request):
     check_auth(request)
@@ -3082,6 +3090,10 @@ async def app_sessions_create(request: Request):
 async def app_sessions_patch(session_id: str, request: Request):
     check_auth(request)
     return loop_json(f"/loop/sessions/{urllib.parse.quote(session_id)}", method="PATCH", body=await request.json())
+
+
+from backend import provider_settings as _provider_settings
+_provider_settings.install_relay(app, sys.modules[__name__])
 
 
 if __name__ == "__main__":

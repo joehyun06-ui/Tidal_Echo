@@ -1119,7 +1119,7 @@ async def _provider_control(operation) -> dict[str, object]:
     try:
         return await operation()
     except codex_app_server_control.CodexControlError as exc:
-        status = 409 if exc.category == "codex_login_in_progress" else 503
+        status = 409 if exc.category in {"codex_login_in_progress", "codex_generation_busy"} else 503
         if exc.category == "codex_not_authenticated":
             status = 401
         raise HTTPException(status_code=status, detail=exc.category) from None
@@ -1179,6 +1179,12 @@ async def loop_provider_status(request: Request):
     check_internal_auth(request)
     result = await _provider_control(CODEX_CONTROL.status)
     return {**result, "generation_provider": "api"}
+
+
+@app.get("/loop/provider/models")
+async def loop_provider_models(request: Request):
+    check_internal_auth(request)
+    return await _provider_control(CODEX_CONTROL.models)
 
 
 @app.get("/loop/provider/usage")
@@ -1358,6 +1364,10 @@ async def loop_ingest(request: Request):
     if result.get("ok") is not True:
         return JSONResponse(result, status_code=504 if result.get("dispatch_uncertain") else 502)
     return result
+
+
+from backend import provider_settings as _provider_settings
+_provider_settings.install_loop(app, sys.modules[__name__])
 
 
 if __name__ == "__main__":

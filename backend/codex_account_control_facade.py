@@ -8,9 +8,11 @@ from collections.abc import Mapping
 from .codex_app_server_control import sanitize_account, sanitize_rate_limits, sanitize_usage
 from .codex_app_server_shared_transport import CodexScopedTransport, CodexTransportError
 from .codex_generation_protocol import CodexGenerationError, CodexProcessActivityGate
+from .codex_model_catalog import CodexModelCatalogMixin
 
 
 P1_ACCOUNT_RPC_METHODS = frozenset({
+    "model/list",
     "account/read",
     "account/login/start",
     "account/login/cancel",
@@ -44,8 +46,10 @@ def _bounded_text(value: object, maximum: int) -> str:
     return value
 
 
-class CodexAccountControlFacade:
+class CodexAccountControlFacade(CodexModelCatalogMixin):
     """Narrow P1 account control whose transport can be shared with P2 generation."""
+
+    model_catalog_error = CodexAccountFacadeError
 
     def __init__(
         self,
@@ -61,19 +65,24 @@ class CodexAccountControlFacade:
         self._login_id = ""
         self._login_starting = False
         self._completed_login_id = ""
+        self._login_status = "idle"
+        self._completed_login_status = ""
 
     async def on_notification(self, method: str, params: Mapping[str, object]) -> None:
         if not self._enabled or method != "account/login/completed":
             return
         completed_id = _bounded_text(params.get("loginId"), 256)
-        if not completed_id:
+        if not completed_id or type(params.get("success")) is not bool:
             return
         async with self._login_lock:
+            completion = "succeeded" if params["success"] else "failed"
             if completed_id == self._login_id:
+                self._login_status = completion
                 self._login_id = ""
                 self._login_starting = False
             elif self._login_starting:
                 self._completed_login_id = completed_id
+                self._completed_login_status = completion
 
     async def _request(self, method: str, params: Mapping[str, object] | None = None) -> object:
         if not self._enabled:
@@ -107,7 +116,7 @@ class CodexAccountControlFacade:
             limits = sanitize_rate_limits(await self._request("account/rateLimits/read"))
         except Exception:
             limits = {"rate_limits": []}
-        return {**account, **limits}
+        return {**account, **limits, "login_status": "succeeded" if account.get("connected") else self._login_status}
 
     async def usage(self) -> dict[str, object]:
         try:
@@ -129,6 +138,8 @@ class CodexAccountControlFacade:
             if self._login_starting or self._login_id:
                 raise CodexAccountFacadeError("codex_login_in_progress")
             self._login_starting = True
+            self._login_status = "pending"
+            self._completed_login_status = ""
         try:
             result = await self._request(
                 "account/login/start", {"type": "chatgptDeviceCode"}
@@ -142,10 +153,13 @@ class CodexAccountControlFacade:
                 raise ValueError
             async with self._login_lock:
                 if self._completed_login_id == login_id:
+                    self._login_status = self._completed_login_status
                     self._completed_login_id = ""
                     self._login_id = ""
                 else:
                     self._login_id = login_id
+                    self._completed_login_id = ""
+                    self._completed_login_status = ""
                 self._login_starting = False
             return {
                 "verification_url": verification_url,
@@ -155,6 +169,7 @@ class CodexAccountControlFacade:
         except CodexAccountFacadeError as exc:
             async with self._login_lock:
                 self._login_starting = False
+                self._login_status = "failed"
                 self._completed_login_id = ""
             if exc.category in {"codex_control_disabled", "codex_generation_busy"}:
                 raise
@@ -162,6 +177,7 @@ class CodexAccountControlFacade:
         except Exception:
             async with self._login_lock:
                 self._login_starting = False
+                self._login_status = "failed"
                 self._completed_login_id = ""
             raise CodexAccountFacadeError("codex_login_unavailable") from None
 
@@ -186,6 +202,8 @@ class CodexAccountControlFacade:
             if self._login_id == login_id:
                 self._login_id = ""
             self._completed_login_id = ""
+            self._login_status = "cancelled"
+            self._completed_login_status = ""
         return {"cancelled": True}
 
     async def logout(self) -> dict[str, bool]:
@@ -194,4 +212,6 @@ class CodexAccountControlFacade:
             self._login_id = ""
             self._login_starting = False
             self._completed_login_id = ""
+            self._login_status = "idle"
+            self._completed_login_status = ""
         return {"logged_out": True}
