@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import sqlite3
 import urllib.error
 import urllib.request
@@ -979,6 +980,8 @@ def loop_json(path: str, method: str = "GET", body=None):
 
 
 _PROVIDER_CONTROL_ERROR_CATEGORIES = frozenset({
+    "codex_models_unavailable",
+    "codex_generation_busy",
     "codex_control_disabled",
     "codex_app_server_unavailable",
     "codex_app_server_protocol_error",
@@ -2992,6 +2995,12 @@ async def provider_status(request: Request):
     return {**result, "generation_provider": "api"}
 
 
+@app.get("/provider/models")
+async def provider_models(request: Request):
+    check_auth(request)
+    return provider_loop_json("/loop/provider/models")
+
+
 @app.get("/provider/usage")
 async def provider_usage(request: Request):
     check_auth(request)
@@ -3082,6 +3091,10 @@ async def app_sessions_create(request: Request):
 async def app_sessions_patch(session_id: str, request: Request):
     check_auth(request)
     return loop_json(f"/loop/sessions/{urllib.parse.quote(session_id)}", method="PATCH", body=await request.json())
+
+
+from backend import provider_settings as _provider_settings
+_provider_settings.install_relay(app, sys.modules[__name__])
 
 
 if __name__ == "__main__":

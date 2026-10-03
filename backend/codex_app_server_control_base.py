@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .deployment_config import CodexControlConfig
+from .codex_model_catalog import CodexModelCatalogMixin
 
 
 MAX_JSONL_BYTES = 1024 * 1024
@@ -28,6 +29,7 @@ MAX_SAFE_NUMBER = 10**18
 PROCESS_TEARDOWN_STEP_TIMEOUT_SECONDS = 2.0
 
 P1_REQUEST_METHODS = frozenset({
+    "model/list",
     "initialize",
     "account/read",
     "account/login/start",
@@ -362,8 +364,10 @@ def sanitize_usage(result: object) -> dict[str, object]:
     return output
 
 
-class CodexAppServerControl:
+class CodexAppServerControl(CodexModelCatalogMixin):
     """Single lazy process owner with a narrow account-control API."""
+
+    model_catalog_error = CodexControlError
 
     def __init__(
         self,

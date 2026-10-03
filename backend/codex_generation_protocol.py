@@ -418,9 +418,25 @@ class CodexGenerationProtocol:
         except Exception:
             raise CodexGenerationError("codex_generation_unavailable") from None
 
-    async def qualify(self) -> ModelSelection:
+    async def qualify(self, model: str | None = None, reasoning_effort: str | None = None) -> ModelSelection:
         require_chatgpt_account(await self._request("account/read", {"refreshToken": False}))
-        return resolve_model(await self._request("model/list", {}), self.config.model_policy)
+        if model is None:
+            return resolve_model(await self._request("model/list", {}), self.config.model_policy)
+        from .codex_model_catalog import read_models
+        _safe_model(model)
+        try:
+            catalog = await read_models(self._request)
+        except CodexGenerationError:
+            raise
+        except Exception:
+            raise CodexGenerationError("codex_generation_model_unavailable") from None
+        row = next((item for item in catalog if item["model"] == model), None)
+        if row is None:
+            raise CodexGenerationError("codex_generation_model_unavailable")
+        effort = reasoning_effort if reasoning_effort is not None else row["default_reasoning_effort"]
+        if effort is not None and effort not in row["reasoning_efforts"]:
+            raise CodexGenerationError("codex_generation_effort_invalid")
+        return ModelSelection(model, effort)
 
     async def start_thread(
         self,
@@ -428,10 +444,13 @@ class CodexGenerationProtocol:
         api_session: str,
         attempt_id: str,
         persona: str,
+        selection: ModelSelection | None = None,
     ) -> ThreadStartResult:
         if not isinstance(persona, str) or not persona.strip() or len(persona) > 131_072:
             raise CodexGenerationError("codex_generation_persona_invalid")
-        selection = await self.qualify()
+        selection = await self.qualify() if selection is None else await self.qualify(
+            selection.model, selection.reasoning_effort
+        )
         cwd = deterministic_workspace(self.config.workspace_root, api_session, attempt_id)
         params: dict[str, object] = {
             "model": selection.model,

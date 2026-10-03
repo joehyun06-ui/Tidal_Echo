@@ -16,6 +16,7 @@ from typing import Protocol
 from . import codex_generation_provider_binding as provider_binding
 from . import codex_generation_store as store
 from .codex_generation_protocol import (
+    ModelSelection,
     CodexGenerationError,
     CodexGenerationProtocol,
     CodexProcessActivityGate,
@@ -47,6 +48,7 @@ _FATAL_PRE_TURN_CATEGORIES = frozenset({
     "codex_generation_disabled",
     "codex_generation_account_unavailable",
     "codex_generation_model_unavailable",
+    "codex_generation_effort_invalid",
     "codex_generation_provider_unavailable",
     "codex_generation_persona_invalid",
     "codex_generation_thread_contract_mismatch",
@@ -229,6 +231,7 @@ class CodexGenerationWorker:
                 api_session=str(job["api_session"]),
                 attempt_id=attempt_id,
                 persona=persona,
+                selection=ModelSelection(str(session["model"]), session.get("reasoning_effort")),
             )
         except CodexGenerationError as exc:
             if exc.category in _FATAL_PRE_TURN_CATEGORIES:
