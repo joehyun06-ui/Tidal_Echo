@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import codex_generation_store as store
-from .codex_0147_wire_compat import correlated_turn_from_page, final_answer_from_turn
+from .codex_generation_protocol import correlated_turn_from_page, final_answer_from_turn
 from .codex_canary_loop_integration import (
     CodexCanaryLoopIntegration,
     CodexCanaryLoopIntegrationError,

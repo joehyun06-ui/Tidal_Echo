@@ -296,7 +296,7 @@ def require_chatgpt_account(account_result: object) -> None:
 
 
 def final_answer_from_turn(turn: Mapping[str, object]) -> str | None:
-    """Project the pinned Codex 0.147 AgentMessageThreadItem wire shape."""
+    """Project Codex 0.160 final text, accepting the historical fixture spelling."""
     items = turn.get("items")
     if not isinstance(items, list):
         return None
@@ -309,7 +309,7 @@ def final_answer_from_turn(turn: Mapping[str, object]) -> str | None:
         if not isinstance(text, str) or not text or len(text) > MAX_ASSISTANT_TEXT_CHARS:
             continue
         phase = item.get("phase")
-        if phase == "finalAnswer":
+        if phase in {"final_answer", "finalAnswer"}:
             final = text
         elif phase is None:
             fallback = text
@@ -459,6 +459,8 @@ class CodexGenerationProtocol:
             "ephemeral": False,
             "historyMode": "paginated",
         }
+        if selection.reasoning_effort is not None:
+            params["config"] = {"model_reasoning_effort": selection.reasoning_effort}
         raw = _mapping(
             await self._request("thread/start", params),
             "codex_generation_thread_start_failed",
@@ -511,7 +513,7 @@ class CodexGenerationProtocol:
             },
         }
         if reasoning_effort is not None:
-            params["effort"] = reasoning_effort
+            params["config"] = {"model_reasoning_effort": reasoning_effort}
         result = _mapping(
             await self._request("thread/resume", params),
             "codex_generation_thread_resume_failed",

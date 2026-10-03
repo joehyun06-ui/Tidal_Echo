@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
-_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+_EFFORT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,31}")
 
 
 def project_model(item: object) -> dict | None:
@@ -20,10 +20,10 @@ def project_model(item: object) -> dict | None:
     efforts = []
     for value in item.get("supportedReasoningEfforts", []) or []:
         effort = value.get("reasoningEffort") if isinstance(value, dict) else None
-        if isinstance(effort, str) and effort in _EFFORTS and effort not in efforts:
+        if isinstance(effort, str) and _EFFORT.fullmatch(effort) and effort not in efforts:
             efforts.append(effort)
     default = item.get("defaultReasoningEffort")
-    if not isinstance(default, str) or default not in _EFFORTS:
+    if not isinstance(default, str) or not _EFFORT.fullmatch(default):
         default = None
     # Older CLI fixtures may only contain the default; preserve that usable choice.
     if default and default not in efforts:

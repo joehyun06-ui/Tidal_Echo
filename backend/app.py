@@ -95,9 +95,8 @@ PORT = deployment_config.parse_port(os.environ.get("RELAY_PORT", "3011"), "inval
 UPLOAD_DIR = Path(os.environ.get("RELAY_UPLOAD_DIR", str(Path(__file__).parent / "uploads")))
 PUBLIC_PREFIX = os.environ.get("RELAY_PUBLIC_PREFIX", "/relay").rstrip("/")
 APP_PATH = os.environ.get("RELAY_APP_PATH", "/")  # where a push-notification tap opens the PWA
-ALLOW_ORIGINS = [o.strip() for o in os.environ.get(
-    "RELAY_ALLOW_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080"
-).split(",") if o.strip()]
+from backend.cors_config import allowed_origins
+ALLOW_ORIGINS = allowed_origins()
 MAX_UPLOAD_BYTES = int(os.environ.get("RELAY_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 VOICE_MAX_BYTES = int(os.environ.get("RELAY_VOICE_MAX_BYTES", str(8 * 1024 * 1024)))
 VOICE_TRANSCRIBE_CMD = os.environ.get("RELAY_VOICE_TRANSCRIBE_CMD", "")

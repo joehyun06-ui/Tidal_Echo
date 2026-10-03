@@ -33,4 +33,4 @@ Codex 模型保存在现有 `codex_sessions` 行，不改变 provider、thread�
 
 后端新增 `test_provider_settings.py`，覆盖鉴权、密钥保留/重定向隔离、磁盘持久化、CLI 分页、模型请求参数、未完成任务禁止切换。既有 provider control、worker、P3 session guard/delete 测试保留。
 
-CLI 协议对照项目锁定版本 `openai-codex==0.147.0` 生成的 JSON schema；无需真实账号完成自动化测试。真实设备授权、账号额度与线上请求要在部署后由用户账号验证。
+CLI 协议对照项目锁定版本 `openai-codex==0.160.0` 生成的 JSON schema；无需真实账号完成自动化测试。真实设备授权、账号额度与线上请求要在部署后由用户账号验证。

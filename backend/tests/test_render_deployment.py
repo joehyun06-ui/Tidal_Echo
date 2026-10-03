@@ -726,7 +726,7 @@ class BlueprintTests(unittest.TestCase):
         requirements = (
             Path(__file__).parents[1] / "requirements.txt"
         ).read_text(encoding="utf-8").splitlines()
-        self.assertEqual(requirements.count("openai-codex==0.147.0"), 1)
+        self.assertEqual(requirements.count("openai-codex==0.160.0"), 1)
 
     def test_render_blueprint_structure_and_secret_placeholders(self):
         blueprint = json.loads((Path(__file__).parents[2] / "render.yaml").read_text(encoding="utf-8"))

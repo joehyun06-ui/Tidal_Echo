@@ -123,7 +123,8 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(params["ephemeral"], False)
         self.assertEqual(params["baseInstructions"], "companion persona")
         self.assertEqual(params["model"], "gpt-5.6-sol")
-        self.assertNotIn("config", params)
+        self.assertEqual(params["config"], {"model_reasoning_effort": "high"})
+        self.assertNotIn("effort", params)
         self.assertNotIn("environments", params)
 
     async def test_start_thread_rejects_non_paginated_response(self):
@@ -158,7 +159,8 @@ class GenerationProtocolTest(unittest.IsolatedAsyncioTestCase):
             "itemsView": "summary",
         })
         self.assertEqual(params["baseInstructions"], "current persona")
-        self.assertNotIn("config", params)
+        self.assertEqual(params["config"], {"model_reasoning_effort": "high"})
+        self.assertNotIn("effort", params)
 
     async def test_turn_start_carries_stable_client_id_and_no_environment(self):
         transport = self.happy_transport()

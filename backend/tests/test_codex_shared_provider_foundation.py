@@ -7,7 +7,7 @@ from pathlib import Path
 
 from backend.codex_account_control_facade import CodexAccountFacadeError
 from backend.codex_app_server_shared_transport import CodexSharedTransportConfig
-from backend.codex_generation_hardening_transport import OFFICIAL_0147_DENY_CONFIG
+from backend.codex_generation_hardening_transport import OFFICIAL_0160_DENY_CONFIG
 from backend.codex_generation_protocol import CodexGenerationConfig, CodexGenerationError
 from backend.codex_shared_provider_foundation import SharedCodexProviderFoundation
 
@@ -65,6 +65,7 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
                 }
             },
             "thread/start": lambda params: {
+                "sandbox": {"type": "readOnly"}, "approvalPolicy": "never",
                 "thread": {"id": "thr-1", "ephemeral": False, "historyMode": "paginated"},
                 "model": params["model"],
                 "modelProvider": "openai",
@@ -130,14 +131,14 @@ class SharedProviderFoundationTest(unittest.IsolatedAsyncioTestCase):
             await foundation.generation.qualify()
         self.assertEqual(runtime.scopes[1].calls, [])
 
-    async def test_composed_generation_uses_pinned_0147_hardening_profile(self):
+    async def test_composed_generation_uses_pinned_0160_hardening_profile(self):
         result = await self.foundation.generation.start_thread(
             api_session="api-canary", attempt_id="attempt-1", persona="persona"
         )
         self.assertEqual(result.model_provider, "openai")
         method, params = self.runtime.scopes[1].calls[-1]
         self.assertEqual(method, "thread/start")
-        for key, value in OFFICIAL_0147_DENY_CONFIG.items():
+        for key, value in OFFICIAL_0160_DENY_CONFIG.items():
             self.assertEqual(params["config"][key], value)
         self.assertEqual(params["config"]["mcp_servers"], {
             "browser": {"enabled": False}
