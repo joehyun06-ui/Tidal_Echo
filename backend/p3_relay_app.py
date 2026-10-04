@@ -402,6 +402,29 @@ async def app_sessions_fork(session_id: str, request: Request):
     encoded = urllib.parse.quote(session_id, safe="")
     return relay_app.loop_json(f"/loop/sessions/{encoded}/fork", method="POST", body=await request.json())
 
+@app.get("/app/conversation-versions")
+async def app_conversation_versions(request: Request):
+    relay_app.check_auth(request)
+    return relay_app.loop_json("/loop/conversation-versions")
+
+@app.post("/app/sessions/{session_id}/versions")
+async def app_message_version(session_id: str, request: Request):
+    relay_app.check_auth(request)
+    encoded = urllib.parse.quote(session_id, safe="")
+    return relay_app.loop_json(f"/loop/sessions/{encoded}/versions", method="POST", body=await request.json())
+
+@app.post("/app/sessions/{session_id}/version-selection")
+async def app_version_selection(session_id: str, request: Request):
+    relay_app.check_auth(request)
+    encoded = urllib.parse.quote(session_id, safe="")
+    return relay_app.loop_json(f"/loop/sessions/{encoded}/version-selection", method="POST", body=await request.json())
+
+@app.delete("/app/conversations/{session_id}")
+async def app_conversation_delete(session_id: str, request: Request):
+    relay_app.check_auth(request)
+    encoded = urllib.parse.quote(session_id, safe="")
+    return relay_app.loop_json(f"/loop/conversations/{encoded}", method="DELETE")
+
 _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_index_refresh_status_route()
@@ -414,4 +437,3 @@ _install_provider_route_classification_probe_route()
 _install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
-
