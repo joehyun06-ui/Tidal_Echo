@@ -21,8 +21,8 @@ class WebProviderCapabilitiesContractTests(unittest.TestCase):
                 "default_provider": "api",
                 "provider_immutable": True,
                 "providers": {
-                    "api": {"create": True},
-                    "codex": {"create": False, "text_only": True},
+                    "api": {"create": True, "message_fork": True},
+                    "codex": {"create": False, "text_only": True, "message_fork": False},
                 },
             },
         })
@@ -267,3 +267,4 @@ class P3ProviderCapabilitiesRelayTests(NoNetworkMixin, unittest.IsolatedAsyncioT
 
 if __name__ == "__main__":
     unittest.main()
+

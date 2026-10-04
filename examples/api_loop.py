@@ -601,6 +601,8 @@ def _chat_completion_body(
         body["temperature"] = TEMPERATURE if temperature is None else temperature
         body["max_tokens"] = resolved_max_tokens
     body["stream"] = stream
+    if stream and deployment_config.parse_strict_bool(os.environ.get("LOOP_STREAM_INCLUDE_USAGE", "1"), "invalid_loop_stream_include_usage"):
+        body["stream_options"] = {"include_usage": True}
     return body
 
 
@@ -1372,3 +1374,4 @@ _provider_settings.install_loop(app, sys.modules[__name__])
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=LOOP_PORT, access_log=False)
+

@@ -274,4 +274,8 @@ async def loop_ingest(request: Request):
     return result
 
 
+from backend import web_session_fork_routes
+web_session_fork_routes.install(app, legacy, AUTHORITY, _SESSION_LOCK)
+
 app.mount("/", legacy.app)
+

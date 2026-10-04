@@ -57,6 +57,7 @@ class ApiLoopGpt56PayloadCompatTests(unittest.TestCase):
             self.messages,
             stream=True,
         )
+        self.assertEqual(body["stream_options"], {"include_usage": True})
         self.assertEqual(body["stream"], True)
         self.assertEqual(body["max_completion_tokens"], 2000)
         self.assertNotIn("max_tokens", body)
@@ -91,6 +92,10 @@ class ApiLoopGpt56PayloadCompatTests(unittest.TestCase):
         })
         self.assertNotIn("max_completion_tokens", body)
 
+    def test_stream_usage_can_be_disabled_for_nonconforming_providers(self):
+        with mock.patch.dict(os.environ, {"LOOP_STREAM_INCLUDE_USAGE": "false"}):
+            self.assertNotIn("stream_options", self.module._chat_completion_body({"model":"legacy-model"}, self.messages, stream=True))
+
     def test_only_exact_gpt56_sol_target_gets_compatibility_payload(self):
         body = self.module._chat_completion_body(
             {"model": "gpt-5.6-sol-preview"},
@@ -104,3 +109,4 @@ class ApiLoopGpt56PayloadCompatTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
