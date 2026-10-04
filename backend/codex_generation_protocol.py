@@ -37,6 +37,7 @@ GENERATION_RPC_METHODS = frozenset({
     "model/list",
     "thread/start",
     "thread/resume",
+    "thread/fork",
     "thread/unsubscribe",
     "turn/start",
     "turn/interrupt",
@@ -483,6 +484,34 @@ class CodexGenerationProtocol:
             reasoning_effort=selection.reasoning_effort,
             cwd=cwd,
         )
+
+    async def fork_thread(
+        self, *, thread_id: str, last_turn_id: str, api_session: str,
+        attempt_id: str, model: str, model_provider: str,
+        reasoning_effort: str | None, persona: str,
+    ) -> ThreadStartResult:
+        """Copy a completed native prefix without starting a model turn."""
+        if not isinstance(persona, str) or not persona.strip() or len(persona) > 131_072:
+            raise CodexGenerationError("codex_generation_persona_invalid")
+        model = _safe_model(model)
+        model_provider = _safe_provider(model_provider)
+        cwd = deterministic_workspace(self.config.workspace_root, api_session, attempt_id)
+        params = {
+            "threadId": _safe_id(thread_id, "codex_generation_thread_invalid"),
+            "lastTurnId": _safe_id(last_turn_id, "codex_generation_turn_invalid"),
+            "model": model, "modelProvider": model_provider, "cwd": str(cwd),
+            "baseInstructions": persona, "ephemeral": False, "excludeTurns": True,
+        }
+        if reasoning_effort is not None:
+            params["config"] = {"model_reasoning_effort": reasoning_effort}
+        raw = _mapping(await self._request("thread/fork", params), "codex_generation_fork_failed")
+        thread = _mapping(raw.get("thread"), "codex_generation_fork_failed")
+        fork_id = _safe_id(thread.get("id"), "codex_generation_fork_failed")
+        if (fork_id == thread_id or thread.get("ephemeral") is not False
+                or thread.get("historyMode") != "paginated" or raw.get("model") != model
+                or raw.get("modelProvider") != model_provider or raw.get("cwd") != str(cwd)):
+            raise CodexGenerationError("codex_generation_thread_contract_mismatch")
+        return ThreadStartResult(fork_id, model, model_provider, reasoning_effort, cwd)
 
     async def resume_thread(
         self,

@@ -264,6 +264,17 @@ class ControlTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("PRIVATE-BALANCE-SENTINEL", serialized)
         self.assertNotIn('"credits"', serialized)
 
+    async def test_secondary_weekly_window_is_projected_without_private_fields(self):
+        result = control.sanitize_rate_limits({"rateLimits": {
+            "limitId": "codex", "primary": {"usedPercent": 12, "windowDurationMins": 300},
+            "secondary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1900000000, "secret": "do-not-project"}}})
+        row = result["rate_limits"][0]
+        self.assertEqual(row["used_percent"], 12)
+        self.assertEqual(row["windows"][1], {"window":"secondary", "used_percent":61, "window_duration_mins":10080, "resets_at":1900000000})
+        self.assertNotIn("do-not-project", json.dumps(result))
+        with self.assertRaises(ValueError):
+            control.sanitize_rate_limits({"rateLimits":{"secondary":{"usedPercent":float("nan")}}})
+
     async def test_usage_is_bounded_and_drops_unknown_fields(self):
         result = await self.make_control().usage()
         self.assertEqual(result["lifetime_tokens"], 1234)
@@ -533,3 +544,4 @@ class ControlTestCase(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

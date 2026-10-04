@@ -36,6 +36,7 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
             "account/read": "GetAccountParams", "model/list": "ModelListParams",
             "config/read": "ConfigReadParams", "thread/start": "ThreadStartParams",
             "thread/resume": "ThreadResumeParams", "turn/start": "TurnStartParams",
+            "thread/fork": "ThreadForkParams",
             "turn/interrupt": "TurnInterruptParams", "thread/unsubscribe": "ThreadUnsubscribeParams",
         }
         calls = []
@@ -49,8 +50,8 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
                 if method == "account/read": return {"account": {"type":"chatgpt"}}
                 if method == "model/list": return {"data":[{"model":"fixture-model", "isDefault":True, "defaultReasoningEffort":"adaptive", "supportedReasoningEfforts":[{"reasoningEffort":"adaptive"}]}]}
                 if method == "config/read": return {"config":{"mcp_servers":{"fixture":{"command":"never-launched"}}}}
-                if method in {"thread/start", "thread/resume"}:
-                    return {"thread":{"id":"thr-fixture", "ephemeral":False, "historyMode":"paginated"}, "model":params["model"], "modelProvider":"openai", "cwd":params["cwd"], "sandbox":{"type":"readOnly"}, "approvalPolicy":"never", "initialTurnsPage":{"data":[]}}
+                if method in {"thread/start", "thread/resume", "thread/fork"}:
+                    return {"thread":{"id":"thr-fork" if method == "thread/fork" else "thr-fixture", "ephemeral":False, "historyMode":"paginated"}, "model":params["model"], "modelProvider":"openai", "cwd":params["cwd"], "sandbox":{"type":"readOnly"}, "approvalPolicy":"never", "initialTurnsPage":{"data":[]}}
                 if method == "turn/start": return {"turn":{"id":"turn-fixture", "status":"inProgress"}}
                 return {}
         transport = CodexGenerationHardeningTransport(Transport())
@@ -62,8 +63,10 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
         await protocol.start_turn(thread_id=thread.thread_id, client_message_id="msg-fixture", text="schema test only", model=thread.model, reasoning_effort="adaptive")
         await protocol.interrupt(thread_id=thread.thread_id, turn_id="turn-fixture")
         await protocol.unsubscribe(thread_id=thread.thread_id)
+        fork = await protocol.fork_thread(thread_id=thread.thread_id, last_turn_id="turn-fixture", api_session="fork-fixture", attempt_id="fork-fixture", model=thread.model, model_provider=thread.model_provider, reasoning_effort="adaptive", persona="test")
+        self.assertEqual(fork.thread_id, "thr-fork")
         for method, params in calls:
-            if method in {"thread/start", "thread/resume"}:
+            if method in {"thread/start", "thread/resume", "thread/fork"}:
                 self.assertEqual(params["config"]["model_reasoning_effort"], "adaptive")
                 self.assertEqual(params["config"]["default_permissions"], ":read-only")
                 self.assertEqual(params["config"]["cloud.skills.enabled"], False)

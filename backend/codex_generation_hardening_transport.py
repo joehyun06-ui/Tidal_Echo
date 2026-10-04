@@ -86,7 +86,7 @@ class CodexGenerationHardeningTransport:
         self._transport = transport
 
     async def request(self, method: str, params: Mapping[str, object]) -> object:
-        if method not in {"thread/start", "thread/resume"}:
+        if method not in {"thread/start", "thread/resume", "thread/fork"}:
             return await self._transport.request(method, params)
         rewritten = dict(params)
         cwd = rewritten.get("cwd")
@@ -130,7 +130,8 @@ class CodexGenerationHardeningTransport:
             name: {"enabled": False} for name in sorted(mcp_names)
         }
         rewritten["config"] = hardened
-        rewritten["runtimeWorkspaceRoots"] = []
+        if method != "thread/fork":
+            rewritten["runtimeWorkspaceRoots"] = []
         rewritten["approvalPolicy"] = "never"
         rewritten.pop("permissions", None)
         rewritten["sandbox"] = "read-only"

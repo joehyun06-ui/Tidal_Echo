@@ -46,23 +46,27 @@ def _project_capabilities(payload: object) -> dict[str, object]:
         _raise()
     api = providers.get(API_PROVIDER)
     codex = providers.get(CODEX_PROVIDER)
-    if not isinstance(api, Mapping) or set(api) != {"create"} or api.get("create") is not True:
+    if not isinstance(api, Mapping) or set(api) - {"create", "message_fork"} or api.get("create") is not True:
         _raise()
     if (
         not isinstance(codex, Mapping)
-        or set(codex) != {"create", "text_only"}
+        or set(codex) - {"create", "text_only", "message_fork"}
         or type(codex.get("create")) is not bool
         or codex.get("text_only") is not True
     ):
         _raise()
+    for provider in (api, codex):
+        if "message_fork" in provider and type(provider["message_fork"]) is not bool:
+            _raise()
     return {
         "default_provider": API_PROVIDER,
         "provider_immutable": True,
         "providers": {
-            API_PROVIDER: {"create": True},
+            API_PROVIDER: {"create": True, **({"message_fork": api["message_fork"]} if "message_fork" in api else {})},
             CODEX_PROVIDER: {
                 "create": bool(codex["create"]),
                 "text_only": True,
+                **({"message_fork": codex["message_fork"]} if "message_fork" in codex else {}),
             },
         },
     }

@@ -396,6 +396,12 @@ def _install_session_delete_route() -> None:
     relay_app._P3_SESSION_DELETE_INSTALLED = True
 
 
+@app.post("/app/sessions/{session_id}/fork")
+async def app_sessions_fork(session_id: str, request: Request):
+    relay_app.check_auth(request)
+    encoded = urllib.parse.quote(session_id, safe="")
+    return relay_app.loop_json(f"/loop/sessions/{encoded}/fork", method="POST", body=await request.json())
+
 _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_index_refresh_status_route()
@@ -408,3 +414,4 @@ _install_provider_route_classification_probe_route()
 _install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
+

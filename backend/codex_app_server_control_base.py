@@ -250,6 +250,25 @@ def _project_rate_limit(value: object, fallback_id: str = "") -> dict[str, objec
             raise ValueError
         if number is not None:
             projected[output_name] = number
+    # Preserve both official windows without changing legacy flattened primary
+    # fields. A weekly window is identified by duration, never by its position.
+    if isinstance(value.get("secondary"), dict):
+        windows = []
+        for window_name in ("primary", "secondary"):
+            source = value.get(window_name)
+            if not isinstance(source, dict):
+                continue
+            item: dict[str, object] = {"window": window_name}
+            for output_name, names, maximum in numeric:
+                raw_number = _field(source, *names)
+                number = _bounded_number(raw_number, maximum=maximum)
+                if raw_number is not None and number is None:
+                    raise ValueError
+                if number is not None:
+                    item[output_name] = number
+            if len(item) > 1:
+                windows.append(item)
+        projected["windows"] = windows
     # RateLimitSnapshot.credits is an optional CreditsSnapshot object in the
     # pinned protocol.  P1 deliberately does not project that object or its
     # balance.  Earned reset credits are handled separately from
@@ -818,3 +837,4 @@ class CodexAppServerControl(CodexModelCatalogMixin):
             self._login_starting = False
             self._completed_login_id = ""
         return {"logged_out": True}
+
