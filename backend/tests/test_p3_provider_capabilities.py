@@ -102,6 +102,18 @@ class P3ProviderStatusProjectionTests(unittest.TestCase):
         self.assertIsNone(projected["active_session"])
         self.assertIsNone(projected["active_provider"])
 
+    def test_optional_message_fork_is_typed_and_legacy_capabilities_remain_valid(self):
+        caps = self.capabilities(codex=True)
+        state = {"active_session":"", "sessions":[]}
+        result = p3_provider_status.project_provider_status(state, caps)
+        self.assertTrue(result["web_sessions"]["providers"]["api"]["message_fork"])
+        for provider in caps["web_sessions"]["providers"].values():
+            provider.pop("message_fork")
+        p3_provider_status.project_provider_status(state, caps)
+        caps["web_sessions"]["providers"]["api"]["message_fork"] = "true"
+        with self.assertRaises(p3_provider_status.P3ProviderStatusError):
+            p3_provider_status.project_provider_status(state, caps)
+
     def test_inconsistent_or_malformed_authority_fails_closed(self):
         bad_states = [
             {"active_session": "missing", "sessions": []},
