@@ -61,9 +61,8 @@ def public_capabilities(
                 "codex": {
                     "create": codex_create,
                     "text_only": True,
-                    "message_fork": False,
+                    "message_fork": codex_create,
                 },
             },
         },
     }
-

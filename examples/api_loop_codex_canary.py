@@ -317,7 +317,6 @@ from backend import codex_session_model
 codex_session_model.install(app, legacy, RUNTIME, INTEGRATION)
 
 from backend import web_session_fork_routes
-web_session_fork_routes.install(app, legacy, INTEGRATION.session_authority, INTEGRATION._session_lock)
+web_session_fork_routes.install(app, legacy, INTEGRATION.session_authority, INTEGRATION._session_lock, runtime=RUNTIME)
 
 app.mount("/", legacy.app)
-

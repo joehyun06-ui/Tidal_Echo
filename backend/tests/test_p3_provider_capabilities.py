@@ -48,6 +48,7 @@ class WebProviderCapabilitiesContractTests(unittest.TestCase):
             {name: "true" for name in names}
         )
         self.assertTrue(enabled["web_sessions"]["providers"]["codex"]["create"])
+        self.assertTrue(enabled["web_sessions"]["providers"]["codex"]["message_fork"])
 
     def test_every_gate_is_validated_even_when_codex_is_already_disabled(self):
         for name in (
@@ -279,4 +280,3 @@ class P3ProviderCapabilitiesRelayTests(NoNetworkMixin, unittest.IsolatedAsyncioT
 
 if __name__ == "__main__":
     unittest.main()
-

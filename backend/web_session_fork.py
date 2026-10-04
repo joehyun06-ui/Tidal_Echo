@@ -1,8 +1,8 @@
 """Immutable API conversation versions; copying history never runs inference.
 
 Use the same session-authority lock as create/rename/delete. A durable request
-receipt prevents transport replays from copying a second history. Codex forks
-are deliberately unavailable until app-server thread/fork is integrated.
+receipt prevents transport replays from copying a second history. The route sends
+Codex sources to web_codex_fork instead of copying them into an API session.
 """
 from __future__ import annotations
 
@@ -99,4 +99,3 @@ def fork_conversation(authority, session_id: str, body: object, *, relay_db: str
                 conn.execute("DELETE FROM web_session_forks WHERE target=?", (target,))
             raise
     return {"ok": True, "created": new, "duplicate": False}
-
