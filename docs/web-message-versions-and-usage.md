@@ -19,3 +19,15 @@ Validation includes isolated SQLite prefix copies, replays/conflicts, original p
 Primary protocol sources (checked 2026-10-04):
 - https://developers.openai.com/codex/app-server
 - https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+
+## Same-conversation alternatives (2026-10-04)
+
+`POST /app/sessions/:id/versions` accepts the same UUID/message/mode body, limited to `edit` and `regenerate`. It reserves a durable relationship before using the existing provider-native fork, then returns the new physical context plus `version`. Only `/fork` creates a new visible conversation. The new UI groups alternatives under a stable root title/row; it never switches provider or appends an old answer to a fresh generation's context.
+
+`GET /app/conversation-versions` returns published `versions` (root, parent, selected message and canonical question/answer keys) and persisted `selections`. `POST /app/sessions/:root/version-selection {version_id}` selects an existing member without inference. Prior answers and their subsequent messages remain in their own contexts. Relationships and selection survive reloads/server restarts; reserved but unpublished versions are omitted. Published copies recover their metadata after interrupted publication.
+
+Copied prefixes inside a conversation carry `version_copy`, `version_key`, and optional `version_usage` for historical display. They do not create usage jobs or new charges. Explicit branch copies keep the original historical-copy label. Both provider capabilities advertise `message_versions` with the same Codex gates as native forks.
+
+`DELETE /app/conversations/:root` removes all internal versions and the root, preserving separately created branches and saved memories. Codex deletion preflights all jobs before retirement; root is deleted last so interrupted cleanup can be retried. The response extends the existing deletion receipt with `deleted_ids`. The new UI validates the receipt before clearing local version history/drafts. Existing single-session endpoints remain compatible.
+
+The frontend uses one-click regeneration, editable prompt confirmation, and per-message previous/next controls. Switching versions sends no generation request. If creation/sending has an uncertain result it never retries automatically; pending versions retain navigation back to the prior answer.

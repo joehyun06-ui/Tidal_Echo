@@ -21,8 +21,8 @@ class WebProviderCapabilitiesContractTests(unittest.TestCase):
                 "default_provider": "api",
                 "provider_immutable": True,
                 "providers": {
-                    "api": {"create": True, "message_fork": True},
-                    "codex": {"create": False, "text_only": True, "message_fork": False},
+                    "api": {"create": True, "message_fork": True, "message_versions": True},
+                    "codex": {"create": False, "text_only": True, "message_fork": False, "message_versions": False},
                 },
             },
         })

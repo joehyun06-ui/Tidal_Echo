@@ -57,11 +57,12 @@ def public_capabilities(
             "default_provider": "api",
             "provider_immutable": True,
             "providers": {
-                "api": {"create": True, "message_fork": True},
+                "api": {"create": True, "message_fork": True, "message_versions": True},
                 "codex": {
                     "create": codex_create,
                     "text_only": True,
                     "message_fork": codex_create,
+                    "message_versions": codex_create,
                 },
             },
         },

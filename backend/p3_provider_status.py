@@ -46,27 +46,28 @@ def _project_capabilities(payload: object) -> dict[str, object]:
         _raise()
     api = providers.get(API_PROVIDER)
     codex = providers.get(CODEX_PROVIDER)
-    if not isinstance(api, Mapping) or set(api) - {"create", "message_fork"} or api.get("create") is not True:
+    if not isinstance(api, Mapping) or set(api) - {"create", "message_fork", "message_versions"} or api.get("create") is not True:
         _raise()
     if (
         not isinstance(codex, Mapping)
-        or set(codex) - {"create", "text_only", "message_fork"}
+        or set(codex) - {"create", "text_only", "message_fork", "message_versions"}
         or type(codex.get("create")) is not bool
         or codex.get("text_only") is not True
     ):
         _raise()
     for provider in (api, codex):
-        if "message_fork" in provider and type(provider["message_fork"]) is not bool:
-            _raise()
+        for key in ("message_fork", "message_versions"):
+            if key in provider and type(provider[key]) is not bool:
+                _raise()
     return {
         "default_provider": API_PROVIDER,
         "provider_immutable": True,
         "providers": {
-            API_PROVIDER: {"create": True, **({"message_fork": api["message_fork"]} if "message_fork" in api else {})},
+            API_PROVIDER: {"create": True, **{key: api[key] for key in ("message_fork", "message_versions") if key in api}},
             CODEX_PROVIDER: {
                 "create": bool(codex["create"]),
                 "text_only": True,
-                **({"message_fork": codex["message_fork"]} if "message_fork" in codex else {}),
+                **{key: codex[key] for key in ("message_fork", "message_versions") if key in codex},
             },
         },
     }
