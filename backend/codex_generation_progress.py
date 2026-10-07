@@ -98,12 +98,12 @@ class ReplyProgress:
 
 def valid_snapshot(body):
     return (
-        isinstance(body, dict) and body.get("provider") == "codex"
+        isinstance(body, dict) and body.get("provider") in {"codex", "api"}
         and all(safe_id(body.get(key)) for key in ("api_session", "generation_id", "stream_id", "epoch"))
         and body["stream_id"] == body["generation_id"]
         and isinstance(body.get("canonical_message_id"), int) and not isinstance(body["canonical_message_id"], bool)
         and 0 < body["canonical_message_id"] < 2**53
-        and body["generation_id"] == f"codex-gen-{body['canonical_message_id']}"
+        and body["generation_id"] == f"{body['provider']}-gen-{body['canonical_message_id']}"
         and isinstance(body.get("revision"), int) and not isinstance(body["revision"], bool)
         and 0 < body["revision"] < 2**53
         and isinstance(body.get("text"), str) and len(body["text"]) <= MAX_ASSISTANT_TEXT_CHARS

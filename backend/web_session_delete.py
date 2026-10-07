@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import codex_generation_store, web_session_provider_authority
+from . import api_web_generation
 
 
 LEGACY_SESSION_ID = "__legacy__"
@@ -257,6 +258,10 @@ def purge_messages(
     conn = _connect_relay(relay_db)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        try:
+            api_web_generation.assert_idle(conn, session_id, deleting=True)
+        except api_web_generation.ApiGenerationError:
+            _raise(DELETE_JOB_ACTIVE)
         rows = _target_messages(conn, session_id)
         ids = [int(row["id"]) for row in rows]
         candidates: set[str] = set()

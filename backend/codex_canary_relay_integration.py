@@ -81,16 +81,20 @@ def _queued_ack(payload: object, *, msg: Mapping[str, object]) -> dict | None:
     meta = msg.get("meta") or {}
     expected_session = str(meta.get("api_session") or "") if isinstance(meta, dict) else ""
     canonical_id = msg.get("id")
+    # API jobs are reserved beside canonical Web input before this dispatch.
+    provider = "codex"
+    if isinstance(meta, dict) and meta.get("api_generation_id") == f"api-gen-{canonical_id}":
+        provider = "api"
     expected_generation_id = (
-        f"codex-gen-{canonical_id}"
+        f"{provider}-gen-{canonical_id}"
         if isinstance(canonical_id, int) and not isinstance(canonical_id, bool) and canonical_id > 0
         else ""
     )
     if (
         not expected_generation_id
         or payload.get("ok") is not True
-        or payload.get("provider") != "codex"
-        or payload.get("generation_provider") != "codex"
+        or payload.get("provider") != provider
+        or payload.get("generation_provider") != provider
         or payload.get("status") != "queued"
         or str(payload.get("api_session") or "") != expected_session
         or payload.get("canonical_message_id") != canonical_id
