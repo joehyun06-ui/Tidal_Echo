@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
+import os
 import sqlite3
+import stat
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 TERMINAL = {"completed", "interrupted", "failed"}
 MAX_TEXT = 64000
@@ -21,6 +26,28 @@ class ApiGenerationError(RuntimeError):
 
 def stamp(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat() if value else None
+
+
+def input_messages(legacy, sid, mid, text):
+    """Keep the original context builder; fill only the current Web image parts."""
+    from .codex_generation_images import load_image_web_message, ImageMessageInput, MAX_IMAGE_BYTES
+    value = load_image_web_message(legacy.RELAY_DB, canonical_message_id=mid, api_session=sid,
+        upload_dir=Path(os.environ.get('RELAY_UPLOAD_DIR') or Path(__file__).parent / 'uploads'), expected_text=text)
+    messages = legacy.build_ingest_messages(text, msg_id=mid, session_id=sid)
+    if isinstance(value, ImageMessageInput):
+        parts = [{'type':'text','text':text}] if text else []
+        for image in value.images:
+            fd = os.open(image.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size != image.size:
+                    raise ApiGenerationError('api_image_unavailable')
+                data = handle.read(MAX_IMAGE_BYTES + 1)
+            if len(data) != image.size or hashlib.sha256(data).hexdigest() != image.sha256:
+                raise ApiGenerationError('api_image_unavailable')
+            parts.append({'type':'image_url','image_url':{'url':f'data:{image.mime};base64,'+base64.b64encode(data).decode('ascii')}})
+        messages[-1] = {'role':'user','content':parts}
+    return messages
 
 
 class Store:
@@ -245,7 +272,7 @@ class ApiWebRuntime:
             if not job or job["status"] != "running" or self.closing:
                 self.store.finish(sid, mid, status="interrupted" if not self.closing else "failed", error="api_process_restarted" if self.closing else None)
                 return
-            messages = self.legacy.build_ingest_messages(text, msg_id=mid, session_id=sid)
+            messages = input_messages(self.legacy, sid, mid, text)
             task = asyncio.create_task(self.legacy.run_model(messages, stream_id=gid, session_id=sid,
                 emit_stream=True, progress_sink=sink, on_route=lambda route: self.store.route(mid, route.get('model'))))
             self.providers[mid] = task

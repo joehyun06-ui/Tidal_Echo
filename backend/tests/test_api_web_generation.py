@@ -1,12 +1,13 @@
 """Isolated API Web cancellation, durability and at-most-once generation checks."""
 import asyncio
+import base64
 import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from backend.api_web_generation import ApiWebRuntime, ApiGenerationError, Store, assert_idle
 
@@ -106,12 +107,20 @@ class ApiWebGenerationTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ApiGenerationError): await self.ingest(row)
 
     async def test_missing_final_usage_failure_and_image_only_input(self):
+        uploads = self.path.parent / 'uploads'; uploads.mkdir()
+        image = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGO4t/3YtrMHGCAUAEEWCT3AjKoyAAAAAElFTkSuQmCC')
+        (uploads / 'att-abcdefghijklmn.png').write_bytes(image)
+        with patch.dict('os.environ', {'RELAY_UPLOAD_DIR':str(uploads)}):
+            await self._image_failure(image)
+
+    async def _image_failure(self, image):
         async def failure(messages, **kwargs):
-            self.assertEqual(messages[-1]['content'],'')
+            self.assertEqual(len(messages[-1]['content']),1)
+            self.assertEqual(base64.b64decode(messages[-1]['content'][0]['image_url']['url'].split(',')[1]),image)
             await kwargs['progress_sink']('部分内容')
             return {'outcome':'dispatch_uncertain','error':'private upstream exception'}
         self.legacy.run_model = failure
-        row = self.accept(text='',attachments=[{'kind':'image','url':'/uploads/fixture.png'}])
+        row = self.accept(text='',attachments=[{'kind':'image','url':'/uploads/att-abcdefghijklmn.png','mime':'image/png','size':len(image)}])
         await self.ingest(row); await self.drain()
         state = self.runtime.status('a'); self.assertEqual(state['generation']['status'],'failed')
         self.assertNotIn('private',json.dumps(state))

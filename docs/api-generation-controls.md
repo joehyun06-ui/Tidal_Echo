@@ -21,6 +21,14 @@ Only one active run per session and 32 across sessions may be admitted. Internal
 ingest is conditional and idempotent. The canonical text, session and provenance
 are checked before a task starts; image-only input remains valid.
 
+The former API context builder dropped attachments. The controlled Web path now
+validates the current canonical upload using the existing local-image validator,
+then sends its bounded bytes as a data URL (Chat `image_url`, Responses
+`input_image`). No relay token, filesystem path or remote fetch reaches the model.
+Missing/changed/invalid uploads fail rather than silently generating text-only.
+Historical image re-attachment is not added. Protocol:
+https://developers.openai.com/api/docs/guides/images-vision
+
 Queued cancellation prevents provider dispatch. Running cancellation cancels the
 specific asyncio provider task and exits its existing HTTPX stream context.
 `stopping` is an ACK, not completion. Partial public text is persisted once after

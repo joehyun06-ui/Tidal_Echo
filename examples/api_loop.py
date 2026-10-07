@@ -620,7 +620,10 @@ def _responses_body(
     resolved_max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
     return {
         "model": route["model"],
-        "input": messages,
+        "input": [{**m, "content": [
+            {"type": "input_image", "image_url": part["image_url"]["url"]} if part.get("type") == "image_url"
+            else {"type": "input_text", "text": part["text"]} if part.get("type") == "text" else part
+            for part in m["content"]]} if isinstance(m.get("content"), list) else m for m in messages],
         "max_output_tokens": resolved_max_tokens,
         "stream": stream,
         "store": False,
