@@ -39,6 +39,7 @@ RUNTIME = StreamingCodexGenerationRuntime(
     persona_loader=lambda: legacy.PERSONA,
     completion_callback=build_completion_callback(legacy),
     progress_callback=build_progress_callback(legacy),
+    upload_dir=Path(os.environ.get("RELAY_UPLOAD_DIR") or Path(__file__).resolve().parents[1] / "backend" / "uploads"),
 )
 INTEGRATION = FailClosedCodexCanaryLoopIntegration(legacy, RUNTIME)
 INTEGRATION.install_legacy_globals()

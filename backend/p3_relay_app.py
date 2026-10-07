@@ -165,6 +165,8 @@ def _install_capability_route() -> None:
             if getattr(relay_app, "_CODEX_GENERATION_CONTROLS_INSTALLED", False):
                 codex = payload["web_sessions"]["providers"]["codex"]
                 codex["generation_controls"] = codex["create"]
+                codex["image_input"] = codex["create"]
+                codex["text_only"] = not codex["create"]
             return payload
         except web_provider_capabilities.WebProviderCapabilitiesError as error:
             return JSONResponse(

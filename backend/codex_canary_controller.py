@@ -16,6 +16,7 @@ from typing import Mapping
 from . import codex_canary_ingress
 from . import codex_generation_provider_binding as provider_binding
 from . import codex_generation_store as store
+from .codex_generation_images import load_image_web_message
 from .codex_generation_protocol import CodexGenerationProtocol, input_digest
 
 
@@ -50,11 +51,13 @@ class CodexCanaryController:
         relay_db: str | Path,
         protocol: CodexGenerationProtocol,
         persona_loader,
+        upload_dir: str | Path | None = None,
     ) -> None:
         self.store_path = Path(store_path)
         self.relay_db = Path(relay_db)
         self.protocol = protocol
         self.persona_loader = persona_loader
+        self.upload_dir = Path(upload_dir) if upload_dir is not None else None
 
     async def pin_session(self, api_session: str) -> Mapping[str, object]:
         persona = self.persona_loader()
@@ -139,15 +142,21 @@ class CodexCanaryController:
             raise CodexCanaryControllerError("codex_canary_session_unavailable")
         try:
             codex_canary_ingress.require_continuity_empty(continuity_status)
-            digest = input_digest(ingress_text)
-            canonical_text = codex_canary_ingress.load_text_only_web_message(
-                self.relay_db,
-                canonical_message_id=canonical_message_id,
-                api_session=api_session,
-                expected_digest=digest,
-            )
-            if canonical_text != ingress_text:
-                raise CodexCanaryControllerError("codex_canary_input_contract_changed")
+            if self.upload_dir is not None:
+                canonical_input = load_image_web_message(
+                    self.relay_db, canonical_message_id=canonical_message_id,
+                    api_session=api_session, upload_dir=self.upload_dir,
+                    expected_text=ingress_text,
+                )
+                digest = input_digest(canonical_input)
+            else:
+                digest = input_digest(ingress_text)
+                canonical_text = codex_canary_ingress.load_text_only_web_message(
+                    self.relay_db, canonical_message_id=canonical_message_id,
+                    api_session=api_session, expected_digest=digest,
+                )
+                if canonical_text != ingress_text:
+                    raise CodexCanaryControllerError("codex_canary_input_contract_changed")
             generation_id, client_message_id, callback_identity = _stable_ids(
                 canonical_message_id
             )

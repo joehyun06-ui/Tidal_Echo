@@ -15,6 +15,7 @@ from backend.codex_generation_protocol import CodexGenerationConfig, CodexGenera
 from backend.codex_model_catalog import read_models
 from backend.codex_app_server_shared_transport import CodexSharedAppServerRuntime, CodexSharedTransportConfig
 from backend.codex_generation_progress import ReplyProgress
+from backend.codex_generation_images import ImageInput, ImageMessageInput
 
 
 class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
@@ -76,6 +77,10 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
         thread = await protocol.start_thread(api_session="api-fixture", attempt_id="attempt-fixture", persona="test")
         await protocol.resume_thread(thread_id=thread.thread_id, model=thread.model, model_provider=thread.model_provider, reasoning_effort="adaptive", cwd=thread.cwd, persona="test")
         await protocol.start_turn(thread_id=thread.thread_id, client_message_id="msg-fixture", text="schema test only", model=thread.model, reasoning_effort="adaptive")
+        for caption in ("", "look at this image"):
+            image = ImageInput(self.root / "upload.png", "a" * 64, "image/png", 128)
+            await protocol.start_turn(thread_id=thread.thread_id, client_message_id="msg-image", text=ImageMessageInput(caption, (image,)), model=thread.model, reasoning_effort="adaptive")
+            self.assertEqual(calls[-1][1]["input"][-1], {"type":"localImage", "path":str(image.path)})
         await protocol.interrupt(thread_id=thread.thread_id, turn_id="turn-fixture")
         await protocol.unsubscribe(thread_id=thread.thread_id)
         fork = await protocol.fork_thread(thread_id=thread.thread_id, last_turn_id="turn-fixture", api_session="fork-fixture", attempt_id="fork-fixture", model=thread.model, model_provider=thread.model_provider, reasoning_effort="adaptive", persona="test")
