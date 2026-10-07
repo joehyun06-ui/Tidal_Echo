@@ -99,6 +99,7 @@ def complete_codex_web_generation(
     text: str,
     ts: str,
     usage: dict[str, int] | None = None,
+    finish_reason: str = "completed",
     timeout_seconds: float = 30.0,
 ) -> dict:
     callback_identity = _safe_id(callback_identity, "codex_web_callback_identity_invalid")
@@ -106,6 +107,8 @@ def complete_codex_web_generation(
     client_message_id = _safe_id(client_message_id, "codex_web_client_message_id_invalid")
     api_session = _safe_id(api_session, "codex_web_session_invalid")
     reply_to = _safe_reply_to(reply_to)
+    if finish_reason not in {"completed", "interrupted"}:
+        raise CodexWebCompletionError("codex_web_completion_status_invalid")
     if not isinstance(text, str) or not text or len(text) > MAX_TEXT_CHARS:
         raise CodexWebCompletionError("codex_web_completion_text_invalid")
     if not isinstance(ts, str) or not ts or len(ts) > 64:
@@ -127,6 +130,8 @@ def complete_codex_web_generation(
         "api_session": api_session,
         "reply_to": reply_to,
         "generation_id": generation_id,
+        "stream_id": generation_id,
+        "finish_reason": finish_reason,
         "client_message_id": client_message_id,
         "codex_callback_identity": callback_identity,
     }
@@ -163,6 +168,7 @@ def complete_codex_web_generation(
                 }
                 if (
                     existing["text"] != text
+                    or existing_meta.get("finish_reason", "completed") != finish_reason
                     or any(existing_meta.get(key) != value for key, value in expected.items())
                 ):
                     conn.execute("ROLLBACK")

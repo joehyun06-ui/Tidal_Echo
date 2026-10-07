@@ -20,9 +20,8 @@ from backend.codex_canary_loop_integration import (
     build_completion_callback,
 )
 from backend.codex_generation_live_reliability import FailClosedCodexCanaryLoopIntegration
-from backend.codex_generation_subscription_reliability import (
-    ResubscribingCodexGenerationRuntime,
-)
+from backend.codex_generation_streaming import StreamingCodexGenerationRuntime, build_progress_callback
+from backend.codex_generation_routes import install_loop as install_generation_routes
 from backend.codex_generation_runtime_config import load_generation_runtime_config
 from examples import api_loop as legacy
 
@@ -33,12 +32,13 @@ GENERATION_CONFIG = load_generation_runtime_config(
     persistent_root=PERSISTENT_ROOT,
     relay_db=Path(legacy.RELAY_DB),
 )
-RUNTIME = ResubscribingCodexGenerationRuntime(
+RUNTIME = StreamingCodexGenerationRuntime(
     control_config=legacy.CODEX_CONTROL_CONFIG,
     generation_config=GENERATION_CONFIG,
     relay_db=legacy.RELAY_DB,
     persona_loader=lambda: legacy.PERSONA,
     completion_callback=build_completion_callback(legacy),
+    progress_callback=build_progress_callback(legacy),
 )
 INTEGRATION = FailClosedCodexCanaryLoopIntegration(legacy, RUNTIME)
 INTEGRATION.install_legacy_globals()
@@ -81,6 +81,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+install_generation_routes(app, legacy, INTEGRATION, RUNTIME)
 
 
 def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:

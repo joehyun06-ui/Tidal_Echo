@@ -14,6 +14,7 @@ from backend.codex_generation_hardening_transport import CodexGenerationHardenin
 from backend.codex_generation_protocol import CodexGenerationConfig, CodexGenerationProtocol
 from backend.codex_model_catalog import read_models
 from backend.codex_app_server_shared_transport import CodexSharedAppServerRuntime, CodexSharedTransportConfig
+from backend.codex_generation_progress import ReplyProgress
 
 
 class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
@@ -28,6 +29,20 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
 
     def schema(self, name):
         return json.loads((self.schema_dir / "v2" / (name + ".json")).read_text())
+
+    async def test_reply_projection_accepts_real_cli_notification_schemas(self):
+        progress = ReplyProgress()
+        context = {"threadId": "thr-fixture", "turnId": "turn-fixture"}
+        events = [
+            ("item/started", "ItemStartedNotification", {**context, "startedAtMs": 1, "item": {"type": "agentMessage", "id": "a1", "text": "", "phase": "final_answer"}}),
+            ("item/agentMessage/delta", "AgentMessageDeltaNotification", {**context, "itemId": "a1", "delta": "哈哈"}),
+            ("item/completed", "ItemCompletedNotification", {**context, "completedAtMs": 2, "item": {"type": "agentMessage", "id": "a1", "text": "哈哈，完成", "phase": "final_answer"}}),
+        ]
+        for method, schema_name, payload in events:
+            Draft7Validator(self.schema(schema_name)).validate(payload)
+            progress.receive(method, payload)
+        snapshot = progress.snapshot({"thread_id": "thr-fixture", "turn_id": "turn-fixture", "api_session": "a", "generation_id": "codex-gen-1", "canonical_message_id": 1, "created_at": "2026-10-07T00:00:00Z"})
+        self.assertEqual(snapshot["text"], "哈哈，完成")
 
     async def test_pinned_binary_and_emitted_generation_requests(self):
         self.assertEqual(importlib.metadata.version("openai-codex"), "0.160.0")

@@ -642,12 +642,13 @@ def record_reconciled_turn(
     job_id: int,
     turn_id: str,
     status: str,
+    deliver_partial: bool = False,
 ) -> dict:
     turn_id = _safe_id(turn_id, "codex_generation_turn_invalid")
     if status not in {"inProgress", "completed", "failed", "interrupted"}:
         raise CodexGenerationStoreError("codex_generation_turn_status_invalid")
     target = "in_progress" if status == "inProgress" else (
-        "callback_pending" if status == "completed" else "failed"
+        "callback_pending" if status == "completed" or (status == "interrupted" and deliver_partial) else "failed"
     )
     error = None if status in {"inProgress", "completed"} else (
         "codex_turn_interrupted" if status == "interrupted" else "codex_turn_failed"
@@ -754,7 +755,8 @@ def mark_completed(
             conn.execute(
                 """UPDATE codex_generation_jobs
                    SET status='completed',assistant_message_id=?,lease_until=NULL,
-                       error_category=NULL,updated_at=? WHERE id=?""",
+                       error_category=CASE WHEN error_category='codex_turn_interrupted'
+                         THEN error_category ELSE NULL END,updated_at=? WHERE id=?""",
                 (assistant_message_id, stamp, job_id),
             )
         else:

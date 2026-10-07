@@ -9,8 +9,10 @@ and other P3 relay behavior remain owned by ``backend.p3_relay_app``.
 from __future__ import annotations
 
 from backend import codex_canary_relay_integration
+from backend.codex_generation_routes import install_relay as install_generation_routes
 from backend import p3_relay_app as bridge
 
 
 codex_canary_relay_integration.install(bridge.relay_app)
+install_generation_routes(bridge.relay_app)
 app = bridge.app
