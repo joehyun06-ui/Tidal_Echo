@@ -166,6 +166,13 @@ def delete_versions(authority, root_id, *, relay_db, upload_dir=None, codex_stor
     ids.append(root_id)
     live = [r for sid in ids if (r := authority.row_for_session(sid))]
     native = [r for r in live if r['provider'] == 'codex']
+    from .api_web_generation import assert_idle, ApiGenerationError
+    with closing(connect(relay_db)) as conn:
+        try:
+            for row in live:
+                if row['provider'] == 'api': assert_idle(conn, row['id'])
+        except ApiGenerationError:
+            raise ForkError('web_session_delete_job_active') from None
     if native:
         if not codex_store:
             raise ForkError('codex_generation_unavailable')

@@ -238,6 +238,12 @@ class CodexCanaryLoopIntegration:
         return "applied"
 
     async def _legacy_ingest(self, body: Mapping[str, object]):
+        api_runtime = getattr(self, "api_generations", None)
+        if api_runtime is not None and not body.get("dry") and not body.get("channel"):
+            sid = str(body.get("session_id") or body.get("api_session") or "")
+            mid = body.get("id")
+            if isinstance(mid, int) and not isinstance(mid, bool) and api_runtime.store.get(sid, mid):
+                return await api_runtime.ingest(body)
         text = str(body.get("text") or body.get("message") or "").strip()
         if not text:
             raise CodexCanaryLoopIntegrationError("empty text", status_code=400)

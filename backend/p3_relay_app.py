@@ -162,6 +162,9 @@ def _install_capability_route() -> None:
         relay_app.check_auth(request)
         try:
             payload = web_provider_capabilities.public_capabilities()
+            if getattr(relay_app, "_API_GENERATION_CONTROLS_INSTALLED", False):
+                payload["web_sessions"]["providers"]["api"]["generation_controls"] = relay_app.brain_target() == "loop"
+                payload["web_sessions"]["providers"]["api"]["steer"] = False
             if getattr(relay_app, "_CODEX_GENERATION_CONTROLS_INSTALLED", False):
                 codex = payload["web_sessions"]["providers"]["codex"]
                 codex["generation_controls"] = codex["create"]

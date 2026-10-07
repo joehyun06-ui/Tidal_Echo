@@ -620,7 +620,10 @@ def _responses_body(
     resolved_max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
     return {
         "model": route["model"],
-        "input": messages,
+        "input": [{**m, "content": [
+            {"type": "input_image", "image_url": part["image_url"]["url"]} if part.get("type") == "image_url"
+            else {"type": "input_text", "text": part["text"]} if part.get("type") == "text" else part
+            for part in m["content"]]} if isinstance(m.get("content"), list) else m for m in messages],
         "max_output_tokens": resolved_max_tokens,
         "stream": stream,
         "store": False,
@@ -936,15 +939,21 @@ async def _complete_provider(
 
 async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", session_id: str = "",
                     emit_stream: bool = False, allow_fallback: bool = True,
-                    temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
+                    temperature: float | None = None, max_tokens: int | None = None,
+                    progress_sink=None, on_route=None) -> dict[str, Any]:
     tried: list[str] = []
 
     async def execute() -> dict[str, Any]:
         for route in main_chain():
             tried.append(str(route.get("model") or ""))
             try:
+                if on_route is not None:
+                    on_route(route)
                 if emit_stream and STREAM_OUTPUT:
                     async def sink(chunk: str) -> None:
+                        if progress_sink is not None:
+                            await progress_sink(chunk)
+                            return
                         await relay_out({"type": "reply_delta", "stream_id": stream_id, "text": chunk,
                                          "done": False, "api_session": session_id})
                     out = await _stream_provider(route, messages, sink)
@@ -1374,4 +1383,3 @@ _provider_settings.install_loop(app, sys.modules[__name__])
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=LOOP_PORT, access_log=False)
-

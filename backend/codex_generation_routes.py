@@ -10,31 +10,34 @@ from fastapi.responses import JSONResponse
 
 from .codex_generation_progress import safe_id, valid_snapshot
 from .codex_generation_streaming import GenerationControlError
+from .api_web_generation import ApiGenerationError
 
 
 def error_response(error):
     return JSONResponse({"ok": False, "error": error.category}, status_code=error.status_code)
 
 
-def install_loop(app, legacy, integration, runtime):
+def install_loop(app, legacy, integration, runtime, *, api_runtime=None):
     def check(session_id):
         if not safe_id(session_id):
             raise GenerationControlError("generation_request_invalid", 400)
-        if not runtime.generation_enabled:
-            raise GenerationControlError("generation_disabled", 503)
         row = integration.session_authority.row_for_session(session_id)
         if row is None:
             raise GenerationControlError("generation_not_found", 404)
+        if row["provider"] == "api" and api_runtime is not None:
+            return api_runtime
+        if not runtime.generation_enabled:
+            raise GenerationControlError("generation_disabled", 503)
         if row["provider"] != "codex":
             raise GenerationControlError("generation_provider_mismatch")
+        return runtime.controls
 
     @app.get("/loop/sessions/{session_id}/generation")
     async def status(session_id: str, request: Request):
         legacy.check_internal_auth(request)
         try:
-            check(session_id)
-            return runtime.controls.status(session_id)
-        except GenerationControlError as error:
+            return check(session_id).status(session_id)
+        except (GenerationControlError, ApiGenerationError) as error:
             return error_response(error)
         except Exception:
             return error_response(GenerationControlError("generation_unavailable", 503))
@@ -44,11 +47,11 @@ def install_loop(app, legacy, integration, runtime):
         legacy.check_internal_auth(request)
         body = await legacy.read_internal_json(request)
         try:
-            check(session_id)
+            controls = check(session_id)
             if not isinstance(body, dict) or set(body) != {"generation_id"} or not safe_id(body["generation_id"]):
                 raise GenerationControlError("generation_request_invalid", 400)
-            return await runtime.controls.stop(session_id, body["generation_id"])
-        except GenerationControlError as error:
+            return await controls.stop(session_id, body["generation_id"])
+        except (GenerationControlError, ApiGenerationError) as error:
             return error_response(error)
         except Exception:
             return error_response(GenerationControlError("generation_unavailable", 503))
@@ -68,6 +71,10 @@ def install_relay(relay):
             "provider", "api_session", "generation_id", "canonical_message_id", "stream_id", "epoch", "revision", "text", "ts",
         )}
         payload["type"] = "reply_snapshot"
+        # Installed older PWA versions still consume ordinary API deltas.
+        if body["provider"] == "api" and isinstance(body.get("delta"), str):
+            await relay.broadcast(relay.app_subs, {"type": "reply_delta", "api_session": body["api_session"],
+                "stream_id": body["stream_id"], "text": body["delta"], "ts": body["ts"], "done": False})
         await relay.broadcast(relay.app_subs, payload)
         return {"ok": True}
 

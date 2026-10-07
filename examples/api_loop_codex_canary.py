@@ -15,6 +15,7 @@ from backend import memory_formation_v2_loopback
 from backend import memory_hierarchy_refinement_loopback
 from backend import memory_hierarchy_summary_loopback_v2
 from backend import web_session_delete, web_session_provider_authority
+from backend.api_web_generation import ApiWebRuntime, ApiGenerationError
 from backend.codex_canary_loop_integration import (
     CodexCanaryLoopIntegrationError,
     build_completion_callback,
@@ -43,6 +44,8 @@ RUNTIME = StreamingCodexGenerationRuntime(
 )
 INTEGRATION = FailClosedCodexCanaryLoopIntegration(legacy, RUNTIME)
 INTEGRATION.install_legacy_globals()
+API_GENERATIONS = ApiWebRuntime(legacy)
+INTEGRATION.api_generations = API_GENERATIONS
 
 
 def _upload_dir() -> Path | None:
@@ -62,6 +65,7 @@ def _public_sessions() -> dict:
 async def lifespan(_app: FastAPI):
     async with legacy.lifespan(legacy.app):
         try:
+            API_GENERATIONS.start()
             await RUNTIME.start()
             if RUNTIME.generation_enabled:
                 codex_generation_observability.log_latest_job_snapshot(
@@ -73,6 +77,7 @@ async def lifespan(_app: FastAPI):
                 )
             yield
         finally:
+            await API_GENERATIONS.close()
             await RUNTIME.close()
 
 
@@ -82,7 +87,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
-install_generation_routes(app, legacy, INTEGRATION, RUNTIME)
+install_generation_routes(app, legacy, INTEGRATION, RUNTIME, api_runtime=API_GENERATIONS)
 
 
 def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:
@@ -220,6 +225,8 @@ async def loop_ingest(request: Request):
     body = await legacy.read_internal_json(request)
     try:
         result = await INTEGRATION.handle_ingest(body)
+    except ApiGenerationError as exc:
+        return _error(exc)
     except CodexCanaryLoopIntegrationError as exc:
         return _error(exc)
     if result.get("ok") is not True:

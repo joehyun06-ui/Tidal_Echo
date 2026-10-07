@@ -57,6 +57,26 @@ class ApiLoopResponsesTransportTests(NoNetworkMixin, unittest.IsolatedAsyncioTes
 
         return factory
 
+    async def test_current_image_parts_reach_chat_and_responses_without_relay_credentials(self):
+        image = 'data:image/png;base64,iVBORw0KGgo='
+        messages = [{'role':'user','content':[{'type':'text','text':'caption'}, {'type':'image_url','image_url':{'url':image}}]}]
+        seen = []
+        def handler(request):
+            seen.append((request.url.path,json.loads(request.content)))
+            if request.url.path.endswith('/responses'):
+                return httpx.Response(200,json={'output':[{'type':'message','content':[{'type':'output_text','text':'image accepted'}]}]})
+            return httpx.Response(200,json={'choices':[{'message':{'content':'image accepted'}}]})
+        with mock.patch.object(self.module,'_provider_client',side_effect=self._client_factory(handler)):
+            for model in ['gpt-5.6-sol','fixture-chat']:
+                with mock.patch.object(self.module,'main_chain',return_value=[{'model':model,'url':'https://provider.invalid/v1','key':'invalid-key'}]):
+                    result = await self.module.run_model(messages)
+                    self.assertEqual(result['text'],'image accepted')
+        self.assertEqual(seen[0][0],'/v1/responses')
+        self.assertEqual(seen[0][1]['input'][0]['content'],[{'type':'input_text','text':'caption'},{'type':'input_image','image_url':image}])
+        self.assertEqual(seen[1][0],'/v1/chat/completions')
+        self.assertEqual(seen[1][1]['messages'],messages)
+        self.assertNotIn('invalid-test-relay-secret',json.dumps(seen))
+
     async def test_gpt56_nonstream_routes_to_responses_with_stateless_body(self):
         seen = {}
 
