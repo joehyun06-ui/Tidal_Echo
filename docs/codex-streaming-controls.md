@@ -27,3 +27,13 @@ SSE 继续使用原 `/app/stream` 和现有鉴权。新增 `reply_snapshot` 事�
 ## 验证范围
 
 新增投射、精确中断、ACK / 终态区分、会话隔离、重复停止、完成竞态、部分回复落库、HTTP 鉴权 / 代理错误脱敏与 CLI schema 检查。配套 PWA 包含断线补回、刷新、草稿、旧能力回退，以及 Chromium / WebKit 交互检查。自动化使用隔离数据库与伪模型，不发送生产聊天，也不消耗真实订阅额度。
+
+## 图片输入
+
+P3 Codex 能力现在声明 `image_input: true`、`text_only: false`。PWA 沿用鉴权 `/app/upload` 和 `/app/send`，支持只发图片及图片加文字。旧能力响应继续禁用图片入口。
+
+生产 worker 从 canonical Web 消息读取附件，限定 relay 的 `att-*` 本地上传，校验来源、会话、MIME、文件类型和大小（每张最多 8 MiB、每条最多 4 张；PWA 当前一次选 1 张）。外部 URL、查询密钥、路径穿越和符号链接均拒绝。持久化 job 仅保存文字及附件内容的联合摘要；worker 再读、再核对，文件丢失或改变时失败，不静默退回纯文字或 API。
+
+图片按 Codex App Server 官方 `localImage` 输入传递，避免大图片 Base64 超过现有 1 MiB JSONL 边界；不拓宽工具、MCP、网络或文件权限配置。无数据库迁移，原纯文字摘要与任务恢复兼容。
+
+协议依据：https://learn.chatgpt.com/docs/app-server （Turns 的 localImage）；新增输入同时通过已安装 CLI 0.160.0 生成的 schema 校验。自动化只用合成图片与隔离伪模型。

@@ -15,6 +15,7 @@ from typing import Protocol
 
 from . import codex_generation_provider_binding as provider_binding
 from . import codex_generation_store as store
+from .codex_generation_images import ImageMessageInput
 from .codex_generation_protocol import (
     ModelSelection,
     CodexGenerationError,
@@ -28,7 +29,7 @@ from .codex_generation_protocol import (
 
 
 class CanonicalMessageLoader(Protocol):
-    def __call__(self, job: Mapping[str, object]) -> str | Awaitable[str]: ...
+    def __call__(self, job: Mapping[str, object]) -> str | ImageMessageInput | Awaitable[str | ImageMessageInput]: ...
 
 
 class CompletionCallback(Protocol):
@@ -170,9 +171,9 @@ class CodexGenerationWorker:
             raise CodexGenerationError("codex_generation_persona_contract_changed")
         return persona
 
-    async def _load_input(self, job: Mapping[str, object]) -> str:
+    async def _load_input(self, job: Mapping[str, object]) -> str | ImageMessageInput:
         text = await _maybe_await(self.canonical_message_loader(job))
-        if not isinstance(text, str):
+        if not isinstance(text, (str, ImageMessageInput)):
             raise CodexGenerationError("codex_generation_input_unavailable")
         if input_digest(text) != job.get("input_digest"):
             raise CodexGenerationError("codex_generation_input_contract_changed")

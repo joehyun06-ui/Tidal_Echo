@@ -276,7 +276,7 @@ class CodexCanaryLoopIntegration:
         if not isinstance(body, dict):
             raise CodexCanaryLoopIntegrationError("invalid body", status_code=400)
         text = str(body.get("text") or body.get("message") or "").strip()
-        if not text:
+        if not text and (not body.get("id") or getattr(self.runtime.controller, "upload_dir", None) is None):
             raise CodexCanaryLoopIntegrationError("empty text", status_code=400)
         session_id = str(
             body.get("session_id")

@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .codex_generation_images import ImageMessageInput
+
 
 MAX_USER_TEXT_CHARS = 1_048_576
 MAX_ASSISTANT_TEXT_CHARS = 64_000
@@ -236,7 +238,9 @@ def _bounded_nonnegative_int(value: object) -> int | None:
     return min(value, 10**18)
 
 
-def input_digest(text: str) -> str:
+def input_digest(text: str | ImageMessageInput) -> str:
+    if isinstance(text, ImageMessageInput):
+        return text.digest()
     if not isinstance(text, str) or not text or len(text) > MAX_USER_TEXT_CHARS:
         raise CodexGenerationError("codex_generation_input_invalid")
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -558,7 +562,7 @@ class CodexGenerationProtocol:
         *,
         thread_id: str,
         client_message_id: str,
-        text: str,
+        text: str | ImageMessageInput,
         model: str,
         reasoning_effort: str | None,
     ) -> TurnStartResult:
@@ -569,7 +573,7 @@ class CodexGenerationProtocol:
         input_digest(text)
         params: dict[str, object] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": text}],
+            "input": text.wire_items() if isinstance(text, ImageMessageInput) else [{"type": "text", "text": text}],
             "clientUserMessageId": client_message_id,
             "model": _safe_model(model),
             "environments": [],

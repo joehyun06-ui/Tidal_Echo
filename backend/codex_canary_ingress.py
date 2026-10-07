@@ -42,19 +42,16 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def load_text_only_web_message(
+def read_web_message(
     relay_db: str | Path,
     *,
     canonical_message_id: int,
     api_session: str,
-    expected_digest: str,
-) -> str:
+) -> tuple[str, dict]:
     if isinstance(canonical_message_id, bool) or not isinstance(canonical_message_id, int) or canonical_message_id <= 0:
         raise CodexCanaryIngressError("codex_canary_message_invalid")
     if not isinstance(api_session, str) or not api_session or len(api_session) > 160:
         raise CodexCanaryIngressError("codex_canary_session_invalid")
-    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
-        raise CodexCanaryIngressError("codex_canary_digest_invalid")
     try:
         with closing(_connect_read_only(relay_db)) as conn:
             row = conn.execute(
@@ -79,10 +76,24 @@ def load_text_only_web_message(
         raise CodexCanaryIngressError("codex_canary_surface_ineligible")
     if meta.get("api_session") != api_session:
         raise CodexCanaryIngressError("codex_canary_session_mismatch")
+    return row["text"], meta
+
+
+def load_text_only_web_message(
+    relay_db: str | Path,
+    *,
+    canonical_message_id: int,
+    api_session: str,
+    expected_digest: str,
+) -> str:
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        raise CodexCanaryIngressError("codex_canary_digest_invalid")
+    text, meta = read_web_message(
+        relay_db, canonical_message_id=canonical_message_id, api_session=api_session,
+    )
     attachments = meta.get("attachments", [])
     if attachments not in (None, []):
         raise CodexCanaryIngressError("codex_canary_attachments_unsupported")
-    text = row["text"]
     if not isinstance(text, str) or not text:
         raise CodexCanaryIngressError("codex_canary_text_invalid")
     if _digest(text) != expected_digest:

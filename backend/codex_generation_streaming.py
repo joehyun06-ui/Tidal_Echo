@@ -5,7 +5,12 @@ import asyncio
 from collections import OrderedDict
 from contextlib import closing
 
+from pathlib import Path
+
 from . import codex_generation_store as store
+from .codex_canary_ingress import CodexCanaryIngressError
+from .codex_generation_images import load_image_web_message
+from .codex_generation_protocol import CodexGenerationError
 from .codex_generation_progress import PROGRESS_NOTIFICATIONS, ReplyProgress, safe_id
 from .codex_generation_subscription_reliability import ResubscribingCodexGenerationRuntime
 
@@ -98,8 +103,10 @@ class GenerationControls:
 
 
 class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
-    def __init__(self, *, progress_callback, **kwargs):
+    def __init__(self, *, progress_callback, upload_dir=None, **kwargs):
         super().__init__(**kwargs)
+        self.upload_dir = Path(upload_dir) if upload_dir is not None else None
+        self.controller.upload_dir = self.upload_dir
         self.progress = ReplyProgress()
         self.controls = GenerationControls(self.config.store_path, self.foundation.generation, self.progress)
         self.progress_callback = progress_callback
@@ -111,6 +118,18 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
 
     def _on_progress(self, method, params):
         self.progress.receive(method, params)
+
+    def _load_canonical_message(self, job):
+        if self.upload_dir is None:
+            return super()._load_canonical_message(job)
+        try:
+            return load_image_web_message(
+                self.relay_db, canonical_message_id=int(job["canonical_message_id"]),
+                api_session=str(job["api_session"]), upload_dir=self.upload_dir,
+                expected_digest=str(job["input_digest"]),
+            )
+        except CodexCanaryIngressError as error:
+            raise CodexGenerationError(error.category) from None
 
     async def start(self):
         await super().start()
