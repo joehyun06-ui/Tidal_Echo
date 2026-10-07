@@ -66,6 +66,7 @@ def _complete_codex_reply(relay_module, msg: Mapping[str, object]) -> dict | Non
             text=msg.get("text") or "",
             ts=meta.get("ts") or relay_module.now_iso(),
             usage=meta.get("usage") if isinstance(meta.get("usage"), dict) else None,
+            finish_reason=meta.get("finish_reason", "completed"),
             timeout_seconds=float(relay_module.DEPLOYMENT.sqlite_busy_timeout_seconds),
         )
     except codex_web_completion.CodexWebCompletionError as exc:

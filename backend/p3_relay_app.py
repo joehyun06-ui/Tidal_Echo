@@ -161,7 +161,11 @@ def _install_capability_route() -> None:
     async def app_provider_capabilities(request: Request):
         relay_app.check_auth(request)
         try:
-            return web_provider_capabilities.public_capabilities()
+            payload = web_provider_capabilities.public_capabilities()
+            if getattr(relay_app, "_CODEX_GENERATION_CONTROLS_INSTALLED", False):
+                codex = payload["web_sessions"]["providers"]["codex"]
+                codex["generation_controls"] = codex["create"]
+            return payload
         except web_provider_capabilities.WebProviderCapabilitiesError as error:
             return JSONResponse(
                 {"ok": False, "error": error.category},

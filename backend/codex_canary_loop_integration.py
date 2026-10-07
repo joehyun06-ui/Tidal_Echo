@@ -73,6 +73,8 @@ def build_completion_callback(legacy):
             "api_session": str(job["api_session"]),
             "reply_to": str(job["canonical_message_id"]),
             "generation_id": str(job["generation_id"]),
+            "stream_id": str(job["generation_id"]),
+            "finish_reason": "interrupted" if job.get("error_category") == "codex_turn_interrupted" else "completed",
             "client_message_id": str(job["client_message_id"]),
             "codex_callback_identity": str(job["callback_identity"]),
         }

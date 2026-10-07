@@ -64,7 +64,7 @@ def enrich_generation_notification(
     status = raw_turn.get("status")
     if status not in {"completed", "failed", "interrupted"}:
         return event
-    answer = final_answer_from_turn(raw_turn) if status == "completed" else None
+    answer = final_answer_from_turn(raw_turn) if status in {"completed", "interrupted"} else None
     return RichGenerationNotification(
         method=event.method,
         thread_id=event.thread_id,
@@ -145,11 +145,16 @@ class ReliableCodexGenerationWorker(CodexGenerationWorker):
             "interrupted",
         }:
             return False
+        if status == "interrupted" and not getattr(event, "final_answer", None):
+            # Some App Server versions emit empty turn.items here. Reconcile the
+            # durable turn before deciding there was no partial reply to retain.
+            return False
         updated = store.record_reconciled_turn(
             self.store_path,
             job_id=job_id,
             turn_id=event.turn_id,
             status=str(status),
+            deliver_partial=status == "interrupted" and bool(getattr(event, "final_answer", None)),
         )
         if updated["status"] == "failed":
             await self._unsubscribe(session)
@@ -235,6 +240,7 @@ class ReliableCodexGenerationWorker(CodexGenerationWorker):
                 job_id=job_id,
                 turn_id=correlated.turn_id,
                 status=correlated.status,
+                deliver_partial=correlated.status == "interrupted" and bool(correlated.final_answer),
             )
             if updated["status"] == "failed":
                 await self._unsubscribe(session)
