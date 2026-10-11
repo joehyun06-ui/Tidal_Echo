@@ -71,15 +71,16 @@ class CodexBudgetObserver:
             item = params.get("item")
             if not isinstance(item, dict) or item.get("type") != "contextCompaction" or not safe_id(item.get("id")):
                 return
-        # Correlate with the actual native thread and current durable generation.
-        # Early events may precede the turn/start ACK that records its turn ID.
+        # Correlate with the actual native thread and exact durable turn ID.
+        # Before ACK, omit an observation rather than assign a late old event
+        # to the new message. A subsequent usage event will fill the gap.
         with closing(sqlite3.connect(self.store_path, timeout=2)) as conn:
             conn.row_factory = sqlite3.Row
             job = conn.execute("""SELECT j.*,s.model FROM codex_generation_jobs j
                 JOIN codex_sessions s ON s.api_session=j.api_session
                 WHERE s.status='active' AND s.thread_id=? AND j.thread_id=?
                 ORDER BY j.id DESC LIMIT 1""", (thread, thread)).fetchone()
-        if not job or not (job["turn_id"] == turn or job["turn_id"] is None and job["status"] == "turn_dispatching"):
+        if not job or job["turn_id"] != turn:
             return
         now = datetime.now(timezone.utc).isoformat()
         with database(self.relay_db) as conn:

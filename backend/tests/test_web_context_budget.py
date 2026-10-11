@@ -84,11 +84,15 @@ class ContextBudgetTests(unittest.TestCase):
         self.event('turn/completed',turn={'id':'turn-a','status':'failed'})
         self.assertEqual(self.value()['compaction']['status'],'unknown')
 
-    def test_non_compaction_items_never_saved_and_early_ack_events_work(self):
+    def test_non_compaction_items_never_saved_and_pre_ack_events_are_not_guessed(self):
         self.event('item/completed',item={'id':'private','type':'reasoning','text':'private'})
         self.assertIsNone(self.value()['compaction'])
         with sqlite3.connect(self.store) as conn:
             conn.execute("UPDATE codex_generation_jobs SET turn_id=NULL,status='turn_dispatching'")
+        self.event()
+        self.assertIsNone(self.value()['context_tokens'])
+        with sqlite3.connect(self.store) as conn:
+            conn.execute("UPDATE codex_generation_jobs SET turn_id='turn-a',status='in_progress'")
         self.event()
         self.assertEqual(self.value()['context_tokens'],1500)
 
