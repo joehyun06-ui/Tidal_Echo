@@ -170,6 +170,7 @@ def _install_capability_route() -> None:
                 codex["generation_controls"] = codex["create"]
                 codex["image_input"] = codex["create"]
                 codex["text_only"] = not codex["create"]
+            payload["session_context"] = bool(getattr(relay_app, "_WEB_SESSION_CONTEXT_INSTALLED", False) and relay_app.brain_target() == "loop")
             return payload
         except web_provider_capabilities.WebProviderCapabilitiesError as error:
             return JSONResponse(

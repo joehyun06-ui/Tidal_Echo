@@ -47,6 +47,12 @@ def input_messages(legacy, sid, mid, text):
                 raise ApiGenerationError('api_image_unavailable')
             parts.append({'type':'image_url','image_url':{'url':f'data:{image.mime};base64,'+base64.b64encode(data).decode('ascii')}})
         messages[-1] = {'role':'user','content':parts}
+    from .codex_canary_ingress import read_web_message
+    from .web_session_context import prompt
+    _, meta = read_web_message(legacy.RELAY_DB, canonical_message_id=mid, api_session=sid)
+    background = prompt(meta)
+    if background:
+        messages.insert(len(messages) - 1, {"role": "user", "content": background})
     return messages
 
 

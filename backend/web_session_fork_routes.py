@@ -28,6 +28,9 @@ def install(app, legacy, authority, lock, *, runtime=None):
                 else:
                     with lock:
                         result = fork_conversation(authority, session_id, body, relay_db=legacy.RELAY_DB)
+                from .web_session_context import copy_branch
+                with lock:
+                    copy_branch(legacy.RELAY_DB, session_id, result['created']['id'])
                 if version:
                     with lock:
                         versions.finish(authority, edge['version_id'], relay_db=legacy.RELAY_DB, select=True)

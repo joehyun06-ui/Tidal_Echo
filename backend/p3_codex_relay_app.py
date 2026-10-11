@@ -17,4 +17,6 @@ from backend import api_web_generation_relay
 codex_canary_relay_integration.install(bridge.relay_app)
 install_generation_routes(bridge.relay_app)
 api_web_generation_relay.install(bridge.relay_app)
+from backend.web_session_context_routes import install_relay as install_context
+install_context(bridge.relay_app)
 app = bridge.app

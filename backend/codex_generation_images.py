@@ -99,6 +99,7 @@ def _read_image(attachment: object, upload_dir: Path) -> ImageInput:
 def load_image_web_message(
     relay_db: str | Path, *, canonical_message_id: int, api_session: str,
     upload_dir: Path, expected_text: str | None = None, expected_digest: str | None = None,
+    include_context: bool = False,
 ) -> str | ImageMessageInput:
     text, meta = read_web_message(relay_db, canonical_message_id=canonical_message_id, api_session=api_session)
     if not isinstance(text, str) or len(text) > 1_048_576:
@@ -110,6 +111,14 @@ def load_image_web_message(
         raise CodexCanaryIngressError("codex_image_count_invalid")
     if not text and not attachments:
         raise CodexCanaryIngressError("codex_canary_text_invalid")
+    if include_context:
+        from .web_session_context import prompt, ContextError
+        try:
+            background = prompt(meta)
+        except ContextError:
+            raise CodexCanaryIngressError("codex_canary_input_contract_changed") from None
+        if background:
+            text = background + "\n\n【当前用户消息】\n" + text
     value = ImageMessageInput(text, tuple(_read_image(item, upload_dir) for item in attachments)) if attachments else text
     digest = value.digest() if isinstance(value, ImageMessageInput) else hashlib.sha256(text.encode()).hexdigest()
     if expected_digest is not None and digest != expected_digest:

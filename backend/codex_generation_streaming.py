@@ -126,7 +126,7 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
             return load_image_web_message(
                 self.relay_db, canonical_message_id=int(job["canonical_message_id"]),
                 api_session=str(job["api_session"]), upload_dir=self.upload_dir,
-                expected_digest=str(job["input_digest"]),
+                expected_digest=str(job["input_digest"]), include_context=True,
             )
         except CodexCanaryIngressError as error:
             raise CodexGenerationError(error.category) from None
