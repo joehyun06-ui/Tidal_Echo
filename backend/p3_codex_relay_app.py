@@ -23,4 +23,6 @@ from backend.web_context_budget_routes import install_relay as install_budget
 install_budget(bridge.relay_app)
 from backend.web_context_actions_routes import install_relay as install_context_actions
 install_context_actions(bridge.relay_app)
+from backend.web_mcp_settings_routes import install as install_mcp_settings
+install_mcp_settings(bridge.relay_app)
 app = bridge.app
