@@ -2659,7 +2659,7 @@ async def app_send(request: Request):
         text,
         attachments=attachments,
         api_session=api_session,
-        extra_meta={"channel": "web", "source": "relay"},
+        extra_meta={"channel": "web", "source": "relay", **({"client_timezone": body["timezone"]} if isinstance(body.get("timezone"), str) else {})},
     )
     if text and DEPLOYMENT.memory.natural_ingress_formation_enabled:
         try:

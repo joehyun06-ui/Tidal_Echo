@@ -83,6 +83,8 @@ def fork_conversation(authority, session_id: str, body: object, *, relay_db: str
             raise ForkError("fork_history_too_large", 413)
         with conn:
             conn.execute("INSERT INTO web_session_forks VALUES (?,?)", (target, fingerprint))
+            from .web_session_context import copy_in_transaction
+            copy_in_transaction(conn, session_id, target)
             for row in rows:
                 original = json.loads(row["meta"])
                 meta = {"api_session": target, "source": "web_fork", "branch_origin": {"session_id": session_id, "message_id": row["id"]}}
@@ -97,5 +99,6 @@ def fork_conversation(authority, session_id: str, body: object, *, relay_db: str
             with conn:
                 conn.execute("DELETE FROM messages WHERE json_extract(meta,'$.api_session')=?", (target,))
                 conn.execute("DELETE FROM web_session_forks WHERE target=?", (target,))
+                conn.execute("DELETE FROM web_session_context WHERE root_id=?", (target,))
             raise
     return {"ok": True, "created": new, "duplicate": False}

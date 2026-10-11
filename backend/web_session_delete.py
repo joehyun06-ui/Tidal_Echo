@@ -262,6 +262,8 @@ def purge_messages(
             api_web_generation.assert_idle(conn, session_id, deleting=True)
         except api_web_generation.ApiGenerationError:
             _raise(DELETE_JOB_ACTIVE)
+        from .web_session_context import delete as delete_context
+        delete_context(conn, session_id)
         rows = _target_messages(conn, session_id)
         ids = [int(row["id"]) for row in rows]
         candidates: set[str] = set()

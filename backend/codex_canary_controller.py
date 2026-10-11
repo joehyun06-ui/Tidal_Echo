@@ -146,7 +146,7 @@ class CodexCanaryController:
                 canonical_input = load_image_web_message(
                     self.relay_db, canonical_message_id=canonical_message_id,
                     api_session=api_session, upload_dir=self.upload_dir,
-                    expected_text=ingress_text,
+                    expected_text=ingress_text, include_context=True,
                 )
                 digest = input_digest(canonical_input)
             else:

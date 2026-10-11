@@ -24,6 +24,25 @@ class WebSessionForkTests(unittest.TestCase):
             return conn.execute("SELECT text,meta FROM messages WHERE json_extract(meta,'$.api_session')=? ORDER BY id",(sid,)).fetchall()
     def fork(self,**updates):
         return fork_conversation(self.authority,'a',{**self.body,**updates},relay_db=self.path)
+    def test_context_commits_before_publication_and_rolls_back_on_failure(self):
+        from backend import web_session_context as context
+        config={**context.defaults(), 'tone':'source tone'}
+        context.save(self.path,'a',{'revision':0,'config':config})
+        publish=self.authority.publish_row
+        def inspect(row, **kwargs):
+            self.assertEqual(context.get(self.path,row['id'])['config']['tone'],'source tone')
+            raise OSError('publication failure')
+        self.authority.publish_row=inspect
+        with self.assertRaises(OSError):self.fork()
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM web_session_context').fetchone()[0],1)
+            self.assertEqual(conn.execute('SELECT count(*) FROM messages').fetchone()[0],5)
+        self.authority.publish_row=publish
+        result=self.fork();sid=result['created']['id']
+        self.assertEqual(context.get(self.path,sid)['config']['tone'],'source tone')
+        context.save(self.path,sid,{'revision':1,'config':{**config,'tone':'branch tone'}})
+        self.fork()
+        self.assertEqual(context.get(self.path,sid)['config']['tone'],'branch tone')
     def test_branch_copies_prefix_only_without_usage_generation_or_active_mutation(self):
         result=self.fork();sid=result['created']['id']
         self.assertEqual([r[0] for r in self.rows(sid)],['before','old answer','typo','answer'])
