@@ -115,6 +115,12 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
             methods=frozenset(), notifications=PROGRESS_NOTIFICATIONS,
             handler=self._on_progress,
         )
+        from .web_context_budget import CodexBudgetObserver, NOTIFICATIONS
+        self.context_budget = CodexBudgetObserver(self.relay_db, self.config.store_path)
+        self._budget_scope = self.foundation.runtime.scope(
+            methods=frozenset(), notifications=NOTIFICATIONS,
+            handler=self.context_budget.receive,
+        )
 
     def _on_progress(self, method, params):
         self.progress.receive(method, params)

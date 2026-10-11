@@ -90,6 +90,8 @@ app = FastAPI(
 install_generation_routes(app, legacy, INTEGRATION, RUNTIME, api_runtime=API_GENERATIONS)
 from backend.web_session_context_routes import install_loop as install_context
 install_context(app, legacy, INTEGRATION)
+from backend.web_context_budget_routes import install_loop as install_budget
+install_budget(app, legacy, INTEGRATION, RUNTIME)
 
 
 def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:
