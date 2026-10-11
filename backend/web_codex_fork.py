@@ -211,6 +211,10 @@ async def fork_codex_conversation(authority, session_id, body, *, relay_db, runt
                 with sqlite3.connect(relay_db, timeout=20) as conn:
                     phase = conn.execute("SELECT phase FROM web_codex_forks WHERE target=?", (target,)).fetchone()[0]
                     if phase != "copied":
+                        # Context and message copies commit before authority publication.
+                        conn.row_factory = sqlite3.Row
+                        from .web_session_context import copy_in_transaction
+                        copy_in_transaction(conn, session_id, target)
                         for row in rows:
                             meta = {"api_session": target, "source": "web_fork", "provider": "codex",
                                     "branch_origin": {"session_id": session_id, "message_id": row["id"]}}

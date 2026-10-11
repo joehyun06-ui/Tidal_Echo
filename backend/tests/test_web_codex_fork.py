@@ -50,6 +50,16 @@ class WebCodexForkTests(unittest.IsolatedAsyncioTestCase):
             conn.row_factory=sqlite3.Row
             return [dict(r) for r in conn.execute("SELECT * FROM messages WHERE json_extract(meta,'$.api_session')=? ORDER BY id", (sid,))]
     def native_calls(self): return [args for name,args in self.calls if name=='fork']
+    async def test_context_is_saved_before_native_branch_is_published(self):
+        from backend import web_session_context as context
+        context.save(self.relay,'source',{'revision':0,'config':{**context.defaults(),'tone':'codex tone'}})
+        publish=self.authority.publish_row
+        def inspect(row, **kwargs):
+            self.assertEqual(context.get(self.relay,row['id'])['config']['tone'],'codex tone')
+            return publish(row,**kwargs)
+        self.authority.publish_row=inspect
+        result=await self.fork()
+        self.assertEqual(context.get(self.relay,result['created']['id'])['config']['tone'],'codex tone')
     async def test_branch_native_boundary_provider_model_usage_and_original_preserved(self):
         result=await self.fork(); sid=result['created']['id']
         self.assertEqual(self.native_calls()[0]['last_turn_id'],'turn-3')

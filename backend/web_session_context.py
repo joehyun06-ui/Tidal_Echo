@@ -107,12 +107,18 @@ def save(path, sid, body):
 
 def copy_branch(path, source, target):
     with database(path) as conn:
-        # Versions resolve to the same root. Replayed forks never overwrite edits.
-        if root_id(conn, target) != target:
-            return
-        value = _get(conn, source)
-        conn.execute("INSERT OR IGNORE INTO web_session_context VALUES (?,?,?,?)",
-                     (target, 1, json.dumps(value["config"], ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+        copy_in_transaction(conn, source, target)
+
+
+def copy_in_transaction(conn, source, target):
+    """Commit settings with the copied history before publishing the new session."""
+    conn.execute("CREATE TABLE IF NOT EXISTS web_session_context (root_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, config TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    # Versions resolve to the same root. Replayed forks never overwrite edits.
+    if root_id(conn, target) != target:
+        return
+    value = _get(conn, source)
+    conn.execute("INSERT OR IGNORE INTO web_session_context VALUES (?,?,?,?)",
+                 (target, 1, json.dumps(value["config"], ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
 
 
 def delete(conn, sid):
