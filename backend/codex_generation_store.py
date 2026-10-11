@@ -252,7 +252,7 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    if actual_tables != expected_tables:
+    if actual_tables - {"web_codex_compactions"} != expected_tables:
         raise CodexGenerationStoreError("codex_generation_store_schema_invalid")
     indexes = {
         str(row["name"])
@@ -368,6 +368,12 @@ def bind_session_thread(
     return dict(row)
 
 
+def compaction_pending(conn, api_session):
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='web_codex_compactions'").fetchone():
+        return False
+    return bool(conn.execute("SELECT 1 FROM web_codex_compactions WHERE session_id=? AND status NOT IN ('completed','failed') LIMIT 1", (api_session,)).fetchone())
+
+
 def enqueue_job(
     path: str | os.PathLike[str],
     *,
@@ -387,6 +393,8 @@ def enqueue_job(
     stamp = now_iso()
     with closing(connect(path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if compaction_pending(conn, api_session):
+            raise CodexGenerationStoreError("codex_compaction_pending")
         session = conn.execute(
             "SELECT * FROM codex_sessions WHERE api_session=?", (api_session,)
         ).fetchone()
@@ -793,6 +801,8 @@ def retire_session(path: str | os.PathLike[str], *, api_session: str) -> dict:
     statuses = tuple(sorted(ACTIVE_JOB_STATUSES))
     with closing(connect(path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if compaction_pending(conn, api_session):
+            raise CodexGenerationStoreError("codex_generation_session_busy")
         session = conn.execute(
             "SELECT * FROM codex_sessions WHERE api_session=?", (api_session,)
         ).fetchone()

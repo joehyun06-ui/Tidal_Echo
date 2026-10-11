@@ -121,6 +121,8 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
             methods=frozenset(), notifications=NOTIFICATIONS,
             handler=self.context_budget.receive,
         )
+        from .web_codex_compaction import Compactions
+        self.compactions = Compactions(self)
 
     def _on_progress(self, method, params):
         self.progress.receive(method, params)
@@ -139,8 +141,20 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
 
     async def start(self):
         await super().start()
+        if self.generation_enabled:
+            self.compactions.initialize()
         if self.generation_enabled and (self._progress_task is None or self._progress_task.done()):
             self._progress_task = asyncio.create_task(self._publish_progress(), name="codex-reply-progress")
+
+    async def _worker_loop(self):
+        # One owner of the native generation slot: no parallel worker can race
+        # a compaction with turn/start or a control operation.
+        while True:
+            worked = await self.compactions.run_once()
+            if not worked:
+                worked = await self.worker.run_once()
+            if not worked:
+                await asyncio.sleep(self.config.poll_interval_seconds)
 
     async def _publish_progress(self):
         sent = {}

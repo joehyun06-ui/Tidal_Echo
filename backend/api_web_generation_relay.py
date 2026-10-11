@@ -18,6 +18,12 @@ def install(relay):
         if is_web and route and existing_message is None and api_session and relay.brain_target() == 'loop':
             state = await asyncio.to_thread(relay.loop_json, '/loop/sessions')
             session = next((s for s in state.get('sessions', []) if s.get('id') == api_session), None)
+            if session and session.get('provider') == 'codex':
+                from urllib.parse import quote
+                compact = await asyncio.to_thread(relay.loop_json, f'/loop/sessions/{quote(api_session, safe="")}/compact')
+                operation = compact.get('operation')
+                if operation and operation.get('status') not in {'completed','failed'}:
+                    raise HTTPException(status_code=409, detail='codex_compaction_pending')
             if session and session.get('provider') == 'api':
                 try:
                     store.initialize()
