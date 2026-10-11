@@ -122,6 +122,8 @@ def copy_in_transaction(conn, source, target):
 
 
 def delete(conn, sid):
+    from .web_context_budget import delete as delete_observation
+    delete_observation(conn, sid)
     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='web_session_context'").fetchone():
         conn.execute("DELETE FROM web_session_context WHERE root_id=?", (sid,))
 
