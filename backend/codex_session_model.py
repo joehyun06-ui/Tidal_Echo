@@ -36,7 +36,7 @@ def save_selection(path, session_id, selection):
                 "SELECT 1 FROM codex_generation_jobs WHERE api_session=? AND status NOT IN ('completed','failed') LIMIT 1",
                 (session_id,),
             ).fetchone()
-            if busy:
+            if busy or store.compaction_pending(conn, session_id):
                 fail("codex_generation_busy")
             conn.execute(
                 "UPDATE codex_sessions SET model=?,reasoning_effort=?,updated_at=? WHERE api_session=?",

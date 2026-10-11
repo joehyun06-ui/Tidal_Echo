@@ -54,6 +54,8 @@ def _pin(store_path, session_id):
     if not pin or pin["status"] != "active":
         raise ForkError("codex_session_unavailable")
     with closing(store.connect(store_path)) as conn:
+        if store.compaction_pending(conn, session_id):
+            raise ForkError("codex_generation_busy")
         busy = conn.execute(
             "SELECT 1 FROM codex_generation_jobs WHERE api_session=? "
             "AND status NOT IN ('completed','failed') LIMIT 1", (session_id,),
