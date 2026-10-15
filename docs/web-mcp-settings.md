@@ -26,3 +26,16 @@ discovery, credentials provisioning and action approval remain separate next ste
 
 Validation uses synthetic configurations, concurrent SQLite writers, browser
 fixtures and the real isolated P3 relay. No production plugins are connected.
+# 手动连接检测（2026-10-15）
+
+`POST /app/mcp/plugins/{id}/inspect` 使用 relay 鉴权，body 为 `{ "revision": 1 }`。
+返回 `status`、`checked_at`、`tools`（名称/说明）、`protocol_version`、`truncated` 和恒为 false 的 `execution_enabled`。
+检测前后核对配置 revision；变更返回 409。结果不持久化，不代表持续在线。
+
+仅公网 HTTPS 443 Streamable HTTP。DNS 全部地址校验后固定连接 IP，保留原域名 TLS 校验；不跟随跳转、不用代理、不读取任意环境变量。带凭据引用的配置返回 `credentials_not_connected`，STDIO/旧 SSE 不启动连接。
+支持 2026-07-28 每请求元数据，以及 2025-11-25/06-18/03-26 初始化握手和 session 清理。只发 tools/list、必要的 initialize/initialized 与 session DELETE，绝不发 tools/call。服务器工具描述仅为未受信任的显示文本，不授予权限。
+
+最多 2 个工作线程、15 秒网络预算、512 KiB 每响应、4 页、100 个工具；HTTP 18 秒返回超时。系统 DNS 若延迟，仍占用原工作槽直到返回，不增长并发。客户端断开不会自动重试。
+
+协议来源：https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning 和 https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http 。
+
