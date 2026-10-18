@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from . import web_mcp_settings as settings
+from . import web_mcp_credentials as credentials
 
 MODERN = '2026-07-28'
 LEGACY = ('2025-11-25', '2025-06-18', '2025-03-26')
@@ -95,9 +96,10 @@ def decode_response(response, request_id, deadline, sock):
 
 
 class Transport:
-    def __init__(self, url, deadline):
+    def __init__(self, url, deadline, bearer_token=None):
         self.parsed, self.address = resolve(url)
         self.deadline = deadline
+        self.bearer_token = bearer_token
 
     def request(self, message, version, session=None, *, delete=False):
         connection = PinnedHTTPS(self.parsed.hostname, self.address, remaining(self.deadline))
@@ -107,6 +109,8 @@ class Transport:
             headers['Mcp-Method'] = message['method']
         if session:
             headers['Mcp-Session-Id'] = session
+        if self.bearer_token:
+            headers['Authorization'] = 'Bearer ' + self.bearer_token
         timer = None
         try:
             connection.connect()
@@ -159,14 +163,14 @@ def rpc_result(status, message, request_id):
     return result
 
 
-def discover(plugin, transport_factory=Transport):
+def discover(plugin, transport_factory=Transport, *, bearer_token=None):
     if plugin['transport'] != 'streamable-http':
         raise InspectionError('transport_not_supported')
-    if plugin['options'].get('bearer_token_env_var') or plugin['options'].get('env_http_headers'):
+    if plugin['options'].get('env_http_headers') or plugin['options'].get('bearer_token_env_var') and not bearer_token:
         # Configuration names must never grant access to arbitrary relay environment secrets.
         raise InspectionError('credentials_not_connected')
     deadline = time.monotonic() + min(15, plugin['options'].get('startup_timeout_sec', 15))
-    transport = transport_factory(plugin['url'], deadline)
+    transport = transport_factory(plugin['url'], deadline, bearer_token=credentials.validate_token(bearer_token)) if bearer_token else transport_factory(plugin['url'], deadline)
     version, session, sequence = MODERN, None, 0
 
     def request(method, params=None, notification=False):
@@ -255,14 +259,24 @@ def inspect(path, plugin_id, body):
     try:
         result = {'ok': True, 'plugin_id': plugin_id, 'revision': current['revision'], 'execution_enabled': False}
         try:
-            result.update(discover(plugin), status='reachable')
+            bearer_token, credential_revision = credentials.load_for_inspection(path,plugin,current['revision'])
+            result.update(discover(plugin,bearer_token=bearer_token), status='reachable')
+            if bearer_token:
+                for tool in result['tools']:
+                    for key in ('name','description'):
+                        tool[key] = tool[key].replace(bearer_token,'[redacted]')
+        except settings.SettingsError:
+            raise
         except InspectionError as exc:
             result.update(status=str(exc), tools=[])
         except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException):
             result.update(status='connection_failed', tools=[])
         if settings.read(path)['revision'] != current['revision']:
             raise settings.SettingsError('mcp_revision_conflict', 409)
+        if credentials.read(path,plugin_id)['credential_revision'] != credential_revision:
+            raise settings.SettingsError('mcp_revision_conflict',409)
         result['checked_at'] = datetime.now(timezone.utc).isoformat()
         return result
     finally:
         SLOTS.release()
+

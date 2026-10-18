@@ -104,7 +104,7 @@ class InspectionTests(unittest.TestCase):
         self.assertTrue(result['truncated']); self.assertEqual(len(transport.calls), 4)
 
     def test_revision_rechecked_after_network_and_errors_sanitized(self):
-        def changed(_):
+        def changed(_, **kwargs):
             settings.save(self.path, {'revision': 1, 'plugins': []})
             return {'tools': []}
         with patch.object(mcp, 'discover', side_effect=changed), self.assertRaisesRegex(settings.SettingsError, 'revision_conflict'):
@@ -138,3 +138,4 @@ class InspectionTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
