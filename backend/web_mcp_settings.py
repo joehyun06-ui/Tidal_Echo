@@ -105,7 +105,10 @@ def save(path,body):
         conn.execute('BEGIN IMMEDIATE')
         current=result(conn)
         if body['revision']!=current['revision']: raise SettingsError('mcp_revision_conflict',409)
+        from .web_mcp_credentials import invalidate
+        invalidate(conn,plugins)
         conn.execute('INSERT INTO web_mcp_settings VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,plugins=excluded.plugins,updated_at=excluded.updated_at',
                      (current['revision']+1,serialized,datetime.now(timezone.utc).isoformat()))
         conn.commit()
         return result(conn)
+
