@@ -29,6 +29,15 @@ def eligible(plugin):
     return plugin['enabled'] and plugin['transport'] == 'streamable-http' and not plugin['options'].get('env_http_headers')
 
 
+def selection_root(conn, sid):
+    # Regenerated/edited alternatives remain one visible conversation.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='web_message_versions'").fetchone():
+        row = conn.execute('SELECT root_id FROM web_message_versions WHERE version_id=?', (sid,)).fetchone()
+        if row:
+            return row[0]
+    return sid
+
+
 def schema_ok(schema):
     # Bounded self-contained schemas only in this adapter. Never fetch references
     # or guess x-mcp-header routing; regex validation needs a bounded engine.
@@ -77,7 +86,7 @@ class Store:
             conn.close()
 
     def selection(self, conn, sid):
-        row = conn.execute('SELECT * FROM web_mcp_chat_settings WHERE session_id=?', (sid,)).fetchone()
+        row = conn.execute('SELECT * FROM web_mcp_chat_settings WHERE session_id=?', (selection_root(conn, sid),)).fetchone()
         return dict(row) if row else {'revision': 0, 'config_revision': 0, 'plugins': '[]'}
 
     def current(self, conn, sid, mid):
@@ -106,7 +115,7 @@ class Store:
             if set(ids) - {p['id'] for p in inventory['plugins'] if eligible(p)}:
                 raise settings.SettingsError('mcp_plugin_not_supported')
             conn.execute('INSERT INTO web_mcp_chat_settings VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,config_revision=excluded.config_revision,plugins=excluded.plugins',
-                         (sid, old['revision'] + 1, inventory['revision'], packed(ids)))
+                         (selection_root(conn, sid), old['revision'] + 1, inventory['revision'], packed(ids)))
         return self.read(sid)
 
     def recover(self):

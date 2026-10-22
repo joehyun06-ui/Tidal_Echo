@@ -68,6 +68,17 @@ class DurableTests(Fixture, unittest.TestCase):
         self.store.claim(aid)
         with self.assertRaises(mcp.McpError): self.store.claim(aid)
 
+    def test_regenerated_alternatives_share_selection_but_not_actions(self):
+        with self.store.db() as conn:
+            conn.execute('CREATE TABLE web_message_versions(version_id TEXT PRIMARY KEY,root_id TEXT)')
+            conn.execute("INSERT INTO web_message_versions VALUES ('answer2','chat')")
+        self.assertEqual(self.store.read('answer2')['plugin_ids'],['reader'])
+        self.store.save('answer2',{'revision':1,'config_revision':1,'plugin_ids':[]})
+        self.assertEqual(self.store.read('chat')['plugin_ids'],[])
+        self.assertEqual(self.store.read('chat')['revision'],2)
+        with self.assertRaises(settings.SettingsError):self.store.save('chat',{'revision':1,'config_revision':1,'plugin_ids':['reader']})
+        self.assertEqual(self.store.actions('answer2')['actions'],[])
+
     def test_changed_selection_config_credentials_block_dispatch(self):
         for change in ('selection','config','credentials'):
             with self.subTest(change=change):
