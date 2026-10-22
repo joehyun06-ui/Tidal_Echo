@@ -1,4 +1,5 @@
 """User-initiated metadata discovery only. No credentials, calls or subprocesses."""
+import base64
 import http.client
 import ipaddress
 import json
@@ -107,6 +108,10 @@ class Transport:
                    'MCP-Protocol-Version': version, 'Connection': 'close'}
         if message:
             headers['Mcp-Method'] = message['method']
+            if message['method'] == 'tools/call':
+                name = message['params']['name']
+                plain = name.strip() == name and all(32 <= ord(c) <= 126 for c in name) and not (name.startswith('=?base64?') and name.endswith('?='))
+                headers['Mcp-Name'] = name if plain else '=?base64?' + base64.b64encode(name.encode()).decode() + '?='
         if session:
             headers['Mcp-Session-Id'] = session
         if self.bearer_token:
@@ -163,7 +168,7 @@ def rpc_result(status, message, request_id):
     return result
 
 
-def discover(plugin, transport_factory=Transport, *, bearer_token=None):
+def discover(plugin, transport_factory=Transport, *, bearer_token=None, include_schemas=False, call=None, before_call=None):
     if plugin['transport'] != 'streamable-http':
         raise InspectionError('transport_not_supported')
     if plugin['options'].get('env_http_headers') or plugin['options'].get('bearer_token_env_var') and not bearer_token:
@@ -186,6 +191,22 @@ def discover(plugin, transport_factory=Transport, *, bearer_token=None):
         if not notification:
             message['id'] = sequence
         return transport.request(message, version, session)
+
+    def finish(tools, truncated):
+        nonlocal deadline
+        if call is None:
+            return {'tools': tools, 'truncated': truncated, 'protocol_version': version}
+        expected, arguments = call
+        found = next((t for t in tools if t['name'] == expected['name']), None)
+        if truncated or found != expected or before_call is None:
+            raise InspectionError('tool_definition_changed')
+        # A fresh schema check and durable approval claim precede the ONLY call.
+        # No call retries, version fallback or follow-up elicitation after dispatch.
+        before_call()
+        deadline = time.monotonic() + min(60, plugin['options'].get('tool_timeout_sec', 30))
+        transport.deadline = deadline
+        status, message, _ = request('tools/call', {'name': expected['name'], 'arguments': arguments})
+        return rpc_result(status, message, sequence)
 
     try:
         status, message, _ = request('tools/list')
@@ -210,7 +231,7 @@ def discover(plugin, transport_factory=Transport, *, bearer_token=None):
             if not isinstance(info.get('capabilities'), dict):
                 raise InspectionError('invalid_response')
             if 'tools' not in info['capabilities']:
-                return {'tools': [], 'truncated': False, 'protocol_version': version}
+                return finish([], False)
             status, message, _ = request('tools/list')
         tools, names, cursors = [], set(), set()
         for page in range(4):
@@ -225,18 +246,21 @@ def discover(plugin, transport_factory=Transport, *, bearer_token=None):
                     continue
                 names.add(item['name'])
                 if len(tools) == 100:
-                    return {'tools': tools, 'truncated': True, 'protocol_version': version}
+                    return finish(tools, True)
                 description = item.get('description', '')
-                tools.append({'name': item['name'], 'description': description[:1000] if isinstance(description, str) else ''})
+                tool = {'name': item['name'], 'description': description[:1000] if isinstance(description, str) else ''}
+                if include_schemas:
+                    tool['inputSchema'] = item.get('inputSchema')
+                tools.append(tool)
             cursor = result.get('nextCursor')
             if cursor is None:
-                return {'tools': tools, 'truncated': False, 'protocol_version': version}
+                return finish(tools, False)
             if not isinstance(cursor, str) or not 0 < len(cursor) <= 2048 or cursor in cursors:
                 raise InspectionError('invalid_response')
             cursors.add(cursor)
             if page < 3:
                 status, message, _ = request('tools/list', {'cursor': cursor})
-        return {'tools': tools, 'truncated': True, 'protocol_version': version}
+        return finish(tools, True)
     finally:
         if session:
             try:

@@ -194,6 +194,9 @@ def assert_idle(conn, session_id, *, deleting=False):
     if deleting:
         conn.execute("INSERT OR IGNORE INTO api_web_closed_sessions VALUES (?)", (session_id,))
         conn.execute("DELETE FROM api_web_generations WHERE session_id=?", (session_id,))
+        for table in ('web_mcp_actions', 'web_mcp_chat_settings'):
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                conn.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
 
 
 class ApiWebRuntime:
@@ -205,6 +208,8 @@ class ApiWebRuntime:
 
     def start(self):
         self.store.initialize(); self.store.recover()
+        from .web_mcp_chat import Store as McpStore
+        McpStore(self.legacy.RELAY_DB).recover()
 
     async def close(self):
         self.closing = True
@@ -279,8 +284,9 @@ class ApiWebRuntime:
                 self.store.finish(sid, mid, status="interrupted" if not self.closing else "failed", error="api_process_restarted" if self.closing else None)
                 return
             messages = input_messages(self.legacy, sid, mid, text)
-            task = asyncio.create_task(self.legacy.run_model(messages, stream_id=gid, session_id=sid,
-                emit_stream=True, progress_sink=sink, on_route=lambda route: self.store.route(mid, route.get('model'))))
+            from .api_mcp_model import generate
+            task = asyncio.create_task(generate(self.legacy, sid, mid, messages, sink,
+                lambda route: self.store.route(mid, route.get('model'))))
             self.providers[mid] = task
             try:
                 out = await task
@@ -289,10 +295,10 @@ class ApiWebRuntime:
                                   error="api_process_restarted" if self.closing else None, unknown=True)
             else:
                 success = out.get("outcome") == "success"
-                api = {"runtime": "api_loop", "model": out.get("model"), "usage": out.get("usage") or {}, "fallback_from": out.get("tried") or [], "session": sid}
+                api = {"runtime": "api_loop", "model": out.get("model"), "usage": out.get("usage") or {}, "fallback_from": out.get("tried") or [], "session": sid, "usage_complete": out.get("usage_complete", True)}
                 self.store.finish(sid, mid, status="completed" if success else "failed",
                     text=(out.get("text") or '') if success else partial, api=api,
-                    error=None if success else "api_provider_incomplete", unknown=out.get("outcome") == "dispatch_uncertain")
+                    error=None if success else out.get("error", "api_provider_incomplete"), unknown=out.get("outcome") == "dispatch_uncertain")
             job = self.store.get(sid, mid)
             if job and job["reply_id"]:
                 # Persistence is authoritative. Failed/lost fan-out is repaired by history GET, never inference.
@@ -300,4 +306,7 @@ class ApiWebRuntime:
         except Exception:
             self.store.finish(sid, mid, status="failed", error="api_generation_unavailable", unknown=True)
         finally:
+            from .web_mcp_chat import Store as McpStore
+            McpStore(self.legacy.RELAY_DB).end(sid, mid)
             self.providers.pop(mid, None); self.progress.pop(mid, None)
+

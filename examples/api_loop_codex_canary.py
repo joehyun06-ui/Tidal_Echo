@@ -94,6 +94,8 @@ from backend.web_context_budget_routes import install_loop as install_budget
 install_budget(app, legacy, INTEGRATION, RUNTIME)
 from backend.web_context_actions_routes import install_loop as install_context_actions
 install_context_actions(app, legacy, INTEGRATION, RUNTIME)
+from backend.web_mcp_chat_routes import install_loop as install_mcp_chat
+install_mcp_chat(app, legacy, INTEGRATION)
 
 
 def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:
@@ -335,3 +337,4 @@ from backend import web_session_fork_routes
 web_session_fork_routes.install(app, legacy, INTEGRATION.session_authority, INTEGRATION._session_lock, runtime=RUNTIME)
 
 app.mount("/", legacy.app)
+
