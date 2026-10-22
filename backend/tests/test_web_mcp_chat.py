@@ -164,10 +164,13 @@ class AsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
 
     async def model_flow(self,responses):
         requests,invoked,chunks=[],[],[]
+        secret='synthetic-"quoted"-header'
+        credentials.write(self.path,'reader',{'revision':1,'credential_revision':0,'http_headers':{'X-Api-Key':secret}})
         def discover(plugin,**kwargs):
+            self.assertEqual(kwargs['http_headers'],{'x-api-key':secret})
             if kwargs.get('call') is None:return {'tools':[TOOL],'truncated':False,'protocol_version':wire.MODERN}
             kwargs['before_call']();invoked.append(kwargs['call'])
-            return {'content':[{'type':'text','text':'合成结果 <img onerror=bad>'}]}
+            return {'content':[{'type':'text','text':'合成结果 <img onerror=bad> '+secret}], 'structuredContent':{'key':secret}}
         async def handler(request):
             data=json.loads(request.content);requests.append(data)
             if len(requests)==1:
@@ -205,6 +208,8 @@ class AsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(invoked),1);self.assertEqual(len(requests),2)
         self.assertEqual(self.store.actions('chat')['actions'][0]['status'],'completed')
         self.assertNotIn('synthetic-api-key',json.dumps(self.store.actions('chat')))
+        self.assertNotIn(secret,json.dumps(self.store.actions('chat')));self.assertNotIn('quoted',json.dumps(requests))
+        self.assertIn('[redacted]',json.dumps(requests))
 
     async def test_authenticated_routes_limits_provider_and_stale_decision(self):
         app=FastAPI()

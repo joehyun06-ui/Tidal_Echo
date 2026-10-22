@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 
 from backend import codex_mcp_chat as native, codex_generation_store as jobs
 from backend import web_mcp_chat as mcp, web_mcp_chat_routes as routes, web_mcp_settings as settings
+from backend import web_mcp_credentials as credentials
 from backend.codex_generation_worker import CodexGenerationEventInbox
 from backend.codex_generation_protocol import GenerationNotification, CodexProcessActivityGate
 from backend.tests import test_codex_app_server_shared_transport as transport_fixture
@@ -90,6 +91,32 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         result = await task
         self.assertFalse(result['success']); self.assertIn('denied', result['contentItems'][0]['text'])
         self.assertEqual(self.calls, [])
+
+    async def test_native_custom_header_call_redacts_results_and_keeps_secrets_out_of_approval(self):
+        secret='synthetic-"quoted"-native-header'
+        credentials.write(self.path,'fixture',{'revision':1,'credential_revision':0,'http_headers':{'X-Api-Key':secret}})
+        self.network.reset_mock()
+        def wire(_plugin,**kw):
+            self.assertEqual(kw['http_headers'],{'x-api-key':secret})
+            if kw.get('call'):
+                kw['before_call']();return {'content':[{'type':'text','text':secret}], 'structuredContent':{'echo':secret}}
+            return {'tools':[TOOL],'truncated':False}
+        self.network.side_effect=wire
+        await self.manager.begin(self.job)
+        task=asyncio.create_task(self.manager.handle(self.params()))
+        row=await self.pending();self.assertNotIn('quoted',json.dumps(row))
+        self.store.decision('chat',row['id'],{'revision':row['revision'],'decision':'approve'})
+        result=await task;self.assertTrue(result['success']);self.assertIn('[redacted]',json.dumps(result));self.assertNotIn('quoted',json.dumps(result))
+        self.assertNotIn('quoted',json.dumps(self.store.actions('chat')));self.assertEqual(self.network.call_count,2)
+
+    async def test_native_header_rotation_invalidates_waiting_approval(self):
+        credentials.write(self.path,'fixture',{'revision':1,'credential_revision':0,'http_headers':{'x-api-key':'synthetic-old'}})
+        await self.manager.begin(self.job)
+        task=asyncio.create_task(self.manager.handle(self.params()))
+        row=await self.pending()
+        credentials.write(self.path,'fixture',{'revision':1,'credential_revision':1,'http_headers':{'x-api-key':'synthetic-new'}})
+        with self.assertRaises(settings.SettingsError):self.store.decision('chat',row['id'],{'revision':row['revision'],'decision':'approve'})
+        self.assertFalse((await task)['success']);self.assertEqual(self.calls,[])
 
     async def test_request_before_turn_reply_waits_for_durable_exact_turn(self):
         from contextlib import closing

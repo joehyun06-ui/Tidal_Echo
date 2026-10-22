@@ -45,7 +45,7 @@ def install(relay):
                 data=bytearray()
                 async for chunk in request.stream():
                     data.extend(chunk)
-                    if len(data)>12288: raise settings.SettingsError('mcp_config_too_large',413)
+                    if len(data)>65536: raise settings.SettingsError('mcp_config_too_large',413)
                 try: body=json.loads(data)
                 except (ValueError,UnicodeError): raise settings.SettingsError('mcp_config_invalid') from None
                 value=await asyncio.to_thread(credentials.write,relay.DB_PATH,plugin_id,body,remove=request.method=='DELETE')

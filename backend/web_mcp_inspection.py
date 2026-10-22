@@ -1,4 +1,4 @@
-"""User-initiated metadata discovery only. No credentials, calls or subprocesses."""
+"""Bounded MCP discovery and explicitly approved calls over pinned HTTPS."""
 import base64
 import http.client
 import ipaddress
@@ -97,15 +97,17 @@ def decode_response(response, request_id, deadline, sock):
 
 
 class Transport:
-    def __init__(self, url, deadline, bearer_token=None):
+    def __init__(self, url, deadline, bearer_token=None, http_headers=None):
+        self.bearer_token = credentials.validate_token(bearer_token) if bearer_token is not None else None
+        self.http_headers = credentials.validate_headers(http_headers or {})
         self.parsed, self.address = resolve(url)
         self.deadline = deadline
-        self.bearer_token = bearer_token
 
     def request(self, message, version, session=None, *, delete=False):
         connection = PinnedHTTPS(self.parsed.hostname, self.address, remaining(self.deadline))
         headers = {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream',
                    'MCP-Protocol-Version': version, 'Connection': 'close'}
+        headers.update(self.http_headers)
         if message:
             headers['Mcp-Method'] = message['method']
             if message['method'] == 'tools/call':
@@ -168,14 +170,21 @@ def rpc_result(status, message, request_id):
     return result
 
 
-def discover(plugin, transport_factory=Transport, *, bearer_token=None, include_schemas=False, call=None, before_call=None):
+def discover(plugin, transport_factory=Transport, *, bearer_token=None, http_headers=None, include_schemas=False, call=None, before_call=None):
     if plugin['transport'] != 'streamable-http':
         raise InspectionError('transport_not_supported')
-    if plugin['options'].get('env_http_headers') or plugin['options'].get('bearer_token_env_var') and not bearer_token:
+    auth = {'bearer_token': credentials.validate_token(bearer_token) if bearer_token is not None else None,
+            'http_headers': credentials.validate_headers(http_headers or {})}
+    try:
+        missing_headers = credentials.reference_names(plugin) - set(auth['http_headers'])
+    except settings.SettingsError:
+        raise InspectionError('credentials_not_connected') from None
+    if missing_headers or plugin['options'].get('bearer_token_env_var') and not bearer_token:
         # Configuration names must never grant access to arbitrary relay environment secrets.
         raise InspectionError('credentials_not_connected')
     deadline = time.monotonic() + min(15, plugin['options'].get('startup_timeout_sec', 15))
-    transport = transport_factory(plugin['url'], deadline, bearer_token=credentials.validate_token(bearer_token)) if bearer_token else transport_factory(plugin['url'], deadline)
+    supplied = {k: v for k, v in auth.items() if v}
+    transport = transport_factory(plugin['url'], deadline, **supplied)
     version, session, sequence = MODERN, None, 0
 
     def request(method, params=None, notification=False):
@@ -245,10 +254,14 @@ def discover(plugin, transport_factory=Transport, *, bearer_token=None, include_
                 if item['name'] in names:
                     continue
                 names.add(item['name'])
+                # Check raw metadata before truncation/serialization can obscure a secret.
+                if include_schemas and credentials.contains_secret(item, auth):
+                    continue
                 if len(tools) == 100:
                     return finish(tools, True)
                 description = item.get('description', '')
-                tool = {'name': item['name'], 'description': description[:1000] if isinstance(description, str) else ''}
+                tool = {'name': credentials.redact(item['name'], auth),
+                        'description': credentials.redact(description, auth)[:1000] if isinstance(description, str) else ''}
                 if include_schemas:
                     tool['inputSchema'] = item.get('inputSchema')
                 tools.append(tool)
@@ -283,12 +296,10 @@ def inspect(path, plugin_id, body):
     try:
         result = {'ok': True, 'plugin_id': plugin_id, 'revision': current['revision'], 'execution_enabled': False}
         try:
-            bearer_token, credential_revision = credentials.load_for_inspection(path,plugin,current['revision'])
-            result.update(discover(plugin,bearer_token=bearer_token), status='reachable')
-            if bearer_token:
-                for tool in result['tools']:
-                    for key in ('name','description'):
-                        tool[key] = tool[key].replace(bearer_token,'[redacted]')
+            auth, credential_revision = credentials.load_for_request(path,plugin,current['revision'])
+            result.update(discover(plugin,**auth), status='reachable')
+            result['tools'] = [{**tool, 'name': credentials.redact(tool['name'], auth),
+                               'description': credentials.redact(tool['description'], auth)} for tool in result['tools']]
         except settings.SettingsError:
             raise
         except InspectionError as exc:

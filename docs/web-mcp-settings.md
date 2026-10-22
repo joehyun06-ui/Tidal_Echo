@@ -22,7 +22,8 @@ server errors, and requires a refresh after an uncertain write or version confli
 Unauthenticated local drafts remain available. Import is explicit, preserves the
 local backup, rejects collisions and uses the same revision check. Logout invalidates
 pending responses and clears the displayed inventory. Explicit inspection and
-write-only bearer credentials are described below; tool execution remains disabled.
+write-only HTTP credentials are described below. Saving credentials does not grant
+execution permission; API and supported Codex sessions use separate per-call approvals.
 
 Validation uses synthetic configurations, concurrent SQLite writers, browser
 fixtures and the real isolated P3 relay. No production plugins are connected.
@@ -48,8 +49,34 @@ Bearer 密钥用 cryptography Fernet 认证加密，密文存 SQLite；随机主
 
 密文绑定插件 ID、serverId、传输方式、完整 URL 和认证引用。修改这些字段或删除配置时，在同一 SQLite 事务内清空绑定；改回旧地址不会恢复。普通名称更改保留绑定。凭据自身也有 CAS revision；检测前后核对，检测中的旧结果不覆盖新密钥状态。
 
-只对已验证并固定 IP 的原地址发送 Authorization: Bearer；不跟随跳转、不转发归汀登录密钥、不读取配置中指定的环境变量。自定义认证头与 OAuth 不在本包中。工具响应中直接回显的已知密钥会被遮蔽。密钥不写浏览器存储、普通配置或 TOML。
+只对已验证并固定 IP 的原地址发送 Authorization: Bearer；不跟随跳转、不转发归汀登录密钥、不读取配置中指定的环境变量。OAuth 尚未接入。工具响应中直接回显的已知密钥会被遮蔽。密钥不写浏览器存储、普通配置或 TOML。
 
-主密钥与数据库由同一个服务器账户访问；此加密保护数据库副本，不代表服务器本身失陷后仍能保密。保存密钥只允许显式检测，不授予模型或工具任何执行权限。
+主密钥与数据库由同一个服务器账户访问；此加密保护数据库副本，不代表服务器本身失陷后仍能保密。保存密钥不授予模型或工具任何执行权限。
+
+## 自定义认证头（2026-10-22）
+
+同一 credentials endpoint 扩展为原子局部更新：PUT 必须携带两个 revision，
+并提供 bearer_token 和/或 http_headers。缺省字段保留；bearer_token:null 单独清除
+Bearer；http_headers:{"X-Api-Key":"新值"} 添加或替换，{"x-api-key":null} 单独移除。
+DELETE 仍清除全部凭据。旧 Bearer 密文无需迁移；第一次局部更新保留其内容。
+GET 额外返回 bearer_configured 与小写、排序后的 header_names，绝不返回值。
+
+名称忽略大小写，支持英文字母、数字和短横线，1–80 字符；最多 8 个头。
+值为 1–8192 可打印 ASCII 字符，不含首尾空格、换行或控制字符；头的名称和值
+合计最多 16 KiB，请求体最多 64 KiB。重复大小写名称拒绝。Authorization 只走
+Bearer 栏；Host、Cookie、连接/路由/代理头、MCP 元数据、Accept、Content-*、
+Sec-* 等保留字段禁止覆盖，不能通过这些字段改变目标或传输协议。
+
+env_http_headers 仅声明需要的名称：必须在此插件密钥窗口手动绑定相应安全请求头，
+不会读取它指向的环境变量。非法或保留名称仍不可执行。没有声明也可直接添加认证头。
+API 与 Codex 共用 vault/传输；所有握手、发现、调用、旧协议 session 清理均使用
+相同绑定。仍只请求固定的公网 HTTPS 443 地址，不跟随跳转、不转发到其他 URL。
+新凭据 revision 使旧待确认动作失效；发出后的操作不会自动重试。
+
+发现工具时，回显密钥的原始执行元数据会被过滤；展示描述在截断前遮蔽直接回显。
+工具文本与 structuredContent 在序列化/截断前遮蔽全部已绑定密钥值。
+这针对已知值的直接回显，不是对任意编码、变形输出的通用内容识别。
+协议依据：https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+与 https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization 。
 
 

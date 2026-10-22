@@ -85,7 +85,7 @@ class CredentialTests(unittest.TestCase):
         self.save()
         with patch.object(inspection,'discover',return_value={'tools':[{'name':'read','description':self.token}],'protocol_version':inspection.MODERN,'truncated':False}) as discover:
             result=inspection.inspect(self.path,'reader',{'revision':1})
-        self.assertEqual(discover.call_args.kwargs,{'bearer_token':self.token})
+        self.assertEqual(discover.call_args.kwargs,{'bearer_token':self.token,'http_headers':{}})
         self.assertNotIn(self.token,json.dumps(result));self.assertEqual(result['tools'][0]['description'],'[redacted]')
 
     def test_replacing_credential_during_detection_invalidates_observation(self):
@@ -103,6 +103,87 @@ class CredentialTests(unittest.TestCase):
             with self.assertRaises(inspection.InspectionError):transport.request({'id':1,'method':'tools/list'},inspection.MODERN)
         self.assertEqual(connection.request.call_args.kwargs['headers']['Authorization'],'Bearer '+self.token)
         self.assertEqual(connection.request.call_count,1)
+
+    def test_headers_patch_preserves_bearer_case_insensitive_replace_and_individual_remove(self):
+        self.save()
+        def update(revision, **fields):
+            return vault.write(self.path,'reader',{'revision':1,'credential_revision':revision,**fields})
+        value=update(1,http_headers={'X-Api-Key':'synthetic-header-secret','X-Account':'account value'})
+        self.assertEqual(value['header_names'],['x-account','x-api-key']);self.assertTrue(value['bearer_configured'])
+        self.assertNotIn('synthetic-header-secret',json.dumps(value));self.assertNotIn(b'synthetic-header-secret',self.path.read_bytes())
+        update(2,http_headers={'x-API-key':'replacement-header-secret','x-account':None})
+        auth,revision=vault.load_for_request(self.path,self.plugin,1)
+        self.assertEqual(auth,{'bearer_token':self.token,'http_headers':{'x-api-key':'replacement-header-secret'}})
+        self.assertEqual(revision,3)
+        value=update(3,bearer_token=None);self.assertFalse(value['bearer_configured']);self.assertTrue(value['configured'])
+        self.assertEqual(vault.load_for_request(self.path,self.plugin,1)[0]['http_headers'],auth['http_headers'])
+        value=update(4,http_headers={'X-API-KEY':None});self.assertFalse(value['configured'])
+
+    def test_legacy_ciphertext_loads_and_new_headers_remain_bound_to_url(self):
+        self.save()
+        with vault.connection(self.path) as conn:
+            raw={'scope':vault.scope(self.plugin),'plugin_id':'reader','bearer_token':self.token}
+            conn.execute('UPDATE web_mcp_credentials SET ciphertext=?',(vault.cipher(self.path).encrypt(json.dumps(raw).encode()),))
+        vault.write(self.path,'reader',{'revision':1,'credential_revision':1,'http_headers':{'x-api-key':'synthetic-header-secret'}})
+        self.assertEqual(vault.load_for_request(self.path,self.plugin,1)[0]['bearer_token'],self.token)
+        settings.save(self.path,{'revision':1,'plugins':[{**self.plugin,'url':'https://other.example/mcp'}]})
+        value=vault.read(self.path,'reader');self.assertFalse(value['configured']);self.assertEqual(value['header_names'],[])
+
+    def test_reserved_duplicate_injected_and_oversized_headers_rejected_atomically(self):
+        self.save()
+        invalid=[{name:'synthetic'} for name in ('Authorization','HOST','Cookie','Connection','MCP-Protocol-Version','Mcp-Name','Content-Length','Accept','Transfer-Encoding','Proxy-Authorization','Origin','Sec-Fetch-Site','X-Forwarded-For','X-Http-Method-Override','bad_name')]
+        invalid += [{'x-key':'a','X-Key':'b'},{'x-key':'line\r\nInjected: true'},{'x-key':'中文'},{'x-key':' space'},{'x-key':''},{f'x-key-{i}':'secret' for i in range(9)},{'x-a':'a'*8192,'x-b':'b'*8192}]
+        for headers in invalid:
+            with self.subTest(names=list(headers)),self.assertRaises(settings.SettingsError):
+                vault.write(self.path,'reader',{'revision':1,'credential_revision':1,'bearer_token':None,'http_headers':headers})
+        self.assertEqual(vault.load_for_request(self.path,self.plugin,1),({'bearer_token':self.token,'http_headers':{}},1))
+
+    def test_merged_header_count_cannot_exceed_limit_and_stale_remove_conflicts(self):
+        vault.write(self.path,'reader',{'revision':1,'credential_revision':0,'http_headers':{f'x-key-{i}':'synthetic' for i in range(8)}})
+        for revision,headers in [(1,{'x-extra':'synthetic'}),(0,{'x-key-0':None})]:
+            with self.assertRaises(settings.SettingsError):
+                vault.write(self.path,'reader',{'revision':1,'credential_revision':revision,'http_headers':headers})
+        self.assertEqual(len(vault.read(self.path,'reader')['header_names']),8)
+
+    def test_required_header_references_use_vault_not_environment(self):
+        plugin={**self.plugin,'options':{'env_http_headers':{'X-Api-Key':'RELAY_SECRET'}}}
+        settings.save(self.path,{'revision':1,'plugins':[plugin]})
+        factory=Mock()
+        with patch.dict(os.environ,{'RELAY_SECRET':'must-not-send'}),self.assertRaises(inspection.InspectionError):
+            inspection.discover(plugin,factory)
+        factory.assert_not_called()
+        from backend.tests.test_web_mcp_inspection import ScriptedTransport
+        transport=ScriptedTransport([(200,{'result':{'tools':[]}},None)])
+        factory.return_value=transport
+        inspection.discover(plugin,factory,http_headers={'x-api-key':'explicit-synthetic'})
+        self.assertEqual(factory.call_args.kwargs,{'http_headers':{'x-api-key':'explicit-synthetic'}})
+
+    def test_headers_sent_on_every_legacy_request_including_cleanup(self):
+        from backend.tests.test_web_mcp_inspection import ScriptedTransport
+        script=ScriptedTransport([(400,None,None),(200,{'result':{'protocolVersion':'2025-06-18','capabilities':{'tools':{}}}},'session'),(202,None,None),(200,{'result':{'tools':[]}},None)])
+        received=[]
+        class FakeTransport(inspection.Transport):
+            def request(inner,message,version,session=None,**kwargs):
+                received.append(inner.http_headers.copy())
+                return script.request(message,version,session,**kwargs)
+        with patch.object(inspection,'resolve',return_value=(inspection.urlsplit(self.plugin['url']),'8.8.8.8')):
+            inspection.discover(self.plugin,FakeTransport,bearer_token=self.token,http_headers={'X-Api-Key':'explicit-synthetic'})
+        self.assertEqual(received,[{'x-api-key':'explicit-synthetic'}]*5)
+        connection=Mock();connection.getresponse.return_value=Mock(status=302)
+        with patch.object(inspection,'resolve',return_value=(inspection.urlsplit(self.plugin['url']),'8.8.8.8')),patch.object(inspection,'PinnedHTTPS',return_value=connection):
+            transport=inspection.Transport(self.plugin['url'],inspection.time.monotonic()+2,http_headers={'X-Api-Key':'explicit-synthetic'})
+            with self.assertRaisesRegex(inspection.InspectionError,'redirect_not_allowed'):transport.request({'id':1,'method':'tools/list'},inspection.MODERN)
+        self.assertEqual(connection.request.call_count,1);self.assertEqual(connection.request.call_args.kwargs['headers']['x-api-key'],'explicit-synthetic')
+
+    def test_secret_metadata_is_filtered_before_truncation_and_json_escaping(self):
+        from backend.tests.test_web_mcp_inspection import ScriptedTransport
+        secret='synthetic-"quoted"-header-'+('a'*1100)
+        tool={'name':'lookup','description':secret,'inputSchema':{'type':'object'}}
+        def factory(*_,**kw):return ScriptedTransport([(200,{'result':{'tools':[tool]}},None)])
+        result=inspection.discover(self.plugin,factory,bearer_token=self.token,http_headers={'x-api-key':secret})
+        self.assertEqual(result['tools'][0]['description'],'[redacted]')
+        result=inspection.discover(self.plugin,factory,bearer_token=self.token,http_headers={'x-api-key':secret},include_schemas=True)
+        self.assertEqual(result['tools'],[])
 
 
 if __name__=='__main__':unittest.main()

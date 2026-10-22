@@ -26,7 +26,11 @@ def packed(value):
 
 
 def eligible(plugin):
-    return plugin['enabled'] and plugin['transport'] == 'streamable-http' and not plugin['options'].get('env_http_headers')
+    try:
+        credentials.reference_names(plugin)
+    except settings.SettingsError:
+        return False
+    return plugin['enabled'] and plugin['transport'] == 'streamable-http'
 
 
 def selection_root(conn, sid):
@@ -228,8 +232,8 @@ def prepare(path, sid, mid, *, store=None):
         if not wire.SLOTS.acquire(blocking=False):
             raise McpError('tools_busy')
         try:
-            token, credential_revision = credentials.load_for_inspection(path, plugin, inventory['revision'])
-            discovered = wire.discover(plugin, include_schemas=True, bearer_token=token)
+            auth, credential_revision = credentials.load_for_request(path, plugin, inventory['revision'])
+            discovered = wire.discover(plugin, include_schemas=True, **auth)
         finally:
             wire.SLOTS.release()
         if discovered['truncated']:
@@ -238,7 +242,7 @@ def prepare(path, sid, mid, *, store=None):
             options = plugin['options']
             if tool['name'] in options.get('disabled_tools', []) or ('enabled_tools' in options and tool['name'] not in options['enabled_tools']):
                 continue
-            if not schema_ok(tool['inputSchema']) or token and token in packed(tool):
+            if not schema_ok(tool['inputSchema']) or credentials.contains_secret(tool, auth):
                 continue
             alias = 'mcp_' + hashlib.sha256(packed([pid, tool['name']]).encode()).hexdigest()[:24]
             catalog[alias] = {'plugin': plugin, 'tool': tool, 'config_revision': inventory['revision'],
@@ -291,25 +295,23 @@ class Context:
             raise McpError('tools_busy')
         dispatched = False
         try:
-            token, revision = credentials.load_for_inspection(self.store.path, value['plugin'], value['config_revision'])
+            auth, revision = credentials.load_for_request(self.store.path, value['plugin'], value['config_revision'])
             if revision != value['credential_revision']:
                 raise McpError('credentials_changed')
             def claim():
                 nonlocal dispatched
                 self.store.claim(aid)
                 dispatched = True
-            result = wire.discover(value['plugin'], include_schemas=True, bearer_token=token,
+            result = wire.discover(value['plugin'], include_schemas=True, **auth,
                                    call=(value['tool'], value['arguments']), before_call=claim)
             # Display text only. Never fetch resources/media or follow elicitation.
             content = result.get('content', [])
             if not isinstance(content, list):
                 raise McpError('invalid_tool_result')
-            texts = [p['text'] for p in content if isinstance(p, dict) and p.get('type') == 'text' and isinstance(p.get('text'), str)]
+            texts = [credentials.redact(p['text'], auth) for p in content if isinstance(p, dict) and p.get('type') == 'text' and isinstance(p.get('text'), str)]
             if isinstance(result.get('structuredContent'), dict):
-                texts.append(packed(result['structuredContent']))
+                texts.append(packed(credentials.redact(result['structuredContent'], auth)))
             output = '\n'.join(texts)
-            if token:
-                output = output.replace(token, '[redacted]')
             output = output[:16000]
             value_out = packed({'status': 'error' if result.get('isError') else 'completed',
                                 'content': output, 'truncated': sum(len(t) for t in texts) > 16000,
