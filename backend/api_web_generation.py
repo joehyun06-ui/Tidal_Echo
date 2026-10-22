@@ -298,7 +298,7 @@ class ApiWebRuntime:
                 api = {"runtime": "api_loop", "model": out.get("model"), "usage": out.get("usage") or {}, "fallback_from": out.get("tried") or [], "session": sid, "usage_complete": out.get("usage_complete", True)}
                 self.store.finish(sid, mid, status="completed" if success else "failed",
                     text=(out.get("text") or '') if success else partial, api=api,
-                    error=None if success else out.get("error", "api_provider_incomplete"), unknown=out.get("outcome") == "dispatch_uncertain")
+                    error=None if success else (out.get("error") if out.get("error") in {"api_mcp_incomplete", "api_mcp_unavailable"} else "api_provider_incomplete"), unknown=out.get("outcome") == "dispatch_uncertain")
             job = self.store.get(sid, mid)
             if job and job["reply_id"]:
                 # Persistence is authoritative. Failed/lost fan-out is repaired by history GET, never inference.
