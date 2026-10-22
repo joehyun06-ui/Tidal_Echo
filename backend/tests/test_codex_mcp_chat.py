@@ -84,10 +84,22 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_denial_returns_tool_output_without_execution(self):
         task = asyncio.create_task(self.manager.handle(self.params()))
-        row = await self.pending(); self.store.decision('chat', row['id'], {'revision': 0, 'decision': 'deny'})
+        row = await self.pending()
+        self.assertFalse((await self.manager.handle(self.params(callId='parallel')))['success'])
+        self.store.decision('chat', row['id'], {'revision': 0, 'decision': 'deny'})
         result = await task
         self.assertFalse(result['success']); self.assertIn('denied', result['contentItems'][0]['text'])
         self.assertEqual(self.calls, [])
+
+    async def test_request_before_turn_reply_waits_for_durable_exact_turn(self):
+        from contextlib import closing
+        with closing(jobs.connect(self.gen)) as conn:
+            conn.execute("UPDATE codex_generation_jobs SET status='turn_dispatching',turn_id=NULL WHERE id=?", (self.job['id'],))
+        task = asyncio.create_task(self.manager.handle(self.params()))
+        await asyncio.sleep(.06); self.assertEqual(self.store.actions('chat')['actions'], [])
+        jobs.record_turn_started(self.gen, job_id=self.job['id'], turn_id='turn')
+        row = await self.pending(); self.store.decision('chat', row['id'], {'revision': 0, 'decision': 'deny'})
+        self.assertFalse((await task)['success']); self.assertEqual(self.calls, [])
 
     async def test_stop_and_recovery_do_not_replay(self):
         task = asyncio.create_task(self.manager.handle(self.params()))
@@ -198,6 +210,19 @@ class NativeTransportTests(unittest.IsolatedAsyncioTestCase):
     setUp = transport_fixture.SharedTransportTest.setUp
     asyncTearDown = transport_fixture.SharedTransportTest.asyncTearDown
     runtime = transport_fixture.SharedTransportTest.runtime
+
+    async def test_tool_reply_write_failure_does_not_cancel_or_await_itself(self):
+        runtime = self.runtime(timeout=3); scope = runtime.scope(methods=frozenset({'account/read'}))
+        await scope.request('account/read', {})
+        async def handler(params): return native.output({'ok': True})
+        runtime.install_tool_handler(handler)
+        owner = runtime._process
+        with patch.object(owner.stdin, 'write', side_effect=BrokenPipeError):
+            await runtime._consume_message({'id': 'tool-1', 'method': 'item/tool/call', 'params': {}}, owner=owner)
+            pending = runtime._tool_tasks['tool-1'][1]
+            await asyncio.wait_for(pending, 3)
+        self.assertIsNone(runtime._process)
+        self.assertFalse(runtime._tool_tasks)
 
     async def test_handler_does_not_block_reader_and_process_exit_cancels_pending_tool(self):
         runtime = self.runtime(timeout=3); scope = runtime.scope(methods=frozenset({'account/read'}))

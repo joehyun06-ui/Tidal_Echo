@@ -468,7 +468,7 @@ class CodexSharedAppServerRuntime:
         self._ready_process = None
         tool_tasks = []
         for request_id, (task_owner, task) in tuple(self._tool_tasks.items()):
-            if task_owner is owner:
+            if task_owner is owner and task is not asyncio.current_task():
                 task.cancel()
                 tool_tasks.append(task)
         reader, self._reader_task = self._reader_task, None
