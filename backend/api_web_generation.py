@@ -187,14 +187,14 @@ class Store:
 
 def assert_idle(conn, session_id, *, deleting=False):
     """Use the caller's transaction: deleting chat also deletes its run metadata."""
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='api_web_generations'").fetchone():
-        return
-    if conn.execute("SELECT 1 FROM api_web_generations WHERE session_id=? AND status IN ('queued','running','stopping')", (session_id,)).fetchone():
+    has_api = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='api_web_generations'").fetchone())
+    if has_api and conn.execute("SELECT 1 FROM api_web_generations WHERE session_id=? AND status IN ('queued','running','stopping')", (session_id,)).fetchone():
         raise ApiGenerationError("generation_busy")
     if deleting:
-        conn.execute("INSERT OR IGNORE INTO api_web_closed_sessions VALUES (?)", (session_id,))
-        conn.execute("DELETE FROM api_web_generations WHERE session_id=?", (session_id,))
-        for table in ('web_mcp_actions', 'web_mcp_chat_settings'):
+        if has_api:
+            conn.execute("INSERT OR IGNORE INTO api_web_closed_sessions VALUES (?)", (session_id,))
+            conn.execute("DELETE FROM api_web_generations WHERE session_id=?", (session_id,))
+        for table in ('web_mcp_actions', 'web_mcp_codex_actions', 'web_mcp_chat_settings'):
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
                 conn.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
 

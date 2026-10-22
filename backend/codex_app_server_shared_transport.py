@@ -178,7 +178,30 @@ class CodexSharedAppServerRuntime:
         self._pending: dict[int, tuple[Any, asyncio.Future]] = {}
         self._next_id = 1
         self._scopes: set[CodexScopedTransport] = set()
+        self._tool_handler = None
+        self._tool_tasks: dict[object, tuple[Any, asyncio.Task]] = {}
         self._closed = False
+
+    def install_tool_handler(self, handler) -> None:
+        # A single application owner; this does not grant any built-in approval.
+        if self._tool_handler is not None:
+            raise CodexTransportError('codex_app_server_protocol_error')
+        self._tool_handler = handler
+
+    async def _reply_tool(self, request_id, params, owner):
+        try:
+            result = await self._tool_handler(params)
+            if owner is self._process:
+                await self._write_message({'id': request_id, 'result': result}, owner=owner)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if owner is self._process:
+                await self._write_message({'id': request_id, 'error': {'code': -32603, 'message': 'tool unavailable'}}, owner=owner)
+        finally:
+            entry = self._tool_tasks.get(request_id)
+            if entry is not None and entry[0] is owner and entry[1] is asyncio.current_task():
+                self._tool_tasks.pop(request_id, None)
 
     @property
     def enabled(self) -> bool:
@@ -359,9 +382,19 @@ class CodexSharedAppServerRuntime:
         if method is not None:
             if not isinstance(method, str) or not method:
                 raise ValueError
-            # Any App Server -> client request is denied. P2 threads must never require
-            # approvals, tools, user-input requests, or elicitation to make progress.
             if "id" in message:
+                request_id = message['id']
+                if isinstance(request_id, bool) or not isinstance(request_id, (int, str)) or len(str(request_id)) > 160:
+                    raise ValueError
+                # Never block the JSONL reader on a user decision: interrupts,
+                # terminal notifications and unrelated RPC replies must still flow.
+                if method == 'item/tool/call' and self._tool_handler is not None:
+                    if request_id in self._tool_tasks:
+                        raise ValueError
+                    if len(self._tool_tasks) < 8 and isinstance(message.get('params'), dict):
+                        task = asyncio.create_task(self._reply_tool(request_id, message['params'], owner))
+                        self._tool_tasks[request_id] = (owner, task)
+                        return
                 await self._write_message(
                     {
                         "id": message.get("id"),
@@ -433,6 +466,11 @@ class CodexSharedAppServerRuntime:
             return
         self._process = None
         self._ready_process = None
+        tool_tasks = []
+        for request_id, (task_owner, task) in tuple(self._tool_tasks.items()):
+            if task_owner is owner:
+                task.cancel()
+                tool_tasks.append(task)
         reader, self._reader_task = self._reader_task, None
         error = CodexTransportError(category)
         futures: list[asyncio.Future] = []
@@ -447,6 +485,8 @@ class CodexSharedAppServerRuntime:
         if reader is not None and not from_reader and reader is not asyncio.current_task():
             reader.cancel()
         await self._terminate_owner(owner)
+        if tool_tasks:
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
 
     async def close(self) -> None:
         self._closed = True
@@ -454,3 +494,4 @@ class CodexSharedAppServerRuntime:
         if owner is not None:
             await self._fail_process("codex_app_server_unavailable", owner=owner)
         self._scopes.clear()
+

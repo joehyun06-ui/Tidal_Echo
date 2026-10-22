@@ -84,6 +84,7 @@ class CodexGenerationHardeningTransport:
 
     def __init__(self, transport: CodexScopedTransport) -> None:
         self._transport = transport
+        self.chat_mcp = None
 
     async def request(self, method: str, params: Mapping[str, object]) -> object:
         if method not in {"thread/start", "thread/resume", "thread/fork"}:
@@ -137,7 +138,7 @@ class CodexGenerationHardeningTransport:
         rewritten["sandbox"] = "read-only"
         if method == "thread/start":
             rewritten["environments"] = []
-            rewritten["dynamicTools"] = []
+            rewritten["dynamicTools"] = self.chat_mcp.definitions() if self.chat_mcp else []
             rewritten["selectedCapabilityRoots"] = []
             rewritten["experimentalRawEvents"] = False
         else:
@@ -147,4 +148,7 @@ class CodexGenerationHardeningTransport:
                 or result["sandbox"].get("type") != "readOnly"
                 or result.get("approvalPolicy") != "never"):
             raise CodexTransportError("codex_app_server_protocol_error")
+        if self.chat_mcp:
+            self.chat_mcp.record_thread(method, params, result)
         return result
+
