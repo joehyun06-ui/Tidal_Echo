@@ -28,7 +28,7 @@ def response_error(exc):
     return JSONResponse({'ok': False, 'error': exc.category}, status_code=exc.status, headers=HEADERS)
 
 
-def install_loop(app, legacy, integration):
+def install_loop(app, legacy, integration, runtime=None):
     store = Store(legacy.RELAY_DB)
     def operation(sid, kind, method, body, aid):
         with integration._session_lock:
@@ -37,14 +37,22 @@ def install_loop(app, legacy, integration):
             row = integration.session_authority.row_for_session(sid)
             if row is None:
                 raise SettingsError('mcp_session_not_found', 404)
-            if row['provider'] != 'api':
+            selected_store = store
+            if row['provider'] == 'codex' and runtime is not None and runtime.generation_enabled:
+                selected_store = runtime.chat_mcp.store
+                if not runtime.chat_mcp.supported(sid):
+                    if method != 'GET':
+                        raise SettingsError('mcp_provider_not_supported', 409)
+                    return {'ok': True, 'contract_version': 1, 'api_session': sid, 'supported': False,
+                            'reason': 'codex_new_session_required', 'actions': []}
+            elif row['provider'] != 'api':
                 if method != 'GET':
                     raise SettingsError('mcp_provider_not_supported', 409)
                 return {'ok': True, 'contract_version': 1, 'api_session': sid, 'supported': False, 'actions': []}
             if kind == 'actions':
-                value = store.actions(sid) if method == 'GET' else store.decision(sid, aid, body)
+                value = selected_store.actions(sid) if method == 'GET' else selected_store.decision(sid, aid, body)
             else:
-                value = store.read(sid) if method == 'GET' else store.save(sid, body)
+                value = selected_store.read(sid) if method == 'GET' else selected_store.save(sid, body)
             return {**value, 'supported': True}
 
     async def handle(sid, request, kind='settings', aid=None):

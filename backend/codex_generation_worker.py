@@ -100,6 +100,7 @@ class CodexGenerationEventInbox:
         turn_id: str,
         *,
         timeout_seconds: float,
+        paused=None,
     ) -> tuple[GenerationNotification, Mapping[str, int] | None]:
         async with self._lock:
             queue = self._queues.get(turn_id)
@@ -108,9 +109,22 @@ class CodexGenerationEventInbox:
                 self._queues[turn_id] = queue
                 self._order.append(turn_id)
         usage: Mapping[str, int] | None = None
-        async with asyncio.timeout(timeout_seconds):
+        remaining = timeout_seconds
+        deadline = asyncio.get_running_loop().time() + timeout_seconds + (900 if paused else 0)
+        async with asyncio.timeout_at(deadline):
             while True:
-                event = await queue.get()
+                before = asyncio.get_running_loop().time()
+                was_paused = bool(paused and paused())
+                try:
+                    event = await asyncio.wait_for(queue.get(), min(0.25, max(0.001, remaining)))
+                except TimeoutError:
+                    event = None
+                if not was_paused:
+                    remaining -= asyncio.get_running_loop().time() - before
+                if event is None:
+                    if remaining <= 0:
+                        raise TimeoutError
+                    continue
                 if event.usage is not None:
                     usage = event.usage
                 if event.terminal:
@@ -408,3 +422,4 @@ class CodexGenerationWorker:
             await self.protocol.unsubscribe(thread_id=str(session["thread_id"]))
         except Exception:
             pass
+

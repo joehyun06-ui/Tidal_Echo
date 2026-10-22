@@ -408,6 +408,9 @@ class CodexGenerationProtocol:
         self.config = config
         self._transport = transport
 
+    def install_chat_mcp(self, manager):
+        self._transport.chat_mcp = manager
+
     def _require_enabled(self) -> None:
         if not self.config.enabled:
             raise CodexGenerationError("codex_generation_disabled")
@@ -605,3 +608,4 @@ class CodexGenerationProtocol:
             "thread/unsubscribe",
             {"threadId": _safe_id(thread_id, "codex_generation_thread_invalid")},
         )
+

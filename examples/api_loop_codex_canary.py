@@ -95,7 +95,7 @@ install_budget(app, legacy, INTEGRATION, RUNTIME)
 from backend.web_context_actions_routes import install_loop as install_context_actions
 install_context_actions(app, legacy, INTEGRATION, RUNTIME)
 from backend.web_mcp_chat_routes import install_loop as install_mcp_chat
-install_mcp_chat(app, legacy, INTEGRATION)
+install_mcp_chat(app, legacy, INTEGRATION, RUNTIME)
 
 
 def _error(exc: CodexCanaryLoopIntegrationError) -> JSONResponse:

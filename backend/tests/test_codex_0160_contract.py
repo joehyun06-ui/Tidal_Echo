@@ -31,6 +31,15 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
     def schema(self, name):
         return json.loads((self.schema_dir / "v2" / (name + ".json")).read_text())
 
+    async def test_native_plugin_bridge_matches_pinned_dynamic_tool_schema(self):
+        from backend.codex_mcp_chat import TOOLS, output
+        schema = self.schema('ThreadStartParams')
+        Draft7Validator(schema).validate({'dynamicTools': TOOLS})
+        request = {'threadId': 'thread', 'turnId': 'turn', 'callId': 'call', 'namespace': None,
+                   'tool': 'guiting_plugin_call', 'arguments': {'name': 'mcp_fixture', 'arguments': {'query': 'synthetic'}}}
+        for name, payload in [('DynamicToolCallParams', request), ('DynamicToolCallResponse', output({'status': 'completed'}))]:
+            Draft7Validator(json.loads((self.schema_dir / (name + '.json')).read_text())).validate(payload)
+
     async def test_reply_projection_accepts_real_cli_notification_schemas(self):
         progress = ReplyProgress()
         context = {"threadId": "thr-fixture", "turnId": "turn-fixture"}
@@ -110,3 +119,4 @@ class Codex0160ContractTests(unittest.IsolatedAsyncioTestCase):
                 Draft7Validator(self.schema("ConfigReadResponse")).validate(config)
             finally:
                 await runtime.close()
+

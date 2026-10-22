@@ -1,4 +1,4 @@
-"""Opt-in API chat plugins and durable, one-use action approvals."""
+"""Opt-in chat plugins and durable, one-use action approvals."""
 import asyncio
 import hashlib
 import json
@@ -64,8 +64,13 @@ def schema_ok(schema):
 
 
 class Store:
+    action_table = 'web_mcp_actions'
+
     def __init__(self, path):
         self.path = path
+
+    def attach(self, conn):
+        pass
 
     @contextmanager
     def db(self):
@@ -73,12 +78,13 @@ class Store:
         conn.row_factory = sqlite3.Row
         try:
             conn.execute('CREATE TABLE IF NOT EXISTS web_mcp_chat_settings (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, config_revision INTEGER NOT NULL, plugins TEXT NOT NULL)')
-            conn.execute("""CREATE TABLE IF NOT EXISTS web_mcp_actions (
+            conn.execute(f"""CREATE TABLE IF NOT EXISTS {self.action_table} (
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, message_id INTEGER NOT NULL,
                 revision INTEGER NOT NULL, status TEXT NOT NULL, created_at REAL NOT NULL,
                 expires_at REAL NOT NULL, payload TEXT NOT NULL, result TEXT)""")
-            conn.execute('CREATE INDEX IF NOT EXISTS web_mcp_actions_message ON web_mcp_actions(session_id,message_id)')
+            conn.execute(f'CREATE INDEX IF NOT EXISTS {self.action_table}_message ON {self.action_table}(session_id,message_id)')
             conn.commit()
+            self.attach(conn)
             conn.execute('BEGIN IMMEDIATE')
             yield conn
             conn.commit()
@@ -120,22 +126,25 @@ class Store:
 
     def recover(self):
         with self.db() as conn:
-            conn.execute("UPDATE web_mcp_actions SET status=CASE WHEN status='executing' THEN 'unknown' ELSE 'cancelled' END,revision=revision+1 WHERE status IN ('pending','approved','executing')")
+            conn.execute(f"UPDATE {self.action_table} SET status=CASE WHEN status='executing' THEN 'unknown' ELSE 'cancelled' END,revision=revision+1 WHERE status IN ('pending','approved','executing')")
 
     def end(self, sid, mid):
         with self.db() as conn:
-            conn.execute("UPDATE web_mcp_actions SET status=CASE WHEN status='executing' THEN 'unknown' ELSE 'cancelled' END,revision=revision+1 WHERE session_id=? AND message_id=? AND status IN ('pending','approved','executing')", (sid, mid))
+            conn.execute(f"UPDATE {self.action_table} SET status=CASE WHEN status='executing' THEN 'unknown' ELSE 'cancelled' END,revision=revision+1 WHERE session_id=? AND message_id=? AND status IN ('pending','approved','executing')", (sid, mid))
+
+    def action_rows(self, conn, sid):
+        return conn.execute("""SELECT a.* FROM web_mcp_actions a JOIN api_web_generations g
+            ON g.message_id=a.message_id AND g.session_id=a.session_id
+            WHERE a.session_id=? ORDER BY a.created_at DESC LIMIT 24""", (sid,)).fetchall()
 
     def actions(self, sid):
         with self.db() as conn:
-            conn.execute("UPDATE web_mcp_actions SET status='expired',revision=revision+1 WHERE session_id=? AND status='pending' AND expires_at<?", (sid, time.time()))
-            rows = conn.execute("""SELECT a.* FROM web_mcp_actions a JOIN api_web_generations g
-                ON g.message_id=a.message_id AND g.session_id=a.session_id
-                WHERE a.session_id=? ORDER BY a.created_at DESC LIMIT 24""", (sid,)).fetchall()
+            conn.execute(f"UPDATE {self.action_table} SET status='expired',revision=revision+1 WHERE session_id=? AND status='pending' AND expires_at<?", (sid, time.time()))
+            rows = self.action_rows(conn, sid)
             result = []
             for row in reversed(rows):
                 value = json.loads(row['payload']); plugin, tool = value['plugin'], value['tool']
-                result.append({'id': row['id'], 'generation_id': f"api-gen-{row['message_id']}",
+                result.append({'id': row['id'], 'generation_id': value.get('generation_id', f"api-gen-{row['message_id']}"),
                                'message_id': row['message_id'], 'revision': row['revision'], 'status': row['status'],
                                'plugin_name': plugin['name'], 'url': plugin['url'], 'tool_name': tool['name'],
                                'arguments': value['arguments'], 'created_at': row['created_at'],
@@ -158,11 +167,11 @@ class Store:
     def propose(self, sid, mid, value):
         with self.db() as conn:
             self.validate_binding(conn, sid, mid, value)
-            count = conn.execute('SELECT count(*) FROM web_mcp_actions WHERE message_id=?', (mid,)).fetchone()[0]
+            count = conn.execute(f'SELECT count(*) FROM {self.action_table} WHERE message_id=? AND session_id=?', (mid, sid)).fetchone()[0]
             if count >= MAX_CALLS:
                 raise McpError('tool_limit')
             aid, now = uuid.uuid4().hex, time.time()
-            conn.execute("INSERT INTO web_mcp_actions VALUES (?,?,?,0,'pending',?,?,?,NULL)",
+            conn.execute(f"INSERT INTO {self.action_table} VALUES (?,?,?,0,'pending',?,?,?,NULL)",
                          (aid, sid, mid, now, now + APPROVAL_SECONDS, packed(value)))
             return aid
 
@@ -170,7 +179,7 @@ class Store:
         if not isinstance(body, dict) or set(body) != {'revision', 'decision'} or type(body['revision']) is not int or body['decision'] not in ('approve', 'deny'):
             raise settings.SettingsError('mcp_config_invalid')
         with self.db() as conn:
-            row = conn.execute('SELECT * FROM web_mcp_actions WHERE id=? AND session_id=?', (aid, sid)).fetchone()
+            row = conn.execute(f'SELECT * FROM {self.action_table} WHERE id=? AND session_id=?', (aid, sid)).fetchone()
             if not row:
                 raise settings.SettingsError('mcp_action_not_found', 404)
             if row['revision'] != body['revision'] or row['status'] != 'pending' or row['expires_at'] <= time.time():
@@ -180,32 +189,32 @@ class Store:
                     self.validate_binding(conn, sid, row['message_id'], json.loads(row['payload']))
                 except (McpError, settings.SettingsError):
                     raise settings.SettingsError('mcp_action_conflict', 409) from None
-            conn.execute('UPDATE web_mcp_actions SET status=?,revision=revision+1 WHERE id=?',
+            conn.execute(f'UPDATE {self.action_table} SET status=?,revision=revision+1 WHERE id=?',
                          ('approved' if body['decision'] == 'approve' else 'denied', aid))
         return self.actions(sid)
 
     def state(self, aid):
         with self.db() as conn:
-            row = conn.execute('SELECT * FROM web_mcp_actions WHERE id=?', (aid,)).fetchone()
+            row = conn.execute(f'SELECT * FROM {self.action_table} WHERE id=?', (aid,)).fetchone()
             if not row:
                 raise McpError('action_missing')
             return dict(row)
 
     def mark(self, aid, status, result=None):
         with self.db() as conn:
-            conn.execute("UPDATE web_mcp_actions SET status=?,result=?,revision=revision+1 WHERE id=? AND status IN ('pending','approved','executing')", (status, result, aid))
+            conn.execute(f"UPDATE {self.action_table} SET status=?,result=?,revision=revision+1 WHERE id=? AND status IN ('pending','approved','executing')", (status, result, aid))
 
     def claim(self, aid):
         with self.db() as conn:
-            row = conn.execute('SELECT * FROM web_mcp_actions WHERE id=?', (aid,)).fetchone()
+            row = conn.execute(f'SELECT * FROM {self.action_table} WHERE id=?', (aid,)).fetchone()
             if not row or row['status'] != 'approved':
                 raise McpError('action_not_approved')
             self.validate_binding(conn, row['session_id'], row['message_id'], json.loads(row['payload']))
-            conn.execute("UPDATE web_mcp_actions SET status='executing',revision=revision+1 WHERE id=?", (aid,))
+            conn.execute(f"UPDATE {self.action_table} SET status='executing',revision=revision+1 WHERE id=?", (aid,))
 
 
-def prepare(path, sid, mid):
-    store = Store(path); selection = store.read(sid)
+def prepare(path, sid, mid, *, store=None):
+    store = store or Store(path); selection = store.read(sid)
     if not selection['plugin_ids']:
         return None
     if selection['stale']:

@@ -89,6 +89,8 @@ class GenerationControls:
         if job["status"] != "in_progress" or not job.get("thread_id") or not job.get("turn_id"):
             raise GenerationControlError("generation_not_interruptible")
         self.stops[generation_id] = "stopping"
+        if getattr(self, 'chat_mcp', None):
+            self.chat_mcp.stop(api_session, generation_id)
         while len(self.stops) > 32:
             self.stops.popitem(last=False)
         try:
@@ -123,6 +125,9 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
         )
         from .web_codex_compaction import Compactions
         self.compactions = Compactions(self)
+        from .codex_mcp_chat import install
+        install(self)
+        self.controls.chat_mcp = self.chat_mcp
 
     def _on_progress(self, method, params):
         self.progress.receive(method, params)
@@ -140,6 +145,11 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
             raise CodexGenerationError(error.category) from None
 
     async def start(self):
+        if self.generation_enabled and (self._worker_task is None or self._worker_task.done()):
+            from .codex_generation_runtime_config import prepare_generation_paths
+            prepare_generation_paths(self.config, self.control_config)
+            store.initialize(self.config.store_path)
+            self.chat_mcp.store.recover()
         await super().start()
         if self.generation_enabled:
             self.compactions.initialize()
@@ -203,3 +213,4 @@ def build_progress_callback(legacy):
         if not ok:
             raise GenerationControlError("generation_progress_unavailable", 503)
     return callback
+

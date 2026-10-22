@@ -28,6 +28,23 @@ class CaptureTransport:
 
 
 class HardeningTransportTest(unittest.IsolatedAsyncioTestCase):
+    async def test_only_application_bridge_replaces_supplied_dynamic_tools(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from backend.codex_mcp_chat import TOOLS
+        inner = CaptureTransport({'local': {'command': 'never-launched'}})
+        transport = CodexGenerationHardeningTransport(inner)
+        transport.chat_mcp = SimpleNamespace(definitions=lambda: TOOLS, record_thread=Mock())
+        await transport.request('thread/start', {'cwd': '/tmp/fixture', 'dynamicTools': ['unsafe'],
+                                                 'config': {'features.shell_tool': True}, 'environments': ['unsafe']})
+        sent = inner.calls[-1][1]
+        self.assertEqual(sent['dynamicTools'], TOOLS)
+        self.assertEqual(sent['environments'], [])
+        self.assertFalse(sent['config']['features.shell_tool'])
+        self.assertEqual(sent['config']['mcp_servers'], {'local': {'enabled': False}})
+        self.assertEqual(sent['approvalPolicy'], 'never')
+        transport.chat_mcp.record_thread.assert_called_once()
+
     async def test_flattened_mcp_and_read_only_response_are_required(self):
         class Flat(CaptureTransport):
             async def request(self, method, params):
@@ -145,3 +162,4 @@ class HardeningTransportTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
