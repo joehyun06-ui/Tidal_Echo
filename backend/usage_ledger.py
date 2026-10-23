@@ -323,6 +323,18 @@ class Ledger:
             if not isinstance(snapshot,dict) or set(snapshot)-{'model','context_limit','cache_policy','price'}: raise LedgerError('ledger_event_invalid')
             model_name(snapshot.get('model'))
             if snapshot.get('context_limit') is not None and count(snapshot['context_limit']) is None: raise LedgerError('ledger_event_invalid')
+        elif value['kind']=='continuation' and snapshot is not None:
+            if (not isinstance(snapshot,dict) or set(snapshot)!={'stage','success','input_message_id','reply_message_id'}
+                    or snapshot['stage'] not in {'target_created','message_received','reply_completed','reply_failed','content_unverified'}
+                    or value.get('source')!='canonical_continuation_receipt' or not value.get('target_session_id')): raise LedgerError('ledger_event_invalid')
+            stage=snapshot['stage']
+            expected_status='completed' if stage=='reply_completed' else 'failed' if stage=='reply_failed' else 'unknown' if stage=='content_unverified' else 'observed'
+            expected_success=True if stage=='reply_completed' else False if stage=='reply_failed' else None
+            if value['status']!=expected_status or snapshot['success'] is not expected_success: raise LedgerError('ledger_event_invalid')
+            for key in ('input_message_id','reply_message_id'):
+                if snapshot[key] is not None and (count(snapshot[key]) is None or snapshot[key]==0): raise LedgerError('ledger_event_invalid')
+            if stage=='target_created' and snapshot['input_message_id'] is not None or stage!='target_created' and snapshot['input_message_id'] is None: raise LedgerError('ledger_event_invalid')
+            if (stage=='reply_completed') != (snapshot['reply_message_id'] is not None): raise LedgerError('ledger_event_invalid')
         elif snapshot is not None: raise LedgerError('ledger_event_invalid')
         payload = {**value,'at':timestamp(value.get('at'))}; encoded = raw_json(payload)
         with closing(self.connect()) as conn:
@@ -368,7 +380,10 @@ class Ledger:
     def purge_session(self, sid):
         identifier(sid)
         with closing(self.connect()) as conn:
-            conn.execute('BEGIN IMMEDIATE'); conn.execute('DELETE FROM usage_ledger WHERE session_id=?',(sid,)); conn.execute('DELETE FROM usage_ledger_events WHERE session_id=?',(sid,)); conn.commit()
+            conn.execute('BEGIN IMMEDIATE'); conn.execute('DELETE FROM usage_ledger WHERE session_id=?',(sid,)); conn.execute('DELETE FROM usage_ledger_events WHERE session_id=? OR json_extract(payload,\'$.target_session_id\')=?',(sid,sid))
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='usage_ledger_continuations'").fetchone():
+                conn.execute('DELETE FROM usage_ledger_continuations WHERE source_id=? OR target_id=?',(sid,sid))
+            conn.commit()
 
 
 def metric_sum(records, field):
@@ -408,7 +423,7 @@ def summarize(records):
             'retries':sum(r['retry_count'] for r in records) if records and all(r.get('retry_count') is not None for r in records) else None}
 
 
-def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/Shanghai', now=None, budgets=None):
+def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/Shanghai', now=None, budgets=None, message_source=None):
     if model is not None: model_name(model)
     settings=ledger.settings(mode); saved_policy=settings['policy']
     zone=saved_policy.get('timezone',zone) if settings['revision'] else zone
@@ -424,6 +439,11 @@ def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/
     events = ledger.events(mode,None if all_sessions else sid)
     counts = next((e.get('snapshot') for e in reversed(events) if e['kind']=='message_counts' and e['session_id']==sid),None) if not all_sessions else None
     counts = {key:count((counts or {}).get(key)) for key in ('total','visible','folded','archived','turns')}
+    counts_provenance = {'source':'recorded_snapshot','status':'unverified'}
+    if message_source is not None:
+        sourced = message_source(mode,sid,all_sessions=all_sessions)
+        counts = {key:count(sourced['counts'].get(key)) for key in counts}
+        counts_provenance = sourced['provenance']
     observation = next((e for e in reversed(events) if e['kind']=='context' and e['session_id']==sid),None) if not all_sessions else None
     obs = observation.get('snapshot') if observation else None
     observed_at = (obs or {}).get('observed_at') or (observation or {}).get('at')
@@ -470,7 +490,7 @@ def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/
     return {'ok':True,'contract_version':1,'mode':mode,'session_id':sid,'scope':'all' if all_sessions else 'session','timezone':zone,
             'coverage':'recorded_turns_only' if mode=='codex' else 'recorded_requests_only','context':ctx,'summary':summarize(rows),'daily':summarize(daily),'monthly':summarize(monthly),
             'last_round':summarize([r for r in rows if latest and (r['session_id'],r['turn_id'])==(latest['session_id'],latest['turn_id'])]),
-            'message_counts':counts,'events':history[-100:],'configuration_changes':changes[-100:],'cache_diagnostics':anomalies[-100:],
+            'message_counts':counts,'message_counts_provenance':counts_provenance,'events':history[-100:],'configuration_changes':changes[-100:],'cache_diagnostics':anomalies[-100:],
             'trends':[{'period':k[0],'at':k[1],'provider_id':k[2],'model':k[3],'summary':summarize(v)} for k,v in sorted(trends.items())],
             'budgets':budget_views,'settings':settings,'models':sorted({r['model'] for r in scope_rows}),'recent_requests':[{k:v for k,v in r.items() if k!='raw_usage'} for r in rows[-100:]]}
 
