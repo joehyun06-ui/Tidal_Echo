@@ -12,6 +12,9 @@
 - 本批增加 `usage_ledger_capture.ApiCollector`，只由离线测试显式注入
   `ApiWebRuntime(legacy, usage_collector=collector)`。默认参数为 `None`，
   既有生成器、独立记忆任务和正式运行不会自动启用采集或缓存参数。
+- Codex 后续批次增加 `usage_ledger_codex.CodexCollector`，显式注入
+  `StreamingCodexGenerationRuntime(..., usage_collector=collector)`；正式入口不创建它。
+  只被动接收原生通知，不增加 RPC，不调用模型、不升级 CLI 或改写线程内容。
 - 不发送真实模型 API 请求，不读取生产聊天或独立记忆验收题、答案、标签、预测。
 - v48 冻结状态、36/36 与 108/108 门槛、现有提示词和记忆策略均保持原样。
 - 验证使用合成用量、临时数据库、ASGI Mock、CI 中 Chromium/WebKit 和本地回环 fixture。
@@ -24,7 +27,7 @@
 | P0 | 上下文监控 | 独立观测：Token、模型上限、比例、剩余、来源、新旧状态 | 接实际观测；不可用时不拿累计 Token 代替 |
 | P0 | 自动换窗预警 | 可配置 Token 阈值和提前空间；历史观测不发当前预警 | 接实际占用与会话预警；自动换窗未启用 |
 | P0 | 换窗与压缩记录 | 事件记录前后 Token、续窗结果、重要记忆验证状态 | 对接实际生命周期；重要记忆等待独立验证，不能用压缩完成推断 |
-| P0 | 单轮 Token | 普通/API MCP 流式与非流式请求采集；按 turn_id 汇总；流式快照只保留最后一次 | Codex 线程累计增量、真实环境启用另行验证 |
+| P0 | 单轮 Token | API 逐请求；Codex 原生轮次与连续累计差值离线适配，首次无基线为不可用 | 生产线程独占归属与事件连续性验证后再启用 |
 | P0 | API 缓存统计 | 读、写、未命中、按 Token 加权命中率及覆盖率 | 按服务商和返回格式明确选择适配器 |
 | P0 | 缓存优化 | 显式服务商配置、稳定前缀 HMAC 和请求缓存参数已通过 Mock；不重排提示词/记忆/工具 | 生产连接能力与费率审核后再启用；无预热或额外请求 |
 | P0 | 费用与预算 | 每请求不可变价格快照；Decimal 估算单轮、每日、本月、净节省；预算预警 | 接实际价格/账单来源；硬预算拦截未实现，不声称保证费用上限 |
@@ -48,6 +51,8 @@
   请求模型的价格；未返回实际模型时只标记请求模型，不宣称确认实际路由。
 - 用量：`raw_usage` 原始 JSON 对象、`usage_complete`、归一化 metrics、字段路径和冲突标记。
   保存的是原始 JSON 值，不是完整响应体、聊天文本或逐字节 HTTP 报文。
+  Codex 原生 envelope 原样保存 `last` / `total` / `modelContextWindow`；另存
+  `usage_baseline` 与 `accounting_basis`，CSV / JSON 都可核对原始累计值与差值。
 - 状态：已完成、错误、超时、限流、中断、未知；耗时、HTTP 状态、实际重试次数。
 - 费用：请求当时的币种和每百万 Token 费率、价格版本，不能用后来的价格回算旧请求。
 - 可选：明确来源的上下文观测、预警策略、稳定前缀 HMAC、缓存策略/配置版本。
@@ -93,9 +98,45 @@ Codex 的 API 缓存和 API 费用为不适用，原始订阅计数仍保留，�
 - 暂未支持 Anthropic 原生 Messages 请求注入、显式断点、缓存预热；已有 Anthropic
   用量归一化与费用快照可独立测试。Codex 不使用这些 API 缓存配置。
 
-后续接入顺序：Codex 累计计数与终态关联 → 真实压缩/续窗与权威消息计数 →
+后续接入顺序：真实压缩/续窗与权威消息计数 →
 持久化采集缺口、保留/删除策略和分页 → 最后再决定生产启用与挂载。
-Codex `last`、线程 `total` 和上下文占用不能直接相加，本批不改订阅统计协议。
+Codex 订阅额度仍沿用现有账户面板，不改账户统计协议或模拟 API 计费。
+
+## Codex 单轮与累计计数（离线后续批次）
+
+核对固定 CLI **0.160.0** 的 schema 与官方同版本源码：
+`thread/tokenUsage/updated` 携带 `last`、线程 `total` 和可能为空的
+`modelContextWindow`。`last` 只用于最近一次上下文观测，不能把多次 last 快照当
+成整轮用量相加；线程 total 也不能直接累加进会话账本。
+参考 [App Server](https://learn.chatgpt.com/docs/app-server) 与
+[固定版本 TokenUsageInfo](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/protocol/src/protocol.rs)。
+
+- 被动订阅 turn/started、turn/completed、thread/tokenUsage/updated 和原生
+  contextCompaction 的 item 通知。不会请求隐藏推理内容或使用 internal-only 事件。
+- 事件可能早于 turn/start ACK：最多暂存 32 轮（可配置 1–128），先核对 durable
+  thread_id + turn_id + canonical_message_id + session_id，再写独立账本。
+  只读路由标识与消息存在性，不读取聊天正文、记忆、验收数据或提示词。
+- 首次只有原始累计值，没有可靠前一轮终态基线时，整轮消耗为 null。
+  下轮必须匹配前一已观测终态、数据库中的紧邻原生轮次、同一会话和模型；
+  才能计算 `本轮 total - 前轮终态 total`。因此一轮工具多请求不会重加快照。
+- **独占归属是显式前提**：`exclusive_threads` 默认 false。只有配置所有者确认
+  这些原生线程由此归汀运行时独占时，才可设 true 使用跨轮差值；其他客户端也可能
+  写入同一线程时，保留原始累计值与上下文，单轮差值仍不可用。离线 fixture 显式为 true。
+- 进程观察 epoch 改变、漏掉中间 durable 轮次、事件次序异常、累计字段回退、压缩、
+  未观察到开始或终态，都会阻断跨轮推算。缺失推理计数为 null，真实上报的 0 保持 0。
+  重启后的重放不会重复入账，也不能把旧账本重放当作新的连续基线。
+- 请求标识由 provider + 原生 thread + turn 确定，进程重启不改变它。
+  已终态轮次不被迟到事件重写；迟到变化会清除基线并记入采集健康计数。
+  不同订阅连接、原生线程、会话和 API 模式各自隔离。已删除消息不能被重建。
+- 上下文单独取最近原生 last.totalTokens 和显式模型上限。下一轮开始即使还没有
+  usage，也会使旧观测过期。压缩使旧占用失效；压缩后出现新观测才恢复显示。
+  压缩完成不等于重要记忆已保留，memory_preserved 仍为 null。
+- 原生轮次并非单个 API 请求：API 延迟、独立请求重试/超时/限流及 API 缓存/账单
+  不从这些事件推测。界面按轮显示来源说明，额度继续在“我的”查看。
+
+当前暂存与健康计数是进程内数据；关闭/重启导致的缺口不伪装完整历史。
+生产启用前仍需完成持久化采集缺口、权威续窗/计数、删除与保留策略、分页，以及
+线程独占归属和通知连续性验收。后台保存失败不会重试生成或改变最终回复。
 
 费用只估算 Token 部分，工具费、税费、阶梯/区域/批次价等未采集时不保证完整账单。
 缓存写入的分 TTL 数值不会与总写入重复计费；价格不全、用量不全或字段冲突时费用不可用。
@@ -119,11 +160,14 @@ Codex `last`、线程 `total` 和上下文占用不能直接相加，本批不�
 
 ## 运行与验证
 
-后端：`python -m unittest backend.tests.test_usage_ledger backend.tests.test_usage_ledger_capture`
+后端：`python -m unittest backend.tests.test_usage_ledger backend.tests.test_usage_ledger_capture backend.tests.test_usage_ledger_codex`
 
 采集测试使用真实 provider 函数的语法树执行片段与 HTTPX MockTransport；不执行
 bridge 模块顶层环境读取，不导入记忆模块。另走真实 Web 生成运行时、临时 relay /
 ledger 数据库和鉴权 ASGI 接口，验证生成 → 采集 → 查看 / 导出闭环及模式隔离。
+Codex 使用合成原生通知、临时 native/relay/ledger 数据库，并禁止出站连接；
+前端 fixture 由实际 CodexCollector 生成两轮记录，核对首次 null、后一轮差值与
+原始累计导出。不会启动真实 Codex、登录或发送真实模型请求。
 
 前端 CI 的 `test:integration` 在安装受检后端后启动独立临时 fixture，
 只绑定 127.0.0.1，显式禁止 Python 出站连接；浏览器只放行两个回环源。

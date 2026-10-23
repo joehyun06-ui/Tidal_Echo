@@ -66,7 +66,7 @@ def raw_json(value):
     return data
 
 
-def normalize(raw, dialect):
+def normalize(raw, dialect, *, usage_baseline=None):
     if dialect not in DIALECTS or raw is not None and not isinstance(raw, dict): raise LedgerError('ledger_usage_invalid')
     raw_json(raw)
     u = raw or {}; m = dict.fromkeys(METRICS); issues = []; paths = {}
@@ -99,7 +99,25 @@ def normalize(raw, dialect):
         m['cache_miss'] = add(m['ordinary_input'], m['cache_write'])
         paths['input'] = 'derived:input_tokens+cache_read_input_tokens+cache_creation_input_tokens'
     elif dialect == 'codex':
-        for name, key in [('input', 'inputTokens'), ('output', 'outputTokens'), ('total', 'totalTokens'), ('reasoning', 'reasoningOutputTokens')]: field(name, key)
+        fields = [('input', 'inputTokens'), ('output', 'outputTokens'), ('total', 'totalTokens'), ('reasoning', 'reasoningOutputTokens')]
+        if 'last' in u or 'total' in u:
+            # Native last is a response/context snapshot, never a whole-turn sum.
+            total = u.get('total') if isinstance(u.get('total'),dict) else {}
+            baseline = usage_baseline if isinstance(usage_baseline,dict) else {}
+            if usage_baseline is None:
+                issues.append('codex_baseline_unavailable')
+            else:
+                raw_json(usage_baseline)
+                reset = any(pick(total,key) is not None and pick(baseline,key) is not None and total[key] < baseline[key] for _,key in fields)
+                conflict = any(pick(v,'inputTokens') is not None and pick(v,'outputTokens') is not None and pick(v,'totalTokens') is not None and add(v['inputTokens'],v['outputTokens']) != v['totalTokens'] for v in (total,baseline))
+                if reset or conflict:
+                    issues.append('codex_counter_reset' if reset else 'codex_counter_conflict')
+                else:
+                    for name,key in fields:
+                        m[name] = subtract(pick(total,key),pick(baseline,key))
+                        if m[name] is not None: paths[name] = 'derived:total.'+key+'-baseline.'+key
+        else:
+            for name,key in fields: field(name,key)
         # Subscription counters never become API cache metrics or API expenses.
     if m['total'] is None:
         m['total'] = add(m['input'], m['output'])
@@ -250,13 +268,15 @@ class Ledger:
         return conn
 
     def append(self, value):
-        if not isinstance(value, dict) or set(value)-{'mode','provider_id','request_id','turn_id','session_id','at','model','requested_model','model_source','dialect','raw_usage','usage_complete','status','latency_ms','http_status','retry_count','price','context','policy','prefix_fingerprint','cache_policy','config_revision'}: raise LedgerError('ledger_record_invalid')
+        if not isinstance(value, dict) or set(value)-{'mode','provider_id','request_id','turn_id','session_id','at','model','requested_model','model_source','dialect','raw_usage','usage_baseline','accounting_basis','usage_complete','status','latency_ms','http_status','retry_count','price','context','policy','prefix_fingerprint','cache_policy','config_revision'}: raise LedgerError('ledger_record_invalid')
         for name in ('provider_id', 'request_id', 'turn_id', 'session_id'): identifier(value.get(name))
         model_name(value.get('model'))
         if value.get('requested_model') is not None: model_name(value['requested_model'])
         if value.get('model_source') is not None and value['model_source'] not in {'request','provider'}: raise LedgerError('ledger_record_invalid')
         mode = value.get('mode'); dialect = value.get('dialect')
         if mode not in ('api', 'codex') or (mode == 'codex') != (dialect == 'codex'): raise LedgerError('ledger_mode_invalid')
+        if value.get('usage_baseline') is not None and (mode != 'codex' or not isinstance(value['usage_baseline'],dict)): raise LedgerError('ledger_record_invalid')
+        if value.get('accounting_basis') is not None and (mode != 'codex' or value['accounting_basis'] not in {'thread_counter_delta','unavailable'}): raise LedgerError('ledger_record_invalid')
         if type(value.get('usage_complete')) is not bool or value.get('status') not in {'completed','error','timeout','rate_limited','interrupted','unknown'}: raise LedgerError('ledger_record_invalid')
         for name in ('latency_ms', 'retry_count'):
             if value.get(name) is not None and count(value[name]) is None: raise LedgerError('ledger_record_invalid')
@@ -264,7 +284,7 @@ class Ledger:
         if status is not None and (type(status) is not int or not 100 <= status <= 599): raise LedgerError('ledger_record_invalid')
         fingerprint = value.get('prefix_fingerprint')
         if fingerprint is not None and (not isinstance(fingerprint, str) or not re.fullmatch('[a-f0-9]{64}', fingerprint)): raise LedgerError('ledger_record_invalid')
-        normalized = normalize(value.get('raw_usage'), dialect)
+        normalized = normalize(value.get('raw_usage'), dialect, usage_baseline=value.get('usage_baseline'))
         validate_context(value.get('context'))
         if value.get('policy') is not None: validate_policy(value['policy'])
         for name in ('cache_policy','config_revision'):
@@ -360,6 +380,7 @@ def metric_sum(records, field):
 
 
 def summarize(records):
+    codex = bool(records) and all(r['mode']=='codex' for r in records)
     metrics = {key: metric_sum(records,key) for key in METRICS}
     pair = [r for r in records if r['normalized']['cache_hit_rate'] is not None]
     denom = sum(r['normalized']['metrics']['input'] for r in pair)
@@ -382,8 +403,8 @@ def summarize(records):
             'latency_ms':sum(latency)/len(latency) if latency else None,'latency_requests':len(latency),
             'error_rate':sum(r['status'] in {'error','timeout','rate_limited'} for r in known_status)/len(known_status) if known_status else None,
             'status_requests':len(known_status),'status_complete':bool(records) and len(known_status)==len(records),
-            'timeouts':sum(r['status']=='timeout' for r in known_status) if known_status else None,
-            'rate_limited':sum(r['status']=='rate_limited' for r in known_status) if known_status else None,
+            'timeouts':sum(r['status']=='timeout' for r in known_status) if known_status and not codex else None,
+            'rate_limited':sum(r['status']=='rate_limited' for r in known_status) if known_status and not codex else None,
             'retries':sum(r['retry_count'] for r in records) if records and all(r.get('retry_count') is not None for r in records) else None}
 
 
@@ -447,7 +468,7 @@ def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/
         budget_views.append({**budget,'known_spend':str(known) if known is not None else None,'remaining':str(max(Decimal(0),number(budget['limit'])-known)) if known is not None and charge['complete'] else None,
                              'complete':bool(charge and charge['complete']),'exceeded':known>=number(budget['limit']) if known is not None else None,'enforcement':'warning_only'})
     return {'ok':True,'contract_version':1,'mode':mode,'session_id':sid,'scope':'all' if all_sessions else 'session','timezone':zone,
-            'coverage':'recorded_requests_only','context':ctx,'summary':summarize(rows),'daily':summarize(daily),'monthly':summarize(monthly),
+            'coverage':'recorded_turns_only' if mode=='codex' else 'recorded_requests_only','context':ctx,'summary':summarize(rows),'daily':summarize(daily),'monthly':summarize(monthly),
             'last_round':summarize([r for r in rows if latest and (r['session_id'],r['turn_id'])==(latest['session_id'],latest['turn_id'])]),
             'message_counts':counts,'events':history[-100:],'configuration_changes':changes[-100:],'cache_diagnostics':anomalies[-100:],
             'trends':[{'period':k[0],'at':k[1],'provider_id':k[2],'model':k[3],'summary':summarize(v)} for k,v in sorted(trends.items())],
@@ -457,10 +478,10 @@ def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/
 def export_records(records, format):
     if format=='json': return json.dumps({'contract_version':1,'records':records},ensure_ascii=False,allow_nan=False,indent=2)
     if format!='csv': raise LedgerError('ledger_export_invalid')
-    output=io.StringIO();fields=['mode','provider_id','session_id','request_id','turn_id','at','model','requested_model','model_source',*METRICS,'usage_complete','status','latency_ms','http_status','retry_count','amount','currency','cost_basis','raw_usage_json']
+    output=io.StringIO();fields=['mode','provider_id','session_id','request_id','turn_id','at','model','requested_model','model_source','accounting_basis',*METRICS,'usage_complete','status','latency_ms','http_status','retry_count','amount','currency','cost_basis','raw_usage_json','usage_baseline_json']
     writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
     for r in records:
-        row={k:r.get(k) for k in fields if k in r};row.update(r['normalized']['metrics']);row.update(amount=r['cost']['amount'],currency=r['cost']['currency'],cost_basis=r['cost']['basis'],raw_usage_json=json.dumps(r.get('raw_usage'),ensure_ascii=False))
+        row={k:r.get(k) for k in fields if k in r};row.update(r['normalized']['metrics']);row.update(amount=r['cost']['amount'],currency=r['cost']['currency'],cost_basis=r['cost']['basis'],raw_usage_json=json.dumps(r.get('raw_usage'),ensure_ascii=False),usage_baseline_json=json.dumps(r.get('usage_baseline'),ensure_ascii=False))
         # Null CSV cells stay blank; numeric zero stays 0. Neutralize formulas.
         row={k:("'"+v if isinstance(v,str) and v.lstrip().startswith(('=','+','-','@')) else v) for k,v in row.items()}
         writer.writerow(row)
