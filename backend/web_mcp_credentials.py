@@ -128,7 +128,7 @@ def row_for(conn, plugin_id):
     return conn.execute('SELECT scope,revision,ciphertext,updated_at FROM web_mcp_credentials WHERE plugin_id=?', (plugin_id,)).fetchone()
 
 
-def decode(path, plugin, row):
+def decode_full(path, plugin, row):
     if not row or not row[2] or row[0] != scope(plugin):
         return {'bearer_token': None, 'http_headers': {}}
     try:
@@ -136,21 +136,42 @@ def decode(path, plugin, row):
         if value.get('scope') != scope(plugin) or value.get('plugin_id') != plugin['id']:
             raise ValueError()
         token = value.get('bearer_token')
-        return {'bearer_token': validate_token(token) if token is not None else None,
+        auth = {'bearer_token': validate_token(token) if token is not None else None,
                 'http_headers': validate_headers(value.get('http_headers', {}))}
+        if 'oauth' in value:
+            if not isinstance(value['oauth'], dict): raise ValueError()
+            auth['oauth'] = value['oauth']
+        return auth
     except (InvalidToken, ValueError, TypeError, KeyError):
         raise settings.SettingsError('mcp_credentials_unavailable', 503) from None
+
+
+def decode(path, plugin, row):
+    auth = decode_full(path, plugin, row)
+    return {k: auth[k] for k in ('bearer_token', 'http_headers')}
+
+
+def encode(path, conn, plugin, auth):
+    if not (auth.get('bearer_token') or auth.get('http_headers') or auth.get('oauth')):
+        return None
+    has_ciphertext = conn.execute('SELECT 1 FROM web_mcp_credentials WHERE ciphertext IS NOT NULL LIMIT 1').fetchone()
+    # OAuth flows may already depend on the same key, even before credentials exist.
+    return cipher(path, create=not has_ciphertext).encrypt(json.dumps({'scope': scope(plugin), 'plugin_id': plugin['id'], **auth}).encode())
 
 
 def view(conn, path, plugin_id):
     plugin, revision = plugin_at(conn, plugin_id)
     row = row_for(conn, plugin_id)
-    auth = decode(path, plugin, row)
+    auth = decode_full(path, plugin, row)
+    oauth = auth.get('oauth')
     configured = bool(auth['bearer_token'] or auth['http_headers'])
     return {'ok': True, 'plugin_id': plugin_id, 'revision': revision,
             'credential_revision': row[1] if row else 0, 'configured': configured,
             'bearer_configured': bool(auth['bearer_token']), 'header_names': sorted(auth['http_headers']),
-            'updated_at': row[3] if row else None, 'execution_enabled': False}
+            'updated_at': row[3] if row else None, 'execution_enabled': False,
+            'oauth': {'connected': True, 'issuer': oauth['issuer'], 'scopes': oauth['scopes'],
+                      'expires_at': oauth.get('expires_at'), 'reauthorization_required': bool(oauth.get('refreshing') or oauth.get('failed'))}
+                     if oauth else None}
 
 
 def read(path, plugin_id):
@@ -180,21 +201,17 @@ def write(path, plugin_id, body, *, remove=False):
         row = row_for(conn, plugin_id)
         if body['credential_revision'] != (row[1] if row else 0):
             raise settings.SettingsError('mcp_revision_conflict', 409)
-        auth = {'bearer_token': None, 'http_headers': {}} if remove else decode(path, plugin, row)
+        auth = {'bearer_token': None, 'http_headers': {}} if remove else decode_full(path, plugin, row)
         if 'bearer_token' in body:
             auth['bearer_token'] = body['bearer_token']
+            auth.pop('oauth', None)
         for name, secret in (headers or {}).items():
             if secret is None:
                 auth['http_headers'].pop(name, None)
             else:
                 auth['http_headers'][name] = secret
         validate_headers(auth['http_headers'])
-        ciphertext = None
-        if auth['bearer_token'] or auth['http_headers']:
-            # If a key is lost, never silently replace it while ciphertext exists.
-            has_ciphertext = conn.execute('SELECT 1 FROM web_mcp_credentials WHERE ciphertext IS NOT NULL LIMIT 1').fetchone()
-            fernet = cipher(path, create=not has_ciphertext)
-            ciphertext = fernet.encrypt(json.dumps({'scope': scope(plugin), 'plugin_id': plugin_id, **auth}).encode())
+        ciphertext = encode(path, conn, plugin, auth)
         conn.execute('INSERT INTO web_mcp_credentials VALUES (?,?,?,?,?) ON CONFLICT(plugin_id) DO UPDATE SET scope=excluded.scope,revision=excluded.revision,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at',
                      (plugin_id, scope(plugin), body['credential_revision']+1, ciphertext, datetime.now(timezone.utc).isoformat()))
         conn.commit()
@@ -219,6 +236,8 @@ def load_for_inspection(path, plugin, revision):
 
 
 def load_for_request(path, plugin, revision):
+    from .web_mcp_oauth import refresh_if_needed
+    refresh_if_needed(path, plugin, revision)
     with closing(connection(path)) as conn:
         plugin_at(conn, plugin['id'], revision)
         row = row_for(conn, plugin['id'])
