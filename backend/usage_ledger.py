@@ -250,9 +250,11 @@ class Ledger:
         return conn
 
     def append(self, value):
-        if not isinstance(value, dict) or set(value)-{'mode','provider_id','request_id','turn_id','session_id','at','model','dialect','raw_usage','usage_complete','status','latency_ms','http_status','retry_count','price','context','policy','prefix_fingerprint','cache_policy','config_revision'}: raise LedgerError('ledger_record_invalid')
+        if not isinstance(value, dict) or set(value)-{'mode','provider_id','request_id','turn_id','session_id','at','model','requested_model','model_source','dialect','raw_usage','usage_complete','status','latency_ms','http_status','retry_count','price','context','policy','prefix_fingerprint','cache_policy','config_revision'}: raise LedgerError('ledger_record_invalid')
         for name in ('provider_id', 'request_id', 'turn_id', 'session_id'): identifier(value.get(name))
         model_name(value.get('model'))
+        if value.get('requested_model') is not None: model_name(value['requested_model'])
+        if value.get('model_source') is not None and value['model_source'] not in {'request','provider'}: raise LedgerError('ledger_record_invalid')
         mode = value.get('mode'); dialect = value.get('dialect')
         if mode not in ('api', 'codex') or (mode == 'codex') != (dialect == 'codex'): raise LedgerError('ledger_mode_invalid')
         if type(value.get('usage_complete')) is not bool or value.get('status') not in {'completed','error','timeout','rate_limited','interrupted','unknown'}: raise LedgerError('ledger_record_invalid')
@@ -455,7 +457,7 @@ def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/
 def export_records(records, format):
     if format=='json': return json.dumps({'contract_version':1,'records':records},ensure_ascii=False,allow_nan=False,indent=2)
     if format!='csv': raise LedgerError('ledger_export_invalid')
-    output=io.StringIO();fields=['mode','provider_id','session_id','request_id','turn_id','at','model',*METRICS,'usage_complete','status','latency_ms','http_status','retry_count','amount','currency','cost_basis','raw_usage_json']
+    output=io.StringIO();fields=['mode','provider_id','session_id','request_id','turn_id','at','model','requested_model','model_source',*METRICS,'usage_complete','status','latency_ms','http_status','retry_count','amount','currency','cost_basis','raw_usage_json']
     writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
     for r in records:
         row={k:r.get(k) for k in fields if k in r};row.update(r['normalized']['metrics']);row.update(amount=r['cost']['amount'],currency=r['cost']['currency'],cost_basis=r['cost']['basis'],raw_usage_json=json.dumps(r.get('raw_usage'),ensure_ascii=False))

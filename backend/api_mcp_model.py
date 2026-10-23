@@ -3,6 +3,7 @@ import asyncio
 import json
 import re
 from .web_mcp_chat import McpError, prepare
+from . import usage_ledger_capture
 
 MAX_RESPONSE = 2 * 1024 * 1024
 SAFE_ID = re.compile(r'^[A-Za-z0-9_.:-]{1,160}$')
@@ -54,6 +55,7 @@ def parse_calls(values, responses=False):
     return calls
 
 
+@usage_ledger_capture.observe_api(route_index=1)
 async def round_trip(legacy, route, messages, definitions, sink, *, responses):
     streaming = bool(legacy.STREAM_OUTPUT)
     body = legacy._responses_body(route, messages, stream=streaming) if responses else legacy._chat_completion_body(route, messages, stream=streaming)
@@ -61,6 +63,7 @@ async def round_trip(legacy, route, messages, definitions, sink, *, responses):
     body['parallel_tool_calls'] = False
     if responses:
         body['include'] = ['reasoning.encrypted_content']
+    body = usage_ledger_capture.prepare_body(body, responses=responses)
     size, text, usage, calls, finished, output, done = 0, '', {}, {}, False, None, False
     async def emit(chunk):
         nonlocal text
@@ -73,6 +76,7 @@ async def round_trip(legacy, route, messages, definitions, sink, *, responses):
         async with legacy._provider_client(timeout=legacy.LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
             async with client.stream('POST', route['url'].rstrip('/') + ('/responses' if responses else '/chat/completions'),
                                      headers={'Authorization': 'Bearer ' + route['key'], 'Content-Type': 'application/json'}, json=body) as resp:
+                usage_ledger_capture.response_status(resp.status_code)
                 await legacy._check_provider_response(resp)
                 if not streaming:
                     raw = bytearray()
@@ -81,7 +85,9 @@ async def round_trip(legacy, route, messages, definitions, sink, *, responses):
                         if len(raw) > MAX_RESPONSE:
                             raise McpError('model_response_too_large')
                     data = json.loads(raw)
+                    usage_ledger_capture.reported_model(data.get('model'))
                     usage = data.get('usage') or {}
+                    usage_ledger_capture.usage(data.get('usage'))
                     if responses:
                         if data.get('status') != 'completed':
                             raise McpError('incomplete_model_response')
@@ -119,16 +125,22 @@ async def round_trip(legacy, route, messages, definitions, sink, *, responses):
                                 await emit(event.get('delta'))
                             elif kind == 'response.completed':
                                 data = event.get('response', {})
+                                usage_ledger_capture.reported_model(data.get('model'))
                                 if data.get('status') not in (None, 'completed'):
                                     raise McpError('incomplete_model_response')
                                 output, usage = data.get('output', []), data.get('usage') or {}
+                                usage_ledger_capture.usage(data.get('usage'))
                                 if not text:
                                     await emit(legacy._responses_text(data))
                                 finished = done = True
                                 break
                             elif kind in ('response.failed', 'response.incomplete', 'error'):
+                                data = event.get('response')
+                                if isinstance(data, dict): usage_ledger_capture.usage(data.get('usage'))
                                 raise McpError('incomplete_model_response')
                         else:
+                            usage_ledger_capture.reported_model(event.get('model'))
+                            usage_ledger_capture.usage(event.get('usage'))
                             if isinstance(event.get('usage'), dict):
                                 usage = event['usage']
                             choices = event.get('choices')
