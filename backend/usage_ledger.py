@@ -168,8 +168,8 @@ def validate_context(value):
         if value.get(k) is not None and count(value[k]) is None: raise LedgerError('ledger_context_invalid')
     if 'stale' in value and type(value['stale']) is not bool: raise LedgerError('ledger_context_invalid')
     if value.get('observed_at') is not None: timestamp(value['observed_at'])
-    for key in ('source','model'):
-        if value.get(key) is not None: identifier(value[key])
+    if value.get('source') is not None: identifier(value['source'])
+    if value.get('model') is not None: model_name(value['model'])
 
 
 def validate_policy(value):
@@ -220,6 +220,12 @@ def identifier(value):
     return value
 
 
+def model_name(value):
+    # OpenAI-compatible gateways may return aliases such as [Pro按量]model.
+    if not isinstance(value,str) or not 1<=len(value)<=160 or len(value.encode())>640 or any(ord(c)<32 or ord(c)==127 for c in value): raise LedgerError('ledger_model_invalid')
+    return value
+
+
 def timestamp(value):
     try:
         if not isinstance(value, str) or len(value) > 40: raise ValueError()
@@ -245,7 +251,8 @@ class Ledger:
 
     def append(self, value):
         if not isinstance(value, dict) or set(value)-{'mode','provider_id','request_id','turn_id','session_id','at','model','dialect','raw_usage','usage_complete','status','latency_ms','http_status','retry_count','price','context','policy','prefix_fingerprint','cache_policy','config_revision'}: raise LedgerError('ledger_record_invalid')
-        for name in ('provider_id', 'request_id', 'turn_id', 'session_id', 'model'): identifier(value.get(name))
+        for name in ('provider_id', 'request_id', 'turn_id', 'session_id'): identifier(value.get(name))
+        model_name(value.get('model'))
         mode = value.get('mode'); dialect = value.get('dialect')
         if mode not in ('api', 'codex') or (mode == 'codex') != (dialect == 'codex'): raise LedgerError('ledger_mode_invalid')
         if type(value.get('usage_complete')) is not bool or value.get('status') not in {'completed','error','timeout','rate_limited','interrupted','unknown'}: raise LedgerError('ledger_record_invalid')
@@ -292,7 +299,7 @@ class Ledger:
             if count(snapshot.get('total')) is not None and all(count(snapshot.get(k)) is not None for k in ('visible','folded','archived')) and add(*(snapshot[k] for k in ('visible','folded','archived'))) != snapshot['total']: raise LedgerError('ledger_counts_invalid')
         elif value['kind']=='model_switch':
             if not isinstance(snapshot,dict) or set(snapshot)-{'model','context_limit','cache_policy','price'}: raise LedgerError('ledger_event_invalid')
-            identifier(snapshot.get('model'))
+            model_name(snapshot.get('model'))
             if snapshot.get('context_limit') is not None and count(snapshot['context_limit']) is None: raise LedgerError('ledger_event_invalid')
         elif snapshot is not None: raise LedgerError('ledger_event_invalid')
         payload = {**value,'at':timestamp(value.get('at'))}; encoded = raw_json(payload)
@@ -309,7 +316,7 @@ class Ledger:
         if mode not in ('api', 'codex'): raise LedgerError('ledger_mode_invalid')
         where, params = ['mode=?'], [mode]
         if sid is not None: where.append('session_id=?'); params.append(identifier(sid))
-        if model is not None: identifier(model)
+        if model is not None: model_name(model)
         with closing(self.connect()) as conn:
             rows = conn.execute('SELECT payload FROM usage_ledger WHERE '+' AND '.join(where)+' ORDER BY at,rowid LIMIT 50001',params).fetchall()
         if len(rows)>50000: raise LedgerError('ledger_query_too_large')
@@ -379,6 +386,7 @@ def summarize(records):
 
 
 def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/Shanghai', now=None, budgets=None):
+    if model is not None: model_name(model)
     settings=ledger.settings(mode); saved_policy=settings['policy']
     zone=saved_policy.get('timezone',zone) if settings['revision'] else zone
     budgets=saved_policy.get('budgets',[]) if budgets is None else budgets

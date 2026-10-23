@@ -111,6 +111,13 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(build_view(self.ledger,'codex','s-1')['summary']['costs'],[])
         self.assertEqual(build_view(self.ledger,'api','s-1')['summary']['metrics']['input']['value'],2000)
 
+    def test_gateway_unicode_model_alias_survives_filters_and_csv_formula_guard(self):
+        self.ledger.append(record(model='[Pro按量]mock-model'))
+        self.assertEqual(build_view(self.ledger,'api','s-1',model='[Pro按量]mock-model')['summary']['requests'],1)
+        self.ledger.append(record(model='=untrusted-alias',request_id='alias-2'))
+        csv_row=list(csv.DictReader(io.StringIO(export_records(self.ledger.records('api',model='=untrusted-alias'),'csv'))))[0]
+        self.assertEqual(csv_row['model'],"'=untrusted-alias")
+
     def test_last_round_sums_unique_tool_requests_not_stream_snapshots(self):
         self.ledger.append(record());self.ledger.append(record(request_id='tool-followup-1'))
         self.ledger.append(record(request_id='next-turn',turn_id='turn-2',raw_usage={'input_tokens':50,'output_tokens':10}))
