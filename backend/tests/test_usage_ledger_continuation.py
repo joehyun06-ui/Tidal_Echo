@@ -93,6 +93,11 @@ class ContinuationTests(unittest.TestCase):
     def test_unknown_upstream_and_wrong_reply_links_do_not_become_success(self):
         self.register(); self.incoming(); self.completed(reply_to='999')
         self.assertEqual(self.stages(),['target_created','message_received'])
+        with sqlite3.connect(self.relay) as conn:
+            meta=json.loads(conn.execute('SELECT meta FROM messages WHERE id=2').fetchone()[0]);meta['reply_to']='1'
+            conn.execute('UPDATE messages SET meta=? WHERE id=2',(json.dumps(meta),))
+            conn.execute('UPDATE api_web_generations SET upstream_unknown=1')
+        self.assertEqual(self.stages(),['target_created','message_received'])
 
     def test_corrupt_empty_copied_or_wrong_session_reply_is_unconfirmed(self):
         self.register();self.incoming();self.completed()
@@ -103,8 +108,6 @@ class ContinuationTests(unittest.TestCase):
                 with sqlite3.connect(self.relay) as conn:conn.execute('UPDATE messages SET meta=? WHERE id=2',(meta,))
                 self.assertEqual(self.stages(),['target_created','message_received'])
         with sqlite3.connect(self.relay) as conn:conn.execute("UPDATE messages SET meta=?,text='' WHERE id=2",(original,))
-        self.assertEqual(self.stages(),['target_created','message_received'])
-        with sqlite3.connect(self.relay) as conn: conn.execute('UPDATE api_web_generations SET upstream_unknown=1')
         self.assertEqual(self.stages(),['target_created','message_received'])
 
     def test_missing_completion_store_still_records_message_receipt(self):
