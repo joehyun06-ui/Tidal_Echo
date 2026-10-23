@@ -157,6 +157,16 @@ class ContinuationTests(unittest.TestCase):
         with closing(self.ledger.connect()) as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM usage_ledger_continuations').fetchone()[0],0)
 
+    def test_purge_between_receipt_read_and_event_write_cannot_restore_old_events(self):
+        self.register();self.incoming();self.completed()
+        write=self.ledger.event
+        def race(value,**kw):
+            self.ledger.purge_session('target')
+            return write(value,**kw)
+        with patch.object(self.ledger,'event',side_effect=race):
+            self.adapter.reconcile('source','api')
+        self.assertEqual(self.ledger.events('api'),[])
+
     def test_target_version_is_rejected_before_registration(self):
         with sqlite3.connect(self.relay) as conn:conn.execute("INSERT INTO web_message_versions VALUES ('target','source','source','edit')")
         with self.assertRaisesRegex(LedgerError,'target_is_version'):self.register()

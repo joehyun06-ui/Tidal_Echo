@@ -141,4 +141,5 @@ class Continuations:
                 self.ledger.event({'event_id':'continuation-'+row['request_id']+'-'+stage,'session_id':source_id,'target_session_id':row['target_id'],
                                    'mode':mode,'at':at,'kind':'continuation','status':status,'source':'canonical_continuation_receipt',
                                    'snapshot':{'stage':stage,'success':success,'input_message_id':row['input_id'] if stage!='target_created' else None,
-                                               'reply_message_id':row['reply_id'] if stage=='reply_completed' else None}})
+                                               'reply_message_id':row['reply_id'] if stage=='reply_completed' else None}},
+                                  continuation_receipt=(row['request_id'],row['created_at']))

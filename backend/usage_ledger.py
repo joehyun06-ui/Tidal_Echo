@@ -304,7 +304,7 @@ class Ledger:
             conn.execute('INSERT INTO usage_ledger VALUES (?,?,?,?,?,?)', (mode,value['provider_id'],value['request_id'],value['session_id'],payload['at'],encoded)); conn.commit()
         return True
 
-    def event(self, value):
+    def event(self, value, *, continuation_receipt=None):
         allowed = {'event_id','session_id','mode','at','kind','status','before_tokens','after_tokens','memory_preserved','target_session_id','snapshot','source'}
         if not isinstance(value, dict) or set(value)-allowed or value.get('kind') not in {'compaction','continuation','model_switch','message_counts','context'} or value.get('mode') not in {'api','codex'} or value.get('status') not in {'completed','failed','unknown','observed'}: raise LedgerError('ledger_event_invalid')
         for key in ('event_id', 'session_id'): identifier(value.get(key))
@@ -339,6 +339,13 @@ class Ledger:
         payload = {**value,'at':timestamp(value.get('at'))}; encoded = raw_json(payload)
         with closing(self.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            # A purge can race with a read-side reconciliation. Serialize the
+            # receipt existence check and event write with purge_session, and
+            # bind to this registration epoch rather than a reused request ID.
+            if continuation_receipt is not None:
+                request_id,created_at=continuation_receipt
+                if value['kind']!='continuation' or not conn.execute('SELECT 1 FROM usage_ledger_continuations WHERE request_id=? AND created_at=? AND source_id=? AND target_id=? AND mode=?',
+                    (request_id,created_at,value['session_id'],value.get('target_session_id'),value['mode'])).fetchone(): return False
             old = conn.execute('SELECT payload FROM usage_ledger_events WHERE event_id=?',(value['event_id'],)).fetchone()
             if old:
                 if old[0] != encoded: raise LedgerError('ledger_duplicate_conflict')
