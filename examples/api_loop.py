@@ -37,6 +37,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from backend import (
+    channel_store,
+    memory_evidence_readonly,
     codex_app_server_control,
     continuity_context,
     deployment_config,
@@ -1209,6 +1211,30 @@ async def loop_provider_logout(request: Request):
 async def loop_sessions(request: Request):
     check_internal_auth(request)
     return sessions_public()
+
+
+@app.get("/loop/sessions/{session_id}/memory/evidence")
+async def loop_session_memory_evidence(session_id: str, request: Request):
+    """Read-only, internally authenticated session evidence; opt-in only."""
+    check_internal_auth(request)
+    if (
+        os.environ.get("MEMORY_EVIDENCE_UI_READONLY_ENABLED") != "true"
+        or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+    ):
+        raise HTTPException(status_code=404, detail="not_found")
+    known = {row["id"] for row in session_rows()}
+    if session_id not in known:
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        with channel_store.connect_read_only(RELAY_DB, timeout_seconds=5.0) as conn:
+            result = memory_evidence_readonly.build_snapshot(
+                conn, session_id=session_id, allowed_sessions=known,
+            )
+        return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+    except memory_evidence_readonly.MemoryEvidenceReadonlyError:
+        raise HTTPException(status_code=503, detail="memory_evidence_unavailable") from None
+    except (OSError, ValueError, sqlite3.Error):
+        raise HTTPException(status_code=503, detail="memory_evidence_unavailable") from None
 
 
 @app.post("/loop/sessions")
