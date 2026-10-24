@@ -36,12 +36,18 @@ def request_id(body):
 
 
 class Compactions:
-    def __init__(self, runtime, *, timeout=180):
+    def __init__(self, runtime, *, timeout=180, usage_collector=None):
         self.runtime, self.path, self.timeout = runtime, runtime.config.store_path, timeout
         self.active, self.finished = None, None
         self.initialized = False
+        self.usage_collector=usage_collector
         self.scope = runtime.foundation.runtime.scope(
-            methods=frozenset({'thread/compact/start'}), notifications=EVENTS, handler=self.receive)
+            methods=frozenset({'thread/compact/start'}), notifications=EVENTS | ({'thread/tokenUsage/updated'} if usage_collector is not None else set()), handler=self.receive)
+
+    def observe_usage(self,rid):
+        if self.usage_collector is not None:
+            try:self.usage_collector.observe(rid)
+            except Exception:pass  # Accounting cannot repeat or fail compaction.
 
     def initialize(self):
         if self.initialized:
@@ -92,6 +98,7 @@ class Compactions:
             now = store.now_iso()
             conn.execute('INSERT INTO web_codex_compactions(request_id,session_id,thread_id,status,created_at,updated_at) VALUES (?,?,?,?,?,?)', (rid,sid,pin['thread_id'],'queued',now,now))
             conn.commit()
+        self.observe_usage(rid)
         return self.status(sid)
 
     def update(self, rid, status, **fields):
@@ -100,6 +107,7 @@ class Compactions:
             raise ValueError('invalid_compaction_fields')
         with closing(store.connect(self.path)) as conn:
             conn.execute('UPDATE web_codex_compactions SET status=?,updated_at=?'+''.join(','+key+'=?' for key in fields)+' WHERE request_id=?', (status,store.now_iso(),*fields.values(),rid))
+        self.observe_usage(rid)
 
     def invalidate_budget(self, sid):
         from .web_context_budget import database
@@ -107,6 +115,11 @@ class Compactions:
             conn.execute('DELETE FROM web_context_observations WHERE session_id=?',(sid,))
 
     def receive(self, method, params):
+        if method=='thread/tokenUsage/updated':
+            if self.usage_collector is not None:
+                try:self.usage_collector.receive(params)
+                except Exception:pass
+            return
         if not isinstance(params,dict) or not self.active or params.get('threadId') != self.active['thread_id']:
             return
         rid = self.active['request_id']

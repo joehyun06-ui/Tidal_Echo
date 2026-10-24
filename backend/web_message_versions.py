@@ -150,7 +150,7 @@ def select_version(authority, root_id, body, *, relay_db):
     return {'ok': True, 'root_id': root_id, 'version_id': target['id']}
 
 
-def delete_versions(authority, root_id, *, relay_db, upload_dir=None, codex_store=None):
+def delete_versions(authority, root_id, *, relay_db, upload_dir=None, codex_store=None, usage_ledger=None):
     """Delete every internal alternative, keeping explicit branches independent.
 
     The caller holds the session lock and, for Codex, the runtime activity gate.
@@ -190,7 +190,7 @@ def delete_versions(authority, root_id, *, relay_db, upload_dir=None, codex_stor
     for sid in ids:
         if not authority.row_for_session(sid) and not authority.tombstone_for_session(sid):
             continue  # A reserved alternative may never have been published.
-        result = delete_conversation(authority, sid, relay_db=relay_db, upload_dir=upload_dir, codex_store=codex_store)
+        result = delete_conversation(authority, sid, relay_db=relay_db, upload_dir=upload_dir, codex_store=codex_store,**({'usage_ledger':usage_ledger} if usage_ledger is not None else {}))
         if sid == root_id or any(r['id'] == sid for r in live):
             deleted_ids.append(sid)
     if root_id not in deleted_ids:

@@ -368,6 +368,7 @@ class CodexCanaryLoopIntegration:
         title: str = "New chat",
         since_id: int = 0,
         activate: bool = True,
+        session_id: str | None = None,
     ) -> Mapping[str, object]:
         try:
             provider = web_session_provider_authority.normalize_provider(provider)
@@ -383,16 +384,19 @@ class CodexCanaryLoopIntegration:
                     title=title,
                     since_id=since_id,
                     activate=activate,
+                    **({'session_id':session_id} if session_id is not None else {}),
                 )
         if not self.runtime.generation_enabled:
             raise CodexCanaryLoopIntegrationError("codex_generation_disabled", status_code=503)
-        sid = (
+        sid = session_id or (
             "api-"
             + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
             + "-"
             + uuid.uuid4().hex[:4]
         )
         try:
+            if session_id is not None and self.session_authority.row_for_session(sid):
+                raise web_session_provider_authority.WebSessionProviderAuthorityError('web_session_conflict')
             row = self.session_authority.new_row(
                 title=title,
                 since_id=since_id,

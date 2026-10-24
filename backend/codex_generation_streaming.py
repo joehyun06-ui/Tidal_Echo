@@ -105,13 +105,18 @@ class GenerationControls:
 
 
 class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
-    def __init__(self, *, progress_callback, upload_dir=None, **kwargs):
+    def __init__(self, *, progress_callback, upload_dir=None, usage_collector=None, compaction_collector=None, **kwargs):
         super().__init__(**kwargs)
         self.upload_dir = Path(upload_dir) if upload_dir is not None else None
         self.controller.upload_dir = self.upload_dir
         self.progress = ReplyProgress()
         self.controls = GenerationControls(self.config.store_path, self.foundation.generation, self.progress)
         self.progress_callback = progress_callback
+        self.usage_collector = usage_collector
+        if usage_collector is not None:
+            from .usage_ledger_codex import NOTIFICATIONS as LEDGER_NOTIFICATIONS
+            self._ledger_scope = self.foundation.runtime.scope(
+                methods=frozenset(), notifications=LEDGER_NOTIFICATIONS, handler=self._on_ledger_usage)
         self._progress_task = None
         self._progress_scope = self.foundation.runtime.scope(
             methods=frozenset(), notifications=PROGRESS_NOTIFICATIONS,
@@ -124,13 +129,20 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
             handler=self.context_budget.receive,
         )
         from .web_codex_compaction import Compactions
-        self.compactions = Compactions(self)
+        self.compactions = Compactions(self,usage_collector=compaction_collector)
         from .codex_mcp_chat import install
         install(self)
         self.controls.chat_mcp = self.chat_mcp
 
     def _on_progress(self, method, params):
         self.progress.receive(method, params)
+
+    def _on_ledger_usage(self, method, params):
+        try:
+            self.usage_collector.receive(method, params, epoch=self.foundation.runtime.connection_epoch)
+        except Exception:
+            # Observability cannot fail or repeat a native generation.
+            pass
 
     def _load_canonical_message(self, job):
         if self.upload_dir is None:
@@ -170,6 +182,8 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
         sent = {}
         while True:
             self.progress.prune()
+            if self.usage_collector is not None:
+                await asyncio.to_thread(self.usage_collector.reconcile, epoch=self.foundation.runtime.connection_epoch)
             # Coalescing full snapshots bounds HTTP traffic and never drops text.
             for (thread, turn), record in tuple(self.progress.turns.items()):
                 key = (thread, turn)

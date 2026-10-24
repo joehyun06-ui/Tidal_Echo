@@ -181,6 +181,12 @@ class CodexSharedAppServerRuntime:
         self._tool_handler = None
         self._tool_tasks: dict[object, tuple[Any, asyncio.Task]] = {}
         self._closed = False
+        self._connection_epoch = 0
+
+    @property
+    def connection_epoch(self) -> int:
+        """Local observation continuity, containing no process or account details."""
+        return self._connection_epoch
 
     def install_tool_handler(self, handler) -> None:
         # A single application owner; this does not grant any built-in approval.
@@ -266,6 +272,7 @@ class CodexSharedAppServerRuntime:
                 await self._terminate_owner(owner)
                 raise CodexTransportError("codex_app_server_unavailable")
             self._process = owner
+            self._connection_epoch += 1
             self._ready_process = None
             self._reader_task = asyncio.create_task(self._reader_loop(owner))
             try:
@@ -465,6 +472,7 @@ class CodexSharedAppServerRuntime:
         if owner is not self._process:
             return
         self._process = None
+        self._connection_epoch += 1
         self._ready_process = None
         tool_tasks = []
         for request_id, (task_owner, task) in tuple(self._tool_tasks.items()):
