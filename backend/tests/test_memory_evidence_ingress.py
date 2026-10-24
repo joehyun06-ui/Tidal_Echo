@@ -29,6 +29,10 @@ class LoopEvidenceRouteTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp.name)
         self.dbpath = root / "relay.sqlite"
         source = database()
+        # sqlite3.Connection.backup waits on an open source write transaction.
+        # Commit the synthetic inserts before copying, including on Windows.
+        source.commit()
+        self.assertFalse(source.in_transaction)
         try:
             with closing(sqlite3.connect(str(self.dbpath))) as dest:
                 source.backup(dest)
