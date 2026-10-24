@@ -76,8 +76,9 @@ Codex 的 API 缓存和 API 费用为不适用，原始订阅计数仍保留，�
 返回 dialect、不可变价格版本与配置版本。不能根据模型名称、域名或一个兼容接口
 猜测计费方式。配置没有密钥字段，采集器不保存实际请求路由或请求头。
 未匹配连接不擅自归类，`health().unmatched` 会增加；写入失败计入 `dropped`，
-不会改变模型结果、触发重试或向前端暴露异常原文。健康计数目前是进程内诊断，
-生产接入前需做持久化缺口记录并在账本显示覆盖范围。
+不会改变模型结果、触发重试或向前端暴露异常原文。即时健康计数是进程内诊断；
+独立 journal 已保存可持久化的未确认标记与固定类别缺口，界面显示保留范围。
+数据库彻底不可写时仍无法保证留痕，未发现缺口不证明完整采集。
 
 - 普通 Chat Completions / Responses 与 MCP 工具多轮在实际 HTTP 请求边界采集。
   一个工具轮次多个请求分别入账，备用模型尝试也分别入账，不把聚合结果再次计入。
@@ -134,9 +135,10 @@ Codex 订阅额度仍沿用现有账户面板，不改账户统计协议或模�
 - 原生轮次并非单个 API 请求：API 延迟、独立请求重试/超时/限流及 API 缓存/账单
   不从这些事件推测。界面按轮显示来源说明，额度继续在“我的”查看。
 
-当前暂存与健康计数是进程内数据；关闭/重启导致的缺口不伪装完整历史。
-生产启用前仍需完成持久化采集缺口、权威来源挂载、删除与保留策略、分页，以及
-线程独占归属和通知连续性验收。后台保存失败不会重试生成或改变最终回复。
+当前暂存与即时健康计数是进程内数据，journal 由后台核对持久化可观测缺口；
+关闭/重启导致的缺口不伪装完整历史。权威来源、删除/保留与分页均已在离线 fixture
+接入，生产仍需组合挂载、线程独占归属和通知连续性验收。后台保存失败不会重试生成
+或改变最终回复。启用前配置审阅见 [覆盖与配置核对](usage-ledger-enabling-review.md)。
 
 费用只估算 Token 部分，工具费、税费、阶梯/区域/批次价等未采集时不保证完整账单。
 缓存写入的分 TTL 数值不会与总写入重复计费；价格不全、用量不全或字段冲突时费用不可用。
@@ -205,7 +207,8 @@ Codex 订阅额度仍沿用现有账户面板，不改账户统计协议或模�
 - 手动压缩单独留回执，不追加聊天请求用量；没有归汀生成 job 的手动 turn 会打断被动
   Codex 采集器的跨轮基线，不能把压缩消耗混入下一轮差值。
 - 清除账本保留仅含会话标识和时间的手动任务清理水位，阻止旧原生历史/迟到通知重建账本。
-  生产会话删除、留存期限和全量数据分页策略仍需单独接入；重要记忆始终未被推断为保留。
+  会话删除、留存期限与分页钩子已在离线 fixture 验证，生产组合仍未挂载；重要记忆始终
+  未被推断为保留。
 
 ### 路由
 
@@ -251,7 +254,10 @@ SQLite 快照里以 256 条为批次扫描；费用保持 Decimal，累计值不
 
 ## 运行与验证
 
-后端：`python -m unittest backend.tests.test_usage_ledger backend.tests.test_usage_ledger_capture backend.tests.test_usage_ledger_codex backend.tests.test_usage_ledger_sources backend.tests.test_usage_ledger_continuation backend.tests.test_usage_ledger_creation backend.tests.test_usage_ledger_compaction backend.tests.test_web_context_actions`
+后端：`python -m unittest backend.tests.test_usage_ledger backend.tests.test_usage_ledger_capture backend.tests.test_usage_ledger_codex backend.tests.test_usage_ledger_sources backend.tests.test_usage_ledger_continuation backend.tests.test_usage_ledger_creation backend.tests.test_usage_ledger_compaction backend.tests.test_usage_ledger_storage backend.tests.test_usage_ledger_preflight backend.tests.test_web_context_actions`
+
+启用前配置审阅：`python -m backend.usage_ledger_preflight --mock`。仅核对合成声明，
+不挂载路由、启动采集或证明完整账单。详细边界见 [覆盖与配置核对](usage-ledger-enabling-review.md)。
 
 采集测试使用真实 provider 函数的语法树执行片段与 HTTPX MockTransport；不执行
 bridge 模块顶层环境读取，不导入记忆模块。另走真实 Web 生成运行时、临时 relay /

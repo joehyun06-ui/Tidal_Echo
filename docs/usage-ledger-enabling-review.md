@@ -1,0 +1,80 @@
+# 用量账本 · 启用前配置与覆盖审阅
+
+本轮只审阅代码和合成配置。**生产采集尚未启用，未读取生产环境变量、数据库、聊天或
+真实账户用量，也未进行真实模型请求。** 文中的“已验证”仅指离线测试，不等于实际
+部署已经具备这些能力。v48、36/36、108/108 继续冻结。
+
+## 当前组合入口
+
+- `examples/api_loop_codex_canary.py` 创建 `ApiWebRuntime(legacy)`，未注入
+  `usage_collector`；创建 `StreamingCodexGenerationRuntime` 时也未注入
+  `usage_collector` / `compaction_collector`。
+- `backend/p3_codex_relay_app.py` 与上述 loop 入口没有安装 `usage_ledger_routes`。
+  因此只合并前端不能让正式账本产生真实数据。
+- `usage_ledger_routes.install` 接收独立账本、鉴权、权威会话解析器和可选来源钩子，
+  只有离线 fixture 现在显式配置了完整组合。
+- 删除与版本删除的 `usage_ledger` 参数仍为 `None`；不能把离线删除验证写成生产已接入。
+- 本轮的 AST 门槛只检查上述受审入口的组合边界，不导入入口，不宣称扫描了所有可能的
+  动态加载器、部署实例或未来代码路径。部署实际组合仍需单独核对。
+
+## 覆盖矩阵
+
+| 来源 | 已有离线证据 | 正式接入条件 / 不覆盖内容 |
+|---|---|---|
+| Web API 普通聊天 | `ApiWebRuntime._run` 在创建任务时传递显式采集作用域；真实 Chat / Responses 请求函数 + MockTransport | 必须向同一 Web runtime 注入采集器，且每条主/备用路由按 endpoint + model + protocol 精确匹配 |
+| Web API 的 MCP 多轮 | `api_mcp_model` 每个模型 HTTP 请求分别采集，不重复计算聚合用量 | 仅记录模型请求；MCP 服务自身的收费与其他工具费不在账本内 |
+| Web Codex | 绑定 durable job、canonical message、thread / turn 后才入账 | 必须注入采集器及后台核对；首次无基线、重启、漏轮、压缩或共享线程时，单轮用量可能不可用 |
+| 手动压缩 | 同一任务/线程的前后上下文与确切完成回执 | 另行注入压缩采集器；完成不证明记忆保留，不把压缩混入下轮 Token |
+| 续窗 | 权威工厂创建、登记 HMAC、核对首条消息与完成回复 | 创建器与回执服务一起接入；不自动发送；重要记忆是否保留仍等待独立验证 |
+| 历史消息计数 | 权威选中版本的 SQL 计数，不读取正文 | 需同一权威来源；折叠/归档无独立来源时不可用，全会话去重尚未定义 |
+| Telegram / channel bridge / Kelivo / Operit / 后台任务 | 不在当前 Web 采集作用域内 | 即使复用了底层 HTTP 函数也不会自动归属到账本；本轮不扩展这些入口 |
+| 外部直连 API / 其他 Codex 客户端 / 启用前历史 | 不可观测 | 不代表账户全部用量，不从累计余额或旧聊天推算回填 |
+| 官方订阅账单、非 Token 费用 | 不适用 / 未采集 | Codex 额度沿用“我的”；API 费用仅为已保留请求的价格快照估算 |
+
+“全部会话”只放宽已记录账本的会话筛选，不能解释成整个账户、全部来源或完整历史。
+没有观察到异常也不能证明采集完整。数据库彻底不可用、崩溃前未持久化的通知无法
+保证留痕；价格缺失、字段冲突、清理范围与采集缺口都必须继续显示。
+
+## 离线配置核对工具
+
+```bash
+python -m backend.usage_ledger_preflight --mock
+python -m backend.usage_ledger_preflight --config /path/to/credential-free-plan.json
+```
+
+`--mock` 只生成合成声明；不加载 `.env`、服务商配置、SDK、数据库或生产入口。
+`--config` 仅读取显式指定的一个 JSON 文件，最多 64 KiB，重复键与额外字段拒绝。
+它不是部署命令，也没有 enable 参数。退出码 0 表示声明一致，1 表示声明缺失/冲突，
+2 表示文件/结构无效；错误只返回固定类别，不回显路径、URL、模型、连接 ID 或原始错误。
+
+输入结构以 `backend.usage_ledger_preflight.mock_plan()` 为合成示例：
+
+| 字段 | 核对内容 |
+|---|---|
+| `schema_version` | 固定整数 1，不接受字符串或布尔值 |
+| `storage` | Linux/Render 绝对路径声明：persistent_root、ledger_db、relay_db，可选 codex_db。账本必须在持久根目录内且与来源库分离；拒绝相对路径、`..` 等 |
+| `hooks` | authenticated_routes、session_authority、message_counts、session_delete、version_delete、retention_reviewed、continuations 七个布尔声明；false 单列缺项 |
+| `api.routes` | 显式声明 web_chat / web_mcp 来源及 endpoint、model、protocol，不接受 key。每一条备用模型和协议变化也必须列出 |
+| `api.profiles` | 直接复用 `RouteProfile` / `CachePolicy` 的校验，核对精确匹配、重复项；允许缺少价格或 unknown dialect，但披露数量且不声称费用完整 |
+| `api.fingerprint_key_configured` | 只接受布尔声明，禁止在计划中提交 HMAC 密钥；运行时真正的密钥验证仍由采集器完成 |
+| `api.dynamic_routes_reviewed` | 是否已审阅运行期间路由变更的重新核对流程，不能只核对启动时的主模型 |
+| `codex` | provider_id、固定适配版本 0.160.0、exclusive_threads、max_pending、durable_binding、background_reconciliation、manual_compaction；未声明独占时允许上下文观测但禁用跨轮推算 |
+| `api` / `codex` 为 null | 该模式未计划接入，不要求另一模式的专属配置，并列出未计划的 Web 来源；不能两者都为空 |
+
+路径检查仅验证字符串关系。它**不证明**目录实际挂载、可写、符号链接/硬链接没有别名、
+磁盘容量或备份策略正确。路由清单和 hooks 也只是调用者的声明，不是线上验证结果。
+工具总是返回 `production_verified=false`、`enables_production=false`、
+`billing_complete=null`，即使所有声明一致也不改变这些字段。
+
+实际启用前还缺：部署组合与鉴权审阅、物理存储/备份核对、配置变化清单、观察连续性验收，
+以及显式启用决定。这些缺项不会通过配置里填 true 自动消除。本轮不代替这些验收。
+
+## 验证
+
+```bash
+python -m unittest backend.tests.test_usage_ledger_preflight
+```
+
+测试覆盖备用模型/协议/endpoint 漏配、同路由不同 Web 来源、重复配置、未知收费字段、
+缺少钩子、非独占线程、版本不符、模式隔离、路径冲突、密钥字段拒绝、固定错误、输入不变、
+无文件/数据库/网络副作用，以及受审生产入口继续未挂载/未注入。所有输入均为合成数据。
