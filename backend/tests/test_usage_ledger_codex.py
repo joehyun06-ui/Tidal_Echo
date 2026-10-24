@@ -80,6 +80,16 @@ class CodexLedgerTests(unittest.TestCase):
         self.assertEqual(view['coverage'],'recorded_turns_only');self.assertIsNone(view['summary']['metrics']['input']['value'])
         self.assertEqual(view['summary']['costs'],[]);self.assertIsNone(row['retry_count'])
 
+    def test_unbound_manual_compaction_turn_cannot_bridge_generation_baselines(self):
+        self.whole(1)
+        self.event('turn/started',99)
+        self.sample(99,usage(10000,2000))
+        self.event('turn/completed',99)
+        self.flush()
+        row=self.whole(2,usage(11000,2200))
+        self.assertIsNone(row['usage_baseline']);self.assertIsNone(row['normalized']['metrics']['input'])
+        self.assertEqual(len(self.ledger.records('codex')),2)
+
     def test_unverified_thread_ownership_never_attributes_cross_turn_totals(self):
         collector=self.make(exclusive_threads=False)
         self.whole(1,collector=collector)

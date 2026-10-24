@@ -45,7 +45,7 @@ class Continuations:
         data=json.dumps([source,target,mode,request,text],ensure_ascii=False,separators=(',',':')).encode()
         return hmac.new(self.key,data,hashlib.sha256).hexdigest()
 
-    def register(self, *, source_id, target_id, mode, request_id, expected_text):
+    def register(self, *, source_id, target_id, mode, request_id, expected_text, creation_receipt=None):
         """Called after authoritative target creation, before any send.
 
         The caller owns the session creation lock. This is not a public API and
@@ -62,6 +62,10 @@ class Continuations:
         digest=self.digest(source_id,target_id,mode,request,expected_text)
         with closing(self.ledger.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            if creation_receipt is not None:
+                rid,created_at=creation_receipt
+                if not conn.execute('SELECT 1 FROM usage_ledger_continuation_creations WHERE request_id=? AND created_at=? AND source_id=? AND target_id=? AND mode=?',
+                                    (rid,created_at,source_id,target_id,mode)).fetchone(): return False
             old=conn.execute('SELECT * FROM usage_ledger_continuations WHERE request_id=? OR target_id=?',(request,target_id)).fetchone()
             if old:
                 if tuple(old[:6])!=(request,source_id,target_id,mode,digest,self.key_id):

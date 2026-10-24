@@ -304,7 +304,7 @@ class Ledger:
             conn.execute('INSERT INTO usage_ledger VALUES (?,?,?,?,?,?)', (mode,value['provider_id'],value['request_id'],value['session_id'],payload['at'],encoded)); conn.commit()
         return True
 
-    def event(self, value, *, continuation_receipt=None):
+    def event(self, value, *, continuation_receipt=None, manual_compaction_receipt=None):
         allowed = {'event_id','session_id','mode','at','kind','status','before_tokens','after_tokens','memory_preserved','target_session_id','snapshot','source'}
         if not isinstance(value, dict) or set(value)-allowed or value.get('kind') not in {'compaction','continuation','model_switch','message_counts','context'} or value.get('mode') not in {'api','codex'} or value.get('status') not in {'completed','failed','unknown','observed'}: raise LedgerError('ledger_event_invalid')
         for key in ('event_id', 'session_id'): identifier(value.get(key))
@@ -335,6 +335,15 @@ class Ledger:
                 if snapshot[key] is not None and (count(snapshot[key]) is None or snapshot[key]==0): raise LedgerError('ledger_event_invalid')
             if stage=='target_created' and snapshot['input_message_id'] is not None or stage!='target_created' and snapshot['input_message_id'] is None: raise LedgerError('ledger_event_invalid')
             if (stage=='reply_completed') != (snapshot['reply_message_id'] is not None): raise LedgerError('ledger_event_invalid')
+        elif value['kind']=='compaction' and snapshot is not None:
+            if (not isinstance(snapshot,dict) or set(snapshot)!={'request_id','stage','dispatched','after_usage_observed'}
+                    or value.get('source')!='codex_manual_task' or value['mode']!='codex'
+                    or type(snapshot['dispatched']) is not bool or type(snapshot['after_usage_observed']) is not bool):raise LedgerError('ledger_event_invalid')
+            identifier(snapshot['request_id'])
+            stage=snapshot['stage']
+            if stage not in {'queued','preparing','dispatching','running','unknown','reconcile_queued','reconciling','completed','failed'}:raise LedgerError('ledger_event_invalid')
+            expected='completed' if stage=='completed' else 'failed' if stage=='failed' else 'unknown' if stage=='unknown' else 'observed'
+            if value['status']!=expected:raise LedgerError('ledger_event_invalid')
         elif snapshot is not None: raise LedgerError('ledger_event_invalid')
         payload = {**value,'at':timestamp(value.get('at'))}; encoded = raw_json(payload)
         with closing(self.connect()) as conn:
@@ -346,6 +355,10 @@ class Ledger:
                 request_id,created_at=continuation_receipt
                 if value['kind']!='continuation' or not conn.execute('SELECT 1 FROM usage_ledger_continuations WHERE request_id=? AND created_at=? AND source_id=? AND target_id=? AND mode=?',
                     (request_id,created_at,value['session_id'],value.get('target_session_id'),value['mode'])).fetchone(): return False
+            if manual_compaction_receipt is not None:
+                request_id,created_at=manual_compaction_receipt
+                if value['kind']!='compaction' or not conn.execute('SELECT 1 FROM usage_ledger_manual_compactions WHERE request_id=? AND created_at=? AND session_id=?',
+                    (request_id,created_at,value['session_id'])).fetchone():return False
             old = conn.execute('SELECT payload FROM usage_ledger_events WHERE event_id=?',(value['event_id'],)).fetchone()
             if old:
                 if old[0] != encoded: raise LedgerError('ledger_duplicate_conflict')
@@ -390,6 +403,11 @@ class Ledger:
             conn.execute('BEGIN IMMEDIATE'); conn.execute('DELETE FROM usage_ledger WHERE session_id=?',(sid,)); conn.execute('DELETE FROM usage_ledger_events WHERE session_id=? OR json_extract(payload,\'$.target_session_id\')=?',(sid,sid))
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='usage_ledger_continuations'").fetchone():
                 conn.execute('DELETE FROM usage_ledger_continuations WHERE source_id=? OR target_id=?',(sid,sid))
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='usage_ledger_continuation_creations'").fetchone():
+                conn.execute('DELETE FROM usage_ledger_continuation_creations WHERE source_id=? OR target_id=?',(sid,sid))
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='usage_ledger_manual_compactions'").fetchone():
+                conn.execute('INSERT OR REPLACE INTO usage_ledger_manual_purges VALUES (?,?)',(sid,datetime.now(timezone.utc).isoformat()))
+                conn.execute('DELETE FROM usage_ledger_manual_compactions WHERE session_id=?',(sid,))
             conn.commit()
 
 
@@ -460,7 +478,7 @@ def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/
         at=latest_scope['context'].get('observed_at') or latest_scope['at']
         if observed_at is None or timestamp(at)>timestamp(observed_at): obs=latest_scope['context']; observed_at=at
     if obs and latest_scope and observed_at and timestamp(latest_scope['at'])>timestamp(observed_at): obs={**obs,'stale':True}
-    if obs and observed_at and any(e['kind']=='compaction' and timestamp(e['at'])>=timestamp(observed_at) for e in events):
+    if obs and observed_at and any(e['kind']=='compaction' and (e.get('snapshot') or {}).get('dispatched') is not False and timestamp(e['at'])>=timestamp(observed_at) for e in events):
         obs={**obs,'tokens':None,'stale':True}
     policy = saved_policy if settings['revision'] else latest_scope.get('policy') if latest_scope else None
     ctx = context(obs,policy)

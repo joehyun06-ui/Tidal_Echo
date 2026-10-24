@@ -105,7 +105,7 @@ class GenerationControls:
 
 
 class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
-    def __init__(self, *, progress_callback, upload_dir=None, usage_collector=None, **kwargs):
+    def __init__(self, *, progress_callback, upload_dir=None, usage_collector=None, compaction_collector=None, **kwargs):
         super().__init__(**kwargs)
         self.upload_dir = Path(upload_dir) if upload_dir is not None else None
         self.controller.upload_dir = self.upload_dir
@@ -129,7 +129,7 @@ class StreamingCodexGenerationRuntime(ResubscribingCodexGenerationRuntime):
             handler=self.context_budget.receive,
         )
         from .web_codex_compaction import Compactions
-        self.compactions = Compactions(self)
+        self.compactions = Compactions(self,usage_collector=compaction_collector)
         from .codex_mcp_chat import install
         install(self)
         self.controls.chat_mcp = self.chat_mcp

@@ -98,8 +98,8 @@ Codex 的 API 缓存和 API 费用为不适用，原始订阅计数仍保留，�
 - 暂未支持 Anthropic 原生 Messages 请求注入、显式断点、缓存预热；已有 Anthropic
   用量归一化与费用快照可独立测试。Codex 不使用这些 API 缓存配置。
 
-后续接入顺序：补齐生产续窗登记钩子与现有手动压缩任务回执 →
-持久化采集缺口、保留/删除策略和分页 → 最后再决定生产启用与挂载。
+后续接入顺序：持久化采集缺口、保留/删除策略和分页 → 最后再决定生产启用与挂载。
+手动压缩回执与续窗建窗工厂已完成默认关闭的钩子及离线集成验证。
 Codex 订阅额度仍沿用现有账户面板，不改账户统计协议或模拟 API 计费。
 
 ## Codex 单轮与累计计数（离线后续批次）
@@ -175,9 +175,37 @@ Codex 订阅额度仍沿用现有账户面板，不改账户统计协议或模�
 5. 阶段事件按请求和阶段去重；登记重放不得改变内容；删除账本来源或目标时一并删除
    关联回执和事件。密钥变化不猜测旧摘要；重要记忆保留始终等待独立验证。
 
-只有离线 fixture 显式注入 `message_source` 和 `continuations`。现有生产「新建会话 →
-本机续窗草稿」流程尚未调用可信登记钩子，不会自动获得上述成功记录，也不自动发送。
-既有压缩事件已由被动 Codex 采集器观察；手动压缩任务的服务端持久化回执仍待接入。
+只有离线 fixture 显式注入 `message_source`、`continuations`、`manual_compactions`
+和 `continuation_creator`。现有生产入口没有配置这些对象，仍沿用本机续窗草稿。
+
+本批增加 `ContinuationCreation`，通过同一个 `create_web_session` 工厂创建 API / Codex
+目标，并调用可信回执登记：
+
+- GET 续窗预览只在显式注入 creator 后返回 `registration.supported=true` 和当前选中版本。
+  前端据此 POST `/app/sessions/{sid}/continuation`，严格提交 UUID、编辑后文本和预览版本。
+  服务端按来源权威行决定 provider/目标 ID；浏览器不能指定目标或运行模式。
+- 同一 UUID 在越过工厂边界前持久化保留，只保存 HMAC 和标识。结果不确定时只读取同一
+  目标进行核对，绝不自动再次建窗；内容、来源、版本、密钥不一致则冲突退出。
+- 原有 API/Codex 建窗工厂新增仅供可信服务调用的可选 session_id；普通路由不接受该字段。
+  Codex 沿用原先的 pin 和发布逻辑，不增加 turn/start 或模型请求。
+- 登记成功后前端同步会话、选择目标并放入本机草稿，原窗草稿保留，必须由用户确认发送。
+  老后端未声明能力时沿用既有流程；已声明能力但失败时不降级创建第二个窗口。
+- 选中版本在预览后变化、会话删除、清除账本与建窗并发时，均不能登记旧回执或重新建窗。
+
+`ManualCompactionReceipts` 通过 `Compactions(..., usage_collector=...)` 或运行时的
+`compaction_collector` 显式接入，默认 None，不改变原有压缩协议：
+
+- 同步已有 `web_codex_compactions` 的排队、准备、派发、运行、未知、核对、完成、失败状态，
+  核对当前原生 pin、线程和来源权威。ACK、超时或传输不确定不等于完成，不自动重放。
+- 压缩前数值仅取匹配最新已完成原生 job、canonical 用户消息和时间的上下文观测。
+  压缩后数值只接受同一任务、同一线程/turn、已观察压缩 item 完成后的原生 last.totalTokens。
+  不用线程累计 total 或费用消耗代替上下文，字段缺失保持 null。
+- 迟到的压缩后数值追加独立观测，不覆盖已记录的终态；排队或派发前失败不使现有上下文
+  失效。已派发的压缩会使旧占用失效，新的正式占用仍需后续观测。
+- 手动压缩单独留回执，不追加聊天请求用量；没有归汀生成 job 的手动 turn 会打断被动
+  Codex 采集器的跨轮基线，不能把压缩消耗混入下一轮差值。
+- 清除账本保留仅含会话标识和时间的手动任务清理水位，阻止旧原生历史/迟到通知重建账本。
+  生产会话删除、留存期限和全量数据分页策略仍需单独接入；重要记忆始终未被推断为保留。
 
 ### 路由
 
@@ -195,7 +223,7 @@ Codex 订阅额度仍沿用现有账户面板，不改账户统计协议或模�
 
 ## 运行与验证
 
-后端：`python -m unittest backend.tests.test_usage_ledger backend.tests.test_usage_ledger_capture backend.tests.test_usage_ledger_codex backend.tests.test_usage_ledger_sources backend.tests.test_usage_ledger_continuation`
+后端：`python -m unittest backend.tests.test_usage_ledger backend.tests.test_usage_ledger_capture backend.tests.test_usage_ledger_codex backend.tests.test_usage_ledger_sources backend.tests.test_usage_ledger_continuation backend.tests.test_usage_ledger_creation backend.tests.test_usage_ledger_compaction backend.tests.test_web_context_actions`
 
 采集测试使用真实 provider 函数的语法树执行片段与 HTTPX MockTransport；不执行
 bridge 模块顶层环境读取，不导入记忆模块。另走真实 Web 生成运行时、临时 relay /
@@ -207,6 +235,10 @@ Codex 使用合成原生通知、临时 native/relay/ledger 数据库，并禁�
 前端 CI 的 `test:integration` 在安装受检后端后启动独立临时 fixture，
 只绑定 127.0.0.1，显式禁止 Python 出站连接；浏览器只放行两个回环源。
 不需要 OpenAI API Key、Codex 登录或任何真实账号。生产代码不导入该 fixture。
+
+`ledger-actions-preview.py` 进一步运行真实上下文路由、权威会话工厂、回执登记、手动压缩
+管理器和账本路由。原生 pin/压缩传输为 Mock，禁止 Python 出站连接；浏览器覆盖新旧能力
+分支、确认/取消、API/Codex 草稿保留、无自动发送、压缩前后观测和手机布局。
 
 ## 核对过的字段来源（2026-10-23）
 

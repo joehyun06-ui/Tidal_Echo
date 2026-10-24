@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from .usage_ledger import LedgerError, build_view, export_records, identifier
 
 
-def install(app, *, ledger, check_auth, session_provider, message_source=None, continuations=None):
+def install(app, *, ledger, check_auth, session_provider, message_source=None, continuations=None, manual_compactions=None):
     headers={'Cache-Control':'private, no-store'}
     def error(exc): return JSONResponse({'ok':False,'error':str(exc)},status_code=409 if str(exc)=='ledger_revision_conflict' else 400,headers=headers)
 
@@ -31,6 +31,8 @@ def install(app, *, ledger, check_auth, session_provider, message_source=None, c
             mode,all_sessions,model=query(sid,request)
             if continuations is not None and not all_sessions:
                 await asyncio.to_thread(continuations.reconcile,sid,mode)
+            if manual_compactions is not None and not all_sessions:
+                await asyncio.to_thread(manual_compactions.reconcile,sid,mode)
             result=await asyncio.to_thread(build_view,ledger,mode,sid,all_sessions=all_sessions,model=model,message_source=message_source)
             return JSONResponse(result,headers=headers)
         except LedgerError as exc: return error(exc)
