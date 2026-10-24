@@ -358,6 +358,13 @@ class Ledger:
                     old=json.loads(previous[0])
                     if old.get('_retention',{}).get('original_digest')!=hashlib.sha256(encoded.encode()).hexdigest():raise LedgerError('ledger_duplicate_conflict')
                 return False
+            retention=conn.execute('SELECT raw_before FROM usage_ledger_storage WHERE mode=?',(mode,)).fetchone()
+            if retention and retention[0] and payload['at']<retention[0]:
+                import hashlib
+                payload['raw_usage']=None
+                if 'usage_baseline' in payload:payload['usage_baseline']=None
+                payload['_retention']={'raw_removed':True,'original_digest':hashlib.sha256(encoded.encode()).hexdigest()}
+                encoded=raw_json(payload)
             conn.execute('INSERT INTO usage_ledger VALUES (?,?,?,?,?,?)', (mode,value['provider_id'],value['request_id'],value['session_id'],payload['at'],encoded))
             conn.execute('INSERT OR IGNORE INTO usage_ledger_sequence(mode,provider_id,request_id) VALUES (?,?,?)',(mode,value['provider_id'],value['request_id']))
             conn.execute("UPDATE usage_ledger_attempts SET state='recorded',updated_at=? WHERE mode=? AND provider_id=? AND request_id=?",(datetime.now(timezone.utc).isoformat(),mode,value['provider_id'],value['request_id']))

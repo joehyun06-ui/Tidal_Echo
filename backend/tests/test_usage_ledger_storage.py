@@ -93,6 +93,14 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(build_view(self.ledger,'api','s-1')['collection_health']['retention']['records_removed'])
         with self.assertRaisesRegex(LedgerError,'cannot_restore'):maintain(self.ledger,'api',records_before='2026-10-22T00:00:00Z')
 
+    def test_late_backfill_obeys_existing_raw_retention_on_first_insert(self):
+        maintain(self.ledger,'api',raw_before='2026-10-24T00:00:00Z')
+        r=record(request_id='late-backfill',at='2026-10-22T00:00:00Z')
+        self.assertTrue(self.ledger.append(r));saved=self.ledger.records('api')[0]
+        self.assertIsNone(saved['raw_usage']);self.assertTrue(saved['_retention']['raw_removed'])
+        self.assertEqual(saved['normalized']['metrics']['input'],1000);self.assertIsNotNone(saved['cost']['amount'])
+        self.assertFalse(self.ledger.append(r));self.assertIsNone(self.ledger.records('api')[0]['raw_usage'])
+
     def test_retired_session_rejects_new_and_late_records_events_and_journal(self):
         self.rows();self.ledger.purge_session('s-1',retire=True,mode='api')
         r=record(request_id='new-late',at=datetime.now(timezone.utc).isoformat());self.assertFalse(self.ledger.append(r))
