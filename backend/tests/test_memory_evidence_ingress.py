@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+from contextlib import closing
 import os
 import sqlite3
 import sys
@@ -28,9 +29,11 @@ class LoopEvidenceRouteTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp.name)
         self.dbpath = root / "relay.sqlite"
         source = database()
-        with sqlite3.connect(str(self.dbpath)) as dest:
-            source.backup(dest)
-        source.close()
+        try:
+            with closing(sqlite3.connect(str(self.dbpath))) as dest:
+                source.backup(dest)
+        finally:
+            source.close()
         patch = mock.patch.dict(os.environ, {
             "LOOP_CONFIG": str(root / "loop.config.json"),
             "RELAY_DB": str(self.dbpath),
