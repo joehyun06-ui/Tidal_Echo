@@ -36,6 +36,8 @@ class ContinuationCreation:
     def source(self,sid,version=None):
         identifier(sid)
         row=self.authority.row_for_session(sid)
+        with closing(self.receipts.ledger.connect()) as conn:
+            if row and self.receipts.ledger.blocked(conn,row['provider'],sid,datetime.now(timezone.utc).isoformat()):raise CreationError('continuation_source_unavailable',404)
         if not row or self.authority.tombstone_for_session(sid): raise CreationError('continuation_source_unavailable',404)
         resolved=self.counts(row['provider'],sid)
         p=resolved['provenance']

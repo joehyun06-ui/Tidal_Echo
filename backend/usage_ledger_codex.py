@@ -18,6 +18,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 
 from .usage_ledger import count, identifier, normalize, raw_json
+from .usage_ledger_journal import CollectionJournal
 
 NOTIFICATIONS = frozenset({'turn/started','turn/completed','thread/tokenUsage/updated','item/started','item/completed'})
 
@@ -45,15 +46,25 @@ class CodexCollector:
         self._pending = OrderedDict(); self._finished = OrderedDict(); self._heads = {}
         self._epoch = None; self._sequence = 0; self._instance = uuid.uuid4().hex
         self.captured = self.dropped = self.unmatched = self.late = self.evicted = 0
+        self.journal_failed=0;self._issues=OrderedDict();self._bindings={}
+        try:self.journal=CollectionJournal(ledger,'codex',provider_id)
+        except Exception:self.journal=None;self.journal_failed=1
+
+    def _issue(self,reason,key):
+        identity=(reason,*key)
+        if identity not in self._issues:
+            if len(self._issues)>=256:self._issues.popitem(last=False);self.journal_failed+=1
+            self._issues[identity]={'session_id':self._bindings.get(key),'request_id':'codex-'+digest(self.provider_id,*key),'at':datetime.now(timezone.utc).isoformat()}
 
     def health(self):
         with self._lock:
             return {'captured':self.captured,'dropped':self.dropped,'unmatched':self.unmatched,
                     'late':self.late,'evicted':self.evicted,'pending':len(self._pending),
-                    'complete':not (self.dropped or self.unmatched or self.late or self.evicted)}
+                    'journal_failed':self.journal_failed,'complete':not (self.dropped or self.unmatched or self.late or self.evicted or self.journal_failed)}
 
     def _continuity(self, epoch):
         if epoch != self._epoch:
+            for key in set(self._heads.values())|set(self._pending):self._issue('epoch_changed',key)
             self._heads.clear()
             for state in self._pending.values(): state['invalid'] = True; state['revision'] += 1
             self._epoch = epoch
@@ -77,6 +88,7 @@ class CodexCollector:
                 usage = json.loads(raw_json(params['tokenUsage']))
             except (ValueError,TypeError,RecursionError):
                 with self._lock:
+                    self._issue('invalid_usage',(thread,turn))
                     self.dropped += 1; self._heads.pop(thread,None)
                     if (thread,turn) in self._pending: self._pending[thread,turn]['invalid'] = True
                 return
@@ -86,6 +98,7 @@ class CodexCollector:
             if key in self._finished:
                 old = self._finished[key]
                 if method == 'thread/tokenUsage/updated' and usage != old.get('raw'):
+                    self._issue('late_event',key)
                     self.late += 1; self._heads.pop(thread,None)
                 return
             state = self._pending.get(key)
@@ -95,7 +108,7 @@ class CodexCollector:
                     if other['thread']==thread and not other['terminal']:
                         other['invalid'] = True; other['revision'] += 1; overlap = True
                 while len(self._pending) >= self.max_pending:
-                    removed,_ = self._pending.popitem(last=False); self._heads.pop(removed[0],None); self.evicted += 1
+                    removed,_ = self._pending.popitem(last=False);self._issue('pending_evicted',removed); self._heads.pop(removed[0],None); self.evicted += 1
                 self._sequence += 1
                 state = {'thread':thread,'turn':turn,'first':self._sequence,'revision':0,'started':False,
                          'terminal':None,'raw':None,'observed_at':None,'at':now,'previous':None,
@@ -110,6 +123,7 @@ class CodexCollector:
             elif method == 'thread/tokenUsage/updated':
                 if state['raw'] == usage: return
                 if state['terminal']:
+                    self._issue('late_event',key)
                     state['invalid'] = True; state['revision'] += 1; self.late += 1; self._heads.pop(thread,None)
                     return
                 previous = (state['raw'] or {}).get('total',{})
@@ -141,7 +155,8 @@ class CodexCollector:
         # Read only routing identities, never prompts, input digests or chat text.
         with closing(sqlite3.connect(self.store_path,timeout=1)) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute('''SELECT j.id,j.api_session,j.canonical_message_id,j.turn_id,j.thread_id,j.status,s.model
+            created=',j.created_at AS native_created_at' if 'created_at' in {r[1] for r in conn.execute('PRAGMA table_info(codex_generation_jobs)')} else ',NULL AS native_created_at'
+            row = conn.execute('''SELECT j.id,j.api_session,j.canonical_message_id,j.turn_id,j.thread_id,j.status,s.model'''+created+'''
                 FROM codex_generation_jobs j JOIN codex_sessions s ON s.api_session=j.api_session
                 WHERE j.thread_id=? AND j.turn_id=? AND s.thread_id=j.thread_id ORDER BY j.id DESC LIMIT 1''',
                 (state['thread'],state['turn'])).fetchone()
@@ -167,7 +182,12 @@ class CodexCollector:
             for state in states:
                 try: self._reconcile(state)
                 except Exception:
-                    with self._lock: self.dropped += 1
+                    with self._lock:self.dropped += 1;self._issue('collector_failure',(state['thread'],state['turn']))
+            with self._lock:
+                issues=list(self._issues.items());self._issues.clear()
+            for (reason,*_),fields in issues:
+                try:self.journal.issue(reason,**fields)
+                except Exception:self.journal_failed+=1
         finally: self._writer.release()
 
     def _reconcile(self, state):
@@ -179,6 +199,17 @@ class CodexCollector:
             previous_key = tuple(state['previous']) if state['previous'] else None
             previous = self._finished.get(previous_key)
         sid = binding['api_session']; rid = 'codex-'+digest(self.provider_id,*key)
+        at=binding.get('native_created_at') or state['at']
+        with closing(self.ledger.connect()) as conn:
+            blocked=self.ledger.blocked(conn,'codex',sid,at) or conn.execute('SELECT 1 FROM usage_ledger_removed WHERE mode=? AND provider_id=? AND request_id=?',('codex',self.provider_id,rid)).fetchone()
+        if blocked:
+            with self._lock:self._pending.pop(key,None);self._heads.pop(state['thread'],None)
+            return
+        with self._lock:
+            self._bindings[key]=sid
+            while len(self._bindings)>256:self._bindings.pop(next(iter(self._bindings)))
+        try:self.journal.start({'mode':'codex','provider_id':self.provider_id,'request_id':rid,'session_id':sid,'at':at})
+        except Exception:self.journal_failed+=1
         raw = state['raw']; last = last_usage(raw)
         context = {'tokens':count(last.get('totalTokens')),'limit':count((raw or {}).get('modelContextWindow')),
                    'source':'codex_app_server','stale':False,'observed_at':state['observed_at'],'model':binding['model']}
@@ -208,7 +239,7 @@ class CodexCollector:
         complete = baseline is not None and all(normalized['metrics'][k] is not None for k in ('input','output','total')) and not normalized['issues'] and terminal != 'unknown'
         status = {'completed':'completed','failed':'error','interrupted':'interrupted','unknown':'unknown'}[terminal]
         payload = {'mode':'codex','provider_id':self.provider_id,'request_id':rid,'turn_id':state['turn'],
-                   'session_id':sid,'at':state['at'],'model':binding['model'],'requested_model':binding['model'],'model_source':'request',
+                   'session_id':sid,'at':at,'model':binding['model'],'requested_model':binding['model'],'model_source':'request',
                    'dialect':'codex','raw_usage':raw,'usage_baseline':baseline,
                    'accounting_basis':'thread_counter_delta' if baseline is not None else 'unavailable',
                    'usage_complete':complete,'status':status,'latency_ms':None,'http_status':None,'retry_count':None,'price':None}

@@ -6,22 +6,25 @@ No model requests, memory access, runtime monkeypatches, or history backfill.
 import asyncio
 import json
 from fastapi import Request
-from fastapi.responses import JSONResponse, Response
-from .usage_ledger import LedgerError, build_view, export_records, identifier
+from fastapi.responses import JSONResponse, StreamingResponse
+from .usage_ledger import LedgerError, build_view, identifier, model_name
+from .usage_ledger_storage import page,stream_export
 
 
 def install(app, *, ledger, check_auth, session_provider, message_source=None, continuations=None, manual_compactions=None):
     headers={'Cache-Control':'private, no-store'}
     def error(exc): return JSONResponse({'ok':False,'error':str(exc)},status_code=409 if str(exc)=='ledger_revision_conflict' else 400,headers=headers)
 
-    def query(sid,request):
+    def query(sid,request,*,page_query=False):
         identifier(sid)
         q=dict(request.query_params)
-        if len(q)!=len(request.query_params.multi_items()) or set(q)-{'mode','scope','model','format'}: raise LedgerError('ledger_query_invalid')
+        allowed={'mode','scope','model','format'}|({'cursor','limit'} if page_query else set())
+        if len(q)!=len(request.query_params.multi_items()) or set(q)-allowed: raise LedgerError('ledger_query_invalid')
         actual=session_provider(sid)
         if actual not in ('api','codex'): raise LedgerError('ledger_session_unavailable')
         mode=q.get('mode',actual)
         if mode not in ('api','codex') or q.get('scope','session') not in ('session','all'): raise LedgerError('ledger_query_invalid')
+        if q.get('model') is not None:model_name(q['model'])
         return mode,q.get('scope')=='all',q.get('model')
 
     @app.get('/app/sessions/{sid}/usage-ledger')
@@ -42,10 +45,21 @@ def install(app, *, ledger, check_auth, session_provider, message_source=None, c
         check_auth(request)
         try:
             mode,all_sessions,model=query(sid,request);format=request.query_params.get('format','json')
-            rows=await asyncio.to_thread(ledger.records,mode,None if all_sessions else sid,model=model)
-            data=await asyncio.to_thread(export_records,rows,format)
-            return Response(data,media_type='application/json' if format=='json' else 'text/csv',headers={**headers,'Content-Disposition':f'attachment; filename="guiting-{mode}-ledger.{format}"'})
+            if format not in {'json','csv'}:raise LedgerError('ledger_export_invalid')
+            data=stream_export(ledger,mode,None if all_sessions else sid,model=model,format=format)
+            return StreamingResponse(data,media_type='application/json' if format=='json' else 'text/csv',headers={**headers,'Content-Disposition':f'attachment; filename="guiting-{mode}-ledger.{format}"'})
         except LedgerError as exc: return error(exc)
+
+    @app.get('/app/sessions/{sid}/usage-ledger/records')
+    async def records(sid:str,request:Request):
+        check_auth(request)
+        try:
+            mode,all_sessions,model=query(sid,request,page_query=True)
+            limit=request.query_params.get('limit','25')
+            if not limit.isascii() or not limit.isdecimal() or len(limit)>3:raise LedgerError('ledger_page_invalid')
+            result=await asyncio.to_thread(page,ledger,mode,None if all_sessions else sid,model=model,limit=int(limit),cursor=request.query_params.get('cursor'))
+            return JSONResponse(result,headers=headers)
+        except LedgerError as exc:return error(exc)
 
     @app.put('/app/usage-ledger/settings/{mode}')
     async def settings(mode:str,request:Request):

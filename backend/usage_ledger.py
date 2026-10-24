@@ -257,15 +257,68 @@ class Ledger:
     def __init__(self, path):
         self.path = str(path)
         with closing(self.connect()) as conn:
+            conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger (mode TEXT NOT NULL, provider_id TEXT NOT NULL, request_id TEXT NOT NULL, session_id TEXT NOT NULL, at TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(mode,provider_id,request_id))')
             conn.execute('CREATE INDEX IF NOT EXISTS usage_ledger_session_time ON usage_ledger(session_id,mode,at)')
             conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_events (event_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,mode TEXT NOT NULL,at TEXT NOT NULL,payload TEXT NOT NULL)')
             conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_settings (mode TEXT PRIMARY KEY, revision INTEGER NOT NULL, payload TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_sequence(id INTEGER PRIMARY KEY AUTOINCREMENT,mode TEXT NOT NULL,provider_id TEXT NOT NULL,request_id TEXT NOT NULL,UNIQUE(mode,provider_id,request_id))')
+            conn.execute('INSERT OR IGNORE INTO usage_ledger_sequence(mode,provider_id,request_id) SELECT mode,provider_id,request_id FROM usage_ledger ORDER BY rowid')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_attempts(mode TEXT,provider_id TEXT,request_id TEXT,session_id TEXT,at TEXT,state TEXT,run_id TEXT,updated_at TEXT,PRIMARY KEY(mode,provider_id,request_id))')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_issues(issue_id TEXT PRIMARY KEY,mode TEXT,provider_id TEXT,request_id TEXT,session_id TEXT,at TEXT,reason TEXT)')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_runs(run_id TEXT PRIMARY KEY,mode TEXT,provider_id TEXT,started_at TEXT)')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_retired(session_id TEXT PRIMARY KEY,at TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_retired_modes(session_id TEXT,mode TEXT,PRIMARY KEY(session_id,mode))')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_removed(mode TEXT,provider_id TEXT,request_id TEXT,PRIMARY KEY(mode,provider_id,request_id))')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_storage(mode TEXT PRIMARY KEY,raw_before TEXT,records_before TEXT,removed INTEGER NOT NULL DEFAULT 0)')
+            conn.execute('CREATE TABLE IF NOT EXISTS usage_ledger_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            import secrets
+            conn.execute("INSERT OR IGNORE INTO usage_ledger_meta VALUES ('cursor_key',?)",(secrets.token_hex(32),))
+            conn.execute("INSERT OR IGNORE INTO usage_ledger_meta VALUES ('revision','0')")
             conn.commit()
 
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=3); conn.row_factory = sqlite3.Row
         return conn
+
+    def blocked(self,conn,mode,sid,at):
+        if conn.execute('SELECT 1 FROM usage_ledger_retired WHERE session_id=?',(sid,)).fetchone():return True
+        row=conn.execute('SELECT records_before FROM usage_ledger_storage WHERE mode=?',(mode,)).fetchone()
+        return bool(row and row[0] and timestamp(at)<row[0])
+
+    def has_record(self,mode,provider,request):
+        with closing(self.connect()) as conn:
+            return bool(conn.execute('SELECT 1 FROM usage_ledger WHERE mode=? AND provider_id=? AND request_id=?',(mode,provider,request)).fetchone())
+
+    def iter_records(self,mode,sid=None,*,model=None,turn=None,conn=None):
+        if conn is None:
+            with closing(self.connect()) as opened:
+                opened.execute('BEGIN');yield from self.iter_records(mode,sid,model=model,turn=turn,conn=opened)
+            return
+        if mode not in ('api','codex'):raise LedgerError('ledger_mode_invalid')
+        where=['mode=?'];args=[mode]
+        if sid is not None:where.append('session_id=?');args.append(identifier(sid))
+        if model is not None:model_name(model);where.append("json_extract(payload,'$.model')=?");args.append(model)
+        if turn is not None:where.append("json_extract(payload,'$.turn_id')=?");args.append(identifier(turn))
+        cursor=conn.execute('SELECT payload FROM usage_ledger WHERE '+' AND '.join(where)+' ORDER BY at,rowid',args)
+        while batch:=cursor.fetchmany(256):
+            for row in batch:yield json.loads(row[0])
+
+    def iter_events(self,mode,sid=None,*,conn=None):
+        if conn is None:
+            with closing(self.connect()) as opened:yield from self.iter_events(mode,sid,conn=opened)
+            return
+        cursor=conn.execute('SELECT payload FROM usage_ledger_events WHERE mode=?'+(' AND session_id=?' if sid is not None else '')+' ORDER BY at,event_id',(mode,sid) if sid is not None else (mode,))
+        while batch:=cursor.fetchmany(256):
+            for row in batch:yield json.loads(row[0])
+
+    def retention(self,mode,*,conn=None):
+        if conn is None:
+            with closing(self.connect()) as opened:return self.retention(mode,conn=opened)
+        row=conn.execute('SELECT * FROM usage_ledger_storage WHERE mode=?',(mode,)).fetchone()
+        retired=conn.execute('SELECT COUNT(*) FROM usage_ledger_retired_modes WHERE mode=?',(mode,)).fetchone()[0]
+        return {'raw_before':row['raw_before'] if row else None,'records_before':row['records_before'] if row else None,
+                'records_removed':bool(retired or row and row['removed']),'retired_sessions':retired,'default':'keep_all','automatic_cleanup':False}
 
     def append(self, value):
         if not isinstance(value, dict) or set(value)-{'mode','provider_id','request_id','turn_id','session_id','at','model','requested_model','model_source','dialect','raw_usage','usage_baseline','accounting_basis','usage_complete','status','latency_ms','http_status','retry_count','price','context','policy','prefix_fingerprint','cache_policy','config_revision'}: raise LedgerError('ledger_record_invalid')
@@ -297,11 +350,21 @@ class Ledger:
         encoded = raw_json(payload)
         with closing(self.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            if self.blocked(conn,mode,value['session_id'],payload['at']) or conn.execute('SELECT 1 FROM usage_ledger_removed WHERE mode=? AND provider_id=? AND request_id=?',(mode,value['provider_id'],value['request_id'])).fetchone():return False
             previous = conn.execute('SELECT payload FROM usage_ledger WHERE mode=? AND provider_id=? AND request_id=?', (mode,value['provider_id'],value['request_id'])).fetchone()
             if previous:
-                if previous[0] != encoded: raise LedgerError('ledger_duplicate_conflict')
+                if previous[0] != encoded:
+                    import hashlib
+                    old=json.loads(previous[0])
+                    if old.get('_retention',{}).get('original_digest')!=hashlib.sha256(encoded.encode()).hexdigest():raise LedgerError('ledger_duplicate_conflict')
                 return False
-            conn.execute('INSERT INTO usage_ledger VALUES (?,?,?,?,?,?)', (mode,value['provider_id'],value['request_id'],value['session_id'],payload['at'],encoded)); conn.commit()
+            conn.execute('INSERT INTO usage_ledger VALUES (?,?,?,?,?,?)', (mode,value['provider_id'],value['request_id'],value['session_id'],payload['at'],encoded))
+            conn.execute('INSERT OR IGNORE INTO usage_ledger_sequence(mode,provider_id,request_id) VALUES (?,?,?)',(mode,value['provider_id'],value['request_id']))
+            conn.execute("UPDATE usage_ledger_attempts SET state='recorded',updated_at=? WHERE mode=? AND provider_id=? AND request_id=?",(datetime.now(timezone.utc).isoformat(),mode,value['provider_id'],value['request_id']))
+            conn.execute("DELETE FROM usage_ledger_issues WHERE mode=? AND provider_id=? AND request_id=? AND reason='write_failed'",(mode,value['provider_id'],value['request_id']))
+            if value['usage_complete'] and not normalized['issues']:
+                conn.execute("DELETE FROM usage_ledger_issues WHERE mode=? AND provider_id=? AND request_id=? AND reason='invalid_usage'",(mode,value['provider_id'],value['request_id']))
+            conn.commit()
         return True
 
     def event(self, value, *, continuation_receipt=None, manual_compaction_receipt=None):
@@ -348,6 +411,7 @@ class Ledger:
         payload = {**value,'at':timestamp(value.get('at'))}; encoded = raw_json(payload)
         with closing(self.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            if self.blocked(conn,value['mode'],value['session_id'],payload['at']) or value.get('target_session_id') and conn.execute('SELECT 1 FROM usage_ledger_retired WHERE session_id=?',(value['target_session_id'],)).fetchone():return False
             # A purge can race with a read-side reconciliation. Serialize the
             # receipt existence check and event write with purge_session, and
             # bind to this registration epoch rather than a reused request ID.
@@ -397,10 +461,21 @@ class Ledger:
             conn.execute('INSERT OR REPLACE INTO usage_ledger_settings VALUES (?,?,?)',(mode,revision+1,raw_json(policy)));conn.commit()
         return self.settings(mode)
 
-    def purge_session(self, sid):
+    def purge_session(self, sid, *, retire=False, mode=None):
         identifier(sid)
         with closing(self.connect()) as conn:
-            conn.execute('BEGIN IMMEDIATE'); conn.execute('DELETE FROM usage_ledger WHERE session_id=?',(sid,)); conn.execute('DELETE FROM usage_ledger_events WHERE session_id=? OR json_extract(payload,\'$.target_session_id\')=?',(sid,sid))
+            conn.execute('BEGIN IMMEDIATE')
+            modes={r[0] for r in conn.execute('SELECT mode FROM usage_ledger WHERE session_id=? UNION SELECT mode FROM usage_ledger_attempts WHERE session_id=?',(sid,sid))}
+            if mode in {'api','codex'}:modes.add(mode)
+            for m in modes:
+                conn.execute('INSERT INTO usage_ledger_storage(mode,removed) VALUES (?,1) ON CONFLICT(mode) DO UPDATE SET removed=1',(m,))
+                if retire:conn.execute('INSERT OR IGNORE INTO usage_ledger_retired_modes VALUES (?,?)',(sid,m))
+            if retire:conn.execute('INSERT OR IGNORE INTO usage_ledger_retired VALUES (?,?)',(sid,datetime.now(timezone.utc).isoformat()))
+            conn.execute('INSERT OR IGNORE INTO usage_ledger_removed SELECT mode,provider_id,request_id FROM usage_ledger WHERE session_id=?',(sid,))
+            conn.execute('INSERT OR IGNORE INTO usage_ledger_removed SELECT mode,provider_id,request_id FROM usage_ledger_attempts WHERE session_id=?',(sid,))
+            conn.execute('DELETE FROM usage_ledger_attempts WHERE session_id=?',(sid,));conn.execute('DELETE FROM usage_ledger_issues WHERE session_id=?',(sid,))
+            conn.execute('DELETE FROM usage_ledger WHERE session_id=?',(sid,)); conn.execute('DELETE FROM usage_ledger_events WHERE session_id=? OR json_extract(payload,\'$.target_session_id\')=?',(sid,sid))
+            conn.execute("UPDATE usage_ledger_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='usage_ledger_continuations'").fetchone():
                 conn.execute('DELETE FROM usage_ledger_continuations WHERE source_id=? OR target_id=?',(sid,sid))
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='usage_ledger_continuation_creations'").fetchone():
@@ -448,85 +523,18 @@ def summarize(records):
             'retries':sum(r['retry_count'] for r in records) if records and all(r.get('retry_count') is not None for r in records) else None}
 
 
-def build_view(ledger, mode, sid, *, all_sessions=False, model=None, zone='Asia/Shanghai', now=None, budgets=None, message_source=None):
-    if model is not None: model_name(model)
-    settings=ledger.settings(mode); saved_policy=settings['policy']
-    zone=saved_policy.get('timezone',zone) if settings['revision'] else zone
-    budgets=saved_policy.get('budgets',[]) if budgets is None else budgets
-    tz = ZoneInfo(zone); now = (now or datetime.now(timezone.utc)).astimezone(tz)
-    scope_rows = ledger.records(mode,None if all_sessions else sid)
-    rows = [r for r in scope_rows if model is None or r['model']==model]
-    all_rows = ledger.records(mode)
-    # A model filter never hides spending from daily/monthly budget evaluation.
-    def local(r): return datetime.fromisoformat(r['at']).astimezone(tz)
-    daily = [r for r in all_rows if local(r).date()==now.date()]
-    monthly = [r for r in all_rows if (local(r).year,local(r).month)==(now.year,now.month)]
-    events = ledger.events(mode,None if all_sessions else sid)
-    counts = next((e.get('snapshot') for e in reversed(events) if e['kind']=='message_counts' and e['session_id']==sid),None) if not all_sessions else None
-    counts = {key:count((counts or {}).get(key)) for key in ('total','visible','folded','archived','turns')}
-    counts_provenance = {'source':'recorded_snapshot','status':'unverified'}
-    if message_source is not None:
-        sourced = message_source(mode,sid,all_sessions=all_sessions)
-        counts = {key:count(sourced['counts'].get(key)) for key in counts}
-        counts_provenance = sourced['provenance']
-    observation = next((e for e in reversed(events) if e['kind']=='context' and e['session_id']==sid),None) if not all_sessions else None
-    obs = observation.get('snapshot') if observation else None
-    observed_at = (obs or {}).get('observed_at') or (observation or {}).get('at')
-    latest = rows[-1] if rows else None
-    latest_scope = scope_rows[-1] if scope_rows else None
-    if latest_scope and not all_sessions and isinstance(latest_scope.get('context'),dict):
-        at=latest_scope['context'].get('observed_at') or latest_scope['at']
-        if observed_at is None or timestamp(at)>timestamp(observed_at): obs=latest_scope['context']; observed_at=at
-    if obs and latest_scope and observed_at and timestamp(latest_scope['at'])>timestamp(observed_at): obs={**obs,'stale':True}
-    if obs and observed_at and any(e['kind']=='compaction' and (e.get('snapshot') or {}).get('dispatched') is not False and timestamp(e['at'])>=timestamp(observed_at) for e in events):
-        obs={**obs,'tokens':None,'stale':True}
-    policy = saved_policy if settings['revision'] else latest_scope.get('policy') if latest_scope else None
-    ctx = context(obs,policy)
-    history = [e for e in events if e['kind'] in {'compaction','continuation','model_switch'}]
-    changes, prior = [], {}
-    anomalies = []
-    for r in rows:
-        key = (r['session_id'],r['provider_id'])
-        old = prior.get(key)
-        if old:
-            changed = [k for k in ('model','cache_policy','price','config_revision') if old.get(k)!=r.get(k)]
-            if (old.get('context') or {}).get('limit') != (r.get('context') or {}).get('limit'): changed.append('context_limit')
-            if changed: changes.append({'at':r['at'],'session_id':r['session_id'],'provider_id':r['provider_id'],'changed':changed,'before_model':old['model'],'model':r['model'],'price':r.get('price'),'context_limit':(r.get('context') or {}).get('limit'),'cache_policy':r.get('cache_policy')})
-            a,b = old['normalized']['cache_hit_rate'],r['normalized']['cache_hit_rate']
-            if a is not None and b is not None and a-b>=.3:
-                reasons=[]
-                if old.get('prefix_fingerprint') and r.get('prefix_fingerprint') and old['prefix_fingerprint']!=r['prefix_fingerprint']: reasons.append('stable_prefix_changed')
-                reasons.extend(changed)
-                anomalies.append({'at':r['at'],'request_id':r['request_id'],'from_rate':a,'to_rate':b,'possible_causes':reasons or ['provider_cache_expiry_or_routing_unknown'],'inference':True})
-        prior[key]=r
-    trends={}
-    for r in rows:
-        dt=local(r)
-        for period,key in [('hour',dt.replace(minute=0,second=0,microsecond=0).isoformat()),('day',dt.date().isoformat())]:
-            trends.setdefault((period,key,r['provider_id'],r['model']),[]).append(r)
-    budget_views=[]
-    for budget in budgets or []:
-        if budget.get('period') not in {'day','month'} or number(budget.get('limit')) is None or not re.fullmatch('[A-Z]{3}',str(budget.get('currency',''))): raise LedgerError('ledger_budget_invalid')
-        summary=summarize(daily if budget['period']=='day' else monthly)
-        charge=next((c for c in summary['costs'] if c['currency']==budget['currency']),None)
-        known=Decimal(charge['amount']) if charge and charge['amount'] is not None else None
-        budget_views.append({**budget,'known_spend':str(known) if known is not None else None,'remaining':str(max(Decimal(0),number(budget['limit'])-known)) if known is not None and charge['complete'] else None,
-                             'complete':bool(charge and charge['complete']),'exceeded':known>=number(budget['limit']) if known is not None else None,'enforcement':'warning_only'})
-    return {'ok':True,'contract_version':1,'mode':mode,'session_id':sid,'scope':'all' if all_sessions else 'session','timezone':zone,
-            'coverage':'recorded_turns_only' if mode=='codex' else 'recorded_requests_only','context':ctx,'summary':summarize(rows),'daily':summarize(daily),'monthly':summarize(monthly),
-            'last_round':summarize([r for r in rows if latest and (r['session_id'],r['turn_id'])==(latest['session_id'],latest['turn_id'])]),
-            'message_counts':counts,'message_counts_provenance':counts_provenance,'events':history[-100:],'configuration_changes':changes[-100:],'cache_diagnostics':anomalies[-100:],
-            'trends':[{'period':k[0],'at':k[1],'provider_id':k[2],'model':k[3],'summary':summarize(v)} for k,v in sorted(trends.items())],
-            'budgets':budget_views,'settings':settings,'models':sorted({r['model'] for r in scope_rows}),'recent_requests':[{k:v for k,v in r.items() if k!='raw_usage'} for r in rows[-100:]]}
+def build_view(ledger,mode,sid,**kwargs):
+    from .usage_ledger_report import build_report
+    return build_report(ledger,mode,sid,**kwargs)
 
 
 def export_records(records, format):
     if format=='json': return json.dumps({'contract_version':1,'records':records},ensure_ascii=False,allow_nan=False,indent=2)
     if format!='csv': raise LedgerError('ledger_export_invalid')
-    output=io.StringIO();fields=['mode','provider_id','session_id','request_id','turn_id','at','model','requested_model','model_source','accounting_basis',*METRICS,'usage_complete','status','latency_ms','http_status','retry_count','amount','currency','cost_basis','raw_usage_json','usage_baseline_json']
+    output=io.StringIO();fields=['mode','provider_id','session_id','request_id','turn_id','at','model','requested_model','model_source','accounting_basis',*METRICS,'usage_complete','status','latency_ms','http_status','retry_count','amount','currency','cost_basis','raw_removed','retained_records_before','raw_usage_json','usage_baseline_json']
     writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
     for r in records:
-        row={k:r.get(k) for k in fields if k in r};row.update(r['normalized']['metrics']);row.update(amount=r['cost']['amount'],currency=r['cost']['currency'],cost_basis=r['cost']['basis'],raw_usage_json=json.dumps(r.get('raw_usage'),ensure_ascii=False),usage_baseline_json=json.dumps(r.get('usage_baseline'),ensure_ascii=False))
+        row={k:r.get(k) for k in fields if k in r};row.update(r['normalized']['metrics']);row.update(amount=r['cost']['amount'],currency=r['cost']['currency'],cost_basis=r['cost']['basis'],raw_removed=bool(r.get('_retention',{}).get('raw_removed')),retained_records_before=(r.get('_export_scope') or {}).get('records_before'),raw_usage_json=json.dumps(r.get('raw_usage'),ensure_ascii=False),usage_baseline_json=json.dumps(r.get('usage_baseline'),ensure_ascii=False))
         # Null CSV cells stay blank; numeric zero stays 0. Neutralize formulas.
         row={k:("'"+v if isinstance(v,str) and v.lstrip().startswith(('=','+','-','@')) else v) for k,v in row.items()}
         writer.writerow(row)

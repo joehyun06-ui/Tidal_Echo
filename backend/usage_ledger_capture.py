@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from .usage_ledger import LedgerError, estimate, identifier, model_name, normalize, raw_json, stable_prefix
+from .usage_ledger_journal import CollectionJournal
 
 _binding = contextvars.ContextVar('ledger_binding', default=None)
 _attempt = contextvars.ContextVar('ledger_attempt', default=None)
@@ -88,15 +89,23 @@ class ApiCollector:
             # Copy configuration, not route dictionaries containing API keys.
             self._profiles[key] = RouteProfile(**{**profile.__dict__, 'price': json.loads(raw_json(profile.price))})
         self.captured = self.dropped = self.unmatched = self.configuration_errors = 0
+        self.journal_failed=0
+        try:self.journal=CollectionJournal(ledger,'api')
+        except Exception:self.journal=None;self.journal_failed=1
+
+    def note(self,reason,**fields):
+        try:self.journal.issue(reason,**fields)
+        except Exception:self.journal_failed+=1
 
     def health(self):
         return {'captured': self.captured, 'dropped': self.dropped, 'unmatched': self.unmatched,
-                'configuration_errors': self.configuration_errors, 'complete': not (self.dropped or self.unmatched)}
+                'configuration_errors': self.configuration_errors,'journal_failed':self.journal_failed, 'complete': not (self.dropped or self.unmatched or self.journal_failed)}
 
     def begin(self, route, protocol, sid, turn):
         profile = self._profiles.get((route.get('url', '').rstrip('/'), route.get('model'), protocol))
         if profile is None:
             self.unmatched += 1
+            self.note('route_unmatched',session_id=sid)
             return None
         return Attempt(self, profile, sid, turn)
 
@@ -115,6 +124,8 @@ class Attempt:
                        'price': json.loads(raw_json(profile.price)), 'config_revision': profile.revision,
                        # HTTPX automatic retries are disabled. A fallback is a separate request.
                        'retry_count': 0}
+        try:collector.journal.start(self.record)
+        except Exception:collector.journal_failed+=1
 
     def usage(self, value):
         if value is None: return
@@ -125,6 +136,7 @@ class Attempt:
         except (ValueError, TypeError, RecursionError):
             # Never persist a complete response/error/credential object in place of usage.
             self.raw = None; self.invalid = True
+            self.collector.note('invalid_usage',session_id=self.record['session_id'],request_id=self.record['request_id'],provider_id=self.profile.provider_id,at=self.record['at'])
 
     def body(self, body, responses):
         try:
@@ -150,6 +162,7 @@ class Attempt:
             return {**body, **extra} if extra else body
         except Exception:
             self.collector.configuration_errors += 1
+            self.collector.note('configuration_unapplied',session_id=self.record['session_id'],request_id=self.record['request_id'],provider_id=self.profile.provider_id,at=self.record['at'])
             self.cache_policy = 'configuration_unapplied'; self.fingerprint = None
             return body
 
@@ -166,11 +179,12 @@ class Attempt:
                    'status': status, 'latency_ms': max(0, round((time.monotonic()-self.started)*1000)),
                    'http_status': self.http_status, 'prefix_fingerprint': self.fingerprint, 'cache_policy': self.cache_policy}
         try:
-            await asyncio.to_thread(self.collector.ledger.append, payload)
-            self.collector.captured += 1
+            inserted=await asyncio.to_thread(self.collector.ledger.append, payload)
+            self.collector.captured += int(inserted)
         except Exception:
             # Disk/validation failures must not change a model result or trigger inference retry.
             self.collector.dropped += 1
+            self.collector.note('write_failed',session_id=self.record['session_id'],request_id=self.record['request_id'],provider_id=self.profile.provider_id,at=self.record['at'])
 
     def transport_error(self, exc):
         # Helpers may replace a transport exception with a sanitized route error.
@@ -218,7 +232,8 @@ def observe_api(*, protocol=None, route_index=0):
                 route = args[route_index] if len(args) > route_index else kwargs['route']
                 kind = protocol or ('responses' if kwargs.get('responses') else 'chat')
                 attempt = collector.begin(route, kind, sid, turn)
-            except Exception: collector.dropped += 1
+            except Exception:
+                collector.dropped += 1;collector.note('collector_failure',session_id=sid)
             token = _attempt.set(attempt)
             error = None
             try:

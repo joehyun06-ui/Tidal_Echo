@@ -62,6 +62,7 @@ class Continuations:
         digest=self.digest(source_id,target_id,mode,request,expected_text)
         with closing(self.ledger.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            if self.ledger.blocked(conn,mode,source_id,datetime.now(timezone.utc).isoformat()) or self.ledger.blocked(conn,mode,target_id,datetime.now(timezone.utc).isoformat()):return False
             if creation_receipt is not None:
                 rid,created_at=creation_receipt
                 if not conn.execute('SELECT 1 FROM usage_ledger_continuation_creations WHERE request_id=? AND created_at=? AND source_id=? AND target_id=? AND mode=?',

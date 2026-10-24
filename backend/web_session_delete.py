@@ -420,7 +420,16 @@ def _append_tombstone(
     cfg[web_session_provider_authority.DELETED_SESSIONS_KEY] = tombstones
 
 
-def delete_conversation(
+def delete_conversation(authority,session_id,*,relay_db,upload_dir,codex_store,usage_ledger=None):
+    result=_delete_conversation(authority,session_id,relay_db=relay_db,upload_dir=upload_dir,codex_store=codex_store)
+    if usage_ledger is not None:
+        detail=result['deleted']
+        usage_ledger.purge_session(detail['id'],retire=detail['scope']!='legacy',mode=detail.get('provider'))
+        detail['ledger_deleted']=True
+    return result
+
+
+def _delete_conversation(
     authority: web_session_provider_authority.WebSessionProviderAuthority,
     session_id: str,
     *,

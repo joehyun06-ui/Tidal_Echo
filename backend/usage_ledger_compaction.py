@@ -54,6 +54,7 @@ class ManualCompactionReceipts:
         dispatched=row['status'] in {'dispatching','running','unknown','reconciling','reconcile_queued','completed'} or bool(row['turn_id'])
         with closing(self.ledger.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            if self.ledger.blocked(conn,'codex',row['session_id'],row['created_at']):return
             purge=conn.execute('SELECT at FROM usage_ledger_manual_purges WHERE session_id=?',(row['session_id'],)).fetchone()
             if purge and timestamp(row['created_at'])<=timestamp(purge[0]):return
             conn.execute('INSERT OR IGNORE INTO usage_ledger_manual_compactions(request_id,session_id,thread_id,created_at,before_tokens,dispatched) VALUES (?,?,?,?,?,?)',
