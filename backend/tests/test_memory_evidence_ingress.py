@@ -106,7 +106,7 @@ class RelayEvidenceRouteTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         load_app(self.temp.name, telegram=False)
         os.environ.update({
-            "LEGACY_CHAT_BRIDGE_TOKEN": "invalid-test-bridge-token",
+            "LEGACY_CHAT_BRIDGE_TOKEN": "test-legacy-bridge-token-1234567890",
             "LEGACY_CHAT_BRIDGE_SESSION": "legacy-test",
             "MEMORY_CORE_ENABLED": "true",
             "MEMORY_EVIDENCE_UI_READONLY_ENABLED": "true",
