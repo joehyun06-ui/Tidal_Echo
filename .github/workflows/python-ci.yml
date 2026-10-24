@@ -39,7 +39,7 @@ jobs:
 
       - name: Check memory evidence HTTP ingress without hanging the full suite
         timeout-minutes: 2
-        run: python -m unittest backend.tests.test_memory_evidence_ingress -v
+        run: python -m unittest backend.tests._memory_evidence_ingress_worker -v
 
       - name: Run unit tests
         run: python -m unittest discover -s backend/tests -p "test_*.py"
