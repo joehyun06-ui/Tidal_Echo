@@ -69,6 +69,10 @@ python -m backend.usage_ledger_preflight --config /path/to/credential-free-plan.
 实际启用前还缺：部署组合与鉴权审阅、物理存储/备份核对、配置变化清单、观察连续性验收，
 以及显式启用决定。这些缺项不会通过配置里填 true 自动消除。本轮不代替这些验收。
 
+已有组件现已整理为显式的 `LedgerServices` 组合，并通过独立实例与真实子进程的合成
+重启验收。生产入口仍未导入或挂载，真实部署和通知连续性仍未核验；详见
+[组合与连续性离线验收](usage-ledger-composition.md)。
+
 ## 验证
 
 ```bash

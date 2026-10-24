@@ -259,6 +259,10 @@ SQLite 快照里以 256 条为批次扫描；费用保持 Decimal，累计值不
 启用前配置审阅：`python -m backend.usage_ledger_preflight --mock`。仅核对合成声明，
 不挂载路由、启动采集或证明完整账单。详细边界见 [覆盖与配置核对](usage-ledger-enabling-review.md)。
 
+显式服务组合与独立进程连续性：`python -m unittest backend.tests.test_usage_ledger_composition`。
+`LedgerServices` 只在离线 fixture 中调用；默认不创建 API/Codex 采集器，挂载、权威来源和
+删除/动作钩子都需显式传入。详见 [组合与连续性离线验收](usage-ledger-composition.md)。
+
 采集测试使用真实 provider 函数的语法树执行片段与 HTTPX MockTransport；不执行
 bridge 模块顶层环境读取，不导入记忆模块。另走真实 Web 生成运行时、临时 relay /
 ledger 数据库和鉴权 ASGI 接口，验证生成 → 采集 → 查看 / 导出闭环及模式隔离。
