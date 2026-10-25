@@ -109,6 +109,55 @@ class MemoryEvidencePairedASGITests(NoNetworkMixin, unittest.IsolatedAsyncioTest
                  "explicit_user_memory", TIMESTAMP),
             )
 
+    def _add_second_canonical_source(self, metadata: dict):
+        """Attach a second provenance row using the production migrated schema."""
+        from backend import channel_store
+        with channel_store.connect(str(self.dbpath)) as conn:
+            conn.execute(
+                """INSERT INTO messages(ts,direction,kind,text,meta)
+                   VALUES(?,?,?,?,?)""",
+                (TIMESTAMP, "in", "user", "Synthetic secondary source",
+                 json.dumps(metadata)),
+            )
+            second_msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            memory_id = conn.execute(
+                "SELECT id FROM memory_items WHERE memory_key=?",
+                ("m" * 32,),
+            ).fetchone()[0]
+            conn.execute(
+                """INSERT INTO memory_evidence_events(
+                    canonical_message_id,action_id,action_type,action_binding_version,
+                    evidence_type,reality_scope,subject_scope,created_by_component,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (second_msg_id, "b" * 32, "remember_explicit_user", 1,
+                 "explicit_user_memory", "real", "user", "web_adapter", TIMESTAMP),
+            )
+            event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                """INSERT INTO memory_sources(
+                    memory_id,canonical_message_id,evidence_event_id,
+                    channel,source,evidence_role,evidence_type,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (memory_id, second_msg_id, event_id, "web", "relay", "user",
+                 "explicit_user_memory", TIMESTAMP),
+            )
+
+    async def test_mixed_cross_session_provenance_is_withheld_in_real_schema(self):
+        self._add_second_canonical_source(
+            {"channel": "web", "source": "relay", "api_session": "s2"},
+        )
+        response, _ = await self._relay("s1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["views"], [])
+
+    async def test_mixed_legacy_unbound_provenance_is_withheld_in_real_schema(self):
+        self._add_second_canonical_source(
+            {"channel": "web", "source": "relay"},
+        )
+        response, _ = await self._relay("s1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["views"], [])
+
     async def _relay(self, session_id="s1", *, auth=True, forward=True):
         """Bridge the REAL two ASGI routers in memory, avoiding live sockets."""
         calls = []
