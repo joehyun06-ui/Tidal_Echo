@@ -20,12 +20,12 @@ def database():
       CREATE TABLE memory_evidence_events(id INTEGER PRIMARY KEY,
         canonical_message_id INTEGER, evidence_type TEXT,
         reality_scope TEXT, subject_scope TEXT);
-      CREATE TABLE messages(id INTEGER PRIMARY KEY, meta TEXT);
+      CREATE TABLE messages(id INTEGER PRIMARY KEY, meta TEXT,\n        direction TEXT NOT NULL, kind TEXT NOT NULL);
     """)
     conn.execute("""INSERT INTO memory_items VALUES
       (1, ?, 'Friday at 16:30', '2026-10-24T10:00:00Z',
        'session', 's1', 'active','normal')""", ("m"*32,))
-    conn.execute("INSERT INTO messages VALUES(1, ?)", ('{"api_session":"s1"}',))
+    conn.execute("INSERT INTO messages VALUES(1, ?, 'in', 'user')", ('{"api_session":"s1"}',))
     conn.execute("""INSERT INTO memory_evidence_events VALUES
       (1, 1, 'confirmed_user_fact','real','user')""")
     conn.execute("""INSERT INTO memory_sources VALUES
@@ -117,10 +117,68 @@ class EvidenceTest(unittest.TestCase):
 
     def test_source_count_limit(self):
         for i in range(2, 23):
-            self.conn.execute("INSERT INTO messages VALUES(?, ?)", (i,'{"api_session":"s1"}'))
+            self.conn.execute("INSERT INTO messages VALUES(?, ?, 'in', 'user')", (i,'{"api_session":"s1"}'))
             self.conn.execute("INSERT INTO memory_evidence_events VALUES (?, ?, 'confirmed_user_fact','real','user')", (i,i))
             self.conn.execute("INSERT INTO memory_sources VALUES (?,?,?,?,?,?)", (i,1,i,i,"confirmed_user_fact","user"))
         self.assertEqual(self.build()["views"], [])
+
+
+    def test_mixed_foreign_source_is_withheld(self):
+        self.conn.execute(
+            "INSERT INTO messages VALUES (2, ?, 'in', 'user')",
+            ('{"api_session":"s2"}',),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence_events VALUES (2, 2, 'confirmed_user_fact','real','user')"
+        )
+        self.conn.execute(
+            "INSERT INTO memory_sources VALUES (2,1,2,2,'confirmed_user_fact','user')"
+        )
+        self.assertEqual(self.build()["views"], [])
+
+    def test_mixed_unbound_source_is_withheld(self):
+        self.conn.execute(
+            "INSERT INTO messages VALUES (2, ?, 'in', 'user')",
+            ('{"channel":"web","source":"relay"}',),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence_events VALUES (2, 2, 'confirmed_user_fact','real','user')"
+        )
+        self.conn.execute(
+            "INSERT INTO memory_sources VALUES (2,1,2,2,'confirmed_user_fact','user')"
+        )
+        self.assertEqual(self.build()["views"], [])
+
+    def test_user_evidence_role_cannot_override_assistant_message(self):
+        self.conn.execute("UPDATE messages SET direction='out',kind='reply' WHERE id=1")
+        self.assertEqual(self.build()["views"], [])
+
+    def test_mixed_unqualified_source_is_withheld(self):
+        self.conn.execute(
+            "INSERT INTO messages VALUES (2, ?, 'in', 'user')",
+            ('{"api_session":"s1"}',),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence_events VALUES (2, 2, 'confirmed_user_fact','fiction','user')"
+        )
+        self.conn.execute(
+            "INSERT INTO memory_sources VALUES (2,1,2,2,'confirmed_user_fact','user')"
+        )
+        self.assertEqual(self.build()["views"], [])
+
+    def test_both_sources_same_session_can_be_displayed(self):
+        self.conn.execute(
+            "INSERT INTO messages VALUES (2, ?, 'in', 'user')",
+            ('{"api_session":"s1"}',),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence_events VALUES (2, 2, 'confirmed_user_fact','real','user')"
+        )
+        self.conn.execute(
+            "INSERT INTO memory_sources VALUES (2,1,2,2,'confirmed_user_fact','user')"
+        )
+        self.assertEqual(self.build()["views"][0]["source_ids"],
+                         ["memory-source-1", "memory-source-2"])
 
     def test_no_write_performed(self):
         count_before = self.conn.total_changes
