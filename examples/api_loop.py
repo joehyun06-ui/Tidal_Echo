@@ -1229,8 +1229,16 @@ async def loop_session_write_preflight(request: Request):
         raise HTTPException(status_code=404, detail="not_found")
     try:
         # These values MUST come from loop-owned config, never HTTP or client.
+        # Do not use active_session_id(): it deliberately falls back to
+        # the latest session for ordinary chat navigation. A memory-write
+        # preflight must NEVER infer the target by fallback.
+        server_config = load_config()
+        configured_id = (
+            server_config.get("active_session")
+            if type(server_config) is dict else None
+        )
         memory_session_write_guard.verify_trusted_active_session(
-            trusted_session_id=active_session_id(),
+            trusted_session_id=configured_id,
             canonical_sessions=session_rows(),
         )
     except memory_session_write_guard.SessionWriteBindingError:
