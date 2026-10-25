@@ -16,11 +16,22 @@ import uuid
 from collections import OrderedDict
 from contextlib import closing
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .usage_ledger import count, identifier, normalize, raw_json
 from .usage_ledger_journal import CollectionJournal
 
 NOTIFICATIONS = frozenset({'turn/started','turn/completed','thread/tokenUsage/updated','item/started','item/completed'})
+
+
+class BindingConflict(ValueError):
+    def __init__(self):
+        super().__init__('ledger_native_binding_conflict')
+
+
+def source_connection(path):
+    # mode=ro prevents an incorrect source path from creating an empty database.
+    return sqlite3.connect(Path(path).absolute().as_uri()+'?mode=ro',uri=True,timeout=1)
 
 
 def digest(*parts):
@@ -153,8 +164,16 @@ class CodexCollector:
 
     def _binding(self, state):
         # Read only routing identities, never prompts, input digests or chat text.
-        with closing(sqlite3.connect(self.store_path,timeout=1)) as conn:
+        with closing(source_connection(self.store_path)) as conn:
             conn.row_factory = sqlite3.Row
+            conn.execute('BEGIN')
+            owners = conn.execute('SELECT api_session FROM codex_sessions WHERE thread_id=? LIMIT 2',
+                                  (state['thread'],)).fetchall()
+            jobs = conn.execute('SELECT id,api_session FROM codex_generation_jobs WHERE thread_id=? AND turn_id=? LIMIT 2',
+                                (state['thread'],state['turn'])).fetchall()
+            if len(owners)>1 or len(jobs)>1: raise BindingConflict()
+            if not owners or not jobs: return None  # Native ACK may still be in flight.
+            if owners[0]['api_session'] != jobs[0]['api_session']: raise BindingConflict()
             created=',j.created_at AS native_created_at' if 'created_at' in {r[1] for r in conn.execute('PRAGMA table_info(codex_generation_jobs)')} else ',NULL AS native_created_at'
             row = conn.execute('''SELECT j.id,j.api_session,j.canonical_message_id,j.turn_id,j.thread_id,j.status,s.model'''+created+'''
                 FROM codex_generation_jobs j JOIN codex_sessions s ON s.api_session=j.api_session
@@ -165,7 +184,8 @@ class CodexCollector:
             latest = conn.execute('SELECT max(id) FROM codex_generation_jobs WHERE thread_id=?',(state['thread'],)).fetchone()[0]
             prior = conn.execute('SELECT turn_id FROM codex_generation_jobs WHERE thread_id=? AND id<? ORDER BY id DESC LIMIT 1',(state['thread'],job['id'])).fetchone()
             job['previous_turn'] = prior[0] if prior else None
-        with closing(sqlite3.connect(self.relay_db,timeout=1)) as conn:
+        with closing(source_connection(self.relay_db)) as conn:
+            conn.execute('BEGIN')
             exists = conn.execute("SELECT 1 FROM messages WHERE id=? AND direction='in' AND kind IN ('user','voice') AND json_extract(meta,'$.api_session')=?",(job['canonical_message_id'],job['api_session'])).fetchone()
             newest = conn.execute("SELECT max(id) FROM messages WHERE direction='in' AND kind IN ('user','voice') AND json_extract(meta,'$.api_session')=?",(job['api_session'],)).fetchone()[0]
         if not exists: return None
@@ -181,6 +201,18 @@ class CodexCollector:
                 states = [json.loads(json.dumps(s)) for s in self._pending.values()]
             for state in states:
                 try: self._reconcile(state)
+                except BindingConflict:
+                    key = (state['thread'],state['turn'])
+                    with self._lock:
+                        self.dropped += 1
+                        self._bindings.pop(key,None)
+                        self._issue('binding_conflict',key)
+                        self._heads.pop(state['thread'],None)
+                        for pending in self._pending.values():
+                            if pending['thread']==state['thread']:
+                                pending['invalid']=True;pending['revision']+=1
+                        for previous_key,previous in self._finished.items():
+                            if previous_key[0]==state['thread']:previous['checkpoint']=False
                 except Exception:
                     with self._lock:self.dropped += 1;self._issue('collector_failure',(state['thread'],state['turn']))
             with self._lock:

@@ -17,30 +17,12 @@ from .usage_ledger_compaction import ManualCompactionReceipts
 from .usage_ledger_continuation import Continuations
 from .usage_ledger_creation import ContinuationCreation
 from .usage_ledger_preflight import CODEX_SCHEMA_VERSION
+from .usage_ledger_paths import separate_paths
 from .usage_ledger_sources import MessageCounts
 
 
 def invalid():
     raise LedgerError('ledger_composition_invalid')
-
-
-def separate_paths(ledger_path, relay_db, native_db):
-    """Reject known aliases before opening the ledger; no mkdir/source DB writes.
-
-    This is a startup check, not a filesystem race or physical-mount guarantee.
-    """
-    values = [ledger_path, relay_db] + ([native_db] if native_db is not None else [])
-    paths = []
-    for value in values:
-        if not isinstance(value, (str, Path)) or not str(value) or str(value) == ':memory:': invalid()
-        raw = Path(value)
-        if not raw.is_absolute() or '..' in raw.parts: invalid()
-        resolved = raw.resolve()
-        for old in paths:
-            if resolved == old or resolved in old.parents or old in resolved.parents: invalid()
-            if resolved.exists() and old.exists() and resolved.samefile(old): invalid()
-        paths.append(resolved)
-    return paths[0], paths[1], paths[2] if len(paths) == 3 else None
 
 
 class LedgerServices:

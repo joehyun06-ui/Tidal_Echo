@@ -97,6 +97,77 @@ class CodexLedgerTests(unittest.TestCase):
         self.assertIsNone(row['usage_baseline']);self.assertIsNone(row['normalized']['metrics']['input'])
         self.assertFalse(row['usage_complete']);self.assertEqual(row['raw_usage']['total']['inputTokens'],300)
 
+    def assert_binding_conflict(self):
+        self.flush();self.flush()
+        self.assertEqual(self.ledger.records('codex'),[])
+        self.assertEqual(self.ledger.events('codex'),[])
+        view=build_view(self.ledger,'codex','session-a')
+        self.assertTrue(view['collection_health']['has_observed_gaps'])
+        self.assertEqual(view['collection_health']['unassigned_issues'],1)
+        self.assertEqual(build_view(self.ledger,'codex',None,all_sessions=True)['collection_health']['issues']['binding_conflict'],1)
+
+    def completed_events(self,n):
+        self.event('turn/started',n);self.sample(n);self.event('turn/completed',n)
+
+    def test_one_native_thread_with_multiple_session_owners_cannot_supply_context_or_usage(self):
+        self.job(1)
+        with sqlite3.connect(self.native) as c:
+            c.execute('INSERT INTO codex_sessions VALUES (?,?,?)',('other-session','thread-a','synthetic-model'))
+        self.completed_events(1);self.assert_binding_conflict()
+
+    def test_same_native_turn_bound_to_two_jobs_is_never_resolved_by_latest_id(self):
+        self.job(1);self.job(2,turn='turn-1')
+        self.completed_events(1);self.assert_binding_conflict()
+
+    def test_same_native_turn_across_two_sessions_is_unassigned_not_guessed(self):
+        self.job(1);self.job(2,sid='other-session',turn='turn-1')
+        self.completed_events(1);self.assert_binding_conflict()
+
+    def test_job_owner_must_match_the_unique_thread_owner(self):
+        self.job(1)
+        with sqlite3.connect(self.native) as c:
+            c.execute("UPDATE codex_generation_jobs SET api_session='different-owner'")
+        self.completed_events(1);self.assert_binding_conflict()
+
+    def test_resolving_conflict_does_not_restore_a_pre_conflict_counter_baseline(self):
+        self.whole(1);self.job(2)
+        with sqlite3.connect(self.native) as c:
+            c.execute('INSERT INTO codex_sessions VALUES (?,?,?)',('other-session','thread-a','synthetic-model'))
+        self.event('turn/started',2);self.sample(2,usage(200,40,10));self.event('turn/completed',2);self.flush()
+        self.assertEqual(len(self.ledger.records('codex')),1)
+        with sqlite3.connect(self.native) as c:c.execute("DELETE FROM codex_sessions WHERE api_session='other-session'")
+        self.flush()
+        self.assertIsNone(self.ledger.records('codex')[-1]['usage_baseline'])
+        row=self.whole(3,usage(300,60,15));self.assertIsNone(row['usage_baseline'])
+        row=self.whole(4,usage(400,80,20));self.assertEqual(row['normalized']['metrics']['input'],100)
+        self.assertEqual(build_view(self.ledger,'codex',None,all_sessions=True)['collection_health']['issues']['binding_conflict'],1)
+
+    def test_conflict_does_not_invalidate_another_threads_counter_continuity(self):
+        self.whole(1)
+        self.job(2,sid='other-session',thread='other-thread')
+        self.job(3,sid='duplicate-owner',thread='other-thread')
+        self.event('turn/started',2,thread='other-thread');self.sample(2,thread='other-thread')
+        self.event('turn/completed',2,thread='other-thread');self.flush()
+        row=self.whole(4,usage(200,40,10))
+        self.assertEqual(row['normalized']['metrics']['input'],100)
+        self.assertEqual(len(self.ledger.records('codex','other-session')),0)
+
+    def test_missing_source_files_are_not_created_during_reconciliation(self):
+        self.job(1);self.completed_events(1)
+        missing=self.native.parent/'missing-native ?#.sqlite'
+        self.collector.store_path=str(missing);self.flush();self.assertFalse(missing.exists())
+        self.collector.store_path=str(self.native)
+        missing=self.relay.parent/'missing-relay ?#.sqlite'
+        self.collector.relay_db=str(missing);self.flush();self.assertFalse(missing.exists())
+        self.assertEqual(self.ledger.records('codex'),[])
+
+    def test_readonly_source_uris_preserve_reserved_path_characters(self):
+        self.job(1);self.completed_events(1)
+        native=self.native.with_name('native ?#.sqlite');self.native.rename(native)
+        relay=self.relay.with_name('relay ?#.sqlite');self.relay.rename(relay)
+        self.collector.store_path=str(native);self.collector.relay_db=str(relay)
+        self.flush();self.assertEqual(len(self.ledger.records('codex')),1)
+
     def test_multirequest_turn_uses_thread_delta_and_never_sums_duplicate_last_snapshots(self):
         first=usage();self.whole(1,first)
         self.job(2);self.event('turn/started',2)

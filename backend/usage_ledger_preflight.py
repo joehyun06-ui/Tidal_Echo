@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 
 from .usage_ledger import LedgerError, identifier
 from .usage_ledger_capture import CachePolicy, RouteProfile
+from .usage_ledger_paths import lexically_separate
 
 MAX_BYTES = 65536
 CODEX_SCHEMA_VERSION = '0.160.0'
@@ -72,8 +73,7 @@ def _review(value):
     fields(storage, {'persistent_root', 'ledger_db', 'relay_db'}, {'codex_db'})
     paths = {k: path(v) for k, v in storage.items()}
     root, ledger = paths['persistent_root'], paths['ledger_db']
-    independent = all(ledger != p and ledger not in p.parents and p not in ledger.parents
-                      for k, p in paths.items() if k not in {'ledger_db', 'persistent_root'})
+    independent = lexically_separate([p for k, p in paths.items() if k != 'persistent_root'])
     checks = {'ledger_under_persistent_root': root in ledger.parents,
               'ledger_separate_from_source_databases': independent, **value['hooks']}
     api = {'planned': False}

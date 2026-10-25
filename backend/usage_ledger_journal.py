@@ -6,7 +6,7 @@ import uuid
 
 from .usage_ledger import LedgerError,identifier,timestamp
 
-REASONS={'route_unmatched','write_failed','invalid_usage','configuration_unapplied','epoch_changed','pending_evicted','late_event','collector_failure','capture_paused'}
+REASONS={'route_unmatched','write_failed','invalid_usage','configuration_unapplied','epoch_changed','pending_evicted','late_event','collector_failure','capture_paused','binding_conflict'}
 
 
 class CollectionJournal:
