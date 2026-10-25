@@ -36,6 +36,68 @@ def _date(value: object) -> str:
     return candidate
 
 
+def _inspect_all_sources(
+    connection: sqlite3.Connection, memory_id: int, session_id: str,
+) -> tuple[str, list[str]]:
+    """Read every linked source, including invalid ones; never cherry-pick.
+
+    Return a fixed diagnostic category and opaque IDs only for fully verified
+    records. Reading a single qualifying source is NOT sufficient when another
+    source is foreign, unbound or invalid.
+    """
+    rows = connection.execute(
+        """SELECT s.id, s.evidence_role, e.reality_scope,
+                  e.subject_scope, e.evidence_type, msg.direction, msg.kind,
+                  CASE WHEN json_valid(msg.meta)
+                         AND json_type(msg.meta,'$.api_session')='text'
+                       THEN json_extract(msg.meta,'$.api_session')
+                       ELSE NULL END AS bound_session
+           FROM memory_sources AS s
+           LEFT JOIN memory_evidence_events AS e
+             ON e.id=s.evidence_event_id
+            AND e.canonical_message_id=s.canonical_message_id
+            AND e.evidence_type=s.evidence_type
+           LEFT JOIN messages AS msg ON msg.id=s.canonical_message_id
+           WHERE s.memory_id=?
+           ORDER BY s.id LIMIT ?""",
+        (memory_id, MAX_SOURCES + 1),
+    ).fetchall()
+    if not rows:
+        return "missing_qualifying_source", []
+    if len(rows) > MAX_SOURCES:
+        return "too_many_sources", []
+    outcomes = set()
+    for source in rows:
+        (source_id, role, reality, subject, evidence, direction, kind, bound) = source
+        if (
+            role != "user" or reality != "real"
+            or subject not in ("user", "project")
+            or evidence not in (
+                "explicit_user_memory", "confirmed_user_fact",
+                "confirmed_project_decision", "explicit_user_correction",
+            )
+            or direction != "in" or kind != "user"
+        ):
+            outcomes.add("unqualified")
+        elif bound == session_id:
+            outcomes.add("verified")
+        elif bound is None or bound == "":
+            outcomes.add("unbound")
+        else:
+            outcomes.add("foreign")
+    if outcomes == {"verified"}:
+        return "verified_session_evidence", [
+            f"memory-source-{int(row[0])}" for row in rows
+        ]
+    if len(outcomes) > 1:
+        return "mixed_or_unverified_sources", []
+    if "foreign" in outcomes:
+        return "different_session_binding", []
+    if "unbound" in outcomes:
+        return "missing_session_binding", []
+    return "missing_qualifying_source", []
+
+
 def build_snapshot(
     connection: sqlite3.Connection,
     *,
@@ -71,29 +133,11 @@ def build_snapshot(
                 continue
             if total_chars + len(content) > MAX_TOTAL_CHARS:
                 break
-            # Canonical source FK, real-world assertion, user authored evidence,
-            # and message metadata must ALL agree on the selected session.
-            sources = connection.execute(
-                """SELECT s.id FROM memory_sources AS s
-                   JOIN memory_evidence_events AS e
-                     ON e.id=s.evidence_event_id
-                    AND e.canonical_message_id=s.canonical_message_id
-                    AND e.evidence_type=s.evidence_type
-                   JOIN messages AS msg ON msg.id=s.canonical_message_id
-                   WHERE s.memory_id=?
-                     AND s.evidence_role='user'
-                     AND e.reality_scope='real'
-                     AND e.subject_scope IN ('user','project')
-                     AND e.evidence_type IN (
-                       'explicit_user_memory','confirmed_user_fact',
-                       'confirmed_project_decision','explicit_user_correction')
-                     AND CASE WHEN json_valid(msg.meta)
-                       THEN json_extract(msg.meta,'$.api_session')
-                       ELSE NULL END = ?
-                   ORDER BY s.id LIMIT ?""",
-                (memory_id, session_id, MAX_SOURCES + 1),
-            ).fetchall()
-            if not sources or len(sources) > MAX_SOURCES:
+            # Every attached source must corroborate this same session.
+            source_verdict, source_ids = _inspect_all_sources(
+                connection, memory_id, session_id,
+            )
+            if source_verdict != "verified_session_evidence":
                 continue
             if not re.fullmatch(r"[A-Za-z0-9_-]{32,96}", memory_key):
                 raise MemoryEvidenceReadonlyError()
@@ -102,7 +146,7 @@ def build_snapshot(
                 "retrieval_status": "found",
                 "answer": content,
                 "as_of": _date(last_confirmed_at),
-                "source_ids": [f"memory-source-{int(row[0])}" for row in sources],
+                "source_ids": source_ids,
             })
             total_chars += len(content)
         return {
@@ -112,5 +156,5 @@ def build_snapshot(
             "api_session": session_id,
             "views": views,
         }
-    except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
         raise MemoryEvidenceReadonlyError() from None
