@@ -43,6 +43,11 @@ jobs:
         run: |
           python -m unittest backend.tests._memory_session_preflight_worker -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify one-use confirmed memory commits on Windows (synthetic only)
+        timeout-minutes: 3
+        run: |
+          python -m unittest backend.tests._memory_session_confirm_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate read-only source and session filters (Windows)
         timeout-minutes: 2
         run: |
