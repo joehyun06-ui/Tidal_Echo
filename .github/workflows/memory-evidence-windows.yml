@@ -1,0 +1,65 @@
+name: Memory evidence Windows acceptance (offline)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  memory-windows:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 18
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+      MEMORY_EVIDENCE_UI_READONLY_ENABLED: "false"
+      OPENAI_API_KEY: ""
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned backend dependencies
+        run: |
+          python -m pip install -r backend/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate read-only source and session filters (Windows)
+        timeout-minutes: 2
+        run: |
+          python -m unittest backend.tests.test_memory_evidence_readonly -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Audit legacy provenance coverage without memory contents (Windows)
+        timeout-minutes: 2
+        run: |
+          python -m unittest backend.tests.test_memory_evidence_coverage -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate HTTP ingress in independent Windows process
+        timeout-minutes: 2
+        run: |
+          python -m unittest backend.tests._memory_evidence_ingress_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate ASGI relay-loop pairing and migrated SQLite
+        timeout-minutes: 2
+        run: |
+          python -m unittest backend.tests._memory_evidence_pair_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate real localhost TCP path on Windows
+        timeout-minutes: 3
+        run: |
+          python -m unittest backend.tests._memory_evidence_tcp_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify no uncommitted changes from read-only run
+        run: |
+          $changes = git status --porcelain -- backend examples
+          if ($changes) { Write-Error "Windows acceptance changed backend source files"; exit 1 }
+          Write-Output "MEMORY_EVIDENCE_WINDOWS_OFFLINE_PASS"

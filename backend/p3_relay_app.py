@@ -7,6 +7,7 @@ relay integrations are still installed only by the alternate Codex relay entrypo
 
 from __future__ import annotations
 
+import os
 import urllib.parse
 
 from fastapi import HTTPException, Request
@@ -384,6 +385,28 @@ def _install_session_delete_route() -> None:
     relay_app._P3_SESSION_DELETE_INSTALLED = True
 
 
+
+def _install_memory_evidence_readonly_route() -> None:
+    if getattr(relay_app, "_P3_MEMORY_EVIDENCE_READONLY_ROUTE", False):
+        return
+
+    @app.get("/app/sessions/{session_id}/memory/evidence")
+    async def app_session_memory_evidence(session_id: str, request: Request):
+        relay_app.check_auth(request)
+        if (
+            os.environ.get("MEMORY_EVIDENCE_UI_READONLY_ENABLED") != "true"
+            or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+        ):
+            raise HTTPException(status_code=404, detail="not_found")
+        encoded = urllib.parse.quote(session_id, safe="")
+        value = relay_app.loop_json(
+            f"/loop/sessions/{encoded}/memory/evidence",
+        )
+        return JSONResponse(value, headers={"Cache-Control": "private, no-store"})
+
+    relay_app._P3_MEMORY_EVIDENCE_READONLY_ROUTE = True
+
+
 _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_capability_route()
@@ -395,3 +418,4 @@ _install_provider_route_classification_probe_route()
 _install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
+_install_memory_evidence_readonly_route()
