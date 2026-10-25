@@ -119,7 +119,8 @@ def summarize_session_coverage(
             "scope": "active_normal_session_only",
             "total_eligible_scope_items": len(rows),
             "counts": {name: counts[name] for name in STATUS_NAMES},
-            "contains_personal_data": False,
+            "raw_content_or_identifiers_returned": False,
+            "counts_may_be_sensitive_metadata": True,
             "writes": 0,
         }
     except (sqlite3.Error, ValueError, TypeError, OverflowError):
