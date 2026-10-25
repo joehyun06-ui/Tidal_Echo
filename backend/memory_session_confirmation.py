@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -35,6 +36,8 @@ TTL_SECONDS = 120
 MAX_PENDING = 8
 MAX_CONTENT_CHARS = 1000
 CONFIRMATION_TEXT = "CONFIRM MEMORY"
+_PRINCIPAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_AUTH_EPOCH = re.compile(r"[A-Za-z0-9_-]{24,96}\Z")
 
 
 class SessionConfirmationError(RuntimeError):
@@ -54,10 +57,29 @@ class ConfirmationOffer:
         return "<ConfirmationOffer>"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class AuthorizedSessionContext:
+    """Trusted server authentication snapshot, not a client-supplied claim.
+
+    The provider MUST authenticate the principal independently and generate
+    a random auth_epoch rotated on login, logout and authorization revocation.
+    This dataclass is not an authentication system.
+    """
+    principal_id: str = field(repr=False)
+    auth_epoch: str = field(repr=False)
+    session_id: str = field(repr=False)
+    canonical_sessions: tuple[dict, ...] = field(repr=False)
+
+    def __repr__(self):
+        return "<AuthorizedSessionContext>"
+
+
 @dataclass(slots=True, repr=False)
 class _Pending:
     request: RememberExplicitMemoryRequest = field(repr=False)
     session_id: str = field(repr=False)
+    principal_id: str = field(repr=False)
+    auth_epoch: str = field(repr=False)
     content_sha256: str = field(repr=False)
     expires_at: float = field(repr=False)
 
@@ -89,36 +111,49 @@ def _enabled() -> bool:
 class SessionWriteConfirmation:
     """In-memory short-lived one-use acknowledgement, fail closed.
 
-    session_provider must be an authorized, server-owned callable returning
-    (explicitly_configured_active_session, canonical_session_rows). It must
-    NEVER be wired to untrusted body/query/header/session claims.
+    authorization_provider must be a server-owned callable returning
+    AuthorizedSessionContext with explicit active session, canonical rows,
+    authenticated principal and auth epoch. Authentication remains the
+    trusted server's responsibility, never that of client-submitted fields.
     """
 
-    __slots__ = ("_service", "_session_provider", "_clock", "_lock", "_pending")
+    __slots__ = ("_service", "_authorization_provider", "_clock", "_lock", "_pending")
 
     def __init__(
         self,
         *,
         service: object,
-        session_provider: Callable[[], tuple[str, Iterable[dict]]],
+        authorization_provider: Callable[[], AuthorizedSessionContext],
         clock: Callable[[], float] = time.monotonic,
     ):
-        if not callable(session_provider) or not callable(clock):
+        if not callable(authorization_provider) or not callable(clock):
             raise SessionConfirmationError()
         self._service = service
-        self._session_provider = session_provider
+        self._authorization_provider = authorization_provider
         self._clock = clock
         self._lock = threading.Lock()
         self._pending: dict[str, _Pending] = {}
 
-    def _context(self) -> tuple[str, Iterable[dict]]:
+    def _context(self) -> AuthorizedSessionContext:
         try:
-            data = self._session_provider()
-            if type(data) is not tuple or len(data) != 2:
+            data = self._authorization_provider()
+            if (
+                type(data) is not AuthorizedSessionContext
+                or type(data.principal_id) is not str
+                or _PRINCIPAL_ID.fullmatch(data.principal_id) is None
+                or type(data.auth_epoch) is not str
+                or _AUTH_EPOCH.fullmatch(data.auth_epoch) is None
+                or type(data.canonical_sessions) is not tuple
+            ):
                 raise SessionConfirmationError()
+            from .memory_session_write_guard import verify_trusted_active_session
+            verify_trusted_active_session(
+                trusted_session_id=data.session_id,
+                canonical_sessions=data.canonical_sessions,
+            )
             return data
-        except SessionConfirmationError:
-            raise
+        except (SessionWriteBindingError, SessionConfirmationError):
+            raise SessionConfirmationError() from None
         except Exception:
             raise SessionConfirmationError() from None
 
@@ -143,11 +178,11 @@ class SessionWriteConfirmation:
                 request.content, max_chars=MAX_CONTENT_CHARS
             ) != request.content:
                 raise SessionConfirmationError()
-            session_id, canonical_sessions = self._context()
+            context = self._context()
             verify_server_session_write(
                 request,
-                trusted_session_id=session_id,
-                canonical_sessions=canonical_sessions,
+                trusted_session_id=context.session_id,
+                canonical_sessions=context.canonical_sessions,
             )
         except (
             SessionWriteBindingError,
@@ -167,7 +202,9 @@ class SessionWriteConfirmation:
                 ticket = secrets.token_urlsafe(32)
             self._pending[ticket] = _Pending(
                 request=request,
-                session_id=session_id,
+                session_id=context.session_id,
+                principal_id=context.principal_id,
+                auth_epoch=context.auth_epoch,
                 content_sha256=digest,
                 expires_at=current + TTL_SECONDS,
             )
@@ -212,13 +249,17 @@ class SessionWriteConfirmation:
         ):
             raise SessionConfirmationError()
         try:
-            session_id, canonical_sessions = self._context()
-            if session_id != pending.session_id:
+            context = self._context()
+            if (
+                context.session_id != pending.session_id
+                or not hmac.compare_digest(context.principal_id, pending.principal_id)
+                or not hmac.compare_digest(context.auth_epoch, pending.auth_epoch)
+            ):
                 raise SessionConfirmationError()
             verify_server_session_write(
                 pending.request,
-                trusted_session_id=session_id,
-                canonical_sessions=canonical_sessions,
+                trusted_session_id=context.session_id,
+                canonical_sessions=context.canonical_sessions,
             )
         except SessionWriteBindingError:
             raise SessionConfirmationError() from None
@@ -229,8 +270,8 @@ class SessionWriteConfirmation:
         # Service's own flag/origin guard is checked again at commit time.
         return self._service.remember_explicit_user_memory_for_server_session(
             pending.request,
-            trusted_session_id=session_id,
-            canonical_sessions=canonical_sessions,
+            trusted_session_id=context.session_id,
+            canonical_sessions=context.canonical_sessions,
         )
 
     def clear_pending(self) -> None:
