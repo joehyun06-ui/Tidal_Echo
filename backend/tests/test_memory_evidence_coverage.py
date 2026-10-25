@@ -97,7 +97,7 @@ class CoverageAuditTests(unittest.TestCase):
 
     def test_excess_sources_classified(self):
         for i in range(2, 23):
-            self.conn.execute("INSERT INTO messages VALUES(?, ?)",(i, '{"api_session":"s1"}'))
+            self.conn.execute("INSERT INTO messages VALUES(?, ?, 'in', 'user')",(i, '{"api_session":"s1"}'))
             self.conn.execute(
                 "INSERT INTO memory_evidence_events VALUES (?, ?, 'confirmed_user_fact','real','user')",
                 (i,i),
