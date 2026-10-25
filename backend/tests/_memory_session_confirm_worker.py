@@ -76,6 +76,28 @@ class ConfirmationProtocolTests(NoNetworkMixin, unittest.TestCase):
         args.update(changes)
         return self.guard.confirm(**args)
 
+    def test_shared_design_contract_matches_internal_confirmation_types(self):
+        from dataclasses import fields
+        manifest_path = Path(__file__).resolve().parent.parent / "contracts" / "memory_confirmation_review_v1.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema"], "guitting-memory-confirmation-review-contract-v1")
+        self.assertEqual(manifest["status"], "design_only_not_transport")
+        self.assertIsNone(manifest["memory_write_http_route"])
+        backend = manifest["backend_internal"]
+        self.assertFalse(backend["ticket_transport_available"])
+        self.assertFalse(backend["ticket_multi_worker_durable"])
+        self.assertFalse(backend["actual_human_consent_verified"])
+        self.assertTrue(backend["principal_or_epoch_from_client_forbidden"])
+        self.assertEqual(backend["confirmation_ttl_seconds"], memory_session_confirmation.TTL_SECONDS)
+        self.assertEqual(backend["max_preview_chars"], memory_session_confirmation.MAX_CONTENT_CHARS)
+        self.assertEqual(backend["max_pending_tickets_per_process"], memory_session_confirmation.MAX_PENDING)
+        self.assertEqual(backend["confirm_phrase"], memory_session_confirmation.CONFIRMATION_TEXT)
+        self.assertEqual(set(backend["offer_fields"]), {item.name for item in fields(memory_session_confirmation.ConfirmationOffer)})
+        self.assertEqual(set(backend["auth_provider_fields_server_only"]), {item.name for item in fields(memory_session_confirmation.AuthorizedSessionContext)})
+        self.assertEqual(backend["recheck_at_confirm"], backend["auth_provider_fields_server_only"])
+        self.assertTrue(manifest["frontend_offline_review"]["writes_memory"] is False)
+        self.assertNotEqual(manifest["frontend_offline_review"]["review_phrase"], backend["confirm_phrase"])
+
     def test_prepare_does_not_write(self):
         offer=self.prepare()
         self.assertEqual(self.service.writes, [])
