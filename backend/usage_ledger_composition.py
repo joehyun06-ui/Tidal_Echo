@@ -144,11 +144,11 @@ class LedgerServices:
             return delete_conversation(self._authority, sid, relay_db=self.relay_db,
                                        codex_store=self.native_db, upload_dir=upload_dir, usage_ledger=self.ledger)
 
-    def install_reader(self, app, *, check_auth):
+    def install_reader(self, app, *, check_auth, prefix='/app'):
         self._bound()
-        if not callable(check_auth): invalid()
-        paths = {'/app/sessions/{}/usage-ledger', '/app/sessions/{}/usage-ledger/export',
-                 '/app/sessions/{}/usage-ledger/records', '/app/usage-ledger/settings/{}'}
+        if not callable(check_auth) or prefix not in {'/app','/loop'}: invalid()
+        paths = {prefix+p for p in ('/sessions/{}/usage-ledger', '/sessions/{}/usage-ledger/export',
+                                   '/sessions/{}/usage-ledger/records', '/usage-ledger/settings/{}')}
         # Reject differently named path parameters too: they match the same URLs.
         if any(re.sub(r'\{[^}]+\}', '{}', getattr(r, 'path', '')) in paths for r in app.routes):
             raise LedgerError('ledger_composition_route_conflict')
@@ -156,4 +156,4 @@ class LedgerServices:
         install(app, ledger=self.ledger, check_auth=check_auth,
                 session_provider=lambda sid: (self._row(sid) or {}).get('provider'),
                 message_source=self.messages, continuations=self.continuations,
-                manual_compactions=self.manual_compactions)
+                manual_compactions=self.manual_compactions, prefix=prefix)

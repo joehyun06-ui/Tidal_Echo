@@ -6,7 +6,7 @@ import uuid
 
 from .usage_ledger import LedgerError,identifier,timestamp
 
-REASONS={'route_unmatched','write_failed','invalid_usage','configuration_unapplied','epoch_changed','pending_evicted','late_event','collector_failure'}
+REASONS={'route_unmatched','write_failed','invalid_usage','configuration_unapplied','epoch_changed','pending_evicted','late_event','collector_failure','capture_paused'}
 
 
 class CollectionJournal:
@@ -52,10 +52,12 @@ def coverage(ledger,mode,sid=None,*,conn=None):
     args=(mode,sid) if sid is not None else (mode,)
     pending=conn.execute('SELECT COUNT(*) FROM usage_ledger_attempts WHERE '+where+" AND state='unconfirmed'",args).fetchone()[0]
     issues=dict(conn.execute('SELECT reason,COUNT(*) FROM usage_ledger_issues WHERE '+where+' GROUP BY reason',args))
-    global_issues=conn.execute('SELECT COUNT(*) FROM usage_ledger_issues WHERE mode=? AND session_id IS NULL',(mode,)).fetchone()[0] if sid is not None else 0
+    issues.pop('capture_paused',None)
+    pauses=conn.execute("SELECT COUNT(*) FROM usage_ledger_issues WHERE mode=? AND reason='capture_paused'",(mode,)).fetchone()[0]
+    global_issues=conn.execute("SELECT COUNT(*) FROM usage_ledger_issues WHERE mode=? AND session_id IS NULL AND reason!='capture_paused'",(mode,)).fetchone()[0] if sid is not None else 0
     global_gaps=conn.execute("SELECT COUNT(*) FROM usage_ledger_issues WHERE mode=? AND session_id IS NULL AND reason!='configuration_unapplied'",(mode,)).fetchone()[0] if sid is not None else 0
     runs=conn.execute('SELECT COUNT(*),MIN(started_at) FROM usage_ledger_runs WHERE mode=?',(mode,)).fetchone()
     retention=ledger.retention(mode,conn=conn)
     return {'unconfirmed':pending,'issues':issues,'unassigned_issues':global_issues,'observed_runs':runs[0],
             'observed_since':runs[1],'coverage':'observed_retained_records_only',
-            'has_observed_gaps':bool(pending or any(k!='configuration_unapplied' for k in issues) or global_gaps),'retention':retention}
+            'capture_pauses':pauses,'has_observed_gaps':bool(pauses or pending or any(k!='configuration_unapplied' for k in issues) or global_gaps),'retention':retention}

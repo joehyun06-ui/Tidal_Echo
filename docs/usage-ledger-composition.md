@@ -21,13 +21,14 @@
 5. 原上下文路由安装器显式接收 `**services.action_kwargs()`；普通删除可显式调用
    `services.delete_session`，消息版本删除安装器显式接收 `**services.deletion_kwargs()`。
    均复用已验收逻辑，不添加浏览器账本写入或破坏性维护端点。
-6. 读取端是另一个 `LedgerServices` 实例，共用同一独立账本和来源路径，省略所有采集
-   配置。绑定所在进程的同源权威适配器后，显式 `install_reader(app, check_auth=...)`。
-   统一使用真实消息计数、续窗和压缩回执；重复路由（包括不同参数名）在挂载前拒绝。
+6. 离线测试保留独立读取实例，共用同一账本和来源路径。候选生产读取端放在 loop，
+   统一使用其真实权威来源，显式 `install_reader(app, check_auth=..., prefix='/loop')`，
+   relay 只鉴权并转发。重复路由（包括不同参数名）在挂载前拒绝。
 
 这些函数不会因配置预检结果为 true 自动调用。`usage_ledger_preflight` 仍只是声明核对，
-不能授权安装。实际部署的两个进程不能共享 Python 对象；各自提供鉴权与权威适配器，
-只通过受管的同一持久路径共享 SQLite。生产 relay/loop 的具体挂载仍未实施。
+不能授权安装。实际部署的两个进程不能共享 Python 对象；候选接线让 loop 独占会话权威，
+relay 通过固定内部协议读取。生产 relay/loop 的具体挂载仍未实施；启停与转发细节见
+[候选接线与回滚](usage-ledger-startup.md)。
 
 只有可信服务端负责装配。读取端的 authority 不能来自浏览器声称的 provider；
 check_auth 必须沿用真实鉴权。路由注册顺序、跨进程权威适配器、实际挂载、磁盘可写与

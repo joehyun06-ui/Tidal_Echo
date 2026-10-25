@@ -11,7 +11,8 @@ from .usage_ledger import LedgerError, build_view, identifier, model_name
 from .usage_ledger_storage import page,stream_export
 
 
-def install(app, *, ledger, check_auth, session_provider, message_source=None, continuations=None, manual_compactions=None):
+def install(app, *, ledger, check_auth, session_provider, message_source=None, continuations=None, manual_compactions=None, prefix='/app'):
+    if prefix not in {'/app','/loop'}:raise LedgerError('ledger_route_prefix_invalid')
     headers={'Cache-Control':'private, no-store'}
     def error(exc): return JSONResponse({'ok':False,'error':str(exc)},status_code=409 if str(exc)=='ledger_revision_conflict' else 400,headers=headers)
 
@@ -27,7 +28,7 @@ def install(app, *, ledger, check_auth, session_provider, message_source=None, c
         if q.get('model') is not None:model_name(q['model'])
         return mode,q.get('scope')=='all',q.get('model')
 
-    @app.get('/app/sessions/{sid}/usage-ledger')
+    @app.get(prefix+'/sessions/{sid}/usage-ledger')
     async def read(sid:str,request:Request):
         check_auth(request)
         try:
@@ -40,7 +41,7 @@ def install(app, *, ledger, check_auth, session_provider, message_source=None, c
             return JSONResponse(result,headers=headers)
         except LedgerError as exc: return error(exc)
 
-    @app.get('/app/sessions/{sid}/usage-ledger/export')
+    @app.get(prefix+'/sessions/{sid}/usage-ledger/export')
     async def export(sid:str,request:Request):
         check_auth(request)
         try:
@@ -50,7 +51,7 @@ def install(app, *, ledger, check_auth, session_provider, message_source=None, c
             return StreamingResponse(data,media_type='application/json' if format=='json' else 'text/csv',headers={**headers,'Content-Disposition':f'attachment; filename="guiting-{mode}-ledger.{format}"'})
         except LedgerError as exc: return error(exc)
 
-    @app.get('/app/sessions/{sid}/usage-ledger/records')
+    @app.get(prefix+'/sessions/{sid}/usage-ledger/records')
     async def records(sid:str,request:Request):
         check_auth(request)
         try:
@@ -61,7 +62,7 @@ def install(app, *, ledger, check_auth, session_provider, message_source=None, c
             return JSONResponse(result,headers=headers)
         except LedgerError as exc:return error(exc)
 
-    @app.put('/app/usage-ledger/settings/{mode}')
+    @app.put(prefix+'/usage-ledger/settings/{mode}')
     async def settings(mode:str,request:Request):
         check_auth(request)
         try:

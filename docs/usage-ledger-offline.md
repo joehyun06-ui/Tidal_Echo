@@ -263,6 +263,10 @@ SQLite 快照里以 256 条为批次扫描；费用保持 Decimal，累计值不
 `LedgerServices` 只在离线 fixture 中调用；默认不创建 API/Codex 采集器，挂载、权威来源和
 删除/动作钩子都需显式传入。详见 [组合与连续性离线验收](usage-ledger-composition.md)。
 
+候选启停与 relay/loop 接线：`python -m unittest backend.tests.test_usage_ledger_startup backend.tests.test_usage_ledger_proxy`。
+默认 disabled 无操作；history 保留历史与删除钩子并记录主动停采，capture 复用显式配置。
+真实入口仍未挂载，详见 [候选接线与回滚](usage-ledger-startup.md)。
+
 采集测试使用真实 provider 函数的语法树执行片段与 HTTPX MockTransport；不执行
 bridge 模块顶层环境读取，不导入记忆模块。另走真实 Web 生成运行时、临时 relay /
 ledger 数据库和鉴权 ASGI 接口，验证生成 → 采集 → 查看 / 导出闭环及模式隔离。
