@@ -21,7 +21,7 @@ from fastapi import HTTPException
 
 from backend.tests._support import NoNetworkMixin, load_app, request
 
-TOKEN = "invalid-test-loop-internal-token-1234567890"
+TOKEN = "test-internal-loop-token-1234567890"
 TIMESTAMP = "2026-10-25T00:00:00+00:00"
 
 
@@ -37,7 +37,6 @@ class MemoryEvidencePairedASGITests(NoNetworkMixin, unittest.IsolatedAsyncioTest
         self.dbpath = Path(os.environ["RELAY_DB"])
         os.environ.update({
             "MEMORY_EVIDENCE_UI_READONLY_ENABLED": "true",
-            "API_LOOP_INTERNAL_TOKEN": TOKEN,
             "LEGACY_CHAT_BRIDGE_TOKEN": "synthetic-legacy-bridge-token-1234567890",
             "LEGACY_CHAT_BRIDGE_SESSION": "test-legacy",
             "CODEX_CONTROL_ENABLED": "false",
@@ -55,6 +54,8 @@ class MemoryEvidencePairedASGITests(NoNetworkMixin, unittest.IsolatedAsyncioTest
         self.loop = importlib.import_module("examples.api_loop")
         self.relay = importlib.import_module("backend.p3_relay_app")
         self.assertIs(self.relay.relay_app.app, self.relay.app)
+        self.assertEqual(self.loop.API_LOOP_INTERNAL_TOKEN, TOKEN)
+        self.assertEqual(self.relay.relay_app.API_LOOP_INTERNAL_TOKEN, TOKEN)
         self.sessions = mock.patch.object(
             self.loop, "session_rows",
             return_value=[{"id": "s1"}, {"id": "s2"}],
