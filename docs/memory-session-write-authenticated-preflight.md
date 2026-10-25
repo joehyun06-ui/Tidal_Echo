@@ -15,7 +15,7 @@
 
 **注意**：`MEMORY_SESSION_BOUND_WRITE_ENABLED` 是另一个独立的写入实验开关。预检本身不打开这个开关，不能发起实际写入，也不会创建任何记忆对象。
 
-只有 loop 内部调用 `active_session_id()` 和 `session_rows()` 获取当前会话；请求无法指定、覆盖或枚举目标会话。返回的唯一成功结果：
+只有 loop 内部从 `load_config()` **显式读取** `active_session`，并与 `session_rows()` 核对；不复用聊天界面的 `active_session_id()`，因为它会在活跃会话缺失时回退到最后一个会话。预检必须拒绝这种推断。请求无法指定、覆盖或枚举目标会话。返回的唯一成功结果：
 
 ```json
 {
