@@ -108,6 +108,36 @@ class CoverageAuditTests(unittest.TestCase):
             )
         self.assertEqual(self.count("too_many_sources"),1)
 
+
+    def test_mixed_other_session_is_not_counted_as_verified(self):
+        self.conn.execute(
+            "INSERT INTO messages VALUES (2, ?, 'in', 'user')", ('{"api_session":"s2"}',),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence_events VALUES (2, 2, 'confirmed_user_fact','real','user')"
+        )
+        self.conn.execute(
+            "INSERT INTO memory_sources VALUES (2,1,2,2,'confirmed_user_fact','user')"
+        )
+        self.assertEqual(self.count("mixed_or_unverified_sources"), 1)
+        self.assertEqual(self.count("verified_session_evidence"), 0)
+
+    def test_mixed_unbound_source_is_not_counted_as_verified(self):
+        self.conn.execute(
+            "INSERT INTO messages VALUES (2, ?, 'in', 'user')", ('{"channel":"web"}',),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence_events VALUES (2, 2, 'confirmed_user_fact','real','user')"
+        )
+        self.conn.execute(
+            "INSERT INTO memory_sources VALUES (2,1,2,2,'confirmed_user_fact','user')"
+        )
+        self.assertEqual(self.count("mixed_or_unverified_sources"), 1)
+
+    def test_assistant_canonical_message_is_not_qualifying(self):
+        self.conn.execute("UPDATE messages SET direction='out',kind='reply'")
+        self.assertEqual(self.count("missing_qualifying_source"), 1)
+
     def test_audit_never_writes(self):
         count = self.conn.total_changes
         self.audit()
