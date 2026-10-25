@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -221,6 +222,7 @@ class MemoryActionEntryBackend:
         action,
         lookup_replay=None,
         validate_new_request=None,
+        canonical_session_id: str | None = None,
     ) -> ExplicitMemoryActionResult:
         binding = None
         try:
@@ -246,9 +248,12 @@ class MemoryActionEntryBackend:
                     return self._safe_result(committed, binding, replayed=True)
                 if validate_new_request is not None:
                     validate_new_request(uow, binding)
+                metadata = {"channel": channel, "source": source}
+                if canonical_session_id is not None:
+                    metadata["api_session"] = canonical_session_id
                 canonical_id = uow._insert_canonical_action(
                     text=canonical_text(binding),
-                    metadata={"channel": channel, "source": source},
+                    metadata=metadata,
                 )
                 action(uow, canonical_id, binding)
                 uow.complete_request()
@@ -262,10 +267,21 @@ class MemoryActionEntryBackend:
                 return self._resolve_uncertain(binding)
             raise
 
-    def remember(self, request, *, origin: str, channel: str, source: str):
+    def remember(self, request, *, origin: str, channel: str, source: str,
+                 canonical_session_id: str | None = None):
         self._validate_projection(origin=origin, channel=channel, source=source)
         if type(request) is not RememberExplicitMemoryRequest:
             raise ExplicitMemoryActionError("invalid_request")
+        if canonical_session_id is not None:
+            # This alternate write path is disabled unless explicitly opted in.
+            # The public/legacy remember path always passes None.
+            if (
+                os.environ.get("MEMORY_SESSION_BOUND_WRITE_ENABLED") != "true"
+                or origin != "operator_cli"
+                or request.scope_type != "session"
+                or request.scope_ref != canonical_session_id
+            ):
+                raise ExplicitMemoryActionError("session_write_binding_invalid")
         if request.kind == "assistant_experience":
             raise ExplicitMemoryActionError("unsupported_evidence")
         self._policy.validate_kind(request.kind)
@@ -308,6 +324,7 @@ class MemoryActionEntryBackend:
             channel=channel,
             source=source,
             action=execute,
+            canonical_session_id=canonical_session_id,
         )
 
     def correct(self, request, *, origin: str, channel: str, source: str):
@@ -465,14 +482,14 @@ class ExplicitMemoryActionService:
             raise ExplicitMemoryActionError("memory_operation_failed")
         return result
 
-    def _execute(self, method_name: str, request: object, action_kind: str):
+    def _execute(self, method_name: str, request: object, action_kind: str,
+                 *, canonical_session_id: str | None = None):
         try:
-            result = getattr(self._backend, method_name)(
-                request,
-                origin=self._origin,
-                channel=self._channel,
-                source=self._source,
-            )
+            kwargs = {"origin": self._origin, "channel": self._channel,
+                      "source": self._source}
+            if canonical_session_id is not None:
+                kwargs["canonical_session_id"] = canonical_session_id
+            result = getattr(self._backend, method_name)(request, **kwargs)
             return self._validate_result(
                 result,
                 request_id=request.request_id,
@@ -497,6 +514,37 @@ class ExplicitMemoryActionService:
         if type(request) is not RememberExplicitMemoryRequest:
             raise ExplicitMemoryActionError("invalid_request")
         return self._execute("remember", request, "remember")
+
+    def remember_explicit_user_memory_for_server_session(
+        self,
+        request: RememberExplicitMemoryRequest,
+        *,
+        trusted_session_id: str,
+        canonical_sessions,
+    ):
+        """Opt-in experiment: trusted session comes from authenticated SERVER state.
+
+        There is deliberately no HTTP route. Never pass untrusted request JSON
+        as trusted_session_id or canonical_sessions. Legacy methods unchanged.
+        """
+        if os.environ.get("MEMORY_SESSION_BOUND_WRITE_ENABLED") != "true":
+            raise ExplicitMemoryActionError("session_write_disabled")
+        if self._origin != "operator_cli":
+            raise ExplicitMemoryActionError("session_write_binding_invalid")
+        from .memory_session_write_guard import (
+            SessionWriteBindingError, verify_server_session_write,
+        )
+        try:
+            validated_id = verify_server_session_write(
+                request, trusted_session_id=trusted_session_id,
+                canonical_sessions=canonical_sessions,
+            )
+        except SessionWriteBindingError:
+            raise ExplicitMemoryActionError("session_write_binding_invalid") from None
+        return self._execute(
+            "remember", request, "remember",
+            canonical_session_id=validated_id,
+        )
 
     def correct_explicit_user_memory(self, request: CorrectExplicitMemoryRequest):
         if type(request) is not CorrectExplicitMemoryRequest:

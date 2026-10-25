@@ -33,6 +33,11 @@ jobs:
         run: |
           python -m pip install -r backend/requirements.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate opt-in session write transaction (Windows, synthetic only)
+        timeout-minutes: 3
+        run: |
+          python -m unittest backend.tests._memory_session_write_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate read-only source and session filters (Windows)
         timeout-minutes: 2
         run: |
