@@ -125,6 +125,7 @@ class SessionWriteConfirmation:
     def prepare(self, request: RememberExplicitMemoryRequest) -> ConfirmationOffer:
         """Prepare a preview but perform NO write or memory action ledger claim."""
         if not _enabled():
+            self.clear_pending()
             raise SessionConfirmationError("session_confirmation_disabled")
         if (
             type(request) is not RememberExplicitMemoryRequest
@@ -190,6 +191,7 @@ class SessionWriteConfirmation:
         action ledger; the coordinator never automatically retries.
         """
         if not _enabled():
+            self.clear_pending()
             raise SessionConfirmationError("session_confirmation_disabled")
         if (
             type(ticket) is not str
@@ -220,6 +222,9 @@ class SessionWriteConfirmation:
             )
         except SessionWriteBindingError:
             raise SessionConfirmationError() from None
+        # Fail closed if either control gate changed during session checking.
+        if not _enabled():
+            raise SessionConfirmationError("session_confirmation_disabled")
         # Preserve existing SQLite transaction and HMAC replay semantics.
         # Service's own flag/origin guard is checked again at commit time.
         return self._service.remember_explicit_user_memory_for_server_session(
