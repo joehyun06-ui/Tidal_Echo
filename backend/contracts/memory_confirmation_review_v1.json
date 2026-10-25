@@ -1,0 +1,75 @@
+{
+  "schema": "guitting-memory-confirmation-review-contract-v1",
+  "status": "design_only_not_transport",
+  "contract_version": 1,
+  "memory_write_http_route": null,
+  "preflight_http_route": "/app/memory/session-write/preflight",
+  "preflight_mode": "dry_run",
+  "preflight_would_write": false,
+  "backend_internal": {
+    "flags_required": [
+      "MEMORY_SESSION_BOUND_WRITE_ENABLED",
+      "MEMORY_SESSION_CONFIRMATION_ENABLED"
+    ],
+    "confirmation_ttl_seconds": 120,
+    "max_preview_chars": 1000,
+    "max_pending_tickets_per_process": 8,
+    "request_fields": [
+      "request_id",
+      "kind",
+      "scope_type",
+      "scope_ref",
+      "content",
+      "sensitivity"
+    ],
+    "offer_fields": [
+      "ticket",
+      "preview_content",
+      "content_sha256",
+      "expires_in_seconds",
+      "confirmation_text"
+    ],
+    "confirm_fields": [
+      "ticket",
+      "content_sha256",
+      "confirmation_text"
+    ],
+    "confirm_phrase": "CONFIRM MEMORY",
+    "recheck_at_confirm": [
+      "principal_id",
+      "auth_epoch",
+      "session_id",
+      "canonical_sessions"
+    ],
+    "auth_provider_fields_server_only": [
+      "principal_id",
+      "auth_epoch",
+      "session_id",
+      "canonical_sessions"
+    ],
+    "principal_or_epoch_from_client_forbidden": true,
+    "ticket_transport_available": false,
+    "ticket_multi_worker_durable": false,
+    "actual_human_consent_verified": false
+  },
+  "frontend_offline_review": {
+    "enabled_by_default": false,
+    "local_hostname_only": true,
+    "opt_in_query": "memory_confirm_review=1",
+    "review_phrase": "确认演练",
+    "writes_memory": false,
+    "sends_memory_content_to_server": false,
+    "generates_real_confirmation_ticket": false,
+    "preview_ttl_seconds": 120,
+    "preview_max_chars": 1000
+  },
+  "prod_integration_blockers": [
+    "authenticated_per_request_principal",
+    "rotating_server_auth_epoch",
+    "user_confirmation_authorization_UI",
+    "CSRF_origin_and_rate_limiting",
+    "atomic_multi_worker_ticket_claim_and_revocation",
+    "crash_recovery_ledger_audit",
+    "real_user_data_authorization_review"
+  ]
+}
