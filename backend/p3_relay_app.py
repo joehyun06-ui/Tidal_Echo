@@ -407,6 +407,45 @@ def _install_memory_evidence_readonly_route() -> None:
     relay_app._P3_MEMORY_EVIDENCE_READONLY_ROUTE = True
 
 
+
+def _install_memory_session_write_preflight_route() -> None:
+    """No write endpoint: review the session trust boundary only."""
+    if getattr(relay_app, "_P3_SESSION_WRITE_PREFLIGHT_ROUTE", False):
+        return
+
+    @app.get("/app/memory/session-write/preflight")
+    async def app_memory_session_write_preflight(request: Request):
+        # check_auth accepts ?token for legacy EventSource. Do NOT allow
+        # credentials in a URL on this new memory-control surface.
+        credentials = request.headers.getlist("authorization")
+        if (
+            len(credentials) != 1
+            or not credentials[0].startswith("Bearer ")
+            or bool(request.query_params)
+        ):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        relay_app.check_auth(request)
+        if (
+            os.environ.get("MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED") != "true"
+            or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+        ):
+            raise HTTPException(status_code=404, detail="not_found")
+        payload = relay_app.loop_json("/loop/memory/session-write/preflight")
+        # The loop service must never return memory, sessions or a writable
+        # capability from this path. Fail closed on contract drift.
+        expected = {
+            "schema": "guitting-session-write-preflight-v1",
+            "mode": "dry_run",
+            "active_session_verified": True,
+            "would_write": False,
+        }
+        if type(payload) is not dict or payload != expected:
+            raise HTTPException(status_code=502, detail="preflight_contract_invalid")
+        return JSONResponse(expected, headers={"Cache-Control": "private, no-store"})
+
+    relay_app._P3_SESSION_WRITE_PREFLIGHT_ROUTE = True
+
+
 _install_hybrid_active_status_route()
 _install_hybrid_shadow_status_route()
 _install_capability_route()
@@ -419,3 +458,4 @@ _install_provider_model_migration_route()
 _install_session_retire_route()
 _install_session_delete_route()
 _install_memory_evidence_readonly_route()
+_install_memory_session_write_preflight_route()
