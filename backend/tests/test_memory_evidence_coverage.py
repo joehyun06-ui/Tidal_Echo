@@ -27,11 +27,13 @@ class CoverageAuditTests(unittest.TestCase):
         result = self.audit()
         self.assertEqual(result["total_eligible_scope_items"], 1)
         self.assertEqual(result["counts"]["verified_session_evidence"], 1)
-        self.assertEqual(result["contains_personal_data"], False)
+        self.assertEqual(result["raw_content_or_identifiers_returned"], False)
+        self.assertEqual(result["counts_may_be_sensitive_metadata"], True)
         self.assertEqual(result["writes"], 0)
         self.assertEqual(set(result), {
             "schema", "scope", "total_eligible_scope_items",
-            "counts", "contains_personal_data", "writes",
+            "counts", "raw_content_or_identifiers_returned",
+            "counts_may_be_sensitive_metadata", "writes",
         })
 
     def test_original_memory_text_is_never_echoed(self):
