@@ -39,6 +39,7 @@ from fastapi.responses import JSONResponse
 from backend import (
     channel_store,
     memory_evidence_readonly,
+    memory_session_write_guard,
     codex_app_server_control,
     continuity_context,
     deployment_config,
@@ -1211,6 +1212,35 @@ async def loop_provider_logout(request: Request):
 async def loop_sessions(request: Request):
     check_internal_auth(request)
     return sessions_public()
+
+
+@app.get("/loop/memory/session-write/preflight")
+async def loop_session_write_preflight(request: Request):
+    """Non-mutating server-owned active-session preflight only."""
+    check_internal_auth(request)
+    if request.query_params or (
+        request.headers.get("content-length") not in (None, "", "0")
+    ):
+        raise HTTPException(status_code=400, detail="invalid_preflight_request")
+    if (
+        os.environ.get("MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED") != "true"
+        or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+    ):
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        # These values MUST come from loop-owned config, never HTTP or client.
+        memory_session_write_guard.verify_trusted_active_session(
+            trusted_session_id=active_session_id(),
+            canonical_sessions=session_rows(),
+        )
+    except memory_session_write_guard.SessionWriteBindingError:
+        raise HTTPException(status_code=409, detail="active_session_unverified") from None
+    return JSONResponse({
+        "schema": "guitting-session-write-preflight-v1",
+        "mode": "dry_run",
+        "active_session_verified": True,
+        "would_write": False,
+    }, headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/loop/sessions/{session_id}/memory/evidence")
