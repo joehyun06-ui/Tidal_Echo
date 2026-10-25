@@ -38,6 +38,11 @@ jobs:
         run: |
           python -m unittest backend.tests.test_memory_evidence_readonly -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Audit legacy provenance coverage without memory contents (Windows)
+        timeout-minutes: 2
+        run: |
+          python -m unittest backend.tests.test_memory_evidence_coverage -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate HTTP ingress in independent Windows process
         timeout-minutes: 2
         run: |
