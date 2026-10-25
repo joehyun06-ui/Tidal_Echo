@@ -3,6 +3,7 @@ import ast
 import __future__
 import copy
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -201,8 +202,12 @@ class EntrypointRouteTests(EntryFixture):
 class EntrypointImportTests(EntryFixture):
     def environment(self, root, mode):
         # Reuse the existing isolated entrypoint fixture; never import the live app here.
-        from backend.tests.test_codex_canary_entrypoint_imports import CodexCanaryEntrypointImportTest
-        env = CodexCanaryEntrypointImportTest()._base_env(root)
+        from backend.tests import test_codex_canary_entrypoint_imports as fixture
+        runtime_env = {k:os.environ[k] for k in ('PATH','LANG','LC_ALL','LD_LIBRARY_PATH') if k in os.environ}
+        # Do not inherit parent tests' feature switches, persona paths or secrets.
+        # Patch this fixture module's os binding, never the process environment.
+        with patch.object(fixture,'os',SimpleNamespace(environ=runtime_env)):
+            env = fixture.CodexCanaryEntrypointImportTest()._base_env(root)
         persistent = root/'persistent'; persistent.mkdir(exist_ok=True)
         plan = mock_plan(); plan['codex'] = None
         plan['storage'] = {'persistent_root':str(persistent),'ledger_db':str(persistent/'ledger.sqlite'),
@@ -211,8 +216,18 @@ class EntrypointImportTests(EntryFixture):
         env.update({MODE:mode,PLAN:str(plan_path),ACTIVATION:'11111111-1111-4111-8111-111111111111',
                     CONTINUATION_KEY:KEY.decode(),FINGERPRINT_KEY:PREFIX_KEY.decode(),
                     'LEGACY_CHAT_BRIDGE_TOKEN':'synthetic-bridge-token-only-1234567890',
-                    'LOOP_INGEST_URL':'http://127.0.0.1:3020/loop/ingest'})
+                    'RELAY_LOOP_INGEST_URL':'http://127.0.0.1:3020/loop/ingest'})
         return env
+
+    def test_environment_isolated_from_parent_feature_and_persona_flags(self):
+        parent = {'PATH':'/synthetic-path','MEMORY_EXPLICIT_WRITES_ENABLED':'true',
+                  'PERSONA_FILE':'synthetic-private-persona','GUITING_LEDGER_CONTINUATION_KEY':'private-parent-key'}
+        with patch('backend.tests.test_usage_ledger_entrypoint.os',SimpleNamespace(environ=parent)):
+            env = self.environment(self.root,'disabled')
+        self.assertEqual(env['PATH'],'/synthetic-path')
+        self.assertEqual(env['MEMORY_CORE_ENABLED'],'false')
+        self.assertNotIn('MEMORY_EXPLICIT_WRITES_ENABLED',env); self.assertNotIn('PERSONA_FILE',env)
+        self.assertEqual(env[CONTINUATION_KEY],KEY.decode())
 
     def run_script(self, script, mode):
         with tempfile.TemporaryDirectory() as tmp:
