@@ -78,7 +78,7 @@ class LoopWritePreflightTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_server_active_session_only(self):
         with (
-            mock.patch.object(self.module, "active_session_id", return_value="s1"),
+            mock.patch.object(self.module, "load_config", return_value={"active_session":"s1"}),
             mock.patch.object(self.module, "session_rows", return_value=[{"id":"s1"},{"id":"s2"}]),
         ):
             r = await self.get()
@@ -90,7 +90,15 @@ class LoopWritePreflightTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_active_session_not_in_own_rows_denied(self):
         with (
-            mock.patch.object(self.module, "active_session_id", return_value="s3"),
+            mock.patch.object(self.module, "load_config", return_value={"active_session":"s3"}),
+            mock.patch.object(self.module, "session_rows", return_value=[{"id":"s1"}]),
+        ):
+            r = await self.get()
+        self.assertEqual(r.status_code, 409)
+
+    async def test_missing_active_session_cannot_choose_last_session(self):
+        with (
+            mock.patch.object(self.module, "load_config", return_value={"sessions":[{"id":"s1"}]}),
             mock.patch.object(self.module, "session_rows", return_value=[{"id":"s1"}]),
         ):
             r = await self.get()
@@ -102,7 +110,7 @@ class LoopWritePreflightTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_preflight_never_touches_memory_storage(self):
         with (
-            mock.patch.object(self.module, "active_session_id", return_value="s1"),
+            mock.patch.object(self.module, "load_config", return_value={"active_session":"s1"}),
             mock.patch.object(self.module, "session_rows", return_value=[{"id":"s1"}]),
             mock.patch.object(self.module.channel_store, "connect", side_effect=AssertionError("write_db")),
             mock.patch.object(self.module.channel_store, "connect_read_only", side_effect=AssertionError("read_db")),
