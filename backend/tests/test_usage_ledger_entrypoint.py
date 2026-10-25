@@ -222,7 +222,7 @@ class EntrypointImportTests(EntryFixture):
     def test_environment_isolated_from_parent_feature_and_persona_flags(self):
         parent = {'PATH':'/synthetic-path','MEMORY_EXPLICIT_WRITES_ENABLED':'true',
                   'PERSONA_FILE':'synthetic-private-persona','GUITING_LEDGER_CONTINUATION_KEY':'private-parent-key'}
-        with patch('backend.tests.test_usage_ledger_entrypoint.os',SimpleNamespace(environ=parent)):
+        with patch.object(sys.modules[__name__],'os',SimpleNamespace(environ=parent)):
             env = self.environment(self.root,'disabled')
         self.assertEqual(env['PATH'],'/synthetic-path')
         self.assertEqual(env['MEMORY_CORE_ENABLED'],'false')
