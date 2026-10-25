@@ -154,6 +154,41 @@ class ServerBoundMemoryWriteTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(self.count("messages"), before)
         self.assertEqual(self.count("memory_action_requests"), 1)
 
+    def test_session_tag_tamper_cannot_replay_authenticated_terminal(self):
+        os.environ["MEMORY_SESSION_BOUND_WRITE_ENABLED"] = "true"
+        self.write()
+        with channel_store.connect(self.path) as conn:
+            row = conn.execute("SELECT id,meta FROM messages").fetchone()
+            value = json.loads(row["meta"])
+            value["api_session"] = "s2"
+            conn.execute(
+                "UPDATE messages SET meta=? WHERE id=?",
+                (json.dumps(value, sort_keys=True), row["id"]),
+            )
+        with self.assertRaises(
+            memory_explicit_actions.ExplicitMemoryActionError,
+        ):
+            self.write()
+        self.assertEqual(self.count("messages"), 1)
+        self.assertEqual(self.count("memory_action_requests"), 1)
+
+    def test_extra_canonical_metadata_not_allowed_on_other_scopes(self):
+        os.environ["MEMORY_SESSION_BOUND_WRITE_ENABLED"] = "true"
+        # A global-user request cannot acquire a session label, even if a
+        # caller directly reaches the internal backend.
+        request = memory_explicit_actions.RememberExplicitMemoryRequest(
+            "z"*32, "project", "global_user", "",
+            "Synthetic wrong scope", "normal",
+        )
+        with self.assertRaises(
+            memory_explicit_actions.ExplicitMemoryActionError,
+        ):
+            self.service._backend.remember(
+                request, origin="operator_cli", channel="web", source="relay",
+                canonical_session_id="s1",
+            )
+        self.assertEqual(self.count("messages"), 0)
+
     def test_legacy_write_does_not_add_new_session_metadata(self):
         result = self.service.remember_explicit_user_memory(
             memory_explicit_actions.RememberExplicitMemoryRequest(
