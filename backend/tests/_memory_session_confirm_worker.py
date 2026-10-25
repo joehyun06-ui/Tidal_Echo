@@ -52,13 +52,17 @@ class ConfirmationProtocolTests(NoNetworkMixin, unittest.TestCase):
         })
         patch.start()
         self.addCleanup(patch.stop)
-        self.server = {"active":"s1", "rows":[{"id":"s1"},{"id":"s2"}]}
+        self.server = {"active":"s1", "rows":[{"id":"s1"},{"id":"s2"}],
+                       "principal":"synthetic-user", "epoch":"A"*32}
         self.now = 400.0
         self.service = FakeService()
         self.guard = memory_session_confirmation.SessionWriteConfirmation(
             service=self.service,
-            session_provider=lambda: (
-                self.server["active"], self.server["rows"],
+            authorization_provider=lambda: memory_session_confirmation.AuthorizedSessionContext(
+                principal_id=self.server["principal"],
+                auth_epoch=self.server["epoch"],
+                session_id=self.server["active"],
+                canonical_sessions=tuple(self.server["rows"]),
             ),
             clock=lambda: self.now,
         )
@@ -71,6 +75,28 @@ class ConfirmationProtocolTests(NoNetworkMixin, unittest.TestCase):
               "confirmation_text":offer.confirmation_text}
         args.update(changes)
         return self.guard.confirm(**args)
+
+    def test_shared_design_contract_matches_internal_confirmation_types(self):
+        from dataclasses import fields
+        manifest_path = Path(__file__).resolve().parent.parent / "contracts" / "memory_confirmation_review_v1.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema"], "guitting-memory-confirmation-review-contract-v1")
+        self.assertEqual(manifest["status"], "design_only_not_transport")
+        self.assertIsNone(manifest["memory_write_http_route"])
+        backend = manifest["backend_internal"]
+        self.assertFalse(backend["ticket_transport_available"])
+        self.assertFalse(backend["ticket_multi_worker_durable"])
+        self.assertFalse(backend["actual_human_consent_verified"])
+        self.assertTrue(backend["principal_or_epoch_from_client_forbidden"])
+        self.assertEqual(backend["confirmation_ttl_seconds"], memory_session_confirmation.TTL_SECONDS)
+        self.assertEqual(backend["max_preview_chars"], memory_session_confirmation.MAX_CONTENT_CHARS)
+        self.assertEqual(backend["max_pending_tickets_per_process"], memory_session_confirmation.MAX_PENDING)
+        self.assertEqual(backend["confirm_phrase"], memory_session_confirmation.CONFIRMATION_TEXT)
+        self.assertEqual(set(backend["offer_fields"]), {item.name for item in fields(memory_session_confirmation.ConfirmationOffer)})
+        self.assertEqual(set(backend["auth_provider_fields_server_only"]), {item.name for item in fields(memory_session_confirmation.AuthorizedSessionContext)})
+        self.assertEqual(backend["recheck_at_confirm"], backend["auth_provider_fields_server_only"])
+        self.assertTrue(manifest["frontend_offline_review"]["writes_memory"] is False)
+        self.assertNotEqual(manifest["frontend_offline_review"]["review_phrase"], backend["confirm_phrase"])
 
     def test_prepare_does_not_write(self):
         offer=self.prepare()
@@ -127,6 +153,69 @@ class ConfirmationProtocolTests(NoNetworkMixin, unittest.TestCase):
         with self.assertRaises(ERR):
             self.confirm(offer)
         self.assertEqual(self.service.writes, [])
+
+    def test_different_principal_cannot_redeem_old_ticket(self):
+        offer = self.prepare()
+        self.server["principal"] = "other-synthetic-user"
+        with self.assertRaises(ERR):
+            self.confirm(offer)
+        self.server["principal"] = "synthetic-user"
+        with self.assertRaises(ERR):
+            self.confirm(offer)
+        self.assertEqual(self.service.writes, [])
+
+    def test_logout_login_same_user_rotates_epoch_and_revokes_ticket(self):
+        offer = self.prepare()
+        self.server["epoch"] = "B"*32
+        with self.assertRaises(ERR):
+            self.confirm(offer)
+        self.server["epoch"] = "A"*32
+        with self.assertRaises(ERR):
+            self.confirm(offer)
+        self.assertEqual(self.service.writes, [])
+
+    def test_auth_epoch_with_invalid_format_fails_closed(self):
+        self.server["epoch"] = "short"
+        with self.assertRaises(ERR):
+            self.prepare()
+        self.assertEqual(self.service.writes, [])
+
+    def test_principal_with_invalid_format_fails_closed(self):
+        self.server["principal"] = ""
+        with self.assertRaises(ERR):
+            self.prepare()
+        self.assertEqual(self.service.writes, [])
+
+    def test_auth_provider_exception_fails_closed(self):
+        self.guard._authorization_provider = lambda: 1/0
+        with self.assertRaises(ERR):
+            self.prepare()
+        self.assertEqual(self.service.writes, [])
+
+    def test_untyped_auth_provider_cannot_authorize(self):
+        self.guard._authorization_provider = lambda: ("s1", [{"id":"s1"}])
+        with self.assertRaises(ERR):
+            self.prepare()
+        self.assertEqual(self.service.writes, [])
+
+    def test_rejected_auth_after_prepare_never_executes_write(self):
+        offer = self.prepare()
+        self.guard._authorization_provider = lambda: None
+        with self.assertRaises(ERR):
+            self.confirm(offer)
+        with self.assertRaises(ERR):
+            self.confirm(offer)
+        self.assertEqual(self.service.writes, [])
+
+    def test_auth_context_repr_does_not_expose_identity_or_epoch(self):
+        context = memory_session_confirmation.AuthorizedSessionContext(
+            principal_id="synthetic-user",
+            auth_epoch="A"*32,
+            session_id="s1",
+            canonical_sessions=({"id":"s1"},),
+        )
+        self.assertNotIn("synthetic-user", repr(context))
+        self.assertNotIn("AAAA", repr(context))
 
     def test_unknown_session_prepare_rejected(self):
         self.server["active"]="unknown"
@@ -260,9 +349,14 @@ class ConfirmationSqliteIntegrationTests(NoNetworkMixin, unittest.TestCase):
         backend=memory_explicit_actions.create_entry_backend(runtime.privileged_actions)
         service=memory_explicit_actions.bind_operator_cli(backend)
         self.active="s1"
+        self.principal="synthetic-user"
+        self.epoch="A"*32
         self.coordinator=memory_session_confirmation.SessionWriteConfirmation(
             service=service,
-            session_provider=lambda: (self.active,[{"id":"s1"},{"id":"s2"}]),
+            authorization_provider=lambda: memory_session_confirmation.AuthorizedSessionContext(
+                principal_id=self.principal, auth_epoch=self.epoch,
+                session_id=self.active, canonical_sessions=({"id":"s1"},{"id":"s2"}),
+            ),
         )
 
     def _count(self,name):
@@ -309,6 +403,28 @@ class ConfirmationSqliteIntegrationTests(NoNetworkMixin, unittest.TestCase):
         self.assertTrue(result.replayed)
         self.assertEqual(self._count("messages"),1)
         self.assertEqual(self._count("memory_action_requests"),1)
+
+    def test_changed_login_epoch_refuses_sqlite_commit(self):
+        offer = self.coordinator.prepare(valid_request())
+        self.epoch = "B"*32
+        with self.assertRaises(ERR):
+            self.coordinator.confirm(
+                ticket=offer.ticket, content_sha256=offer.content_sha256,
+                confirmation_text=offer.confirmation_text,
+            )
+        self.assertEqual(self._count("messages"), 0)
+        self.assertEqual(self._count("memory_action_requests"), 0)
+
+    def test_changed_principal_refuses_sqlite_commit(self):
+        offer = self.coordinator.prepare(valid_request())
+        self.principal = "someone-else"
+        with self.assertRaises(ERR):
+            self.coordinator.confirm(
+                ticket=offer.ticket, content_sha256=offer.content_sha256,
+                confirmation_text=offer.confirmation_text,
+            )
+        self.assertEqual(self._count("messages"), 0)
+        self.assertEqual(self._count("memory_action_requests"), 0)
 
     def test_revalidate_active_session_before_sqlite_commit(self):
         offer=self.coordinator.prepare(valid_request())
