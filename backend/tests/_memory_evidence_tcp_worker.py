@@ -106,7 +106,7 @@ class MemoryEvidenceTcpLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 "MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED": "true",
                 "MEMORY_SESSION_BOUND_WRITE_ENABLED": "false",
             }),
-            mock.patch.object(self.loop, "active_session_id", return_value="s1"),
+            mock.patch.object(self.loop, "load_config", return_value={"active_session":"s1"}),
             mock.patch.object(
                 self.relay.relay_app, "LOOP_INGEST_URL",
                 f"http://127.0.0.1:{self.port}/loop/ingest",
@@ -131,7 +131,7 @@ class MemoryEvidenceTcpLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 "MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED": "true",
                 "MEMORY_SESSION_BOUND_WRITE_ENABLED": "false",
             }),
-            mock.patch.object(self.loop, "active_session_id", return_value="missing"),
+            mock.patch.object(self.loop, "load_config", return_value={"active_session":"missing"}),
             mock.patch.object(
                 self.relay.relay_app, "LOOP_INGEST_URL",
                 f"http://127.0.0.1:{self.port}/loop/ingest",
