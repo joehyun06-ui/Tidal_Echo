@@ -170,6 +170,17 @@ class RelayWritePreflightTests(NoNetworkMixin, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(r.headers.get("cache-control"), "private, no-store")
         proxy.assert_called_once_with(INTERNAL)
 
+    async def test_post_method_cannot_be_used_to_write(self):
+        with mock.patch.object(
+            self.module.relay_app, "loop_json",
+            side_effect=AssertionError("unexpected_write_forward"),
+        ):
+            response = await request(
+                self.module, "POST", PUBLIC,
+                headers={"Authorization": "Bearer test-relay-secret"},
+            )
+        self.assertEqual(response.status_code, 405)
+
     async def test_upstream_cannot_return_writable_capability(self):
         with mock.patch.object(
             self.module.relay_app, "loop_json",
