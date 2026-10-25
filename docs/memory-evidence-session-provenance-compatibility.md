@@ -17,7 +17,7 @@
 `different_session_binding`、`missing_qualifying_source`、
 `content_over_display_limit`、`too_many_sources`。
 
-不从 SQLite SELECT 记忆文本、memory_key、原始消息文本或完整 meta；不返回任何逐条 ID、原文、会话名、真实来源 ID、哈希或凭证。单次最多扫描 2,000 个候选，超限拒绝；用于未来经过授权的**本机只读检查**，不是浏览器 telemetry。当前只在虚构数据上运行测试，没有读取用户真实数据库。
+不从 SQLite SELECT 记忆文本、memory_key、原始消息文本或完整 meta；不返回任何逐条 ID、原文、会话名、真实来源 ID、哈希或凭证。单次最多扫描 2,000 个候选，超限拒绝；用于未来经过授权的**本机只读检查**，不是浏览器 telemetry。**即使只有数量也可能透露用户是否存有记忆，仍属于需保护的元数据**，只能在本机明确授权下查看，不能对外暴露或自动上报。当前只在虚构数据上运行测试，没有读取用户真实数据库。
 
 ## 兼容性处理原则
 
