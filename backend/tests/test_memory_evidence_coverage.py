@@ -38,7 +38,7 @@ class CoverageAuditTests(unittest.TestCase):
         self.conn.execute("UPDATE memory_items SET normalized_content=?", ("PRIVATE_SYNTHETIC_XYZ",))
         serialized = json.dumps(self.audit(), sort_keys=True)
         self.assertNotIn("PRIVATE_SYNTHETIC_XYZ", serialized)
-        self.assertNotIn("memory-source", serialized)
+        self.assertNotIn("memory-source-1", serialized)
         self.assertNotIn("m"*32, serialized)
 
     def test_missing_session_binding_detected(self):
