@@ -1,7 +1,7 @@
 # 账本组合与连续性离线验收
 
-本批将已有组件整理为 `backend.usage_ledger_composition.LedgerServices`，不改动生产
-入口、环境配置、模型协议、提示词或记忆策略。仍为独立草稿，未合并/部署，不发真实模型
+已有组件整理为 `backend.usage_ledger_composition.LedgerServices`，候选入口已加入默认
+关闭接线；线上配置、模型协议、提示词或记忆策略未改变。仍为独立草稿，未合并/部署，不发真实模型
 请求，不读生产数据；v48、36/36、108/108 保持冻结。
 
 ## 组合顺序
@@ -27,7 +27,7 @@
 
 这些函数不会因配置预检结果为 true 自动调用。`usage_ledger_preflight` 仍只是声明核对，
 不能授权安装。实际部署的两个进程不能共享 Python 对象；候选接线让 loop 独占会话权威，
-relay 通过固定内部协议读取。生产 relay/loop 的具体挂载仍未实施；启停与转发细节见
+relay 通过固定内部协议读取。候选 relay/loop 已按显式 mode 安装，线上未部署；启停与转发细节见
 [候选接线与回滚](usage-ledger-startup.md)。
 
 只有可信服务端负责装配。读取端的 authority 不能来自浏览器声称的 provider；

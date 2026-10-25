@@ -8,7 +8,7 @@
 - 独立分支 `codex/usage-ledger-offline-20261023`，草稿 PR，不合并、不部署生产。
 - 新模块 `backend/usage_ledger.py` 只使用独立 SQLite，不导入记忆、SDK、
   生成器或 HTTP 客户端。`usage_ledger_routes.install` 只由离线 fixture 显式挂载。
-  生产入口没有安装这些路由，没有创建或注入采集器，也不回填历史消息。
+  候选入口现已加入默认关闭接线，线上未部署、未启用，也不回填历史消息。
 - 本批增加 `usage_ledger_capture.ApiCollector`，只由离线测试显式注入
   `ApiWebRuntime(legacy, usage_collector=collector)`。默认参数为 `None`，
   既有生成器、独立记忆任务和正式运行不会自动启用采集或缓存参数。
@@ -265,7 +265,7 @@ SQLite 快照里以 256 条为批次扫描；费用保持 Decimal，累计值不
 
 候选启停与 relay/loop 接线：`python -m unittest backend.tests.test_usage_ledger_startup backend.tests.test_usage_ledger_proxy`。
 默认 disabled 无操作；history 保留历史与删除钩子并记录主动停采，capture 复用显式配置。
-真实入口仍未挂载，详见 [候选接线与回滚](usage-ledger-startup.md)。
+候选入口已按显式配置接线，线上仍未挂载；详见 [候选接线与回滚](usage-ledger-startup.md)。
 
 采集测试使用真实 provider 函数的语法树执行片段与 HTTPX MockTransport；不执行
 bridge 模块顶层环境读取，不导入记忆模块。另走真实 Web 生成运行时、临时 relay /

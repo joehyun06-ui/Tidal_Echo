@@ -4,18 +4,17 @@
 真实账户用量，也未进行真实模型请求。** 文中的“已验证”仅指离线测试，不等于实际
 部署已经具备这些能力。v48、36/36、108/108 继续冻结。
 
-## 当前组合入口
+## 候选分支组合入口（线上版本仍冻结）
 
-- `examples/api_loop_codex_canary.py` 创建 `ApiWebRuntime(legacy)`，未注入
-  `usage_collector`；创建 `StreamingCodexGenerationRuntime` 时也未注入
-  `usage_collector` / `compaction_collector`。
-- `backend/p3_codex_relay_app.py` 与上述 loop 入口没有安装 `usage_ledger_routes`。
-  因此只合并前端不能让正式账本产生真实数据。
+- `examples/api_loop_codex_canary.py` 已按默认关闭的 `load_loop` 结果构造 runtime，
+  返回 None 时展开空 kwargs，维持原关闭态行为；只有明确配置才注入采集/回执服务。
+- `backend/p3_codex_relay_app.py` 按同一 mode 选择是否安装内部转发；缺省不新增路由。
+  loop 继续拥有唯一会话权威。只合并前端不能让正式账本产生真实数据。
 - `usage_ledger_routes.install` 接收独立账本、鉴权、权威会话解析器和可选来源钩子，
-  只有离线 fixture 现在显式配置了完整组合。
-- 删除与版本删除的 `usage_ledger` 参数仍为 `None`；不能把离线删除验证写成生产已接入。
-- 本轮的 AST 门槛只检查上述受审入口的组合边界，不导入入口，不宣称扫描了所有可能的
-  动态加载器、部署实例或未来代码路径。部署实际组合仍需单独核对。
+  候选入口按 mode 显式配置，离线 fixture 用合成计划验证该组合。
+- 删除与版本删除按服务对象是否存在注入同一账本；线上未部署这些修改，不能写成生产已接入。
+- 默认 kwargs 的 AST 检查、关闭态导入检查及三种模式的隔离导入共同验证候选入口；
+  不宣称扫描了所有动态加载器、部署实例或未来路径。部署实际配置仍需单独核对。
 
 ## 覆盖矩阵
 
@@ -70,7 +69,7 @@ python -m backend.usage_ledger_preflight --config /path/to/credential-free-plan.
 以及显式启用决定。这些缺项不会通过配置里填 true 自动消除。本轮不代替这些验收。
 
 已有组件现已整理为显式的 `LedgerServices` 组合，并通过独立实例与真实子进程的合成
-重启验收。生产入口仍未导入或挂载，真实部署和通知连续性仍未核验；详见
+重启验收。候选入口已默认关闭接线，线上未部署，真实存储/归属和通知连续性仍未核验；详见
 [组合与连续性离线验收](usage-ledger-composition.md)。
 
 ## 验证
@@ -81,4 +80,5 @@ python -m unittest backend.tests.test_usage_ledger_preflight
 
 测试覆盖备用模型/协议/endpoint 漏配、同路由不同 Web 来源、重复配置、未知收费字段、
 缺少钩子、非独占线程、版本不符、模式隔离、路径冲突、密钥字段拒绝、固定错误、输入不变、
-无文件/数据库/网络副作用，以及受审生产入口继续未挂载/未注入。所有输入均为合成数据。
+账本关闭态不额外读写文件/数据库或访问网络，以及显式模式下受审入口的挂载/注入。
+所有输入均为合成数据。

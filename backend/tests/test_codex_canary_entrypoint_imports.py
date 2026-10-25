@@ -49,8 +49,10 @@ class CodexCanaryEntrypointImportTest(unittest.TestCase):
 from pathlib import Path
 import examples.api_loop_codex_canary as module
 assert module.RUNTIME.generation_enabled is False
+assert module.LEDGER_SERVICES is None
 assert module.INTEGRATION.legacy.CODEX_CONTROL.__class__.__name__ == "LegacyControlAdapter"
 assert any(getattr(route, "path", "") == "/loop/ingest" for route in module.app.routes)
+assert not any("usage-ledger" in getattr(route, "path", "") for route in module.app.routes)
 assert not Path(module.GENERATION_CONFIG.store_path).exists()
 print("ok")
 '''

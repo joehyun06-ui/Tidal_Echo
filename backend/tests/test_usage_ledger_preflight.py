@@ -179,7 +179,7 @@ class PreflightTests(unittest.TestCase):
             code, value = self.command('--config', str(Path(tmp)/'missing-private-file'))
             self.assertEqual(code, 2); self.assertNotIn(tmp, json.dumps(value))
 
-    def test_current_production_composition_stays_unmounted_and_uninjected(self):
+    def test_candidate_entrypoint_expansions_are_empty_without_prepared_services(self):
         # Parse only source: importing the entrypoint would load secrets/workers/memory.
         names = {'ApiWebRuntime', 'StreamingCodexGenerationRuntime'}
         entry = ast.parse((ROOT/'examples/api_loop_codex_canary.py').read_text())
@@ -188,10 +188,16 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual({n.func.id for n in constructors}, names)
         for call in constructors:
             self.assertFalse(any(k.arg in {'usage_collector', 'compaction_collector'} for k in call.keywords))
+            for kw in call.keywords:
+                if kw.arg is None:
+                    self.assertEqual(eval(compile(ast.Expression(kw.value), '<default-ledger-kwargs>', 'eval'),
+                                          {'LEDGER_SERVICES': None}), {})
         for file in ('examples/api_loop_codex_canary.py', 'backend/p3_codex_relay_app.py'):
             source = ast.parse((ROOT/file).read_text())
             for node in ast.walk(source):
                 if isinstance(node, ast.ImportFrom):
-                    self.assertFalse((node.module or '').startswith('backend.usage_ledger'))
+                    if (node.module or '').startswith('backend.usage_ledger'):
+                        self.assertEqual(node.module, 'backend.usage_ledger_entrypoint')
+                        self.assertTrue({a.name for a in node.names} <= {'load_loop','install_relay'})
                 if isinstance(node, ast.Call):
                     self.assertFalse(any(k.arg in {'usage_ledger', 'continuation_creator', 'manual_compactions'} for k in node.keywords))

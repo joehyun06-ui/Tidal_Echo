@@ -85,3 +85,13 @@ class StartupTests(CompositionFixture):
         self.assertIsNone(prepare(mode='disabled'))
         self.assertTrue(self.path.exists())
         self.assertEqual(build_view(services.ledger, 'api', 'a')['collection_health']['capture_pauses'], 1)
+
+    async def test_changing_to_native_only_capture_cannot_hide_stopped_api_coverage(self):
+        api = self.start('capture', api_profiles=[profile()], fingerprint_key=PREFIX_KEY)
+        attempt = api.api.begin(ROUTE, 'chat', 'a', 'before-mode-change'); attempt.usage(RAW); await attempt.finish(None)
+        native = self.start('capture', codex_provider_id='synthetic-subscription', codex_cli_version='0.160.0')
+        self.assertIsNone(native.api); self.assertIsNotNone(native.codex)
+        view = build_view(native.ledger, 'api', 'a')
+        self.assertEqual(view['summary']['requests'], 1)
+        self.assertEqual(view['collection_health']['capture_pauses'], 1)
+        self.assertTrue(view['collection_health']['has_observed_gaps'])

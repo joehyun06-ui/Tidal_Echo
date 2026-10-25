@@ -1,6 +1,6 @@
 # 账本候选接线、启停与回滚
 
-本批提供候选安装函数并用离线 Mock 验证，**没有改动或启用正式入口**。没有读取生产
+本批已在候选分支接入默认关闭的入口，**尚未合并、部署或更改线上设置**。没有读取生产
 配置、账户、聊天或独立记忆验收内容，没有真实模型请求。v48 与 36/36、108/108 门槛
 保持冻结；下述示例是待审阅的装配位置，不是已执行的部署。
 
@@ -17,6 +17,10 @@ activation UUID 去重；重开 capture 不删除旧标记。标记只证明发�
 不是精确停采时长、丢失请求数或费用。未记录的消耗保持未知，相关模式预算剩余不可完整
 计算；会话/模型筛选不能藏掉这个范围。页面把主动停采与错误计数分开显示。
 
+capture 若仅配置 API 或仅配置 Codex，另一模式也保留该次启动未采集的范围标记。它不
+表示此前一定启用过或实际丢失了请求；用于防止切换成单模式采集后，另一模式的历史
+预算仍被误认为覆盖完整。
+
 这不是实时开关。不要在运行中的 runtime 上替换采集器。已在途的旧请求仍可按原快照
 结束；进程退出造成的未确认标记保留，不重发模型请求。完全回滚到 disabled 不会自行
 记录未运行期间的事实；需要停采审计时，先在受控切换中选择 history。
@@ -30,24 +34,49 @@ relay 不读取来源库，不另造会话权威对象。已有独立实例/子�
 relay 的读取路径由 `usage_ledger_proxy.install` 转发给 loop；模型用量仍由 loop runtime
 构造时显式注入。两个公开/内部前缀只接受 `/app` 或 `/loop`，不接受浏览器指定目标。
 
-具体待审阅的安装位置：
+候选分支已落地的安装位置：
 
-1. 在创建 runtime 前调用 `prepare`，默认保持 disabled。只有返回服务对象时，才向现有
-   `ApiWebRuntime` / `StreamingCodexGenerationRuntime` 构造器展开对应 kwargs。
+1. `examples/api_loop_codex_canary.py` 创建 runtime 前调用 `load_loop`，缺省返回 None。
+   只有返回服务对象时，才向现有 runtime 构造器展开对应 kwargs；history 不创建模型
+   用量采集器，但仍显式接入手动压缩回执，不把上下文变化当作 API 消耗。
 2. 既有 integration 建立后，绑定其 `session_authority`、`_session_lock` 和
    `create_web_session`。为原上下文动作安装器提供 `action_kwargs()`；普通会话删除提供
    `usage_ledger` 钩子，版本删除安装器展开 `deletion_kwargs()`。不能重复安装旧路由。
 3. loop 在父级 legacy app 挂载前执行：
    `services.install_reader(loop_app, check_auth=legacy.check_internal_auth, prefix='/loop')`。
-   调用为显式安装，原入口当前没有这段代码。
-4. relay 在既有总应用的路由层显式执行 `usage_ledger_proxy.install`。默认
-   `enabled=False` 完全无操作；候选启用时，提供 `relay.check_auth`、受审的数字回环
-   origin、服务端已有内部 token。不能把浏览器通行凭据当作内部 token。
+   这段代码已在候选入口中按服务对象是否存在分支安装。
+4. `backend/p3_codex_relay_app.py` 调用 `install_relay`，缺省立即返回 False。选择启用时，
+   使用既有 `relay.check_auth`、数字回环 origin 和服务端内部 token；不会读取或转发
+   浏览器通行凭据。只有该适配器显式调用底层 `usage_ledger_proxy.install(enabled=True)`。
 5. 真实部署仍需核对持久路径、权限、账户/线程归属、CLI 版本和完整主/备用路由清单，
    以及确认入口选择与挂载顺序；本批没有代做这些线上检查。
 
 `service_options` 沿用组合层字段；不接受任意 API Key 等额外字段。HMAC 密钥与内部
 token 只能由服务器运行时取得，不能写入 JSON 计划、仓库、模板、报告或日志。
+
+## 入口配置契约
+
+以下名称只在候选代码中定义，本轮没有向线上环境写入任何值。
+
+| 环境变量 | 行为 |
+|---|---|
+| `GUITING_LEDGER_MODE` | 缺省为 disabled；只接受 disabled / history / capture，拼写不合法返回固定启动错误 |
+| `GUITING_LEDGER_PLAN` | 仅非 disabled 时读取：受信持久根目录内的绝对 `.json` 路径，禁止符号链接，最多 64 KiB；沿用离线计划结构，拒绝重复键和凭据字段 |
+| `GUITING_LEDGER_ACTIVATION_ID` | history/capture 的 UUID；history 的主动停采标记据此去重 |
+| `GUITING_LEDGER_CONTINUATION_KEY` | 只在非 disabled 时从运行时读取，32–512 个可见 ASCII 字符；跨实例/重启需保持稳定 |
+| `GUITING_LEDGER_FINGERPRINT_KEY` | 仅 API capture 读取，约束同上；history / Codex-only 不读取 |
+
+入口验证计划中的根目录、relay/native 来源路径与现有部署配置一致，账本仍由组合层
+检查独立路径。capture 要求计划声明一致；声明不能替代线上归属、存储和通知连续性验收。
+relay 复用现有内部 token，不接受新的浏览器凭据或任意转发目标。
+
+显式启用后配置/存储不合法会以固定类别拒绝启动，不静默猜测费率或假装采集成功。
+disabled 路径只检查 mode，不读取计划、相关密钥或打开账本。真实入口的隔离导入测试
+覆盖三种模式，原有关闭态入口导入检查继续执行，并验证没有新增账本路由。
+
+普通删除和消息版本删除均注入同一账本。普通删除若聊天已删除、账本清理失败，会返回
+503 和 `deletion_unconfirmed=true`，不泄露存储错误；同一删除可重试核对。disabled 保留
+原异常路径。跨存储仍不是分布式事务。
 
 ## relay 转发契约
 
@@ -75,6 +104,7 @@ token 只能由服务器运行时取得，不能写入 JSON 计划、仓库、�
    状态保留，不能根据重启把它改成零消耗或失败。不要启动第二套模型工作循环。
 3. history 模式保留统计、不可变价格和删除标记。暂停期间的生成沿用原业务流程，但
    没有模型用量采集；回执核对和消息计数不等于补回缺失消耗。
+   API 采集器附带的缓存参数也不再注入，回到原提供方默认行为，不能承诺停采前后的命中率。
 4. 恢复时审阅新 profile，再以 capture 重建。Codex 首轮无可靠基线时保持不可用，不能
    以线程累计量填补停采期间的消耗。旧停采/异常证据继续保留。
 5. 若撤回整个功能，选择 disabled 并回到未安装代理/读取端点的原组合，保留独立账本
@@ -90,3 +120,12 @@ python -m unittest backend.tests.test_usage_ledger_startup backend.tests.test_us
 鉴权、分页/导出/设置、错误与重定向不泄露、超时不重试、JSON 上限、流式背压和断连
 资源释放。前端 fixture 通过同一真实代理访问独立 loop app，HTTPX 传输为 ASGI Mock，
 Python 出站网络与浏览器外部请求仍被禁止。真实部署尚未执行。
+
+入口与配置的新增验证：
+
+```bash
+python -m unittest backend.tests.test_usage_ledger_entrypoint
+```
+
+隔离子进程使用临时计划、合成密钥和关闭的模型运行开关，禁止出站连接。它导入真实
+入口代码并检查三种模式的挂载与注入，不启动 SDK 工作循环、账号登录或真实生成。

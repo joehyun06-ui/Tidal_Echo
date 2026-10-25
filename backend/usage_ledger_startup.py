@@ -34,10 +34,12 @@ def prepare(*, mode='disabled', activation_id=None, service_options=None):
     except TypeError:
         raise LedgerError('ledger_startup_invalid') from None
     try:
-        if mode == 'history':
+        paused = ('api', 'codex') if mode == 'history' else tuple(
+            name for name in ('api', 'codex') if getattr(services, name) is None)
+        if paused:
             # Reusing one activation UUID is idempotent. Do not erase this evidence
             # on resumption: the intentionally unobserved interval remains unknown.
-            for run_mode in ('api', 'codex'):
+            for run_mode in paused:
                 request = 'pause-'+activation
                 with closing(services.ledger.connect()) as conn:
                     exists = conn.execute("SELECT 1 FROM usage_ledger_issues WHERE mode=? AND provider_id='ledger-startup' AND request_id=? AND reason='capture_paused'", (run_mode, request)).fetchone()
