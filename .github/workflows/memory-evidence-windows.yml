@@ -38,6 +38,11 @@ jobs:
         run: |
           python -m unittest backend.tests._memory_session_write_worker -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate guarded session preflight (Windows, dry-run)
+        timeout-minutes: 2
+        run: |
+          python -m unittest backend.tests._memory_session_preflight_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate read-only source and session filters (Windows)
         timeout-minutes: 2
         run: |
