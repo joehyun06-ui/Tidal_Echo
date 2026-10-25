@@ -22,3 +22,12 @@
 - 未改动 v48 冻结验收基线，不触碰线上主分支，未批准合并或部署。
 
 测试：`python -m unittest backend.tests.test_memory_evidence_readonly -v`；对应 CI 运行全部 `backend/tests`。
+
+## Canonical SQLite / 双服务隔离验证
+
+附加独立测试进程：`python -m unittest backend.tests._memory_evidence_pair_worker -v`。
+使用真实 `channel_store` 迁移后的记忆表、模拟的同会话 user/real 来源，穿过 relay 身份检查和 loop 内部令牌，再经过 `connect_read_only` 返回前端契约。桥接使用两个真实 ASGI 路由和内存传输，**没有开放监听端口，也没有验证实际 TCP/部署环境的代理行为**；后者仍须在隔离预览部署中单独验收。
+
+兼容性约束：现有显式记忆操作的 canonical messages 有时只有 `{"channel":"web","source":"relay"}`，不含 `meta.api_session`。这一类无法从 canonical 来源独立证明会话归属，接口会有意将其过滤；**不能把空列表等同于“用户没有记忆”**。后续应在受审写入路径中保存正式会话绑定（不更改 v48 冻结行为），再验证迁移兼容性。不得直接移除来源与会话的关联校验来让界面显示内容。
+
+禁用开关仍应保持关闭，直到实际服务联调、会话授权与 Windows 验收完成。
