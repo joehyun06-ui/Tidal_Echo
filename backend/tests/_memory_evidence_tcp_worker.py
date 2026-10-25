@@ -100,6 +100,49 @@ class MemoryEvidenceTcpLoopbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["api_session"], "s1")
         self.assertEqual(payload["views"][0]["answer"], "Aurora demo: Friday 16:30")
 
+    async def test_real_tcp_preflight_uses_internal_token_and_server_session(self):
+        with (
+            mock.patch.dict(os.environ, {
+                "MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED": "true",
+                "MEMORY_SESSION_BOUND_WRITE_ENABLED": "false",
+            }),
+            mock.patch.object(self.loop, "active_session_id", return_value="s1"),
+            mock.patch.object(
+                self.relay.relay_app, "LOOP_INGEST_URL",
+                f"http://127.0.0.1:{self.port}/loop/ingest",
+            ),
+        ):
+            result = await request(
+                self.relay, "GET", "/app/memory/session-write/preflight",
+                headers={"Authorization":"Bearer test-relay-secret"},
+            )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json(), {
+            "schema":"guitting-session-write-preflight-v1",
+            "mode":"dry_run",
+            "active_session_verified":True,
+            "would_write":False,
+        })
+        self.assertEqual(result.headers["cache-control"], "private, no-store")
+
+    async def test_real_tcp_preflight_rejects_invalid_server_active_session(self):
+        with (
+            mock.patch.dict(os.environ, {
+                "MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED": "true",
+                "MEMORY_SESSION_BOUND_WRITE_ENABLED": "false",
+            }),
+            mock.patch.object(self.loop, "active_session_id", return_value="missing"),
+            mock.patch.object(
+                self.relay.relay_app, "LOOP_INGEST_URL",
+                f"http://127.0.0.1:{self.port}/loop/ingest",
+            ),
+        ):
+            result = await request(
+                self.relay, "GET", "/app/memory/session-write/preflight",
+                headers={"Authorization":"Bearer test-relay-secret"},
+            )
+        self.assertEqual(result.status_code, 409)
+
     async def test_real_tcp_internal_endpoint_rejects_missing_token(self):
         with self.assertRaises(urllib.error.HTTPError) as rejected:
             urllib.request.urlopen(
