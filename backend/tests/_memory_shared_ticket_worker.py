@@ -278,6 +278,60 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
         self.assertIsNotNone(result[0])
         self.assertEqual(self.claim(result[0], storage=store).request_id, "a" * 32)
 
+    def test_session_switch_while_waiting_for_claim_lock_fails_closed(self):
+        # The pending ticket was made for s1; the trusted server session
+        # changes during SQLite contention. A pre-lock snapshot is unsafe.
+        offer = self.storage.prepare(valid_request())
+        started = threading.Event()
+        outcomes = []
+        with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            def attempt():
+                started.set()
+                try:
+                    self.claim(offer, storage=self.new_storage())
+                    outcomes.append("accepted")
+                except SharedTicketError:
+                    outcomes.append("rejected")
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.15)
+            self.state["session"] = "s2"
+            lock.execute("COMMIT")
+        thread.join(timeout=7)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, ["rejected"])
+        self.state["session"] = "s1"
+        with self.assertRaises(SharedTicketError):
+            self.claim(offer)
+
+    def test_session_switch_while_waiting_for_prepare_lock_fails_closed(self):
+        started = threading.Event()
+        outcomes = []
+        with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            def attempt():
+                started.set()
+                try:
+                    self.new_storage().prepare(valid_request())
+                    outcomes.append("accepted")
+                except SharedTicketError:
+                    outcomes.append("rejected")
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.15)
+            self.state["session"] = "s2"
+            lock.execute("COMMIT")
+        thread.join(timeout=7)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, ["rejected"])
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM memory_shared_ticket_v1 WHERE status='pending'"
+            ).fetchone()[0], 0)
+
     def test_bad_identity_provider_refused(self):
         offer = self.storage.prepare(valid_request())
         invalid = SharedConfirmationTickets(
