@@ -189,6 +189,9 @@ class SharedConfirmationTickets:
             conn = sqlite3.connect(str(self._path), timeout=5, isolation_level=None)
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                # Recheck OFF gate after any wait for the SQLite write lock.
+                if not _enabled():
+                    raise SharedTicketError()
                 conn.execute(_DDL)
                 result = func(conn)
                 conn.execute("COMMIT")
@@ -206,13 +209,13 @@ class SharedConfirmationTickets:
         if not _enabled():
             raise SharedTicketError()
         context = self._context(request)
-        now = self._now()
         token = secrets.token_urlsafe(32)
         token_sha = hashlib.sha256(token.encode("ascii")).hexdigest()
         digest = _digest(request)
         epoch_sha = hashlib.sha256(context.auth_epoch.encode("ascii")).hexdigest()
 
         def op(conn):
+            now = self._now()
             if not self._epoch_valid_locked(conn, context):
                 raise SharedTicketError()
             conn.execute(
@@ -252,7 +255,6 @@ class SharedConfirmationTickets:
         """
         if not _enabled() or not _valid(ticket, _TICKET):
             raise SharedTicketError()
-        now = self._now()
         token_sha = hashlib.sha256(ticket.encode("ascii")).hexdigest()
         try:
             context = self._context(request)
@@ -261,6 +263,9 @@ class SharedConfirmationTickets:
         supplied_digest = _digest(request) if context is not None else None
 
         def op(conn):
+            # Time must be sampled AFTER BEGIN IMMEDIATE acquires the lock.
+            # Sampling before lock acquisition can admit expired tickets.
+            now = self._now()
             row = conn.execute(
                 """SELECT principal_id,login_id,epoch_sha256,session_id,
                           request_id,content_sha256,expires_at
