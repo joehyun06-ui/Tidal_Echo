@@ -173,6 +173,7 @@ class CodexSharedAppServerRuntime:
         self._process: Any | None = None
         self._ready_process: Any | None = None
         self._reader_task: asyncio.Task | None = None
+        self._teardown_tasks: set[asyncio.Task] = set()
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._pending: dict[int, tuple[Any, asyncio.Future]] = {}
@@ -459,6 +460,9 @@ class CodexSharedAppServerRuntime:
             try:
                 if owner.returncode is None:
                     owner.kill()
+                # Killing alone does not reap the child or finish pipe cleanup.
+                async with asyncio.timeout(PROCESS_TEARDOWN_STEP_TIMEOUT_SECONDS):
+                    await owner.wait()
             except Exception:
                 pass
 
@@ -490,9 +494,30 @@ class CodexSharedAppServerRuntime:
         for future in futures:
             if not future.done():
                 future.set_exception(error)
-        if reader is not None and not from_reader and reader is not asyncio.current_task():
+        join_reader = reader is not None and not from_reader and reader is not asyncio.current_task()
+        if join_reader:
             reader.cancel()
+        # A failed RPC is notified before reaping finishes. Keep cleanup owned
+        # independently of that caller/reader so cancellation or close cannot
+        # lose a detached process whose public _process slot is already empty.
+        teardown = asyncio.create_task(self._cleanup_owner(owner, reader if join_reader else None, tool_tasks))
+        self._teardown_tasks.add(teardown)
+        teardown.add_done_callback(self._teardown_done)
+        await asyncio.shield(teardown)
+
+    def _teardown_done(self, task):
+        self._teardown_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _cleanup_owner(self, owner, reader, tool_tasks):
         await self._terminate_owner(owner)
+        if reader is not None:
+            try:
+                async with asyncio.timeout(PROCESS_TEARDOWN_STEP_TIMEOUT_SECONDS):
+                    await asyncio.gather(reader, return_exceptions=True)
+            except TimeoutError:
+                pass
         if tool_tasks:
             await asyncio.gather(*tool_tasks, return_exceptions=True)
 
@@ -501,5 +526,7 @@ class CodexSharedAppServerRuntime:
         owner = self._process
         if owner is not None:
             await self._fail_process("codex_app_server_unavailable", owner=owner)
+        if self._teardown_tasks:
+            await asyncio.shield(asyncio.gather(*tuple(self._teardown_tasks), return_exceptions=True))
         self._scopes.clear()
 

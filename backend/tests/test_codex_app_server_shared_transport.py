@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from backend.codex_app_server_shared_transport import (
     CodexSharedAppServerRuntime,
@@ -208,6 +210,77 @@ class SharedTransportTest(unittest.IsolatedAsyncioTestCase):
             await scope.request("account/read", {})
         self.assertFalse(launched)
 
+    async def test_close_waits_for_cancelled_reader_cleanup_before_returning(self):
+        runtime = self.runtime()
+        entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def reader():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup.set()
+                await release.wait()
+        task = asyncio.create_task(reader())
+        await entered.wait()
+        runtime._process = object()
+        runtime._reader_task = task
+        runtime._terminate_owner = AsyncMock()
+        closing = asyncio.create_task(runtime.close())
+        try:
+            await asyncio.wait_for(cleanup.wait(), 1)
+            self.assertFalse(closing.done())
+        finally:
+            release.set()
+            await closing
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.done())
+
+    async def test_timed_out_termination_reaps_the_killed_child(self):
+        runtime = self.runtime()
+        owner = SimpleNamespace(returncode=None, terminate=Mock(), kill=Mock(),
+                                wait=AsyncMock(side_effect=[TimeoutError(), None]))
+        await runtime._terminate_owner(owner)
+        owner.terminate.assert_called_once()
+        owner.kill.assert_called_once()
+        self.assertEqual(owner.wait.await_count, 2)
+
+    async def test_close_joins_teardown_after_reader_has_detached_the_owner(self):
+        runtime = self.runtime()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def terminate(owner):
+            entered.set()
+            await release.wait()
+        runtime._process = owner = object()
+        runtime._terminate_owner = AsyncMock(side_effect=terminate)
+        loss = asyncio.create_task(runtime._fail_process('codex_app_server_unavailable', owner=owner, from_reader=True))
+        await entered.wait()
+        closing = asyncio.create_task(runtime.close())
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(closing.done())
+        finally:
+            release.set()
+            await asyncio.gather(loss, closing)
+
+    async def test_cancelled_failure_caller_cannot_abandon_child_teardown(self):
+        runtime = self.runtime()
+        entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def terminate(owner):
+            entered.set()
+            await release.wait()
+            finished.set()
+        runtime._process = owner = object()
+        runtime._terminate_owner = AsyncMock(side_effect=terminate)
+        loss = asyncio.create_task(runtime._fail_process('codex_app_server_unavailable', owner=owner, from_reader=True))
+        await entered.wait()
+        loss.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await loss
+        release.set()
+        await runtime.close()
+        self.assertTrue(finished.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()
+

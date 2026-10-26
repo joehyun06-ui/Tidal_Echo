@@ -1,9 +1,10 @@
 # Codex 通知连续性的离线传输验收
 
 本批让合成 Python 子进程通过真实 stdin/stdout JSONL、共享传输 reader、原运行时
-账本回调和 CodexCollector 进入临时 SQLite。没有启动 Codex CLI、读取账号认证文件、
-登录、读取生产数据或调用模型。父/子进程均禁止网络连接。v48、36/36、108/108 保持
-冻结，仍在独立草稿中，生产采集继续关闭。
+账本回调和 CodexCollector 进入临时 SQLite。这条 JSONL 链路使用合成 Python 子进程，
+父/子进程均禁止网络连接。另用实际固定版本 CLI 生成协议 schema，见下节。没有读取
+真实账号认证文件、登录、读取生产数据或调用模型。v48、36/36、108/108 保持冻结，
+仍在独立草稿中，生产采集继续关闭。
 
 ## 修复的差值归属问题
 
@@ -43,8 +44,50 @@ python -W error::ResourceWarning -m unittest backend.tests.test_usage_ledger_nat
 ```
 
 测试子进程仅认识内部 `fixture/*` 方法，使用临时 home 和来源库。它不实现 Codex 推理，
-不会调用 `turn/start`、`thread/resume` 或订阅账户接口。测试复用现有固定版本的通知形状，
-不构成对任何实际 CLI 版本、正式账号或服务端通知行为的验收。
+不会调用 `turn/start`、`thread/resume` 或订阅账户接口。该合成链路本身不构成对实际
+CLI、正式账号或服务端通知行为的验收；协议字段另按下节核对。
+
+## 实际 CLI 生成的协议校验
+
+复用 `test_codex_0160_contract` 的真实 CLI 验收基础，固定 wheel 和二进制版本均为
+0.160.0。版本读取和 `app-server generate-json-schema --experimental` 仅在临时目录
+执行，显式提供空的 HOME/CODEX_HOME 与最小子进程环境，不继承真实配置、认证文件
+或父进程密钥。已有的匿名 initialize/account/config 检查继续保留，不发起登录或推理。
+
+新增 4 项账本协议检查，同时验证实际生成的 ServerNotification envelope 与 v2 参数
+schema，再把通过校验的合成通知交给真实采集器和临时 SQLite：
+
+| 场景 | 核对内容 |
+|---|---|
+| JSONL 合成样例与单轮差值 | 轮次通知补齐必需的 `items`，精确绑定和输入/输出/推理差值符合固定协议 |
+| 空上下文上限与原生缓存字段 | `modelContextWindow` 缺省/null 保持不可用；缓存字段保留原文，Codex API 缓存/费用仍不适用；真实报告的零差值保留零 |
+| 压缩生命周期 | `contextCompaction` 和必需时间戳通过 schema，阻断压缩前后差值，保留前后观测且记忆保留未知 |
+| completed/failed/interrupted | 原生终态与错误结构通过协议核对，记录状态但不把合成回复或错误正文写入账本 |
+
+命令：
+
+```bash
+python -W error::ResourceWarning -m unittest backend.tests.test_codex_0160_contract
+```
+
+这些 schema 每次由安装的真实 CLI 重新生成，不以工作区旧副本作为 CI 依据。没有
+增加模型请求、SDK 采集、登录步骤或生产启用选项。协议通过只证明给定合成消息符合
+这一版本的字段契约，不证明真实通知顺序、断线恢复、账户归属或完整用量。
+
+依据：[OpenAI Docs · App Server message schema](https://developers.openai.com/codex/app-server#message-schema)。
+官方说明生成产物与执行生成命令的 CLI 版本对应；升级时应重新核对，不放宽现有门槛。
+
+## 子进程关闭与回收
+
+实际 CLI 与合成传输的组合检查暴露了资源清理警告。本批另修复共享传输关闭时的
+4 个可复现边界：取消 reader 后等待其清理；终止超时后 kill 并再次 wait 回收；
+reader 已摘除当前 owner 时 close 仍等待在途清理；失败调用方取消不会取消独立清理。
+对应 4 项回归在修复前失败，修复后通过。
+
+清理任务单独持有旧 owner，由 runtime 跟踪并在 close 时等待；完成后释放跟踪引用。
+终止/回收和 reader 收尾沿用有期限的等待，不把“发出 kill”当成“回收完成”。这不是
+无限期限下保证清理成功，也不新增模型请求、重放、登录或自动部署。账号、协议方法
+权限、进程启动参数和账本启用条件均保持原规则。
 
 ## 尚未验证
 

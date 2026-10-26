@@ -57,7 +57,8 @@ for line in sys.stdin:
 def event(method, n, *, thread='thread-a', **params):
     body = {'threadId': thread}
     if method in {'turn/started', 'turn/completed'}:
-        body['turn'] = {'id': f'turn-{n}', 'status': 'completed' if method.endswith('completed') else 'inProgress'}
+        body['turn'] = {'id': f'turn-{n}', 'items': [],
+                        'status': 'completed' if method.endswith('completed') else 'inProgress'}
     else:
         body['turnId'] = f'turn-{n}'
     return {'method': method, 'params': {**body, **params}}

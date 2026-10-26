@@ -75,5 +75,6 @@ python -m unittest backend.tests.test_usage_ledger_composition
 
 另已加入[通知连续性的真实 JSONL 离线传输验收](usage-ledger-native-notifications.md)：
 合成子进程经过共享 reader 与原运行时回调进入账本，并覆盖 EOF、协议错误、重连、
-重放及迟到/无效用量与核对并发。仍未运行真实 CLI。迟到用量会作废已经开始的同线程
+重放及迟到/无效用量与核对并发。实际 CLI 仅做匿名协议检查和 schema 生成，没有推理
+或真实通知采集。迟到用量会作废已经开始的同线程
 后继基线，其他线程保持独立；已落库的原始观测不被改写，异常单独保留。
