@@ -278,18 +278,36 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
         self.assertIsNotNone(result[0])
         self.assertEqual(self.claim(result[0], storage=store).request_id, "a" * 32)
 
+    def _observed_context_storage(self, called):
+        # Record WHEN trusted server state is read, rather than relying only
+        # on a sleep-based scheduling guess in lock contention tests.
+        def provider():
+            called.set()
+            return TrustedTicketContext(
+                principal_id=self.state["principal"],
+                login_id=self.state["login"],
+                auth_epoch=self.state["epoch"].value,
+                session_id=self.state["session"],
+                canonical_sessions=({"id": "s1"}, {"id": "s2"}),
+            )
+        return SharedConfirmationTickets(
+            path=self.path, context_provider=provider,
+        )
+
     def test_session_switch_while_waiting_for_claim_lock_fails_closed(self):
         # The pending ticket was made for s1; the trusted server session
         # changes during SQLite contention. A pre-lock snapshot is unsafe.
         offer = self.storage.prepare(valid_request())
         started = threading.Event()
+        provider_called = threading.Event()
+        observed_store = self._observed_context_storage(provider_called)
         outcomes = []
         with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
             lock.execute("BEGIN IMMEDIATE")
             def attempt():
                 started.set()
                 try:
-                    self.claim(offer, storage=self.new_storage())
+                    self.claim(offer, storage=observed_store)
                     outcomes.append("accepted")
                 except SharedTicketError:
                     outcomes.append("rejected")
@@ -297,10 +315,15 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
             thread.start()
             self.assertTrue(started.wait(timeout=2))
             time.sleep(0.15)
+            self.assertFalse(
+                provider_called.is_set(),
+                "trusted context was sampled before acquiring the DB lock",
+            )
             self.state["session"] = "s2"
             lock.execute("COMMIT")
         thread.join(timeout=7)
         self.assertFalse(thread.is_alive())
+        self.assertTrue(provider_called.is_set())
         self.assertEqual(outcomes, ["rejected"])
         self.state["session"] = "s1"
         with self.assertRaises(SharedTicketError):
@@ -308,13 +331,15 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
 
     def test_session_switch_while_waiting_for_prepare_lock_fails_closed(self):
         started = threading.Event()
+        provider_called = threading.Event()
+        observed_store = self._observed_context_storage(provider_called)
         outcomes = []
         with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
             lock.execute("BEGIN IMMEDIATE")
             def attempt():
                 started.set()
                 try:
-                    self.new_storage().prepare(valid_request())
+                    observed_store.prepare(valid_request())
                     outcomes.append("accepted")
                 except SharedTicketError:
                     outcomes.append("rejected")
@@ -322,10 +347,15 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
             thread.start()
             self.assertTrue(started.wait(timeout=2))
             time.sleep(0.15)
+            self.assertFalse(
+                provider_called.is_set(),
+                "trusted context was sampled before acquiring the DB lock",
+            )
             self.state["session"] = "s2"
             lock.execute("COMMIT")
         thread.join(timeout=7)
         self.assertFalse(thread.is_alive())
+        self.assertTrue(provider_called.is_set())
         self.assertEqual(outcomes, ["rejected"])
         with closing(sqlite3.connect(self.path)) as conn:
             self.assertEqual(conn.execute(
