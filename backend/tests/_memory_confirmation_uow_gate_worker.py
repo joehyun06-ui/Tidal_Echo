@@ -38,7 +38,7 @@ class UowGateTests(NoNetworkMixin, unittest.TestCase):
         })
         patch.start()
         self.addCleanup(patch.stop)
-        with channel_store.connect(self.path) as db:
+        with closing(channel_store.connect(self.path)) as db:
             db.execute(channel_store.RELAY_TABLE_DDL["messages"])
         channel_store.run_migrations(self.path)
         runtime = bootstrap_runtime(self.path, memory_config())
@@ -168,7 +168,7 @@ class UowGateTests(NoNetworkMixin, unittest.TestCase):
     def test_foreign_db_uow_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             other = str(Path(tmp) / "other.sqlite")
-            with channel_store.connect(other) as db:
+            with closing(channel_store.connect(other)) as db:
                 db.execute(channel_store.RELAY_TABLE_DDL["messages"])
             channel_store.run_migrations(other)
             other_runtime = bootstrap_runtime(other, memory_config())
