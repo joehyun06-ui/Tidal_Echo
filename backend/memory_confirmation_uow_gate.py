@@ -2,7 +2,7 @@
 
 Review-only integration seam; no production memory write call is wired. The
 gate validates a still-pending ticket and live auth epoch *inside* the real
-MemoryActionUnitOfWork's SQLite write transaction and marks the ticket
+_MemoryActionUnitOfWork's SQLite write transaction and marks the ticket
 consumed there. The existing UOW owns commit/rollback, never this module.
 
 IMPORTANT: This dataclass provider is NOT authentication or human consent.
@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .memory_action_ledger import MemoryActionUnitOfWork
+from .memory_action_ledger import _MemoryActionUnitOfWork
 from .memory_explicit_actions import RememberExplicitMemoryRequest
 from .memory_session_confirmation import CONFIRMATION_TEXT, _digest
 from .memory_session_write_guard import verify_server_session_write
@@ -67,7 +67,7 @@ class MemoryUowConfirmationGate:
     Inject only from trusted server composition, with provider values derived
     from an already verified and active login/session. Never construct from
     request JSON/HTTP headers. This component can consume a ticket inside a
-    real MemoryActionUnitOfWork, but cannot itself commit a memory.
+    real _MemoryActionUnitOfWork, but cannot itself commit a memory.
     """
 
     __slots__ = ("_path", "_context_provider", "_clock")
@@ -116,7 +116,7 @@ class MemoryUowConfirmationGate:
             raise UowConfirmationGateError() from None
 
     def consume_in_existing_uow(
-        self, *, uow: MemoryActionUnitOfWork,
+        self, *, uow: _MemoryActionUnitOfWork,
         request: RememberExplicitMemoryRequest,
         ticket: str, content_sha256: str,
         confirmation_text: str,
@@ -131,7 +131,7 @@ class MemoryUowConfirmationGate:
         """
         if (
             not _enabled()
-            or type(uow) is not MemoryActionUnitOfWork
+            or type(uow) is not _MemoryActionUnitOfWork
             or type(request) is not RememberExplicitMemoryRequest
             or not _matches(ticket, _TICKET)
             or not _matches(content_sha256, _DIGEST)
