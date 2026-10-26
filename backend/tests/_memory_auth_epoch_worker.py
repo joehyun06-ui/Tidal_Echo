@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import closing
 import os
 import sqlite3
 import tempfile
@@ -59,7 +60,7 @@ class EpochRegistryTests(NoNetworkMixin, unittest.TestCase):
         self.assertNotIn(issued.value, repr(issued))
         self.assertNotIn(issued.value, repr(self.registry))
         self.assertNotIn(self.state["principal"], repr(AuthenticatedLogin("synthetic-a", "L" * 32)))
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             row = db.execute("SELECT epoch_sha256, generation, revoked FROM memory_auth_epoch_v1").fetchone()
         self.assertEqual(row, (hashlib.sha256(issued.value.encode()).hexdigest(), 1, 0))
         self.assertNotEqual(row[0], issued.value)
@@ -71,7 +72,7 @@ class EpochRegistryTests(NoNetworkMixin, unittest.TestCase):
         with self.assertRaises(AuthEpochError):
             self.registry.assert_current(old)
         self.registry.assert_current(new)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT generation FROM memory_auth_epoch_v1").fetchone()[0], 2)
 
     def test_logout_revokes_and_relogin_never_restores_old_epoch(self):
@@ -162,7 +163,7 @@ class EpochRegistryTests(NoNetworkMixin, unittest.TestCase):
                 pass
         self.assertEqual(len(issued), 8)
         self.assertEqual(valid, 1)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT generation FROM memory_auth_epoch_v1").fetchone()[0], 8)
 
     def test_adapter_rejects_old_ticket_on_logout(self):
