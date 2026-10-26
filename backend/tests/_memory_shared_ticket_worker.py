@@ -199,6 +199,85 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
             store.prepare(valid_request(marker="z"))
         self.new_storage(clock=lambda: start + 121).prepare(valid_request(marker="z"))
 
+    def test_lock_wait_does_not_extend_ticket_expiry(self):
+        # An expired ticket must not be accepted with a timestamp sampled
+        # before SQLite BEGIN IMMEDIATE has finished waiting for the lock.
+        moment = [1000.0]
+        store = self.new_storage(clock=lambda: moment[0])
+        offer = store.prepare(valid_request())
+        started = threading.Event()
+        results = []
+        with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            def attempt():
+                started.set()
+                try:
+                    self.claim(offer, storage=store)
+                    results.append("accepted")
+                except SharedTicketError:
+                    results.append("rejected")
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.12)
+            moment[0] = 1120.0
+            lock.execute("COMMIT")
+        thread.join(timeout=6)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, ["rejected"])
+
+    def test_flag_disabled_while_waiting_for_db_lock(self):
+        moment = [1000.0]
+        store = self.new_storage(clock=lambda: moment[0])
+        offer = store.prepare(valid_request())
+        started = threading.Event()
+        results = []
+        with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            def attempt():
+                started.set()
+                try:
+                    self.claim(offer, storage=store)
+                    results.append("accepted")
+                except SharedTicketError:
+                    results.append("rejected")
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.12)
+            os.environ["MEMORY_SHARED_CONFIRMATION_TICKETS_ENABLED"] = "false"
+            lock.execute("COMMIT")
+        thread.join(timeout=6)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, ["rejected"])
+        os.environ["MEMORY_SHARED_CONFIRMATION_TICKETS_ENABLED"] = "true"
+        self.assertEqual(self.claim(offer, storage=store).request_id, valid_request().request_id)
+
+    def test_prepare_ttl_begins_after_db_lock_acquisition(self):
+        moment = [1000.0]
+        store = self.new_storage(clock=lambda: moment[0])
+        started = threading.Event()
+        result = []
+        with closing(sqlite3.connect(self.path, timeout=5, isolation_level=None)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            def attempt():
+                started.set()
+                try:
+                    result.append(store.prepare(valid_request()))
+                except SharedTicketError:
+                    result.append(None)
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.12)
+            moment[0] = 1120.0
+            lock.execute("COMMIT")
+        thread.join(timeout=6)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertIsNotNone(result[0])
+        self.assertEqual(self.claim(result[0], storage=store).request_id, "a" * 32)
+
     def test_bad_identity_provider_refused(self):
         offer = self.storage.prepare(valid_request())
         invalid = SharedConfirmationTickets(
