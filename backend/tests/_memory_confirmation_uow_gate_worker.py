@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -187,6 +189,74 @@ class UowGateTests(NoNetworkMixin, unittest.TestCase):
             with self.assertRaises(UowConfirmationGateError):
                 self.run_gate(uow)
         self.assertEqual(self._status(), "consumed")
+
+    def test_real_uow_lock_defers_logout_until_rollback(self):
+        # This is the production transaction OBJECT with synthetic evidence;
+        # no canonical record/ledger write occurs.
+        started = threading.Event()
+        finished = threading.Event()
+        outcomes = []
+
+        def revoke():
+            started.set()
+            try:
+                outcomes.append(self.registry.revoke_before_logout())
+            except Exception as exc:
+                outcomes.append(type(exc).__name__)
+            finally:
+                finished.set()
+
+        with self.store._action_unit_of_work() as uow:
+            self.run_gate(uow)
+            thread = threading.Thread(target=revoke)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.15)
+            self.assertFalse(finished.is_set(), "revocation bypassed UOW lock")
+            self.assertEqual(
+                uow._execute(
+                    "SELECT status FROM memory_shared_ticket_v1"
+                ).fetchone()[0], "consumed",
+            )
+            # No ledger terminal -> implicit ROLLBACK on exit.
+
+        thread.join(timeout=7)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, [True])
+        self.assertEqual(self._status(), "pending")
+        with self.store._action_unit_of_work() as uow:
+            with self.assertRaises(UowConfirmationGateError):
+                self.run_gate(uow)
+        self.assertEqual(self._count("messages"), 0)
+        self.assertEqual(self._count("memory_action_requests"), 0)
+
+    def test_expiry_checked_at_real_uow_verification(self):
+        # The clock is sampled while already inside the real write lock.
+        self.gate = MemoryUowConfirmationGate(
+            path=self.path,
+            context_provider=self.provider,
+            clock=lambda: time.time() + 121,
+        )
+        with self.store._action_unit_of_work() as uow:
+            with self.assertRaises(UowConfirmationGateError):
+                self.run_gate(uow)
+        self.assertEqual(self._status(), "pending")
+        self.assertEqual(self._count("messages"), 0)
+
+    def test_gate_kill_switch_after_trusted_context_fails_closed(self):
+        def provider_disables_gate():
+            snapshot = self.provider()
+            os.environ["MEMORY_CONFIRMED_UOW_GATE_ENABLED"] = "false"
+            return snapshot
+
+        self.gate = MemoryUowConfirmationGate(
+            path=self.path, context_provider=provider_disables_gate,
+        )
+        with self.store._action_unit_of_work() as uow:
+            with self.assertRaises(UowConfirmationGateError):
+                self.run_gate(uow)
+        self.assertEqual(self._status(), "pending")
+        self.assertEqual(self._count("messages"), 0)
 
     def test_ticket_still_pending_after_failed_uow(self):
         try:
