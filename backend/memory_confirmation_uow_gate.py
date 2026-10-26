@@ -148,6 +148,10 @@ class MemoryUowConfirmationGate:
                 raise UowConfirmationGateError()
             ctx = self._context(request)
             current = self._now()
+            # A trusted callback may take time; fail closed if a feature
+            # kill switch changed while that callback was executing.
+            if not _enabled():
+                raise UowConfirmationGateError()
             if (
                 not hmac.compare_digest(content_sha256, _digest(request))
                 or not hmac.compare_digest(confirmation_text, CONFIRMATION_TEXT)
