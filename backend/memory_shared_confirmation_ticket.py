@@ -208,16 +208,22 @@ class SharedConfirmationTickets:
         """Store only hashes + server identity metadata; zero memory writes."""
         if not _enabled():
             raise SharedTicketError()
-        context = self._context(request)
+        if not _request_valid(request):
+            raise SharedTicketError()
         token = secrets.token_urlsafe(32)
         token_sha = hashlib.sha256(token.encode("ascii")).hexdigest()
         digest = _digest(request)
-        epoch_sha = hashlib.sha256(context.auth_epoch.encode("ascii")).hexdigest()
 
         def op(conn):
+            # Re-read trusted session context only AFTER the SQLite lock.
+            # A pre-lock snapshot can be stale after a blocked transaction.
+            context = self._context(request)
+            if not _enabled():
+                raise SharedTicketError()
             now = self._now()
             if not self._epoch_valid_locked(conn, context):
                 raise SharedTicketError()
+            epoch_sha = hashlib.sha256(context.auth_epoch.encode("ascii")).hexdigest()
             conn.execute(
                 """DELETE FROM memory_shared_ticket_v1
                    WHERE (status='pending' AND expires_at<=?)
@@ -256,16 +262,18 @@ class SharedConfirmationTickets:
         if not _enabled() or not _valid(ticket, _TICKET):
             raise SharedTicketError()
         token_sha = hashlib.sha256(ticket.encode("ascii")).hexdigest()
-        try:
-            context = self._context(request)
-        except SharedTicketError:
-            context = None
-        supplied_digest = _digest(request) if context is not None else None
 
         def op(conn):
-            # Time must be sampled AFTER BEGIN IMMEDIATE acquires the lock.
-            # Sampling before lock acquisition can admit expired tickets.
+            # Time and trusted session must be read after the write lock;
+            # a session switch during lock contention must not be ignored.
             now = self._now()
+            try:
+                context = self._context(request)
+            except SharedTicketError:
+                context = None
+            if not _enabled():
+                raise SharedTicketError()
+            supplied_digest = _digest(request) if context is not None else None
             row = conn.execute(
                 """SELECT principal_id,login_id,epoch_sha256,session_id,
                           request_id,content_sha256,expires_at
