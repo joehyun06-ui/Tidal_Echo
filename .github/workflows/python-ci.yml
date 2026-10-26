@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - feat/kelivo-heartbeat-foundation
+      - codex/usage-ledger-offline-20261023
   workflow_dispatch:
 
 permissions:
