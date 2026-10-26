@@ -80,6 +80,18 @@ class CodexCollector:
             for state in self._pending.values(): state['invalid'] = True; state['revision'] += 1
             self._epoch = epoch
 
+    def _invalidate_thread(self, thread):
+        # A successor may already hold a previous key after removing the head.
+        # Invalidate both that staged successor and retained checkpoints, while
+        # leaving immutable ledger rows and unrelated threads untouched. Called
+        # under _lock; revision changes also reject an in-flight disk snapshot.
+        self._heads.pop(thread,None)
+        for state in self._pending.values():
+            if state['thread']==thread:
+                state['invalid']=True;state['revision']+=1
+        for key,state in self._finished.items():
+            if key[0]==thread:state['checkpoint']=False
+
     def receive(self, method, params, *, epoch):
         if method not in NOTIFICATIONS or not isinstance(params,dict): return
         thread = params.get('threadId'); native = params.get('turn') if method in {'turn/started','turn/completed'} else None
@@ -100,8 +112,7 @@ class CodexCollector:
             except (ValueError,TypeError,RecursionError):
                 with self._lock:
                     self._issue('invalid_usage',(thread,turn))
-                    self.dropped += 1; self._heads.pop(thread,None)
-                    if (thread,turn) in self._pending: self._pending[thread,turn]['invalid'] = True
+                    self.dropped += 1; self._invalidate_thread(thread)
                 return
         now = datetime.now(timezone.utc).isoformat(); key = (thread,turn)
         with self._lock:
@@ -110,7 +121,7 @@ class CodexCollector:
                 old = self._finished[key]
                 if method == 'thread/tokenUsage/updated' and usage != old.get('raw'):
                     self._issue('late_event',key)
-                    self.late += 1; self._heads.pop(thread,None)
+                    self.late += 1; self._invalidate_thread(thread)
                 return
             state = self._pending.get(key)
             if state is None:
@@ -135,7 +146,7 @@ class CodexCollector:
                 if state['raw'] == usage: return
                 if state['terminal']:
                     self._issue('late_event',key)
-                    state['invalid'] = True; state['revision'] += 1; self.late += 1; self._heads.pop(thread,None)
+                    self.late += 1; self._invalidate_thread(thread)
                     return
                 previous = (state['raw'] or {}).get('total',{})
                 current = usage.get('total',{})
