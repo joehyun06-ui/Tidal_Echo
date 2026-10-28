@@ -70,6 +70,28 @@ def _require_target(command: list[str], expected: str) -> list[str]:
     return command
 
 
+def _require_p3_proxy_header_isolation(commands: dict[str, list[str]]) -> dict[str, list[str]]:
+    """P3 must not undo the base supervisor's explicit proxy-header opt-out."""
+    for process, host in (("api_loop", "127.0.0.1"), ("relay", "0.0.0.0")):
+        command = commands.get(process)
+        if (
+            type(command) is not list
+            or command.count("--no-proxy-headers") != 1
+            or "--proxy-headers" in command
+            or "--forwarded-allow-ips" in command
+            or command.count("--host") != 1
+        ):
+            raise deployment_config.DeploymentConfigError(
+                "p3_proxy_header_boundary_unreviewed"
+            )
+        index = command.index("--host")
+        if index + 1 >= len(command) or command[index + 1] != host:
+            raise deployment_config.DeploymentConfigError(
+                "p3_proxy_header_boundary_unreviewed"
+            )
+    return commands
+
+
 def _select_child_commands(
     base_selector: Callable[..., dict[str, list[str]]],
     config: render_start.SupervisorConfig,
@@ -77,6 +99,10 @@ def _select_child_commands(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
+    # Protect the direct P3 selection path, even if callers skip base preflight.
+    render_start.reject_unreviewed_browser_identity_ingress(
+        os.environ if environ is None else environ
+    )
     commands = dict(base_selector(config, executable=executable))
     commands["api_loop"] = _replace_target(
         list(commands["api_loop"]),
@@ -88,7 +114,7 @@ def _select_child_commands(
         P3_RELAY,
     )
     if not codex_entrypoints_enabled(environ):
-        return commands
+        return _require_p3_proxy_header_isolation(commands)
     commands["api_loop"] = _replace_target(
         list(commands["api_loop"]),
         GUARD_API_LOOP,
@@ -99,7 +125,7 @@ def _select_child_commands(
         P3_RELAY,
         CODEX_RELAY,
     )
-    return commands
+    return _require_p3_proxy_header_isolation(commands)
 
 
 def child_commands(
@@ -117,7 +143,17 @@ def child_commands(
 
 
 def main() -> int:
-    # Validate gates before any child process can start.
+    # The real Render startup command calls this P3 wrapper. Apply the
+    # OIDC review interlock before changing selectors or starting children.
+    try:
+        render_start.reject_unreviewed_browser_identity_ingress(os.environ)
+    except deployment_config.DeploymentConfigError:
+        render_start.safe_log(
+            "supervisor", os.getpid(), "preflight_failed",
+            "unreviewed_memory_browser_identity_ingress",
+        )
+        return 2
+    # Preserve the existing independent Codex qualification gate.
     codex_entrypoints_enabled(os.environ)
     original = render_start.child_commands
 
