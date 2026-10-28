@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import ssl
 import urllib.error
 import urllib.request
@@ -85,12 +84,15 @@ def _from_json(endpoint: str, http_status: int, raw: bytes, content_type: str):
     if any(type(x) is not str or x not in CHECKS for x in data.get("errors", {})):
         return ReadonlyHealthObservation(endpoint, "invalid_response", 200)
     failed = tuple(sorted(k for k, value in checks.items() if not value))
-    if data["ready"] is True and data["status"] == "ready":
-        # memory_core may be deliberately non-gating when disabled. Its false
-        # value is therefore not proof of a readiness failure.
+    if (
+        data["ready"] is True and data["status"] == "ready"
+        and set(failed) <= {"memory_core"}
+        and not data.get("errors")
+    ):
+        # memory_core may be deliberately non-gating when disabled.
         return ReadonlyHealthObservation(endpoint, "ready_observed", 200, len(checks), failed)
-    if data["ready"] is False and data["status"] == "not_ready":
-        return ReadonlyHealthObservation(endpoint, "not_ready_observed", 200, len(checks), failed)
+    # The current deployed endpoint uses 503 for not_ready. Any 200 with a
+    # not_ready payload or contradictory checks is not accepted as healthy.
     return ReadonlyHealthObservation(endpoint, "invalid_response", 200)
 
 
