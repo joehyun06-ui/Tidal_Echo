@@ -22,10 +22,14 @@ def webhook(**overrides):
 
 
 def snapshot(**overrides):
-    item = {"diskId": EXPECTED_DISK_ID, "mountPath": EXPECTED_MOUNT,
+    item = {"snapshotKey": "SYNTHETIC_SECRET_KEY", "instanceId": "instance-test",
             "createdAt": "2026-10-28T12:00:00Z"}
     item.update(overrides)
     return item
+
+
+def classify_snapshot(metadata, *, disk_id=EXPECTED_DISK_ID, mount=EXPECTED_MOUNT, observed_at=NOW):
+    return review_disk_snapshot(metadata, queried_disk_id=disk_id, disk_mount=mount, observed_at=observed_at)
 
 
 def old_deploy(**overrides):
@@ -83,34 +87,37 @@ class Stage35OfflineEvidenceTests(unittest.TestCase):
         self.assertNotIn(EXPECTED_WEBHOOK_URL, repr(status))
 
     def test_snapshot_metadata_fresh_but_restore_unverified(self):
-        self.assertEqual(review_disk_snapshot(snapshot(), observed_at=NOW).status,
-                         "snapshot_record_observed_restore_unverified")
+        self.assertEqual(classify_snapshot(snapshot()).status, "snapshot_record_observed_restore_unverified")
+
+    def test_snapshot_key_is_required_but_never_output(self):
+        item = snapshot(snapshotKey="SECRET_VALUE")
+        status = classify_snapshot(item)
+        self.assertNotIn("SECRET_VALUE", repr(status))
+        self.assertNotIn("SECRET_VALUE", str(dataclasses.asdict(status)))
+        self.assertEqual(classify_snapshot(snapshot(snapshotKey="")).status, "invalid_or_unavailable")
 
     def test_snapshot_stale(self):
-        self.assertEqual(review_disk_snapshot(snapshot(createdAt="2026-10-20T00:00:00Z"), observed_at=NOW).status,
+        self.assertEqual(classify_snapshot(snapshot(createdAt="2026-10-20T00:00:00Z")).status,
                          "snapshot_metadata_stale")
 
     def test_snapshot_wrong_disk(self):
-        self.assertEqual(review_disk_snapshot(snapshot(diskId="dsk-other"), observed_at=NOW).status,
-                         "invalid_or_unavailable")
+        self.assertEqual(classify_snapshot(snapshot(), disk_id="dsk-other").status, "invalid_or_unavailable")
 
     def test_snapshot_wrong_mount(self):
-        self.assertEqual(review_disk_snapshot(snapshot(mountPath="/tmp"), observed_at=NOW).status,
-                         "disk_mismatch")
+        self.assertEqual(classify_snapshot(snapshot(), mount="/tmp").status, "disk_mismatch")
 
     def test_snapshot_future_or_malformed_timestamp(self):
         for created in ("2026-10-29T01:00:00Z", "not-a-time", "2026-10-28", None, "x" * 1000):
             with self.subTest(created="redacted"):
-                self.assertEqual(review_disk_snapshot(snapshot(createdAt=created), observed_at=NOW).status,
+                self.assertEqual(classify_snapshot(snapshot(createdAt=created)).status,
                                  "invalid_or_unavailable")
 
     def test_snapshot_timezone_offset_accepted(self):
-        self.assertEqual(review_disk_snapshot(snapshot(createdAt="2026-10-28T20:00:00+08:00"),
-                                              observed_at=NOW).status,
+        self.assertEqual(classify_snapshot(snapshot(createdAt="2026-10-28T20:00:00+08:00")).status,
                          "snapshot_record_observed_restore_unverified")
 
     def test_snapshot_observation_must_be_aware_datetime(self):
-        self.assertEqual(review_disk_snapshot(snapshot(), observed_at=datetime(2026, 10, 29)).status,
+        self.assertEqual(classify_snapshot(snapshot(), observed_at=datetime(2026, 10, 29)).status,
                          "invalid_or_unavailable")
 
     def test_old_deploy_status_only_candidate_not_artifact(self):
@@ -126,9 +133,9 @@ class Stage35OfflineEvidenceTests(unittest.TestCase):
         self.assertEqual(review_old_deploy(old_deploy(status="live")).status, "state_different")
 
     def test_every_result_forbids_action(self):
-        samples = (review_telegram_webhook(webhook()), review_disk_snapshot(snapshot(), observed_at=NOW),
+        samples = (review_telegram_webhook(webhook()), classify_snapshot(snapshot()),
                    review_old_deploy(old_deploy()), review_telegram_webhook({}),
-                   review_disk_snapshot({}, observed_at=NOW), review_old_deploy({}))
+                   classify_snapshot({}), review_old_deploy({}))
         for obj in samples:
             self.assertIsInstance(obj, EvidenceStatus)
             for attr in ("may_deploy", "may_rollback", "may_write_memory",
@@ -144,7 +151,7 @@ class Stage35OfflineEvidenceTests(unittest.TestCase):
     def test_never_make_network_calls(self):
         with mock.patch("socket.socket", side_effect=AssertionError("NETWORK FORBIDDEN")):
             self.assertEqual(review_telegram_webhook(webhook()).source, "telegram_webhook")
-            self.assertEqual(review_disk_snapshot(snapshot(), observed_at=NOW).source, "render_disk_snapshot")
+            self.assertEqual(classify_snapshot(snapshot()).source, "render_disk_snapshot")
             self.assertEqual(review_old_deploy(old_deploy()).source, "render_old_deploy")
 
 
