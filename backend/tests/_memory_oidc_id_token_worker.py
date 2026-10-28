@@ -223,6 +223,17 @@ class PinnedIdTokenVerificationTests(NoNetworkMixin, unittest.TestCase):
             with self.subTest(changes=changes):
                 self.rejects(self.sign(claims=self.claims(**changes)))
 
+    def test_future_auth_time_skew_cannot_stack_with_future_iat(self):
+        # iat may be +30s due to clock skew; auth_time must not compound
+        # another +30s on top of that.
+        too_future = self.claims(iat=100030, auth_time=100060, exp=100180)
+        self.rejects(self.sign(claims=too_future))
+        within_skew = self.claims(iat=100030, auth_time=100030, exp=100180)
+        self.assertEqual(
+            self.verifier.verify(self.sign(claims=within_skew)).subject,
+            "opaque-provider-user",
+        )
+
     def test_security_numeric_dates_must_be_integer_not_bool_or_float(self):
         for field in ("iat", "exp", "auth_time"):
             for value in (True, 99980.0, "99980", None):

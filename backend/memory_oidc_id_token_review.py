@@ -209,6 +209,7 @@ class PinnedOidcIdTokenVerifier:
                 or iat < 0 or auth < 0
                 or exp <= now or iat > now + _CLOCK_SKEW
                 or auth > iat + _CLOCK_SKEW
+                or auth > now + _CLOCK_SKEW
                 or now - auth > _MAX_AGE_SECONDS
                 or exp <= iat or exp - iat > _MAX_TOKEN_TTL
                 or now - iat > _MAX_TOKEN_TTL
