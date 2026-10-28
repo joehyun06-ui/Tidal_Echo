@@ -1,0 +1,42 @@
+name: OIDC pinned origin real browser TLS offload offline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, webkit]
+    env:
+      OPENAI_API_KEY: ""
+      OIDC_BROWSER_ENGINE: ${{ matrix.browser }}
+      MEMORY_OIDC_PINNED_ORIGIN_REHEARSAL_ENABLED: "false"
+      MEMORY_OIDC_ISOLATED_ASGI_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_BROWSER_CALLBACK_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_CODE_PKCE_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_ID_TOKEN_VERIFIER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_HTTPS_SENDER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_REAL_NETWORK_EXPLICITLY_APPROVED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install existing pinned browser harness and dependencies
+        run: |
+          python -m pip install -r backend/requirements.txt
+          python -m pip install playwright==1.64.1
+      - name: Install test-only browser dependencies
+        run: python -m playwright install --with-deps ${{ matrix.browser }}
+      - name: Run strict loopback TLS to internal HTTP pinned-origin browser checks
+        run: python -m unittest backend.tests._memory_oidc_pinned_origin_real_browser_worker -v
