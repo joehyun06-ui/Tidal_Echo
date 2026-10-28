@@ -1,0 +1,53 @@
+name: OIDC browser callback state and issuer offline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_OIDC_BROWSER_CALLBACK_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_CODE_PKCE_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_ID_TOKEN_VERIFIER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_HTTPS_SENDER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_REAL_NETWORK_EXPLICITLY_APPROVED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python -m unittest backend.tests._memory_oidc_browser_callback_worker -v
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_OIDC_BROWSER_CALLBACK_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_CODE_PKCE_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_ID_TOKEN_VERIFIER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_HTTPS_SENDER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_REAL_NETWORK_EXPLICITLY_APPROVED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Synthetic browser OIDC start and callback
+        shell: pwsh
+        run: |
+          python -m pip install -r backend/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest backend.tests._memory_oidc_browser_callback_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
