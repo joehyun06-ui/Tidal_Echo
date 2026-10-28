@@ -1,0 +1,46 @@
+name: Render Telegram and disk evidence OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RENDER_READONLY_HEALTH_GET_EXPLICITLY_APPROVED: "false"
+      TELEGRAM_BOT_TOKEN: ""
+      OPENAI_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: No-network metadata evidence checks
+        run: python -m unittest backend.tests._render_telegram_disk_evidence_offline_worker -v
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      RENDER_READONLY_HEALTH_GET_EXPLICITLY_APPROVED: "false"
+      TELEGRAM_BOT_TOKEN: ""
+      OPENAI_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: No-network metadata evidence checks
+        shell: pwsh
+        run: |
+          python -m unittest backend.tests._render_telegram_disk_evidence_offline_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
