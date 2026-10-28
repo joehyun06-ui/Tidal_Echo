@@ -1,0 +1,41 @@
+name: OIDC real browsers cross-site cookies offline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, webkit]
+    env:
+      OPENAI_API_KEY: ""
+      OIDC_BROWSER_ENGINE: ${{ matrix.browser }}
+      MEMORY_OIDC_ISOLATED_ASGI_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_BROWSER_CALLBACK_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_CODE_PKCE_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_ID_TOKEN_VERIFIER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_HTTPS_SENDER_REVIEW_ENABLED: "false"
+      MEMORY_OIDC_REAL_NETWORK_EXPLICITLY_APPROVED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned test-only browser runner and backend
+        run: |
+          python -m pip install -r backend/requirements.txt
+          python -m pip install playwright==1.64.1
+      - name: Install matching browser and system dependencies
+        run: python -m playwright install --with-deps ${{ matrix.browser }}
+      - name: Execute cross-site browser checks via strict localhost proxy
+        run: python -m unittest backend.tests._memory_oidc_real_browser_worker -v
