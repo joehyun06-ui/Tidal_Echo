@@ -301,6 +301,14 @@ class BrowserLoginSessionTests(NoNetworkMixin, unittest.TestCase):
 
     def _rows(self):
         with closing(sqlite3.connect(self.path)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='memory_browser_login_session_v1'"
+            ).fetchone()
+            if exists is None:
+                # Transactional DDL rolls back as well: no table is even
+                # stronger fail-closed evidence than an empty table.
+                return 0
             return conn.execute(
                 "SELECT COUNT(*) FROM memory_browser_login_session_v1"
             ).fetchone()[0]
