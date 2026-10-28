@@ -111,15 +111,23 @@ class RenderPublicReadOnlyHealthTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(result.check_count, 6)
         self.assertEqual(result.failed_checks, ("memory_core",))
         self.assertEqual(self.requests[0][0].full_url, ORIGIN + "/readyz")
-    def test_readyz_false_check_is_not_automatically_safely_ready(self):
+    def test_readyz_200_with_not_ready_payload_is_inconsistent(self):
         self.response = _Response({
             "ready": False, "status": "not_ready",
             "checks": {"database": False, "api_loop": True},
             "errors": {"database": "core_schema_invalid"},
         })
         result = self.check("readyz")
-        self.assertEqual(result.status, "not_ready_observed")
-        self.assertEqual(result.failed_checks, ("database",))
+        self.assertEqual(result.status, "invalid_response")
+        self.assertEqual(result.http_status, 200)
+
+    def test_readyz_ready_claim_cannot_mask_failed_database(self):
+        self.response = _Response({
+            "ready": True, "status": "ready",
+            "checks": {"database": False, "api_loop": True},
+        })
+        result = self.check("readyz")
+        self.assertEqual(result.status, "invalid_response")
     def test_malformed_readyz_payload_is_rejected(self):
         variants = (
             {"ready": 1, "status": "ready", "checks": {"database": True}},
