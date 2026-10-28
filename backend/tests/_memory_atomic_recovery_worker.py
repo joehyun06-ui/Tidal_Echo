@@ -56,29 +56,93 @@ class CrashAndRecoveryTests(unittest.TestCase):
             "crash process did not reach injection: " + run.stderr[-700:],
         )
 
+    def _reconcile_after_crashed_process(self):
+        """Test-side read-only reconstruction after the original process dies.
+
+        No new ticket consumption and no memory write; uses the signed-ledger
+        recovery UOW plus the exact consumed ticket from the original request.
+        """
+        request = self.fx.request
+        binding = memory_action_ledger.MemoryActionRequestBinding(
+            request_id=request.request_id,
+            action_kind="remember",
+            origin="operator_cli",
+            scope_type=request.scope_type,
+            scope_ref=request.scope_ref,
+            kind=request.kind,
+            sensitivity=request.sensitivity,
+            normalized_content=request.content,
+        )
+        return self.fx.backend._resolve_uncertain(
+            binding,
+            validate_uncertain=lambda uow: (
+                self.fx.gate.assert_consumed_for_uncertain_in_existing_uow(
+                    uow=uow,
+                    request=request,
+                    ticket=self.fx.offer.ticket,
+                    content_sha256=self.fx.offer.content_sha256,
+                    confirmation_text=self.fx.offer.confirmation_text,
+                )
+            ),
+        )
+
     def test_exit_after_ticket_rolls_back_all(self):
         self._hard_exit("after_ticket")
         self._assert_db(committed=False)
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "transaction_outcome_uncertain",
+        ):
+            self._reconcile_after_crashed_process()
         self.assertEqual(self.fx.commit().status, "completed")
         self._assert_db(committed=True)
 
     def test_exit_after_canonical_rolls_back_all(self):
         self._hard_exit("after_canonical")
         self._assert_db(committed=False)
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "transaction_outcome_uncertain",
+        ):
+            self._reconcile_after_crashed_process()
         self.assertEqual(self.fx.commit().status, "completed")
         self._assert_db(committed=True)
 
     def test_exit_after_ledger_rolls_back_all(self):
         self._hard_exit("after_ledger")
         self._assert_db(committed=False)
+        with self.assertRaisesRegex(
+            memory_explicit_actions.ExplicitMemoryActionError,
+            "transaction_outcome_uncertain",
+        ):
+            self._reconcile_after_crashed_process()
         self.assertEqual(self.fx.commit().status, "completed")
         self._assert_db(committed=True)
 
     def test_exit_after_commit_retains_all_and_blocks_same_ticket(self):
         self._hard_exit("after_commit")
         self._assert_db(committed=True)
+        recovered = self._reconcile_after_crashed_process()
+        self.assertTrue(recovered.replayed)
+        self.assertEqual(recovered.status, "completed")
         with self.assertRaises(UowConfirmationGateError):
             self.fx.commit()
+        self._assert_db(committed=True)
+
+    def test_after_crashed_commit_logout_refuses_result_disclosure(self):
+        self._hard_exit("after_commit")
+        self._assert_db(committed=True)
+        self.assertTrue(self.fx.registry.revoke_before_logout())
+        with self.assertRaises(UowConfirmationGateError):
+            self._reconcile_after_crashed_process()
+        self._assert_db(committed=True)
+
+    def test_after_crashed_commit_ttl_expiry_does_not_invalidate_recovery(self):
+        self._hard_exit("after_commit")
+        self._assert_db(committed=True)
+        self.fx.gate._clock = lambda: time.time() + 3600
+        recovered = self._reconcile_after_crashed_process()
+        self.assertTrue(recovered.replayed)
         self._assert_db(committed=True)
 
     def _lose_ack(self, on_committed):
