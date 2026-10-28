@@ -72,12 +72,14 @@ class OidcTokenEndpointWireTests(NoNetworkMixin, unittest.TestCase):
             offline_transport=self.transport if transport else None,
         )
 
-    def good_response(self, *, id_token=None, **changes):
+    _UNSET = object()
+
+    def good_response(self, *, id_token=_UNSET, **changes):
         data = {
             "access_token": ACCESS,
             "token_type": "Bearer",
             "expires_in": 300,
-            "id_token": id_token if id_token is not None else self.token,
+            "id_token": self.token if id_token is self._UNSET else id_token,
         }
         data.update(changes)
         raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
