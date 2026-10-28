@@ -1,6 +1,6 @@
 # 归汀 · HTTPS 发送器真实 TLS/CA 信任验证（本机离线）
 
-堆叠已验收的 Draft #154。本轮不修改 `backend.app`、登录、#151 实际发送器或记忆 UOW，只在独立专项中用**真实 TLS 握手**验证 #151 的 `_PinnedHttpsConnection` 及上层发送器的校验边界。
+堆叠已验收的 Draft #154。本轮不修改 `backend.app`、登录或记忆 UOW；用**真实 TLS 握手**验证 #151 的 `_PinnedHttpsConnection` 和上层发送器，并修复了真实握手测试揭示的 `Connection: close` 响应读取兼容缺陷。该修复只使 HTTP 响应流与连接对象分离时能够继续有界读取，不更改 TLS 信任、已批准目标、默认 OFF 或受信身份边界。
 
 测试在 Windows、Linux 的本地 `127.0.0.1` 随机端口启动临时 TLS 服务，进程内生成一套独立测试 CA 和叶证书。客户端保持服务端固定域名 `login.example.test` 用于 TLS SNI/主机名匹配；`socket.create_connection` 由测试严格拦截，只接受发送器已经锁定的合成公网地址 `8.8.8.8:443`，但实际拨号只连接本机回环端口。不会做公网 DNS 解析或 TCP 连接。临时证书/私钥仅写入操作系统临时目录，全部测试结束后删除，不提交或打印到仓库和日志。
 
