@@ -198,6 +198,16 @@ class PinnedOidcHttpsSenderReview:
                 return min(3.0, value)
             conn.sock.settimeout(remaining())
             response = conn.getresponse()
+            # http.client detaches its connection for Connection: close
+            # responses (conn.sock becomes None), while the HTTPResponse
+            # still owns the readable socket via its buffered stream. Keep
+            # bounded reads on that response-owned socket rather than
+            # assuming the connection retains a socket after getresponse().
+            # http.client closes conn.sock for Connection: close, while
+            # the response's file object independently retains readable
+            # bytes under the timeout installed before getresponse().
+            # Do not alter a detached socket's timeout mode here.
+            detached = conn.sock is None
             headers = response.getheaders()
             if len(headers) > _RESPONSE_HEADER_LIMIT:
                 raise OidcHttpsSenderReviewError()
@@ -222,8 +232,13 @@ class PinnedOidcHttpsSenderReview:
                 raise OidcHttpsSenderReviewError()
             body = bytearray()
             while len(body) <= _MAX_BODY:
-                conn.sock.settimeout(remaining())
+                remaining()
+                if not detached:
+                    conn.sock.settimeout(remaining())
                 chunk = response.read(min(2048, _MAX_BODY + 1 - len(body)))
+                # The detached response keeps the original <=3s timeout.
+                # A slow peer must never produce an ACCEPT after deadline.
+                remaining()
                 if not chunk:
                     break
                 if type(chunk) is not bytes:
