@@ -166,7 +166,10 @@ def collect(
             return _result(source, "invalid_response", http_status=status)
         if type(body) is not bytes or len(body) > MAX_RESPONSE_BYTES:
             return _result(source, "invalid_response", http_status=status)
-        payload = json.loads(body.decode("utf-8", "strict"))
+        try:
+            payload = json.loads(body.decode("utf-8", "strict"))
+        except (ValueError, UnicodeError):
+            return _result(source, "invalid_response", http_status=status)
         if source == "telegram":
             return _classify_telegram(payload)
         timestamp = now or datetime.now(timezone.utc)
