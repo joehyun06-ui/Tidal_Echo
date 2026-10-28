@@ -1,0 +1,52 @@
+name: Memory commit vs revocation ordering proof (offline)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_SESSION_BOUND_WRITE_ENABLED: "false"
+      MEMORY_SESSION_CONFIRMATION_ENABLED: "false"
+      MEMORY_COMMIT_ORDERING_PROBE_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python -m unittest backend.tests._memory_commit_ordering_worker -v
+
+  windows:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_SESSION_BOUND_WRITE_ENABLED: "false"
+      MEMORY_SESSION_CONFIRMATION_ENABLED: "false"
+      MEMORY_COMMIT_ORDERING_PROBE_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install requirements and run synthetic offline proof
+        shell: pwsh
+        run: |
+          python -m pip install -r backend/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest backend.tests._memory_commit_ordering_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
