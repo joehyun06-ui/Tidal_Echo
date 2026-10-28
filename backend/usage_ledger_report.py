@@ -8,6 +8,7 @@ import re
 
 from .usage_ledger import METRICS,LedgerError,context,count,model_name,number,timestamp
 from .usage_ledger_journal import coverage
+from .usage_ledger_rollover import preview as rollover_preview
 
 
 class Summary:
@@ -111,9 +112,12 @@ def build_report(ledger,mode,sid,*,all_sessions=False,model=None,zone='Asia/Shan
         known=Decimal(c['amount']) if c and c['amount'] is not None else None
         complete=bool(c and c['complete']) and not health['retention']['records_removed'] and not budget_health['has_observed_gaps']
         budget_views.append({**b,'known_spend':str(known) if known is not None else None,'remaining':str(max(Decimal(0),number(b['limit'])-known)) if known is not None and complete else None,'complete':complete,'exceeded':known>=number(b['limit']) if known is not None else None,'enforcement':'warning_only'})
+    observed_context=context(obs,policy if settings['revision'] else (latest_scope or {}).get('policy'))
     return {'ok':True,'contract_version':1,'mode':mode,'session_id':sid,'scope':'all' if all_sessions else 'session','timezone':zone,
         'coverage':'recorded_turns_only' if mode=='codex' else 'recorded_requests_only','collection_health':health,
-        'context':context(obs,policy if settings['revision'] else (latest_scope or {}).get('policy')),'summary':summary,'daily':day,'monthly':month,'last_round':round_summary.value(),
+        'context':observed_context,
+        'rollover_preview':rollover_preview(observed_context,observed_at=observed_at,all_sessions=all_sessions,unconfirmed=health['unconfirmed']),
+        'summary':summary,'daily':day,'monthly':month,'last_round':round_summary.value(),
         'message_counts':counts,'message_counts_provenance':provenance,'events':list(history),'configuration_changes':list(changes),'cache_diagnostics':list(anomalies),
         'trends':[{'period':k[0],'at':k[1],'provider_id':k[2],'model':k[3],'summary':v.value()} for k,v in sorted(trends.items())],'trends_complete':trends_complete,
         'budgets':budget_views,'settings':settings,'models':sorted(models),'recent_requests':list(recent)}
