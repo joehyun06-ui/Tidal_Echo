@@ -11,7 +11,7 @@ from .codex_generation_protocol import CodexGenerationError
 from .codex_generation_store import CodexGenerationStoreError
 
 
-def install(app, legacy, authority, lock, *, runtime=None):
+def install(app, legacy, authority, lock, *, runtime=None, usage_ledger=None):
     fork_lock = asyncio.Lock()
     async def perform(session_id, body, *, version=False):
         try:
@@ -82,7 +82,7 @@ def install(app, legacy, authority, lock, *, runtime=None):
         legacy.check_internal_auth(request)
         operation = lambda: versions.delete_versions(authority, session_id, relay_db=legacy.RELAY_DB,
             upload_dir=os.environ.get('RELAY_UPLOAD_DIR') or None,
-            codex_store=runtime.config.store_path if runtime else None)
+            codex_store=runtime.config.store_path if runtime else None,**({'usage_ledger':usage_ledger} if usage_ledger is not None else {}))
         async with fork_lock:
             if runtime is not None:
                 try:

@@ -37,6 +37,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from backend import (
+    channel_store,
+    memory_evidence_readonly,
+    memory_session_write_guard,
     codex_app_server_control,
     continuity_context,
     deployment_config,
@@ -44,6 +47,7 @@ from backend import (
     memory_formation_v2_loopback,
     memory_hierarchy_refinement_loopback,
     memory_hierarchy_summary_loopback_v2,
+    usage_ledger_capture,
 )
 
 
@@ -664,8 +668,9 @@ def _responses_event_error_metadata(event: dict[str, Any]) -> tuple[str | None, 
     )
 
 
+@usage_ledger_capture.observe_api(protocol='responses')
 async def stream_responses(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
-    body = _responses_body(route, messages, stream=True)
+    body = usage_ledger_capture.prepare_body(_responses_body(route, messages, stream=True), responses=True)
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
     model_work_started = False
@@ -676,6 +681,7 @@ async def stream_responses(route: dict[str, str], messages: list[dict[str, str]]
                 "POST", route["url"].rstrip("/") + "/responses",
                 headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
             ) as resp:
+                usage_ledger_capture.response_status(resp.status_code)
                 await _check_provider_response(resp)
                 async for line in resp.aiter_lines():
                     line = line.strip()
@@ -703,6 +709,8 @@ async def stream_responses(route: dict[str, str], messages: list[dict[str, str]]
                     if event_type == "response.completed":
                         response = event.get("response")
                         if isinstance(response, dict):
+                            usage_ledger_capture.reported_model(response.get('model'))
+                            usage_ledger_capture.usage(response.get('usage'))
                             if isinstance(response.get("usage"), dict):
                                 usage = response["usage"]
                             if not text_parts:
@@ -712,6 +720,8 @@ async def stream_responses(route: dict[str, str], messages: list[dict[str, str]]
                         completed = True
                         break
                     if event_type in {"response.failed", "response.incomplete", "error"}:
+                        response = event.get('response')
+                        if isinstance(response, dict): usage_ledger_capture.usage(response.get('usage'))
                         code, error_type = _responses_event_error_metadata(event)
                         raise ModelRouteError(
                             "provider_response_uncertain",
@@ -724,7 +734,8 @@ async def stream_responses(route: dict[str, str], messages: list[dict[str, str]]
         raise
     except ModelRouteError:
         raise
-    except Exception:
+    except Exception as exc:
+        usage_ledger_capture.transport_error(exc)
         category = "model_stream_interrupted" if model_work_started else "model_transport_uncertain"
         raise ModelRouteError(category, "dispatch_uncertain") from None
     if not completed or not text_parts:
@@ -732,19 +743,21 @@ async def stream_responses(route: dict[str, str], messages: list[dict[str, str]]
     return {"text": "".join(text_parts).strip(), "usage": usage}
 
 
+@usage_ledger_capture.observe_api(protocol='responses')
 async def complete_responses(
     route: dict[str, str],
     messages: list[dict[str, str]],
     *,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
-    body = _responses_body(route, messages, stream=False, max_tokens=max_tokens)
+    body = usage_ledger_capture.prepare_body(_responses_body(route, messages, stream=False, max_tokens=max_tokens), responses=True)
     try:
         async with _provider_client(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
             async with client.stream(
                 "POST", route["url"].rstrip("/") + "/responses",
                 headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
             ) as resp:
+                usage_ledger_capture.response_status(resp.status_code)
                 raw = bytearray()
                 async for chunk in resp.aiter_bytes():
                     raw.extend(chunk)
@@ -776,11 +789,15 @@ async def complete_responses(
                         error_type,
                     )
                 data = json.loads(bytes(raw))
+                if isinstance(data, dict):
+                    usage_ledger_capture.usage(data.get('usage'))
+                    usage_ledger_capture.reported_model(data.get('model'))
     except asyncio.CancelledError:
         raise
     except ModelRouteError:
         raise
-    except Exception:
+    except Exception as exc:
+        usage_ledger_capture.transport_error(exc)
         raise ModelRouteError("model_transport_uncertain", "dispatch_uncertain") from None
     if not isinstance(data, dict):
         raise ModelRouteError("invalid_model_response", "dispatch_uncertain")
@@ -803,8 +820,9 @@ async def complete_responses(
     return {"text": text, "usage": data.get("usage") or {}}
 
 
+@usage_ledger_capture.observe_api(protocol='chat')
 async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
-    body = _chat_completion_body(route, messages, stream=True)
+    body = usage_ledger_capture.prepare_body(_chat_completion_body(route, messages, stream=True))
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
     model_work_started = False
@@ -815,6 +833,7 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
                 "POST", route["url"].rstrip("/") + "/chat/completions",
                 headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
             ) as resp:
+                usage_ledger_capture.response_status(resp.status_code)
                 await _check_provider_response(resp)
                 async for line in resp.aiter_lines():
                     line = line.strip()
@@ -830,6 +849,8 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
                         raise ModelRouteError("invalid_stream_response", "dispatch_uncertain") from None
                     if not isinstance(ev, dict) or not isinstance(ev.get("choices"), list):
                         raise ModelRouteError("invalid_stream_response", "dispatch_uncertain")
+                    usage_ledger_capture.reported_model(ev.get('model'))
+                    usage_ledger_capture.usage(ev.get('usage'))
                     if isinstance(ev.get("usage"), dict):
                         usage = ev["usage"]
                     delta = (((ev.get("choices") or [{}])[0]).get("delta") or {})
@@ -842,7 +863,8 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
         raise
     except ModelRouteError:
         raise
-    except Exception:
+    except Exception as exc:
+        usage_ledger_capture.transport_error(exc)
         category = "model_stream_interrupted" if model_work_started else "model_transport_uncertain"
         raise ModelRouteError(category, "dispatch_uncertain") from None
     if not done_received or not text_parts:
@@ -850,6 +872,7 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
     return {"text": "".join(text_parts).strip(), "usage": usage}
 
 
+@usage_ledger_capture.observe_api(protocol='chat')
 async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *,
                         temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
     body = _chat_completion_body(
@@ -859,12 +882,14 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    body = usage_ledger_capture.prepare_body(body)
     try:
         async with _provider_client(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
             async with client.stream(
                 "POST", route["url"].rstrip("/") + "/chat/completions",
                 headers={"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}, json=body,
             ) as resp:
+                usage_ledger_capture.response_status(resp.status_code)
                 raw = bytearray()
                 async for chunk in resp.aiter_bytes():
                     raw.extend(chunk)
@@ -896,11 +921,15 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *
                         error_type,
                     )
                 data = json.loads(bytes(raw))
+                if isinstance(data, dict):
+                    usage_ledger_capture.usage(data.get('usage'))
+                    usage_ledger_capture.reported_model(data.get('model'))
     except asyncio.CancelledError:
         raise
     except ModelRouteError:
         raise
-    except Exception:
+    except Exception as exc:
+        usage_ledger_capture.transport_error(exc)
         raise ModelRouteError("model_transport_uncertain", "dispatch_uncertain") from None
     msg = ((data.get("choices") or [{}])[0]).get("message") or {}
     text = (msg.get("content") or "").strip()
@@ -985,8 +1014,9 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
         return {"outcome": "explicit_failed", "error": "no_supported_model", "tried": tried}
 
     try:
-        async with asyncio.timeout(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS):
-            return await execute()
+        with usage_ledger_capture.request_deadline(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS):
+            async with asyncio.timeout(LOOP_MODEL_TOTAL_TIMEOUT_SECONDS):
+                return await execute()
     except TimeoutError:
         _safe_log("model_timeout")
         return {"outcome": "dispatch_uncertain", "error": "model_timeout", "tried": tried}
@@ -1228,6 +1258,67 @@ async def loop_sessions(request: Request):
     return sessions_public()
 
 
+@app.get("/loop/memory/session-write/preflight")
+async def loop_session_write_preflight(request: Request):
+    """Non-mutating server-owned active-session preflight only."""
+    check_internal_auth(request)
+    if request.query_params or (
+        request.headers.get("content-length") not in (None, "", "0")
+    ):
+        raise HTTPException(status_code=400, detail="invalid_preflight_request")
+    if (
+        os.environ.get("MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED") != "true"
+        or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+    ):
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        # These values MUST come from loop-owned config, never HTTP or client.
+        # Do not use active_session_id(): it deliberately falls back to
+        # the latest session for ordinary chat navigation. A memory-write
+        # preflight must NEVER infer the target by fallback.
+        server_config = load_config()
+        configured_id = (
+            server_config.get("active_session")
+            if type(server_config) is dict else None
+        )
+        memory_session_write_guard.verify_trusted_active_session(
+            trusted_session_id=configured_id,
+            canonical_sessions=session_rows(),
+        )
+    except memory_session_write_guard.SessionWriteBindingError:
+        raise HTTPException(status_code=409, detail="active_session_unverified") from None
+    return JSONResponse({
+        "schema": "guitting-session-write-preflight-v1",
+        "mode": "dry_run",
+        "active_session_verified": True,
+        "would_write": False,
+    }, headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/loop/sessions/{session_id}/memory/evidence")
+async def loop_session_memory_evidence(session_id: str, request: Request):
+    """Read-only, internally authenticated session evidence; opt-in only."""
+    check_internal_auth(request)
+    if (
+        os.environ.get("MEMORY_EVIDENCE_UI_READONLY_ENABLED") != "true"
+        or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+    ):
+        raise HTTPException(status_code=404, detail="not_found")
+    known = {row["id"] for row in session_rows()}
+    if session_id not in known:
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        with channel_store.connect_read_only(RELAY_DB, timeout_seconds=5.0) as conn:
+            result = memory_evidence_readonly.build_snapshot(
+                conn, session_id=session_id, allowed_sessions=known,
+            )
+        return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+    except memory_evidence_readonly.MemoryEvidenceReadonlyError:
+        raise HTTPException(status_code=503, detail="memory_evidence_unavailable") from None
+    except (OSError, ValueError, sqlite3.Error):
+        raise HTTPException(status_code=503, detail="memory_evidence_unavailable") from None
+
+
 @app.post("/loop/sessions")
 async def loop_sessions_create(request: Request):
     check_internal_auth(request)
@@ -1383,3 +1474,4 @@ _provider_settings.install_loop(app, sys.modules[__name__])
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=LOOP_PORT, access_log=False)
+

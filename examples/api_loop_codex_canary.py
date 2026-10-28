@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from backend.codex_generation_live_reliability import FailClosedCodexCanaryLoopI
 from backend.codex_generation_streaming import StreamingCodexGenerationRuntime, build_progress_callback
 from backend.codex_generation_routes import install_loop as install_generation_routes
 from backend.codex_generation_runtime_config import load_generation_runtime_config
+from backend.usage_ledger_entrypoint import load_loop as load_ledger_services
 from examples import api_loop as legacy
 
 
@@ -33,6 +35,10 @@ GENERATION_CONFIG = load_generation_runtime_config(
     persistent_root=PERSISTENT_ROOT,
     relay_db=Path(legacy.RELAY_DB),
 )
+LEDGER_SERVICES = load_ledger_services(
+    os.environ, persistent_root=PERSISTENT_ROOT,
+    relay_db=legacy.RELAY_DB, native_db=GENERATION_CONFIG.store_path,
+)
 RUNTIME = StreamingCodexGenerationRuntime(
     control_config=legacy.CODEX_CONTROL_CONFIG,
     generation_config=GENERATION_CONFIG,
@@ -41,10 +47,15 @@ RUNTIME = StreamingCodexGenerationRuntime(
     completion_callback=build_completion_callback(legacy),
     progress_callback=build_progress_callback(legacy),
     upload_dir=Path(os.environ.get("RELAY_UPLOAD_DIR") or Path(__file__).resolve().parents[1] / "backend" / "uploads"),
+    **(dict(LEDGER_SERVICES.codex_runtime_kwargs(), compaction_collector=LEDGER_SERVICES.manual_compactions)
+       if LEDGER_SERVICES is not None else {}),
 )
 INTEGRATION = FailClosedCodexCanaryLoopIntegration(legacy, RUNTIME)
 INTEGRATION.install_legacy_globals()
-API_GENERATIONS = ApiWebRuntime(legacy)
+if LEDGER_SERVICES is not None:
+    LEDGER_SERVICES.bind_authority(INTEGRATION.session_authority, INTEGRATION._session_lock,
+                                   create_session=INTEGRATION.create_web_session)
+API_GENERATIONS = ApiWebRuntime(legacy, **(LEDGER_SERVICES.api_runtime_kwargs() if LEDGER_SERVICES is not None else {}))
 INTEGRATION.api_generations = API_GENERATIONS
 
 
@@ -93,7 +104,8 @@ install_context(app, legacy, INTEGRATION)
 from backend.web_context_budget_routes import install_loop as install_budget
 install_budget(app, legacy, INTEGRATION, RUNTIME)
 from backend.web_context_actions_routes import install_loop as install_context_actions
-install_context_actions(app, legacy, INTEGRATION, RUNTIME)
+install_context_actions(app, legacy, INTEGRATION, RUNTIME,
+    **(LEDGER_SERVICES.action_kwargs() if LEDGER_SERVICES is not None else {}))
 from backend.web_mcp_chat_routes import install_loop as install_mcp_chat
 install_mcp_chat(app, legacy, INTEGRATION, RUNTIME)
 
@@ -222,9 +234,15 @@ async def loop_sessions_delete(session_id: str, request: Request):
                 relay_db=legacy.RELAY_DB,
                 upload_dir=_upload_dir(),
                 codex_store=GENERATION_CONFIG.store_path,
+                **(LEDGER_SERVICES.deletion_kwargs() if LEDGER_SERVICES is not None else {}),
             )
     except web_session_provider_authority.WebSessionProviderAuthorityError as exc:
         return _authority_error(exc)
+    except (OSError, sqlite3.Error, ValueError):
+        if LEDGER_SERVICES is None:
+            raise
+        return JSONResponse({"ok": False, "error": "session_delete_unavailable", "deletion_unconfirmed": True},
+                            status_code=503, headers={"Cache-Control": "private, no-store"})
 
 
 @app.post("/loop/ingest")
@@ -334,7 +352,11 @@ from backend import codex_session_model
 codex_session_model.install(app, legacy, RUNTIME, INTEGRATION)
 
 from backend import web_session_fork_routes
-web_session_fork_routes.install(app, legacy, INTEGRATION.session_authority, INTEGRATION._session_lock, runtime=RUNTIME)
+web_session_fork_routes.install(app, legacy, INTEGRATION.session_authority, INTEGRATION._session_lock, runtime=RUNTIME,
+    **(LEDGER_SERVICES.deletion_kwargs() if LEDGER_SERVICES is not None else {}))
+
+if LEDGER_SERVICES is not None:
+    LEDGER_SERVICES.install_reader(app, check_auth=legacy.check_internal_auth, prefix='/loop')
 
 app.mount("/", legacy.app)
 

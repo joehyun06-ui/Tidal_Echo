@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -203,11 +204,18 @@ class MemoryActionEntryBackend:
     def _resolve_uncertain(
         self,
         binding: memory_action_ledger.MemoryActionRequestBinding,
+        *,
+        validate_uncertain=None,
     ) -> ExplicitMemoryActionResult:
         with self._store._action_unit_of_work() as lookup:
             replay = lookup._lookup_existing_terminal(binding)
             if replay is None:
                 raise ExplicitMemoryActionError("transaction_outcome_uncertain")
+            # Only the isolated confirmed-review path passes this callback.
+            # Refuse to report successful recovery if its durable ticket
+            # consumption cannot ALSO be verified under this same DB lock.
+            if validate_uncertain is not None:
+                validate_uncertain(lookup)
             committed = lookup.commit()
         return self._safe_result(committed, binding, replayed=True)
 
@@ -221,10 +229,18 @@ class MemoryActionEntryBackend:
         action,
         lookup_replay=None,
         validate_new_request=None,
+        canonical_session_id: str | None = None,
+        in_uow_confirmation=None,
+        before_commit=None,
+        validate_uncertain=None,
     ) -> ExplicitMemoryActionResult:
         binding = None
         try:
             with self._store._action_unit_of_work() as uow:
+                # All confirmed-review checks must happen on THIS UOW connection
+                # after BEGIN IMMEDIATE, before ledger claim/canonical insert.
+                if in_uow_confirmation is not None:
+                    in_uow_confirmation(uow)
                 if lookup_replay is not None:
                     terminal = lookup_replay(uow)
                     if terminal is not None:
@@ -242,16 +258,23 @@ class MemoryActionEntryBackend:
                 binding = prepare_binding(uow)
                 replay = uow.claim_request(binding)
                 if replay is not None:
+                    if before_commit is not None:
+                        before_commit()
                     committed = uow.commit()
                     return self._safe_result(committed, binding, replayed=True)
                 if validate_new_request is not None:
                     validate_new_request(uow, binding)
+                metadata = {"channel": channel, "source": source}
+                if canonical_session_id is not None:
+                    metadata["api_session"] = canonical_session_id
                 canonical_id = uow._insert_canonical_action(
                     text=canonical_text(binding),
-                    metadata={"channel": channel, "source": source},
+                    metadata=metadata,
                 )
                 action(uow, canonical_id, binding)
                 uow.complete_request()
+                if before_commit is not None:
+                    before_commit()
                 committed = uow.commit()
                 return self._safe_result(committed, binding, replayed=False)
         except memory_action_ledger.MemoryActionLedgerError as error:
@@ -259,13 +282,27 @@ class MemoryActionEntryBackend:
                 error.category == "transaction_outcome_uncertain"
                 and binding is not None
             ):
-                return self._resolve_uncertain(binding)
+                return self._resolve_uncertain(
+                    binding, validate_uncertain=validate_uncertain,
+                )
             raise
 
-    def remember(self, request, *, origin: str, channel: str, source: str):
+    def _remember_impl(self, request, *, origin: str, channel: str, source: str,
+                       canonical_session_id: str | None = None,
+                       _confirmation=None):
         self._validate_projection(origin=origin, channel=channel, source=source)
         if type(request) is not RememberExplicitMemoryRequest:
             raise ExplicitMemoryActionError("invalid_request")
+        if canonical_session_id is not None:
+            # This alternate write path is disabled unless explicitly opted in.
+            # The public/legacy remember path always passes None.
+            if (
+                os.environ.get("MEMORY_SESSION_BOUND_WRITE_ENABLED") != "true"
+                or origin != "operator_cli"
+                or request.scope_type != "session"
+                or request.scope_ref != canonical_session_id
+            ):
+                raise ExplicitMemoryActionError("session_write_binding_invalid")
         if request.kind == "assistant_experience":
             raise ExplicitMemoryActionError("unsupported_evidence")
         self._policy.validate_kind(request.kind)
@@ -274,6 +311,56 @@ class MemoryActionEntryBackend:
             request.content,
             request.sensitivity,
         )
+        in_uow_confirmation = None
+        before_commit = None
+        validate_uncertain = None
+        if _confirmation is not None:
+            # Experimental internal path only. No production caller/HTTP route.
+            from .memory_confirmation_uow_gate import (
+                MemoryUowConfirmationGate, _enabled as gate_enabled,
+            )
+            if (
+                type(_confirmation) is not tuple
+                or len(_confirmation) != 4
+                or type(_confirmation[0]) is not MemoryUowConfirmationGate
+                or origin != "operator_cli"
+                or canonical_session_id is None
+                or request.scope_type != "session"
+                or request.scope_ref != canonical_session_id
+                or request.sensitivity != "normal"
+                or normalized != request.content
+                or not 1 <= len(normalized) <= 1000
+            ):
+                raise ExplicitMemoryActionError("session_write_binding_invalid")
+
+            def require_review_flags():
+                if (
+                    os.environ.get("MEMORY_ATOMIC_CONFIRMED_REVIEW_ENABLED") != "true"
+                    or os.environ.get("MEMORY_SESSION_BOUND_WRITE_ENABLED") != "true"
+                    or os.environ.get("MEMORY_SESSION_CONFIRMATION_ENABLED") != "true"
+                    or not gate_enabled()
+                ):
+                    raise ExplicitMemoryActionError("session_write_disabled")
+
+            require_review_flags()
+            gate, ticket, digest, phrase = _confirmation
+
+            def in_uow_confirmation(uow):
+                require_review_flags()
+                gate.consume_in_existing_uow(
+                    uow=uow, request=request, ticket=ticket,
+                    content_sha256=digest, confirmation_text=phrase,
+                )
+
+            before_commit = require_review_flags
+
+            def validate_uncertain(uow):
+                require_review_flags()
+                gate.assert_consumed_for_uncertain_in_existing_uow(
+                    uow=uow, request=request, ticket=ticket,
+                    content_sha256=digest, confirmation_text=phrase,
+                )
+
         binding = memory_action_ledger.MemoryActionRequestBinding(
             request_id=request.request_id,
             action_kind="remember",
@@ -308,6 +395,37 @@ class MemoryActionEntryBackend:
             channel=channel,
             source=source,
             action=execute,
+            canonical_session_id=canonical_session_id,
+            in_uow_confirmation=in_uow_confirmation,
+            before_commit=before_commit,
+            validate_uncertain=validate_uncertain,
+        )
+
+    def remember(self, request, *, origin: str, channel: str, source: str,
+                 canonical_session_id: str | None = None):
+        # Preserve the existing API and legacy behavior exactly.
+        return self._remember_impl(
+            request, origin=origin, channel=channel, source=source,
+            canonical_session_id=canonical_session_id,
+        )
+
+    def _remember_confirmed_offline_review(
+        self, request: RememberExplicitMemoryRequest, *,
+        gate, ticket: str, content_sha256: str, confirmation_text: str,
+    ) -> ExplicitMemoryActionResult:
+        """Isolated Python-only rehearsal; NEVER expose through a route.
+
+        The exact UOW transaction validates/consumes the ticket before its
+        normal HMAC request claim, canonical message, provenance and commit.
+        Caller must provide a trusted server-owned gate; no live provider is
+        installed by this method.
+        """
+        if type(request) is not RememberExplicitMemoryRequest:
+            raise ExplicitMemoryActionError("invalid_request")
+        return self._remember_impl(
+            request, origin="operator_cli", channel="web", source="relay",
+            canonical_session_id=request.scope_ref,
+            _confirmation=(gate, ticket, content_sha256, confirmation_text),
         )
 
     def correct(self, request, *, origin: str, channel: str, source: str):
@@ -465,14 +583,14 @@ class ExplicitMemoryActionService:
             raise ExplicitMemoryActionError("memory_operation_failed")
         return result
 
-    def _execute(self, method_name: str, request: object, action_kind: str):
+    def _execute(self, method_name: str, request: object, action_kind: str,
+                 *, canonical_session_id: str | None = None):
         try:
-            result = getattr(self._backend, method_name)(
-                request,
-                origin=self._origin,
-                channel=self._channel,
-                source=self._source,
-            )
+            kwargs = {"origin": self._origin, "channel": self._channel,
+                      "source": self._source}
+            if canonical_session_id is not None:
+                kwargs["canonical_session_id"] = canonical_session_id
+            result = getattr(self._backend, method_name)(request, **kwargs)
             return self._validate_result(
                 result,
                 request_id=request.request_id,
@@ -497,6 +615,37 @@ class ExplicitMemoryActionService:
         if type(request) is not RememberExplicitMemoryRequest:
             raise ExplicitMemoryActionError("invalid_request")
         return self._execute("remember", request, "remember")
+
+    def remember_explicit_user_memory_for_server_session(
+        self,
+        request: RememberExplicitMemoryRequest,
+        *,
+        trusted_session_id: str,
+        canonical_sessions,
+    ):
+        """Opt-in experiment: trusted session comes from authenticated SERVER state.
+
+        There is deliberately no HTTP route. Never pass untrusted request JSON
+        as trusted_session_id or canonical_sessions. Legacy methods unchanged.
+        """
+        if os.environ.get("MEMORY_SESSION_BOUND_WRITE_ENABLED") != "true":
+            raise ExplicitMemoryActionError("session_write_disabled")
+        if self._origin != "operator_cli":
+            raise ExplicitMemoryActionError("session_write_binding_invalid")
+        from .memory_session_write_guard import (
+            SessionWriteBindingError, verify_server_session_write,
+        )
+        try:
+            validated_id = verify_server_session_write(
+                request, trusted_session_id=trusted_session_id,
+                canonical_sessions=canonical_sessions,
+            )
+        except SessionWriteBindingError:
+            raise ExplicitMemoryActionError("session_write_binding_invalid") from None
+        return self._execute(
+            "remember", request, "remember",
+            canonical_session_id=validated_id,
+        )
 
     def correct_explicit_user_memory(self, request: CorrectExplicitMemoryRequest):
         if type(request) is not CorrectExplicitMemoryRequest:

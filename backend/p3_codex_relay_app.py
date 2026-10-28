@@ -8,10 +8,13 @@ and other P3 relay behavior remain owned by ``backend.p3_relay_app``.
 
 from __future__ import annotations
 
+import os
+
 from backend import codex_canary_relay_integration
 from backend.codex_generation_routes import install_relay as install_generation_routes
 from backend import p3_relay_app as bridge
 from backend import api_web_generation_relay
+from backend.usage_ledger_entrypoint import install_relay as install_ledger_relay
 
 
 codex_canary_relay_integration.install(bridge.relay_app)
@@ -27,5 +30,6 @@ from backend.web_mcp_settings_routes import install as install_mcp_settings
 install_mcp_settings(bridge.relay_app)
 from backend.web_mcp_chat_routes import install_relay as install_mcp_chat
 install_mcp_chat(bridge.relay_app)
+install_ledger_relay(bridge.relay_app, os.environ)
 app = bridge.app
 

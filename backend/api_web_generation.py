@@ -200,8 +200,9 @@ def assert_idle(conn, session_id, *, deleting=False):
 
 
 class ApiWebRuntime:
-    def __init__(self, legacy):
+    def __init__(self, legacy, *, usage_collector=None):
         self.legacy, self.store = legacy, Store(legacy.RELAY_DB)
+        self.usage_collector = usage_collector
         self.tasks, self.providers, self.progress = {}, {}, {}
         self.epoch = uuid.uuid4().hex
         self.closing = False
@@ -285,8 +286,10 @@ class ApiWebRuntime:
                 return
             messages = input_messages(self.legacy, sid, mid, text)
             from .api_mcp_model import generate
-            task = asyncio.create_task(generate(self.legacy, sid, mid, messages, sink,
-                lambda route: self.store.route(mid, route.get('model'))))
+            from .usage_ledger_capture import capture_scope
+            with capture_scope(self.usage_collector, sid, gid):
+                task = asyncio.create_task(generate(self.legacy, sid, mid, messages, sink,
+                    lambda route: self.store.route(mid, route.get('model'))))
             self.providers[mid] = task
             try:
                 out = await task

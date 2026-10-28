@@ -298,12 +298,14 @@ class WebSessionProviderAuthority:
         title: str = "New chat",
         since_id: int = 0,
         activate: bool = True,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         rows = self.session_rows()
         row = self.new_row(
             title=title,
             since_id=since_id,
             provider=API_PROVIDER,
+            **({'session_id':session_id} if session_id is not None else {}),
         )
         rows.append(row)
         self.save_sessions(rows, row["id"] if activate else None)
