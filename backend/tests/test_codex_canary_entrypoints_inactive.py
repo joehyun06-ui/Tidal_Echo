@@ -17,10 +17,11 @@ class CodexCanaryEntrypointsInactiveTest(unittest.TestCase):
         self.assertNotIn("examples.api_loop_codex_canary:app", source)
         self.assertNotIn("backend.codex_canary_relay_app:app", source)
 
-    def test_render_blueprint_start_command_and_codex_gates_are_unchanged(self):
+    def test_render_blueprint_p3_start_preserves_codex_gates_off(self):
         payload = json.loads((ROOT / "render.yaml").read_text(encoding="utf-8"))
         service = payload["services"][0]
-        self.assertEqual(service["startCommand"], "python scripts/render_start.py")
+        self.assertEqual(service["startCommand"], "python scripts/render_start_p3.py")
+        self.assertEqual(service["autoDeployTrigger"], "off")
         env = {row["key"]: row for row in service["envVars"]}
         self.assertNotIn("CODEX_GENERATION_ENABLED", env)
         self.assertEqual(env["CODEX_CONTROL_ENABLED"]["value"], "false")
