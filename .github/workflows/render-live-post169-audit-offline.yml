@@ -1,0 +1,50 @@
+name: Render post-169 live audit snapshot offline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_OIDC_REAL_NETWORK_EXPLICITLY_APPROVED: "false"
+      MEMORY_OIDC_PINNED_ORIGIN_REHEARSAL_ENABLED: "false"
+      CODEX_GENERATION_ENABLED: "false"
+      CODEX_CANARY_ENTRYPOINTS_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify archived service/deploy/telemetry cannot authorize release
+        run: python -m unittest backend.tests._render_live_readonly_audit_worker -v
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_OIDC_REAL_NETWORK_EXPLICITLY_APPROVED: "false"
+      MEMORY_OIDC_PINNED_ORIGIN_REHEARSAL_ENABLED: "false"
+      CODEX_GENERATION_ENABLED: "false"
+      CODEX_CANARY_ENTRYPOINTS_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify archived service/deploy/telemetry cannot authorize release
+        shell: pwsh
+        run: |
+          python -m unittest backend.tests._render_live_readonly_audit_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
