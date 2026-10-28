@@ -4,6 +4,10 @@ from __future__ import annotations
 import json
 import os
 import unittest
+import io
+import tempfile
+from contextlib import redirect_stdout
+from scripts import memory_oidc_render_drift_check_offline as checker
 from pathlib import Path
 from unittest import mock
 
@@ -193,6 +197,39 @@ class RenderDriftReviewTests(NoNetworkMixin, unittest.TestCase):
     def test_review_flag_revocation_does_not_produce_result(self):
         os.environ["MEMORY_OIDC_RENDER_DRIFT_REVIEW_ENABLED"] = "False"
         self.deny()
+
+    def test_cli_always_returns_blocked_nonzero_and_sanitized_json(self):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            code = checker.main([
+                "--review-branch", _BRANCH, "--review-sha", _HEAD,
+                "--blueprint", str(_ROOT / "render.yaml"),
+            ])
+        report = json.loads(stream.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(report["status"], "release_blocked")
+        self.assertFalse(report["may_deploy"])
+        self.assertIn("live_service_snapshot_missing", report["blockers"])
+        self.assertNotIn(_HEAD, stream.getvalue())
+
+    def test_cli_rejects_unknown_snapshot_fields_without_echo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot_path = Path(directory) / "redacted.json"
+            leaked = "DO_NOT_LOG_SYNTHETIC_SECRET"
+            snapshot_path.write_text(
+                json.dumps(snapshot(apiKey=leaked)), encoding="utf-8",
+            )
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                code = checker.main([
+                    "--review-branch", _BRANCH, "--review-sha", _HEAD,
+                    "--blueprint", str(_ROOT / "render.yaml"),
+                    "--snapshot", str(snapshot_path),
+                ])
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(stream.getvalue())["status"],
+                             "review_unavailable")
+            self.assertNotIn(leaked, stream.getvalue())
 
     def test_no_network_or_login_and_memory_grant_in_contract(self):
         result = self.review()
