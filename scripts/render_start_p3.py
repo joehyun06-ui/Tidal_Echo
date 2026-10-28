@@ -104,6 +104,10 @@ def _select_child_commands(
         os.environ if environ is None else environ
     )
     commands = dict(base_selector(config, executable=executable))
+    if "api_loop" not in commands or "relay" not in commands:
+        raise deployment_config.DeploymentConfigError(
+            "p3_provider_supervisor_contract_invalid"
+        )
     commands["api_loop"] = _replace_target(
         list(commands["api_loop"]),
         BASE_API_LOOP,
