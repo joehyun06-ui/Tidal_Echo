@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -253,6 +256,49 @@ class RenderReleaseEvidenceTests(NoNetworkMixin, unittest.TestCase):
     def test_review_flag_revocation_denies_without_exception_data(self):
         os.environ["MEMORY_OIDC_RENDER_DRIFT_REVIEW_ENABLED"] = "false"
         self.reject(data=redacted_record())
+
+    def test_standalone_cli_returns_blocked_nonzero_for_real_blueprint(self):
+        process = subprocess.run([
+            sys.executable,
+            str(_ROOT / "scripts" / "memory_oidc_render_release_evidence_check_offline.py"),
+            "--blueprint", str(_ROOT / "render.yaml"),
+            "--review-branch", _REVIEW_BRANCH,
+            "--review-sha", _REVIEW_SHA,
+        ], cwd=_ROOT, env={**os.environ,
+            "MEMORY_OIDC_RENDER_DRIFT_REVIEW_ENABLED": "true"},
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertEqual(process.stderr, "")
+        report = json.loads(process.stdout)
+        self.assertEqual(report["status"], "release_blocked")
+        self.assertFalse(report["may_deploy"])
+        self.assertFalse(report["may_enable_oidc"])
+        self.assertIn("live_metadata_record_missing", report["blockers"])
+        self.assertNotIn(_REVIEW_SHA, process.stdout)
+
+    def test_standalone_cli_rejects_secret_key_and_never_echoes_value(self):
+        with tempfile.TemporaryDirectory() as dirname:
+            path = Path(dirname) / "no-real-credentials.json"
+            sensitive_fixture = "SYNTHETIC_SECRET_DO_NOT_LOG"
+            path.write_text(json.dumps(redacted_record(
+                api_key=sensitive_fixture,
+            )), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable,
+                str(_ROOT / "scripts" / "memory_oidc_render_release_evidence_check_offline.py"),
+                "--blueprint", str(_ROOT / "render.yaml"),
+                "--observed", str(path),
+                "--review-branch", _REVIEW_BRANCH,
+                "--review-sha", _REVIEW_SHA,
+            ], cwd=_ROOT, env={**os.environ,
+                "MEMORY_OIDC_RENDER_DRIFT_REVIEW_ENABLED": "true"},
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["status"],
+                             "review_unavailable")
+            self.assertNotIn(sensitive_fixture, result.stdout + result.stderr)
 
     def test_no_endpoint_session_or_mutation_methods(self):
         r = self.assess(redacted_record())
