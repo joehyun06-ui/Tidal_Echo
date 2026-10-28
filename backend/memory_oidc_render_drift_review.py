@@ -58,11 +58,11 @@ class RenderDriftReviewResult:
         return "<RenderDriftReviewResult blocked offline_metadata_only>"
 
 
-def _clean(value: object, limit: int) -> str:
+def _clean(value: object, limit: int, *, allow_space: bool = False) -> str:
     if (
         type(value) is not str or not 1 <= len(value) <= limit
         or not value.isascii()
-        or any(ord(c) < 33 or ord(c) > 126 for c in value)
+        or any(ord(c) < (32 if allow_space else 33) or ord(c) > 126 for c in value)
     ):
         raise RenderDriftReviewError()
     return value
@@ -114,7 +114,7 @@ def assess_render_deployment_drift(
         if service.get("type") != "web":
             raise RenderDriftReviewError()
         b_branch = _clean(service.get("branch"), 200)
-        b_command = _clean(service.get("startCommand"), 300)
+        b_command = _clean(service.get("startCommand"), 300, allow_space=True)
         blueprint_branch_ok = b_branch == branch
         blueprint_auto_off = _auto_off(service)
         blueprint_start_ok = b_command == "python scripts/render_start.py"
@@ -135,7 +135,8 @@ def assess_render_deployment_drift(
                 raise RenderDriftReviewError()
             # No additional keys: never accept envVars, tokens, headers, logs
             # or claims about a proof from unauthenticated JSON.
-            values = {k: _clean(v, 300) for k, v in snapshot.items()}
+            values = {k: _clean(v, 300, allow_space=(k == "start_command"))
+                      for k, v in snapshot.items()}
             if (
                 values["service_name"] != "ouou-home-telegram"
                 or values["service_type"] != "web_service"
