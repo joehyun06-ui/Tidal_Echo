@@ -1000,11 +1000,21 @@ class _MemoryActionUnitOfWork:
             if normalized_text != raw_text:
                 raise self._semantic_error()
             metadata = json.loads(raw_meta)
+            keys = set(metadata) if type(metadata) is dict else set()
             if (
-                not isinstance(metadata, dict)
-                or set(metadata) != {"channel", "source"}
-                or not isinstance(metadata["channel"], str)
-                or not isinstance(metadata["source"], str)
+                keys not in (
+                    {"channel", "source"},
+                    {"channel", "source", "api_session"},
+                )
+                or type(metadata["channel"]) is not str
+                or type(metadata["source"]) is not str
+                or (
+                    "api_session" in metadata
+                    and (
+                        type(metadata["api_session"]) is not str
+                        or SCOPE_REF_PATTERN.fullmatch(metadata["api_session"]) is None
+                    )
+                )
             ):
                 raise self._semantic_error()
             channel = metadata["channel"]
@@ -1039,6 +1049,9 @@ class _MemoryActionUnitOfWork:
             metadata_projection=(
                 ("channel", channel),
                 ("source", source),
+            ) + (
+                (("api_session", metadata["api_session"]),)
+                if "api_session" in metadata else ()
             ),
             canonical_action_contract_version=(
                 CANONICAL_ACTION_CONTRACT_VERSION
@@ -1682,14 +1695,28 @@ class _MemoryActionUnitOfWork:
             if binding.action_kind == "forget"
             else binding.normalized_content
         )
+        expected_metadata = (
+            ("channel", expected_channel),
+            ("source", expected_source),
+        )
+        # Existing V1 legacy terminals keep their byte-for-byte projection.
+        # The opt-in remember-only extension may carry its authenticated
+        # session scope inside the HMAC-covered terminal semantic snapshot.
+        # Do NOT accept a session tag on correct, forget, or other origins.
+        canonical_metadata = snapshot.canonical.metadata_projection
+        permitted_metadata = [expected_metadata]
+        if (
+            binding.action_kind == "remember"
+            and binding.origin == "operator_cli"
+            and binding.scope_type == "session"
+        ):
+            permitted_metadata.append(
+                expected_metadata + (("api_session", binding.scope_ref),)
+            )
         if (
             snapshot.canonical.channel != expected_channel
             or snapshot.canonical.source != expected_source
-            or snapshot.canonical.metadata_projection
-            != (
-                ("channel", expected_channel),
-                ("source", expected_source),
-            )
+            or canonical_metadata not in permitted_metadata
             or snapshot.canonical.normalized_text != expected_text
         ):
             raise self._semantic_error()

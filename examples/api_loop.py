@@ -37,6 +37,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from backend import (
+    channel_store,
+    memory_evidence_readonly,
+    memory_session_write_guard,
     codex_app_server_control,
     continuity_context,
     deployment_config,
@@ -1253,6 +1256,67 @@ async def loop_provider_logout(request: Request):
 async def loop_sessions(request: Request):
     check_internal_auth(request)
     return sessions_public()
+
+
+@app.get("/loop/memory/session-write/preflight")
+async def loop_session_write_preflight(request: Request):
+    """Non-mutating server-owned active-session preflight only."""
+    check_internal_auth(request)
+    if request.query_params or (
+        request.headers.get("content-length") not in (None, "", "0")
+    ):
+        raise HTTPException(status_code=400, detail="invalid_preflight_request")
+    if (
+        os.environ.get("MEMORY_SESSION_WRITE_PREFLIGHT_ENABLED") != "true"
+        or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+    ):
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        # These values MUST come from loop-owned config, never HTTP or client.
+        # Do not use active_session_id(): it deliberately falls back to
+        # the latest session for ordinary chat navigation. A memory-write
+        # preflight must NEVER infer the target by fallback.
+        server_config = load_config()
+        configured_id = (
+            server_config.get("active_session")
+            if type(server_config) is dict else None
+        )
+        memory_session_write_guard.verify_trusted_active_session(
+            trusted_session_id=configured_id,
+            canonical_sessions=session_rows(),
+        )
+    except memory_session_write_guard.SessionWriteBindingError:
+        raise HTTPException(status_code=409, detail="active_session_unverified") from None
+    return JSONResponse({
+        "schema": "guitting-session-write-preflight-v1",
+        "mode": "dry_run",
+        "active_session_verified": True,
+        "would_write": False,
+    }, headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/loop/sessions/{session_id}/memory/evidence")
+async def loop_session_memory_evidence(session_id: str, request: Request):
+    """Read-only, internally authenticated session evidence; opt-in only."""
+    check_internal_auth(request)
+    if (
+        os.environ.get("MEMORY_EVIDENCE_UI_READONLY_ENABLED") != "true"
+        or os.environ.get("MEMORY_CORE_ENABLED") != "true"
+    ):
+        raise HTTPException(status_code=404, detail="not_found")
+    known = {row["id"] for row in session_rows()}
+    if session_id not in known:
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        with channel_store.connect_read_only(RELAY_DB, timeout_seconds=5.0) as conn:
+            result = memory_evidence_readonly.build_snapshot(
+                conn, session_id=session_id, allowed_sessions=known,
+            )
+        return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+    except memory_evidence_readonly.MemoryEvidenceReadonlyError:
+        raise HTTPException(status_code=503, detail="memory_evidence_unavailable") from None
+    except (OSError, ValueError, sqlite3.Error):
+        raise HTTPException(status_code=503, detail="memory_evidence_unavailable") from None
 
 
 @app.post("/loop/sessions")
