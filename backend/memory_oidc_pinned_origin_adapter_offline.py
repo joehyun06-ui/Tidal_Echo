@@ -167,12 +167,14 @@ class SyntheticPinnedOriginAsgi:
                 raise PinnedOriginOfflineReviewError()
             if not self._enabled() or self._proof() is not True:
                 raise PinnedOriginOfflineReviewError()
-            # Only the newly copied ASGI scope is altered. Never change
-            # original scope, client, server, Host or forwarded headers.
-            synthetic_scope = dict(scope, scheme="https")
-            await self._inner(synthetic_scope, receive, send)
         except Exception:
             await Response(status_code=400)(scope, receive, send)
+            return
+        # Only the newly copied ASGI scope is altered. Never change original
+        # scope, client, server, Host or forwarded headers. Inner app owns
+        # its own exception handling and ASGI response-start lifecycle.
+        synthetic_scope = dict(scope, scheme="https")
+        await self._inner(synthetic_scope, receive, send)
 
     def __repr__(self):
         return "<SyntheticPinnedOriginAsgi offline_unprivileged>"
