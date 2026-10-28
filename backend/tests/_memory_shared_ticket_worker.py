@@ -329,7 +329,7 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
         with self.assertRaises(SharedTicketError):
             self.claim(offer)
 
-    def test_session_switch_while_waiting_for_prepare_lock_fails_closed(self):
+    def _assert_prepare_rejected_after_session_switch_while_waiting_for_lock(self):
         started = threading.Event()
         provider_called = threading.Event()
         observed_store = self._observed_context_storage(provider_called)
@@ -357,10 +357,30 @@ class SharedTicketTests(NoNetworkMixin, unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertTrue(provider_called.is_set())
         self.assertEqual(outcomes, ["rejected"])
+
+    def test_session_switch_while_waiting_for_prepare_lock_fails_closed(self):
+        self._assert_prepare_rejected_after_session_switch_while_waiting_for_lock()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute(
-                "SELECT COUNT(*) FROM memory_shared_ticket_v1 WHERE status='pending'"
-            ).fetchone()[0], 0)
+            # The first prepare creates its table inside the same transaction;
+            # rejecting that prepare must roll back the DDL as well as any row.
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='memory_shared_ticket_v1'"
+            ).fetchone())
+
+    def test_session_switch_while_waiting_for_prepare_lock_preserves_existing_ticket(self):
+        request = valid_request(marker="b")
+        offer = self.storage.prepare(request)
+        with closing(sqlite3.connect(self.path)) as conn:
+            before = conn.execute("SELECT * FROM memory_shared_ticket_v1").fetchall()
+        self._assert_prepare_rejected_after_session_switch_while_waiting_for_lock()
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT * FROM memory_shared_ticket_v1").fetchall(),
+                before,
+            )
+        self.state["session"] = "s1"
+        self.assertEqual(self.claim(offer, request=request).request_id, request.request_id)
 
     def test_bad_identity_provider_refused(self):
         offer = self.storage.prepare(valid_request())
