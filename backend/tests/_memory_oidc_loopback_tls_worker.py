@@ -128,6 +128,7 @@ class _LoopbackTls:
         self.sni = []
         self.requests = []
         self.handshake_failures = 0
+        self.server_errors = []
         self.stopping = threading.Event()
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -172,7 +173,8 @@ class _LoopbackTls:
                         + _FAKE_BODY
                     )
                     secured.sendall(response)
-            except (ssl.SSLError, OSError):
+            except (ssl.SSLError, OSError) as error:
+                self.server_errors.append(type(error).__name__)
                 self.handshake_failures += 1
                 try:
                     accepted.close()
@@ -260,7 +262,15 @@ class PinnedLoopbackTlsCaTests(unittest.TestCase):
                 else:
                     conn.request("POST", "/token", body=b"synthetic=true")
                     certificate = conn.sock.getpeercert()
-                    result = conn.getresponse()
+                    try:
+                        result = conn.getresponse()
+                    except Exception as error:
+                        self.fail(
+                            'TLS local response failed: ' + type(error).__name__
+                            + '; accepted=' + str(len(server.requests))
+                            + '; server_errors=' + repr(server.server_errors)
+                            + '; sni=' + repr(server.sni)
+                        )
                     self.assertEqual(result.status, 200)
                     self.assertEqual(result.read(), _FAKE_BODY)
                     return certificate
@@ -316,7 +326,14 @@ class PinnedLoopbackTlsCaTests(unittest.TestCase):
 
     def test_sender_real_tls_handshake_through_review_transport(self):
         srv, _ = self._server()
-        response = self._sender(srv)
+        try:
+            response = self._sender(srv)
+        except OidcHttpsSenderReviewError:
+            self.fail(
+                'sender local TLS failed: accepted=' + str(len(srv.requests))
+                + '; server_errors=' + repr(srv.server_errors)
+                + '; sni=' + repr(srv.sni)
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.final_url, TOKEN_URL)
         self.assertEqual(response.body, _FAKE_BODY)
