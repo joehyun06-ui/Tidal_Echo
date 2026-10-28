@@ -40,8 +40,43 @@ class SupervisorConfig:
     autonomous_wake_enabled: bool = False
 
 
+# Offline review modules do not establish a production browser-login boundary.
+# A Render supervisor must never promote those independently testable flags
+# into a deployed identity or ingress capability without a separate review.
+# This interlock has intentionally NO auto-approval or runtime override.
+_UNREVIEWED_BROWSER_IDENTITY_FLAGS = frozenset({
+    "MEMORY_PER_USER_AUTH_REVIEW_ENABLED",
+    "MEMORY_BROWSER_CONSENT_REVIEW_ENABLED",
+})
+
+
+def reject_unreviewed_browser_identity_ingress(environ: Mapping[str, str]) -> None:
+    """Fail closed before startup side effects, not an ingress attestation."""
+    try:
+        for key, value in environ.items():
+            if type(key) is not str:
+                raise DeploymentConfigError("unreviewed_memory_browser_identity_ingress")
+            normalized = key.upper()
+            protected = (
+                normalized in _UNREVIEWED_BROWSER_IDENTITY_FLAGS
+                or (
+                    normalized.startswith("MEMORY_OIDC_")
+                    and normalized.endswith(("_ENABLED", "_APPROVED"))
+                )
+            )
+            # Missing is OFF; explicit values must be precisely 'false'.
+            # Lower-case / mixed-case flag names get the same deny treatment.
+            if protected and (type(value) is not str or value != "false"):
+                raise DeploymentConfigError("unreviewed_memory_browser_identity_ingress")
+    except DeploymentConfigError:
+        raise
+    except Exception:
+        raise DeploymentConfigError("unreviewed_memory_browser_identity_ingress") from None
+
+
 def preflight(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
     env = os.environ if environ is None else environ
+    reject_unreviewed_browser_identity_ingress(env)
     telegram = TelegramConfig.from_env(env)
     deployment = load_deployment_config(telegram, env)
     relay_port = deployment_config.parse_port(env.get("PORT", ""), "invalid_relay_port")
@@ -73,6 +108,7 @@ def preflight(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
 
 def child_environment(config: SupervisorConfig, environ: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if environ is None else environ)
+    reject_unreviewed_browser_identity_ingress(env)
     env.pop("API_LOOP_INSTANCE_NONCE", None)
     env.pop("API_LOOP_EXPECTED_NONCE", None)
     env.pop("API_LOOP_INTERNAL_TOKEN", None)
