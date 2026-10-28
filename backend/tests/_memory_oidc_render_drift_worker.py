@@ -35,7 +35,7 @@ def snapshot(**changes):
         "repository_full_name": "joehyun06-ui/Tidal_Echo",
         "branch": _BRANCH,
         "deployed_commit_sha": _HEAD,
-        "start_command": "python scripts/render_start.py",
+        "start_command": "python scripts/render_start_p3.py",
         "auto_deploy_trigger": "off",
         "deploy_status": "live",
     }
