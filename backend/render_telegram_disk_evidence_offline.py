@@ -91,19 +91,28 @@ def _utc(value: object) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def review_disk_snapshot(metadata: object, *, observed_at: datetime) -> EvidenceStatus:
+def review_disk_snapshot(
+    metadata: object, *, queried_disk_id: str, disk_mount: str, observed_at: datetime
+) -> EvidenceStatus:
     """Classify a supplied snapshot inventory item, without accessing Render.
 
     Never construe a snapshot record as a verified restorable backup. The disk
     must still be tested using approved restore procedures and SQLite checks.
     """
     source = "render_disk_snapshot"
-    if type(metadata) is not dict or type(observed_at) is not datetime or observed_at.tzinfo is None:
+    if (
+        type(metadata) is not dict
+        or type(observed_at) is not datetime or observed_at.tzinfo is None
+        or queried_disk_id != EXPECTED_DISK_ID
+    ):
         return EvidenceStatus(source, "invalid_or_unavailable")
+    # Official Render GET /disks/{diskId}/snapshots returns createdAt,
+    # snapshotKey and instanceId. diskId and mountPath are NOT per-item fields.
+    key = metadata.get("snapshotKey")
     created = _utc(metadata.get("createdAt"))
-    if created is None or metadata.get("diskId") != EXPECTED_DISK_ID:
+    if created is None or type(key) is not str or not (1 <= len(key) <= 2048):
         return EvidenceStatus(source, "invalid_or_unavailable")
-    if "mountPath" in metadata and metadata["mountPath"] != EXPECTED_MOUNT:
+    if disk_mount != EXPECTED_MOUNT:
         return EvidenceStatus(source, "disk_mismatch")
     now = observed_at.astimezone(timezone.utc)
     if created > now + timedelta(minutes=5):
