@@ -1,0 +1,48 @@
+name: Browser login session credential registry offline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_BROWSER_SESSION_REGISTRY_REVIEW_ENABLED: "false"
+      MEMORY_TRUSTED_AUTH_EPOCH_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python -m unittest backend.tests._memory_browser_session_registry_worker -v
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      OPENAI_API_KEY: ""
+      MEMORY_BROWSER_SESSION_REGISTRY_REVIEW_ENABLED: "false"
+      MEMORY_TRUSTED_AUTH_EPOCH_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Offline session issuance and revocation
+        shell: pwsh
+        run: |
+          python -m pip install -r backend/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest backend.tests._memory_browser_session_registry_worker -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
