@@ -19,8 +19,9 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import uvicorn
 from cryptography import x509
@@ -244,7 +245,7 @@ class RealBrowserCrossSiteCookieTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         folder = Path(self.temp.name)
-        patch = unittest.mock.patch.dict(os.environ, {
+        patch = mock.patch.dict(os.environ, {
             "OPENAI_API_KEY": "",
             "MEMORY_OIDC_ISOLATED_ASGI_REVIEW_ENABLED": "true",
             "MEMORY_OIDC_BROWSER_CALLBACK_REVIEW_ENABLED": "true",
