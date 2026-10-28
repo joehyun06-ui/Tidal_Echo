@@ -4,7 +4,7 @@
 
 仓库的 **PR #169 已正式合并**，merge commit `33f2fb9e09d42a901728355720b8334054c7fab5`，base `feat/render-telegram-deployment`。它集成了此前离线隔离的用量账本与大部分记忆/OIDC 审核代码（包括 #157 的 Uvicorn `--no-proxy-headers`、#158 的 OIDC 默认禁止和 #161 的 P3 入口保护），但没有启用真人 OIDC 登录或记忆写入。因此“全部安全 PR 仍未合并”的历史表述**已经过时**。尚未合并的 #168 是单独的发布元数据证据核对器。
 
-用户已授权对 Render `ouott` 工作区 / `ouou-home-telegram` 服务进行只读检查。最新本轮查询仍显示真实 live 部署为 **2026-10-23 的 `a2d8699a7e2a0e9126d2ca565bfb3cd2297c181c`**，启动命令 `python scripts/render_start_p3.py`，部署分支 `feat/render-telegram-deployment`，`autoDeployTrigger=off`、默认 `onrender.com` 域名启用，公网 IP 白名单 `0.0.0.0/0`。**#169 代码虽已合并，但没有自动部署到 Render。** 没有更改或触发任何线上部署。
+用户已授权对 Render `ouott` 工作区 / `ouou-home-telegram` 服务进行只读检查。本轮初次核对时 live 版本仍是 **2026-10-23 的 `a2d8699a7e2a0e9126d2ca565bfb3cd2297c181c`**；**之后的独立只读复核发现状态已更新**：2026-10-28 14:49 UTC，Render 通过 API 触发对 #169 合并提交 `33f2fb9e09d42a901728355720b8334054c7fab5` 的部署，14:51 UTC 完成，状态 `live`，原 `a2d8699a` 为 `deactivated`。实际启动命令依旧为 `python scripts/render_start_p3.py`，分支 `feat/render-telegram-deployment`，`autoDeployTrigger=off`、默认 `onrender.com` 域名启用，公网 IP 白名单 `0.0.0.0/0`。**已经上线的是 #169 中已合并的代码，而不是本 PR #170 的 Blueprint 修订。** 本阶段所有操作仍是 GitHub Draft 和 Render 只读查询，没有自行触发部署。
 
 ## 本阶段限定改动
 
