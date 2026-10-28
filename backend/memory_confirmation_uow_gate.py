@@ -194,3 +194,72 @@ class MemoryUowConfirmationGate:
             return CheckedInTransaction(request_id=request.request_id)
         except Exception:
             raise UowConfirmationGateError() from None
+
+    def assert_consumed_for_uncertain_in_existing_uow(
+        self, *, uow: _MemoryActionUnitOfWork,
+        request: RememberExplicitMemoryRequest,
+        ticket: str, content_sha256: str,
+        confirmation_text: str,
+    ) -> None:
+        """Read-only confirmation of COMMITTED ticket on uncertain ACK.
+
+        This never grants a new write or consumes a second ticket. The HMAC
+        ledger validates its own terminal separately; BOTH must match.
+        Do not require ticket to be unexpired at recovery time: the original
+        consumption time, not reply arrival time, must be within TTL.
+        """
+        if (
+            not _enabled()
+            or type(uow) is not _MemoryActionUnitOfWork
+            or type(request) is not RememberExplicitMemoryRequest
+            or not _matches(ticket, _TICKET)
+            or not _matches(content_sha256, _DIGEST)
+            or type(confirmation_text) is not str
+        ):
+            raise UowConfirmationGateError()
+        try:
+            if Path(uow._store.path).resolve() != self._path:
+                raise UowConfirmationGateError()
+            uow._require_active()
+            ctx = self._context(request)
+            if (
+                not _enabled()
+                or not hmac.compare_digest(content_sha256, _digest(request))
+                or not hmac.compare_digest(confirmation_text, CONFIRMATION_TEXT)
+            ):
+                raise UowConfirmationGateError()
+            ticket_sha = hashlib.sha256(ticket.encode("ascii")).hexdigest()
+            epoch_sha = hashlib.sha256(ctx.auth_epoch.encode("ascii")).hexdigest()
+            row = uow._execute(
+                """SELECT t.principal_id,t.login_id,t.epoch_sha256,
+                          t.session_id,t.request_id,t.content_sha256,
+                          t.expires_at,t.status,t.consumed_at,
+                          e.epoch_sha256,e.revoked
+                   FROM memory_shared_ticket_v1 AS t
+                   LEFT JOIN memory_auth_epoch_v1 AS e
+                     ON t.principal_id=e.principal_id AND t.login_id=e.login_id
+                   WHERE t.ticket_sha256=?""",
+                (ticket_sha,),
+            ).fetchone()
+            if not (
+                row is not None
+                and row[0] == ctx.principal_id
+                and row[1] == ctx.login_id
+                and type(row[2]) is str
+                and hmac.compare_digest(row[2], epoch_sha)
+                and row[3] == ctx.session_id
+                and row[4] == request.request_id
+                and type(row[5]) is str
+                and hmac.compare_digest(row[5], content_sha256)
+                and row[7] == "consumed"
+                and type(row[6]) in (int, float)
+                and type(row[8]) in (int, float)
+                and math.isfinite(row[6]) and math.isfinite(row[8])
+                and 0 <= row[8] < row[6]
+                and type(row[9]) is str
+                and hmac.compare_digest(row[9], epoch_sha)
+                and row[10] == 0
+            ):
+                raise UowConfirmationGateError()
+        except Exception:
+            raise UowConfirmationGateError() from None
