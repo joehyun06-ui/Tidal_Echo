@@ -7,6 +7,7 @@ No public DNS, Internet, real IdP, OAuth code or memory writer.
 from __future__ import annotations
 
 import datetime
+import http.server
 import json
 import os
 import socket
@@ -119,71 +120,69 @@ class _FixtureCa:
 
 
 class _LoopbackTls:
+    """Use a real standard-library HTTPS server for deterministic HTTP framing."""
+
     def __init__(self, cert_file: Path, key_file: Path):
-        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(5)
-        self.listener.settimeout(0.15)
-        self.port = self.listener.getsockname()[1]
         self.sni = []
         self.requests = []
         self.handshake_failures = 0
         self.server_errors = []
-        self.stopping = threading.Event()
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                # Only a tiny synthetic request is accepted in this fixture.
+                try:
+                    size = int(self.headers.get("content-length", "0"))
+                    if not 0 <= size <= 4096:
+                        raise ValueError("too large")
+                    self.rfile.read(size)
+                    owner.requests.append(
+                        (self.requestline + "\r\n" +
+                         "\r\n".join(f"{k}: {v}" for k,v in self.headers.items())
+                        ).encode("ascii")
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.send_header("Content-Length", str(len(_FAKE_BODY)))
+                    self.end_headers()
+                    self.wfile.write(_FAKE_BODY)
+                    self.wfile.flush()
+                    self.close_connection = True
+                except (OSError, ValueError) as error:
+                    owner.server_errors.append(type(error).__name__)
+                    self.close_connection = True
+
+            def log_message(self, _fmt, *_args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         self.ctx.load_cert_chain(str(cert_file), str(key_file))
         self.ctx.set_servername_callback(
-            lambda _sock, name, _context: self.sni.append(name),
+            lambda _sock, name, _context: self.sni.append(name)
+        )
+        self.server.socket = self.ctx.wrap_socket(
+            self.server.socket, server_side=True,
         )
         self.worker = threading.Thread(
-            target=self._serve, name="gt-offline-tls-loopback", daemon=True,
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            name="gt-offline-tls-loopback", daemon=True,
         )
         self.worker.start()
 
-    def _serve(self):
-        while not self.stopping.is_set():
-            try:
-                accepted, _ = self.listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            try:
-                accepted.settimeout(3)
-                with self.ctx.wrap_socket(accepted, server_side=True) as secured:
-                    secured.settimeout(3)
-                    data = bytearray()
-                    while b"\r\n\r\n" not in data and len(data) <= 8192:
-                        fragment = secured.recv(2048)
-                        if not fragment:
-                            break
-                        data.extend(fragment)
-                    self.requests.append(bytes(data))
-                    if b"\r\n\r\n" not in data:
-                        continue
-                    response = (
-                        b"HTTP/1.1 200 OK\r\n"
-                        b"Content-Type: application/json\r\n"
-                        b"Cache-Control: no-store\r\n"
-                        b"Pragma: no-cache\r\n"
-                        b"Connection: close\r\n"
-                        + ("Content-Length: " + str(len(_FAKE_BODY)) +
-                           "\r\n\r\n").encode("ascii")
-                        + _FAKE_BODY
-                    )
-                    secured.sendall(response)
-            except (ssl.SSLError, OSError) as error:
-                self.server_errors.append(type(error).__name__)
-                self.handshake_failures += 1
-                try:
-                    accepted.close()
-                except OSError:
-                    pass
-
     def close(self):
-        self.stopping.set()
-        self.listener.close()
+        self.server.shutdown()
+        self.server.server_close()
         self.worker.join(timeout=6)
 
 

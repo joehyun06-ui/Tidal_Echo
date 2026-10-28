@@ -198,6 +198,19 @@ class PinnedOidcHttpsSenderReview:
                 return min(3.0, value)
             conn.sock.settimeout(remaining())
             response = conn.getresponse()
+            # http.client detaches its connection for Connection: close
+            # responses (conn.sock becomes None), while the HTTPResponse
+            # still owns the readable socket via its buffered stream. Keep
+            # bounded reads on that response-owned socket rather than
+            # assuming the connection retains a socket after getresponse().
+            reader_socket = conn.sock
+            if reader_socket is None:
+                reader_socket = getattr(
+                    getattr(getattr(response, "fp", None), "raw", None),
+                    "_sock", None,
+                )
+            if reader_socket is None:
+                raise OidcHttpsSenderReviewError()
             headers = response.getheaders()
             if len(headers) > _RESPONSE_HEADER_LIMIT:
                 raise OidcHttpsSenderReviewError()
@@ -222,7 +235,7 @@ class PinnedOidcHttpsSenderReview:
                 raise OidcHttpsSenderReviewError()
             body = bytearray()
             while len(body) <= _MAX_BODY:
-                conn.sock.settimeout(remaining())
+                reader_socket.settimeout(remaining())
                 chunk = response.read(min(2048, _MAX_BODY + 1 - len(body)))
                 if not chunk:
                     break
