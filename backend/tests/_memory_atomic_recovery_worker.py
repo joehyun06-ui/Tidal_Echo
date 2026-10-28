@@ -163,7 +163,7 @@ class CrashAndRecoveryTests(unittest.TestCase):
         def tamper_signed_terminal():
             with closing(sqlite3.connect(self.fx.path)) as conn:
                 conn.execute(
-                    "UPDATE memory_action_requests SET terminal_digest=?",
+                    "UPDATE memory_action_requests SET request_binding_digest=?",
                     (b"X" * 32,),
                 )
                 conn.commit()
