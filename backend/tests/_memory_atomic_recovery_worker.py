@@ -17,15 +17,13 @@ from unittest import mock
 
 from backend import memory_action_ledger, memory_explicit_actions
 from backend.memory_confirmation_uow_gate import UowConfirmationGateError
-from backend.tests._memory_atomic_confirmed_worker import (
-    AtomicConfirmedMemoryTests,
-)
+from backend.tests import _memory_atomic_confirmed_worker as atomic_fixture_module
 
 
 class CrashAndRecoveryTests(unittest.TestCase):
     def setUp(self):
         # Reuse the thoroughly reviewed fixture and its NoNetworkMixin.
-        fixture = AtomicConfirmedMemoryTests(
+        fixture = atomic_fixture_module.AtomicConfirmedMemoryTests(
             "test_no_route_or_public_service_method_added"
         )
         fixture.setUp()
@@ -159,16 +157,21 @@ class CrashAndRecoveryTests(unittest.TestCase):
             self._lose_ack(disable_after_commit)
         self._assert_db(committed=True)
 
-    def test_lost_ack_tampered_hmac_ledger_refuses_recovery(self):
-        def tamper_signed_terminal():
+    def test_immutable_hmac_ledger_rejects_tamper_and_recovers(self):
+        def attempt_signed_terminal_tamper():
             with closing(sqlite3.connect(self.fx.path)) as conn:
-                conn.execute(
-                    "UPDATE memory_action_requests SET request_binding_digest=?",
-                    (b"X" * 32,),
-                )
-                conn.commit()
-        with self.assertRaises(memory_action_ledger.MemoryActionLedgerError):
-            self._lose_ack(tamper_signed_terminal)
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "memory_action_request_immutable",
+                ):
+                    conn.execute(
+                        "UPDATE memory_action_requests "
+                        "SET request_binding_digest=?",
+                        (b"X" * 32,),
+                    )
+                conn.rollback()
+        result = self._lose_ack(attempt_signed_terminal_tamper)
+        self.assertTrue(result.replayed)
         self._assert_db(committed=True)
 
     def test_no_unexpected_public_confirmation_write_entry(self):
