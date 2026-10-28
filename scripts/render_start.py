@@ -88,12 +88,12 @@ def child_commands(config: SupervisorConfig, executable: str | None = None) -> d
         "api_loop": [
             python, "-m", "uvicorn", "examples.api_loop:app", "--host", "127.0.0.1",
             "--port", str(config.deployment.loop_port), "--workers", "1",
-            "--no-access-log",
+            "--no-access-log", "--no-proxy-headers",
         ],
         "relay": [
             python, "-m", "uvicorn", "backend.p3_relay_app:app", "--host", "0.0.0.0",
             "--port", str(config.relay_port), "--workers", "1",
-            "--no-access-log",
+            "--no-access-log", "--no-proxy-headers",
         ],
     }
     if config.autonomous_wake_enabled:
