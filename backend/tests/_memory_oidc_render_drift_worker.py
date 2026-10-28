@@ -6,6 +6,8 @@ import os
 import unittest
 import io
 import tempfile
+import sys
+import subprocess
 from contextlib import redirect_stdout
 from scripts import memory_oidc_render_drift_check_offline as checker
 from pathlib import Path
@@ -211,6 +213,26 @@ class RenderDriftReviewTests(NoNetworkMixin, unittest.TestCase):
         self.assertFalse(report["may_deploy"])
         self.assertIn("live_service_snapshot_missing", report["blockers"])
         self.assertNotIn(_HEAD, stream.getvalue())
+
+    def test_cli_direct_script_launch_from_repo_root_is_blocked_safely(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(_ROOT / "scripts" / "memory_oidc_render_drift_check_offline.py"),
+                "--blueprint", str(_ROOT / "render.yaml"),
+                "--review-branch", _BRANCH, "--review-sha", _HEAD,
+            ],
+            cwd=_ROOT,
+            env={**os.environ,
+                 "MEMORY_OIDC_RENDER_DRIFT_REVIEW_ENABLED": "true",
+                 "OPENAI_API_KEY": ""},
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        report = json.loads(completed.stdout)
+        self.assertEqual(report["status"], "release_blocked")
+        self.assertFalse(report["may_deploy"])
 
     def test_cli_rejects_unknown_snapshot_fields_without_echo(self):
         with tempfile.TemporaryDirectory() as directory:
