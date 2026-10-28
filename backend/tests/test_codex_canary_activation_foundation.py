@@ -120,10 +120,11 @@ class CodexCanaryActivationFoundationTest(unittest.TestCase):
         self.assertIn(canary_start.CANARY_RELAY, observed["commands"]["relay"])
         self.assertIs(render_start.child_commands, original)
 
-    def test_current_render_blueprint_still_uses_base_supervisor_and_has_no_activation_flags(self):
+    def test_current_render_blueprint_uses_reviewed_p3_supervisor_with_no_canary_activation(self):
         payload = json.loads((ROOT / "render.yaml").read_text(encoding="utf-8"))
         service = payload["services"][0]
-        self.assertEqual(service["startCommand"], "python scripts/render_start.py")
+        self.assertEqual(service["startCommand"], "python scripts/render_start_p3.py")
+        self.assertEqual(service["autoDeployTrigger"], "off")
         env = {row["key"]: row for row in service["envVars"]}
         self.assertNotIn(canary_start.CANARY_FLAG, env)
         self.assertNotIn(canary_start.GENERATION_FLAG, env)
