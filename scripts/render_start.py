@@ -264,10 +264,12 @@ class RenderSupervisor:
 
     def run(self, config: SupervisorConfig, environ: Mapping[str, str] | None = None) -> int:
         commands = child_commands(config)
-        env = child_environment(config, environ)
         result = 0
         previous: dict[int, object] = {}
         try:
+            # Keep the ingress interlock within the supervisor's fail-closed
+            # startup error handler, before any subprocess or signal handler.
+            env = child_environment(config, environ)
             for signum in (signal.SIGTERM, signal.SIGINT):
                 previous[signum] = signal.signal(signum, self.handle_signal)
             api_env = dict(env)
