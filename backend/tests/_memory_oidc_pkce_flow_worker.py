@@ -24,7 +24,7 @@ from backend.memory_oidc_pkce_flow_review import (
 )
 from backend.tests._support import NoNetworkMixin
 
-_TEST_KEY = b"Synthetic-only-AES-256-key-000000"
+_TEST_KEY = b"Synthetic-only-AES-256-key-00000"
 _ISSUER = "https://login.example.test"
 _REDIRECT = "https://app.example.test/callback/oidc"
 _AUTH = _ISSUER + "/authorize"
