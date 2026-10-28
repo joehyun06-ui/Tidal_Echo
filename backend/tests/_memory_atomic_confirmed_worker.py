@@ -136,9 +136,9 @@ class AtomicConfirmedMemoryTests(NoNetworkMixin, unittest.TestCase):
             self.assertGreaterEqual(conn.execute(
                 "SELECT COUNT(*) FROM memory_sources"
             ).fetchone()[0], 1)
-        with channel_store.connect_read_only(
+        with closing(channel_store.connect_read_only(
             str(Path(self.path).resolve()), timeout_seconds=2.0,
-        ) as conn:
+        )) as conn:
             snapshot = build_snapshot(
                 conn, session_id="s1", allowed_sessions=("s1", "s2"),
             )
