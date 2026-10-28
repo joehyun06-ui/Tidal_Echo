@@ -204,11 +204,18 @@ class MemoryActionEntryBackend:
     def _resolve_uncertain(
         self,
         binding: memory_action_ledger.MemoryActionRequestBinding,
+        *,
+        validate_uncertain=None,
     ) -> ExplicitMemoryActionResult:
         with self._store._action_unit_of_work() as lookup:
             replay = lookup._lookup_existing_terminal(binding)
             if replay is None:
                 raise ExplicitMemoryActionError("transaction_outcome_uncertain")
+            # Only the isolated confirmed-review path passes this callback.
+            # Refuse to report successful recovery if its durable ticket
+            # consumption cannot ALSO be verified under this same DB lock.
+            if validate_uncertain is not None:
+                validate_uncertain(lookup)
             committed = lookup.commit()
         return self._safe_result(committed, binding, replayed=True)
 
@@ -225,6 +232,7 @@ class MemoryActionEntryBackend:
         canonical_session_id: str | None = None,
         in_uow_confirmation=None,
         before_commit=None,
+        validate_uncertain=None,
     ) -> ExplicitMemoryActionResult:
         binding = None
         try:
@@ -274,7 +282,9 @@ class MemoryActionEntryBackend:
                 error.category == "transaction_outcome_uncertain"
                 and binding is not None
             ):
-                return self._resolve_uncertain(binding)
+                return self._resolve_uncertain(
+                    binding, validate_uncertain=validate_uncertain,
+                )
             raise
 
     def _remember_impl(self, request, *, origin: str, channel: str, source: str,
@@ -303,6 +313,7 @@ class MemoryActionEntryBackend:
         )
         in_uow_confirmation = None
         before_commit = None
+        validate_uncertain = None
         if _confirmation is not None:
             # Experimental internal path only. No production caller/HTTP route.
             from .memory_confirmation_uow_gate import (
@@ -343,6 +354,13 @@ class MemoryActionEntryBackend:
 
             before_commit = require_review_flags
 
+            def validate_uncertain(uow):
+                require_review_flags()
+                gate.assert_consumed_for_uncertain_in_existing_uow(
+                    uow=uow, request=request, ticket=ticket,
+                    content_sha256=digest, confirmation_text=phrase,
+                )
+
         binding = memory_action_ledger.MemoryActionRequestBinding(
             request_id=request.request_id,
             action_kind="remember",
@@ -380,6 +398,7 @@ class MemoryActionEntryBackend:
             canonical_session_id=canonical_session_id,
             in_uow_confirmation=in_uow_confirmation,
             before_commit=before_commit,
+            validate_uncertain=validate_uncertain,
         )
 
     def remember(self, request, *, origin: str, channel: str, source: str,
