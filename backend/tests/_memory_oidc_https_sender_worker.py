@@ -252,7 +252,7 @@ class PinnedHttpsSenderTests(NoNetworkMixin, unittest.TestCase):
     def test_wrong_dns_family_port_or_shape_denied(self):
         bads = [
             [self.answer(PUBLIC, port=80)],
-            [self.answer(PUBLIC, family=socket.AF_UNIX)],
+            [self.answer(PUBLIC, family=-1)],
             [("bad",)],
             ["8.8.8.8"],
         ]
