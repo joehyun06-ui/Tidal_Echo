@@ -118,9 +118,12 @@ class OidcPkceFlowTests(NoNetworkMixin, unittest.TestCase):
         self.nonce = params["nonce"][0]
         return plan, params
 
-    def finish(self, params, *, store=None, state=None, code="CODE-synthetic-123"):
+    _UNSET = object()
+
+    def finish(self, params, *, store=None, state=_UNSET, code="CODE-synthetic-123"):
         return (store or self.store).complete(
-            state=params["state"][0] if state is None else state, code=code,
+            state=params["state"][0] if state is self._UNSET else state,
+            code=code,
         )
 
     def rows(self):
