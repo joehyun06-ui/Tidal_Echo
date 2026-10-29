@@ -1,0 +1,42 @@
+name: Render Stage50 G1A private candidate identity SYNTHETIC OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-g1a:
+    name: "Stage50 G1A fake-file identity privacy gate (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      GUITING_STAGE50_SYNTHETIC_ONLY: "true"
+      TELEGRAM_BOT_TOKEN: ""
+      OPENAI_API_KEY: ""
+      RENDER_API_KEY: ""
+      LLM_API_KEY: ""
+      GUITING_LEDGER_MODE: disabled
+      CODEX_GENERATION_ENABLED: "false"
+      CODEX_CONTROL_ENABLED: "false"
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+    steps:
+      - name: Checkout without saved credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test fake only candidate identity and privacy
+        run: python -m unittest backend.tests._render_stage50_g1a_private_identity_worker -v
+      - name: Compile audit source
+        run: python -m compileall -q scripts/render_stage50_g1a_private_identity_readonly.py backend/tests/_render_stage50_g1a_private_identity_worker.py
