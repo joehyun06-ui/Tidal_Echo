@@ -1,0 +1,44 @@
+name: Render Stage48 P1 recovery decision design SYNTHETIC OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  p1-decision:
+    name: "Stage48 P1 design policy (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      TELEGRAM_BOT_TOKEN: ""
+      OPENAI_API_KEY: ""
+      RENDER_API_KEY: ""
+      LLM_API_KEY: ""
+      GUITING_LEDGER_MODE: disabled
+      CODEX_GENERATION_ENABLED: "false"
+      CODEX_CONTROL_ENABLED: "false"
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      GUITING_STAGE48_SYNTHETIC_ONLY: "true"
+    steps:
+      - name: Checkout without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run synthetic metadata decision tests only
+        run: python -m unittest backend.tests._render_stage48_p1_plan_worker -v
+      - name: Demonstrate data-free synthetic decision
+        run: python scripts/render_stage48_p1_recovery_decision_offline.py --synthetic-only
+      - name: Compile pure no-I/O policy
+        run: python -m compileall -q scripts/render_stage48_p1_recovery_decision_offline.py backend/tests/_render_stage48_p1_plan_worker.py
