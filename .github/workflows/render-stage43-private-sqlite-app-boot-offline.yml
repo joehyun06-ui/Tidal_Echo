@@ -1,0 +1,43 @@
+name: Render Stage43 private SQLite isolated app startup OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-runtime-probe:
+    name: "Stage43 synthetic restored app boot (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      LLM_API_KEY: ""
+      GUITING_LEDGER_MODE: disabled
+      RENDER_TELEGRAM_MVP: "false"
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      CODEX_CONTROL_ENABLED: "false"
+    steps:
+      - name: Checkout code without saved credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install supported Python minor
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install repository test dependencies only
+        run: python -m pip install -r backend/requirements-test.txt
+      - name: Test isolated synthetic application startup on copied SQLite
+        run: python -m unittest backend.tests._stage43_private_restore_probe_worker -v
+      - name: Compile tool and worker
+        run: python -m compileall -q scripts/stage43_private_restore_probe.py backend/tests/_stage43_private_restore_probe_worker.py
