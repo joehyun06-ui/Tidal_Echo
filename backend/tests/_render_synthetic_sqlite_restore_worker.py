@@ -82,7 +82,8 @@ class SyntheticSQLiteRestoreDrill(NoNetworkMixin, unittest.TestCase):
             if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise sqlite3.DatabaseError("synthetic_foreign_key_failed")
             channel_store.validate_core_schema_v1_v6(conn, require_relay_tables=True)
-            # Validate the v7-v11 migration-owned objects without requiring the\n            # operator's extra strict main-schema object inventory.
+            # Validate the v7-v11 migration-owned objects without requiring the
+            # operator's extra strict main-schema object inventory.
             channel_store.validate_memory_index_outbox_schema_v1_v11(conn)
             return int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
 
