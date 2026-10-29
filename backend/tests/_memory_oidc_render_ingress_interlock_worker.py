@@ -164,7 +164,8 @@ class RenderIngressInterlockTests(NoNetworkMixin, unittest.TestCase):
         self.assertEqual(len(services), 1)
         service = services[0]
         self.assertIs(service["autoDeploy"], False)
-        self.assertEqual(service["startCommand"], "python scripts/render_start.py")
+        self.assertEqual(service["autoDeployTrigger"], "off")
+        self.assertEqual(service["startCommand"], "python scripts/render_start_p3.py")
         self.assertEqual(service["type"], "web")
         self.assertEqual(service["numInstances"], 1)
         env = {row["key"]: row.get("value", "unset") for row in service["envVars"]}

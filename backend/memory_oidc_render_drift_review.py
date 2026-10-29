@@ -117,7 +117,7 @@ def assess_render_deployment_drift(
         b_command = _clean(service.get("startCommand"), 300, allow_space=True)
         blueprint_branch_ok = b_branch == branch
         blueprint_auto_off = _auto_off(service)
-        blueprint_start_ok = b_command == "python scripts/render_start.py"
+        blueprint_start_ok = b_command == "python scripts/render_start_p3.py"
         blockers = list(_BASE_BLOCKERS)
         if not blueprint_branch_ok:
             blockers.append("blueprint_branch_differs_from_review")
