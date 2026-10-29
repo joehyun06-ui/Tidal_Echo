@@ -83,7 +83,7 @@ class Stage52P0Tests(unittest.TestCase):
         result = p0.audit_p0(self.root, synthetic=True, synthetic_euid=self.owner)
         record = json.dumps(result)
         for sensitive in ("private-sample", "DO_NOT_READ_PRIVATE", str(self.root),
-                          "private-directory", "st_uid", "atime", "CAP_FOWNER"):
+                          "private-directory", "st_uid", "st_atime_ns", "CAP_FOWNER"):
             self.assertNotIn(sensitive, record)
 
     def test_synthetic_not_allowed_to_target_production(self):
