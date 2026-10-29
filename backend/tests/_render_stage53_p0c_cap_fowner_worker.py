@@ -122,6 +122,16 @@ class FakeCapTests(unittest.TestCase):
             with self.assertRaises(p0c.StopCheck):
                 p0c.current_cap_fowner_effective()
 
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux ABI only")
+    def test_ctypes_argument_error_is_anonymized(self):
+        class FakeLib:
+            syscall = staticmethod(lambda *args: (_ for _ in ()).throw(p0c.ctypes.ArgumentError("PRIVATE_RAW_CAPABILITY")))
+        with mock.patch.object(p0c.ctypes, "CDLL", return_value=FakeLib()):
+            with self.assertRaises(p0c.StopCheck) as cm:
+                p0c.current_cap_fowner_effective()
+        self.assertNotIn("PRIVATE_RAW", str(cm.exception))
+
     def test_no_privilege_file_or_network_apis_in_source(self):
         from pathlib import Path
         s = Path(p0c.__file__).read_text("utf-8")
