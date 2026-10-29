@@ -25,8 +25,14 @@ def selected_mode(environ):
     return mode
 
 
-def secret(environ, name):
+def secret(environ, name, *, persistent_root):
     value = environ.get(name)
+    file_path = environ.get(name + '_FILE')
+    if file_path is not None:
+        if value is not None:
+            raise ValueError()
+        from .usage_ledger_secret_files import read_key_file
+        value = read_key_file(file_path, persistent_root)
     if (not isinstance(value, str) or not 32 <= len(value) <= 512 or not value.isascii()
             or any(ord(c) < 33 or ord(c) > 126 for c in value)):
         raise ValueError()
@@ -62,12 +68,12 @@ def load_loop(environ, *, persistent_root, relay_db, native_db):
         if 'codex_db' in storage and absolute(storage['codex_db']).resolve() != absolute(native_db).resolve():
             raise ValueError()
         options = {'ledger_path': ledger, 'relay_db': relay_db, 'native_db': native_db,
-                   'continuation_key': secret(environ, CONTINUATION_KEY)}
+                   'continuation_key': secret(environ, CONTINUATION_KEY, persistent_root=root)}
         if mode == 'capture':
             if plan['api'] is not None:
                 options['api_profiles'] = [RouteProfile(**{**p, 'cache': CachePolicy(**p.get('cache', {}))})
                                            for p in plan['api']['profiles']]
-                options['fingerprint_key'] = secret(environ, FINGERPRINT_KEY)
+                options['fingerprint_key'] = secret(environ, FINGERPRINT_KEY, persistent_root=root)
             if plan['codex'] is not None:
                 c = plan['codex']
                 options.update(codex_provider_id=c['provider_id'], codex_cli_version=c['cli_version'],

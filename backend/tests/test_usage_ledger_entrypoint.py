@@ -64,6 +64,26 @@ class EntrypointTests(EntryFixture):
         self.assertIsNone(services.api); self.assertIsNotNone(services.codex)
         self.assertFalse(services.codex.exclusive_threads)
 
+    def test_private_key_file_configures_native_capture_without_reading_api_key_file(self):
+        import os
+        if not all(hasattr(os, name) for name in ('O_NOFOLLOW','O_DIRECTORY','geteuid')):
+            return  # File mode is POSIX-only; environment-based startup is unchanged.
+        private=self.root/'keys';private.mkdir(mode=0o700)
+        key=private/'continuation.key';key.write_bytes(KEY);key.chmod(0o600)
+        self.plan['api']=None;self.plan['codex']=mock_plan()['codex']
+        env={CONTINUATION_KEY:None,CONTINUATION_KEY+'_FILE':str(key),
+             FINGERPRINT_KEY:object(),FINGERPRINT_KEY+'_FILE':object()}
+        services=self.load(**env)
+        self.assertIsNotNone(services.codex)
+        self.assertIsNone(services.api)
+
+    def test_file_failures_are_redacted_before_any_ledger_creation(self):
+        for path in (str(self.root/'private-missing.key'),'/tmp/private-outside.key'):
+            with self.assertRaisesRegex(LedgerError,'^ledger_entrypoint_unavailable$') as caught:
+                self.load(**{CONTINUATION_KEY:None,CONTINUATION_KEY+'_FILE':path})
+            self.assertNotIn('private',str(caught.exception))
+            self.assertFalse(self.path.exists())
+
     def test_history_reads_no_fingerprint_secret_and_preserves_pause_evidence(self):
         services = self.load(**{MODE:'history', FINGERPRINT_KEY:object()})
         self.assertIsNone(services.api); self.assertIsNone(services.codex)
