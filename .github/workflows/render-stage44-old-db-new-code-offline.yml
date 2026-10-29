@@ -1,0 +1,43 @@
+name: Render Stage44 old private backup vs new release OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility-worker:
+    name: "Stage44 synthetic historical backup compatibility (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      LLM_API_KEY: ""
+      CODEX_CONTROL_ENABLED: "false"
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      GUITING_LEDGER_MODE: disabled
+      RENDER_TELEGRAM_MVP: "false"
+    steps:
+      - name: Checkout without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install repository test requirements
+        run: python -m pip install -r backend/requirements-test.txt
+      - name: Test new-release compatibility on old-layout synthetic backup
+        run: python -m unittest backend.tests._stage44_private_new_release_compatibility_worker -v
+      - name: Compile tools
+        run: python -m compileall -q scripts/stage44_private_new_release_compatibility.py backend/tests/_stage44_private_new_release_compatibility_worker.py
