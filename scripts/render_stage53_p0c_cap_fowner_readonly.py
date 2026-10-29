@@ -63,7 +63,8 @@ def current_cap_fowner_effective(*, synthetic_mask: int | None = None) -> str:
         if status != 0 or header.version != LINUX_CAPABILITY_VERSION_3:
             raise StopCheck("capget_unavailable")
         return mask_to_hint(int(data[0].effective))
-    except (AttributeError, OSError, TypeError, ValueError):
+    except Exception:
+        # Includes ctypes.ArgumentError; never print a low-level error.
         raise StopCheck("capget_unavailable") from None
 
 
@@ -93,7 +94,7 @@ def main() -> int:
         if args.synthetic_effective_mask is not None and os.environ.get("GUITING_STAGE53_SYNTHETIC_ONLY") != "true":
             raise StopCheck("synthetic_gate_missing")
         data = report(synthetic_mask=args.synthetic_effective_mask)
-    except (StopCheck, OSError, ValueError, TypeError):
+    except Exception:
         print('{"stage":53,"gate":"G1B1_PERMISSION_P0C","result":"STOP_CAPABILITY_CHECK_UNAVAILABLE"}')
         return 2
     print(json.dumps(data, sort_keys=True, separators=(",", ":")))
