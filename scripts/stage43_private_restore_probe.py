@@ -66,6 +66,21 @@ def guard_run(repo_root: Path, backup: Path, expected_hash: str | None = None) -
     if expected_hash and digest.lower() != expected_hash.lower():
         raise ValueError("BACKUP_HASH_MISMATCH")
 
+    # Windows asyncio uses socket.socketpair for a self-pipe; this pair is
+    # private local IPC only. Do not allow any other Python socket connect.
+    original_connect = socket.socket.connect
+    def internal_socketpair():
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            original_connect(client, listener.getsockname())
+            server, _ = listener.accept()
+            return server, client
+        finally:
+            listener.close()
+
     # Application init_db() may update the temporary copy, never the source.
     with tempfile.TemporaryDirectory(prefix="guiting-stage43-", dir=private_root) as t:
         temp = Path(t)
@@ -87,7 +102,8 @@ def guard_run(repo_root: Path, backup: Path, expected_hash: str | None = None) -
             sys.path.insert(0, str(repo_root))
             # Block every Python-level external connect and subprocess while
             # importing the real backend, entering its ASGI lifespan and probing.
-            with mock.patch("socket.socket.connect", side_effect=forbid_network), \
+            with mock.patch("socket.socketpair", new=internal_socketpair), \
+                 mock.patch("socket.socket.connect", side_effect=forbid_network), \
                  mock.patch("socket.socket.connect_ex", side_effect=forbid_network), \
                  mock.patch("socket.create_connection", side_effect=forbid_network), \
                  mock.patch("socket.getaddrinfo", side_effect=forbid_network), \
