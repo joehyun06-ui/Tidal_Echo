@@ -2653,13 +2653,16 @@ async def app_send(request: Request):
     text = (body.get("text") or "").strip()
     attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
     api_session = str(body.get("api_session") or body.get("session_id") or "").strip()
+    # Correlation only: a history receipt must never cause another dispatch.
+    from backend.web_send_receipt import request_meta
+    receipt_meta = request_meta(body)
     if not text and not attachments:
         raise HTTPException(status_code=400, detail="empty text")
     msg = await dispatch_human_message(
         text,
         attachments=attachments,
         api_session=api_session,
-        extra_meta={"channel": "web", "source": "relay", **({"client_timezone": body["timezone"]} if isinstance(body.get("timezone"), str) else {})},
+        extra_meta={"channel": "web", "source": "relay", **receipt_meta, **({"client_timezone": body["timezone"]} if isinstance(body.get("timezone"), str) else {})},
     )
     if text and DEPLOYMENT.memory.natural_ingress_formation_enabled:
         try:
