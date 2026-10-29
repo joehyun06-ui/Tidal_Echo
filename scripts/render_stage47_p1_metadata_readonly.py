@@ -221,7 +221,7 @@ def describe(root: Path, *, synthetic: bool) -> dict:
         unknown = anonymous_root(root, synthetic=True)
 
     return {"stage": 47, "scope": "SYNTHETIC_ONLY" if synthetic else "LIVE_READONLY_METADATA",
-            "result": "PASS_METADATA" if not unknown["truncated"] else "PARTIAL_METADATA",
+            "result": ("PARTIAL_METADATA" if unknown["truncated"] or (home_counts is not None and home_counts["truncated"]) else "PASS_METADATA"),
             "codex_generation_files": file_summary,
             "codex_home_status": home_state, "codex_home": home_counts,
             "anonymous_unclassified_root": unknown,
