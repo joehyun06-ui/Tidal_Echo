@@ -1,0 +1,40 @@
+name: Render Stage45 persistent disk inventory OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-inventory:
+    name: "Stage45 synthetic metadata-only inventory (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      LLM_API_KEY: ""
+      CODEX_CONTROL_ENABLED: "false"
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      GUITING_LEDGER_MODE: disabled
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python minor
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run synthetic file-type and privacy tests
+        run: python -m unittest backend.tests._render_stage45_persistent_inventory_worker -v
+      - name: Compile no-network inventory source
+        run: python -m compileall -q scripts/render_stage45_persistent_inventory_readonly.py backend/tests/_render_stage45_persistent_inventory_worker.py
