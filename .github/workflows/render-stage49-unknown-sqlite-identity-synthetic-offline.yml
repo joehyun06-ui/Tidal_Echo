@@ -1,0 +1,44 @@
+name: Render Stage49 unknown SQLite identity plan SYNTHETIC OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-gates:
+    name: "Stage49 fake-only identity and export approval (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      GUITING_STAGE49_SYNTHETIC_ONLY: "true"
+      TELEGRAM_BOT_TOKEN: ""
+      OPENAI_API_KEY: ""
+      RENDER_API_KEY: ""
+      LLM_API_KEY: ""
+      GUITING_LEDGER_MODE: disabled
+      CODEX_GENERATION_ENABLED: "false"
+      CODEX_CONTROL_ENABLED: "false"
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+    steps:
+      - name: Checkout source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prove synthetic unknown database identity-stage gates
+        run: python -m unittest backend.tests._render_stage49_unknown_sqlite_review_worker -v
+      - name: Demonstrate fake-only non-authorizing decision output
+        run: python scripts/render_stage49_unknown_sqlite_review_design_offline.py --synthetic-only
+      - name: Compile pure policy without external dependencies
+        run: python -m compileall -q scripts/render_stage49_unknown_sqlite_review_design_offline.py backend/tests/_render_stage49_unknown_sqlite_review_worker.py
