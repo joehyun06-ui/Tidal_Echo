@@ -68,7 +68,7 @@ def scan_once(root_fd_or_path: int | Path, *, synthetic: bool) -> tuple[tuple, d
             if is_dir:
                 unknown_dirs += 1
                 kind = "dir"
-            elif is_file and st.st_nlink == 1 and Path(item.name).suffix.lower() in SQLITE_EXTENSIONS:
+            elif is_file and (st.st_nlink == 1 or (synthetic and os.name == "nt")) and Path(item.name).suffix.lower() in SQLITE_EXTENSIONS:
                 candidates.append(item.name)
                 kind = "candidate"
             else:
