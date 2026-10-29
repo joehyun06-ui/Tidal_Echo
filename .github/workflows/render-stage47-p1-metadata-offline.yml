@@ -1,0 +1,40 @@
+name: Render Stage47 P1 metadata recovery inventory OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-p1:
+    name: "Stage47 P1 private-state metadata test (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      LLM_API_KEY: ""
+      GUITING_LEDGER_MODE: disabled
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      CODEX_CONTROL_ENABLED: "false"
+    steps:
+      - name: Checkout without credential persistence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Stage47 synthetic-only metadata tests
+        run: python -m unittest backend.tests._render_stage47_p1_metadata_worker -v
+      - name: Compile source and synthetic worker
+        run: python -m compileall -q scripts/render_stage47_p1_metadata_readonly.py backend/tests/_render_stage47_p1_metadata_worker.py
