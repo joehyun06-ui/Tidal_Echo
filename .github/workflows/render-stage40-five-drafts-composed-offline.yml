@@ -1,0 +1,123 @@
+name: Render Stage40 all-five Draft composition OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-five:
+    name: "All five Drafts combined - ${{ matrix.order }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - order: forward
+            drafts: "170:e1df2077aa8ce0b86164eb6aae39484177ce13f0 171:b8247b345f8f675abe2452c335dc15089ce46be7 172:fdd98e9a1f824e5c1cbffe1ea18dcb7b77f4f9f3 173:afba43f7e397e3f5299f3035f17352ea6228b838 174:b59a81541cd0b9ce5511a3eafc4dc4c965e31061"
+          - order: reverse
+            drafts: "174:b59a81541cd0b9ce5511a3eafc4dc4c965e31061 173:afba43f7e397e3f5299f3035f17352ea6228b838 172:fdd98e9a1f824e5c1cbffe1ea18dcb7b77f4f9f3 171:b8247b345f8f675abe2452c335dc15089ce46be7 170:e1df2077aa8ce0b86164eb6aae39484177ce13f0"
+    env:
+      BASE_SHA: "58ecb255e5cb32e37ee0d949aaa7d8bff896d971"
+      OLD_SHA: "33f2fb9e09d42a901728355720b8334054c7fab5"
+      DRAFTS: "${{ matrix.drafts }}"
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      KELIVO_API_KEY: ""
+      CODEX_CANARY_ENTRYPOINTS_ENABLED: "false"
+      CODEX_GENERATION_ENABLED: "false"
+      MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED: "false"
+      RENDER_OPERATOR_READONLY_GET_EXPLICITLY_APPROVED: "false"
+      RENDER_READONLY_HEALTH_GET_EXPLICITLY_APPROVED: "false"
+    steps:
+      - name: Checkout full pinned SHA history without credentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.11"
+
+      - name: Check provenance and apply five exact Draft patches to detached production tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${OLD_SHA}^{commit}"
+          git merge-base --is-ancestor "${OLD_SHA}" "${BASE_SHA}"
+          git diff --name-only --no-renames "${OLD_SHA}" "${BASE_SHA}" | LC_ALL=C sort > "${RUNNER_TEMP}/release.txt"
+          : > "${RUNNER_TEMP}/all.txt"
+          for entry in ${DRAFTS}; do
+            num="${entry%%:*}"
+            sha="${entry#*:}"
+            case "${num}" in 170|171|172|173|174) ;; *) exit 2 ;; esac
+            git cat-file -e "${sha}^{commit}"
+            git merge-base --is-ancestor "${OLD_SHA}" "${sha}"
+            git diff --name-only --no-renames "${OLD_SHA}" "${sha}" | LC_ALL=C sort > "${RUNNER_TEMP}/draft-${num}.txt"
+            test -s "${RUNNER_TEMP}/draft-${num}.txt"
+            cat "${RUNNER_TEMP}/draft-${num}.txt" >> "${RUNNER_TEMP}/all.txt"
+          done
+          LC_ALL=C sort -u "${RUNNER_TEMP}/all.txt" > "${RUNNER_TEMP}/unique.txt"
+          test "$(wc -l < "${RUNNER_TEMP}/all.txt")" -eq "$(wc -l < "${RUNNER_TEMP}/unique.txt")" || {
+            echo "BLOCK: frozen Drafts modify overlapping file paths"; exit 1;
+          }
+          test -z "$(comm -12 "${RUNNER_TEMP}/release.txt" "${RUNNER_TEMP}/unique.txt")" || {
+            echo "BLOCK: Draft intersects post-175 production files"; exit 1;
+          }
+          git switch --detach "${BASE_SHA}"
+          for entry in ${DRAFTS}; do
+            num="${entry%%:*}"
+            sha="${entry#*:}"
+            git diff --binary --no-ext-diff --no-renames "${OLD_SHA}" "${sha}" > "${RUNNER_TEMP}/draft-${num}.patch"
+            test -s "${RUNNER_TEMP}/draft-${num}.patch"
+            git apply --check --index "${RUNNER_TEMP}/draft-${num}.patch"
+            git apply --index "${RUNNER_TEMP}/draft-${num}.patch"
+            echo "APPLIED pinned Draft #${num} in detached runner"
+          done
+          git diff --cached --check
+          git diff --cached --name-only | LC_ALL=C sort > "${RUNNER_TEMP}/result.txt"
+          cmp "${RUNNER_TEMP}/unique.txt" "${RUNNER_TEMP}/result.txt"
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
+          echo "PASS: all five overlays coexist in one detached local code tree"
+
+      - name: Install test dependencies only
+        run: python -m pip install -r backend/requirements-test.txt
+
+      - name: Run all five Draft focused offline test suites together
+        run: |
+          python -m unittest -v \
+            backend.tests._render_p3_blueprint_parity_offline_worker \
+            backend.tests._memory_oidc_render_ingress_interlock_worker \
+            backend.tests._memory_oidc_render_drift_worker \
+            backend.tests._render_live_readonly_audit_worker \
+            backend.tests._render_public_health_readonly_worker \
+            backend.tests._render_telegram_disk_evidence_offline_worker \
+            backend.tests._render_operator_evidence_readonly_worker
+
+      - name: Entire Python regression on fully composed tree
+        timeout-minutes: 9
+        run: python -m unittest discover -s backend/tests -p "test_*.py"
+
+      - name: Compile combined code
+        run: python -m compileall -q backend examples scripts
+
+      - name: Reassert no live action authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in TELEGRAM_BOT_TOKEN RENDER_API_KEY OPENAI_API_KEY KELIVO_API_KEY; do
+            test -z "${!key}"
+          done
+          test "${RENDER_OPERATOR_READONLY_GET_EXPLICITLY_APPROVED}" = false
+          test "${RENDER_READONLY_HEALTH_GET_EXPLICITLY_APPROVED}" = false
+          test "${CODEX_CANARY_ENTRYPOINTS_ENABLED}" = false
+          test "${CODEX_GENERATION_ENABLED}" = false
+          test "${MEMORY_HYBRID_RETRIEVAL_ACTIVE_ENABLED}" = false
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
