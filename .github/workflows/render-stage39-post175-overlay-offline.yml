@@ -1,0 +1,103 @@
+name: Render Stage39 post-175 overlay compatibility OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolate-draft-on-current-base:
+    name: "PR #${{ matrix.pr }} vs new production base (offline)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: "170"
+            source_sha: e1df2077aa8ce0b86164eb6aae39484177ce13f0
+            focus: "backend.tests._render_p3_blueprint_parity_offline_worker backend.tests._memory_oidc_render_ingress_interlock_worker backend.tests._memory_oidc_render_drift_worker"
+          - pr: "171"
+            source_sha: b8247b345f8f675abe2452c335dc15089ce46be7
+            focus: "backend.tests._render_live_readonly_audit_worker"
+          - pr: "172"
+            source_sha: fdd98e9a1f824e5c1cbffe1ea18dcb7b77f4f9f3
+            focus: "backend.tests._render_public_health_readonly_worker"
+          - pr: "173"
+            source_sha: afba43f7e397e3f5299f3035f17352ea6228b838
+            focus: "backend.tests._render_telegram_disk_evidence_offline_worker"
+          - pr: "174"
+            source_sha: b59a81541cd0b9ce5511a3eafc4dc4c965e31061
+            focus: "backend.tests._render_operator_evidence_readonly_worker"
+    env:
+      BASE_SHA: "58ecb255e5cb32e37ee0d949aaa7d8bff896d971"
+      PREVIOUS_SHA: "33f2fb9e09d42a901728355720b8334054c7fab5"
+      SOURCE_SHA: "${{ matrix.source_sha }}"
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      KELIVO_API_KEY: ""
+      RENDER_OPERATOR_READONLY_GET_EXPLICITLY_APPROVED: "false"
+      RENDER_READONLY_HEALTH_GET_EXPLICITLY_APPROVED: "false"
+    steps:
+      - name: Read complete repository history for pinned SHAs
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.11"
+
+      - name: Reconstruct one old Draft's exact patch on post-175 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${PREVIOUS_SHA}^{commit}"
+          git cat-file -e "${SOURCE_SHA}^{commit}"
+          git merge-base --is-ancestor "${PREVIOUS_SHA}" "${BASE_SHA}"
+          git merge-base --is-ancestor "${PREVIOUS_SHA}" "${SOURCE_SHA}"
+          git diff --name-only --no-renames "${PREVIOUS_SHA}" "${BASE_SHA}" | LC_ALL=C sort > "${RUNNER_TEMP}/release-files.txt"
+          git diff --name-only --no-renames "${PREVIOUS_SHA}" "${SOURCE_SHA}" | LC_ALL=C sort > "${RUNNER_TEMP}/draft-files.txt"
+          if test -n "$(comm -12 "${RUNNER_TEMP}/release-files.txt" "${RUNNER_TEMP}/draft-files.txt")"; then
+            echo "ERROR: new production and Draft modify overlapping paths; manual review required"
+            exit 1
+          fi
+          git diff --binary --no-ext-diff --no-renames "${PREVIOUS_SHA}" "${SOURCE_SHA}" > "${RUNNER_TEMP}/draft.patch"
+          test -s "${RUNNER_TEMP}/draft.patch"
+          git switch --detach "${BASE_SHA}"
+          git apply --check --index "${RUNNER_TEMP}/draft.patch"
+          git apply --index "${RUNNER_TEMP}/draft.patch"
+          git diff --cached --check
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
+          echo "OFFLINE overlay applied cleanly to current production SHA; no deploy or merge"
+
+      - name: Install test-only dependencies
+        run: python -m pip install -r backend/requirements-test.txt
+
+      - name: Check exact old Draft's targeted offline tests
+        run: python -m unittest ${{ matrix.focus }} -v
+
+      - name: Full Python regression on the isolated merged tree
+        timeout-minutes: 8
+        run: python -m unittest discover -s backend/tests -p "test_*.py"
+
+      - name: Compile checked sources
+        run: python -m compileall -q backend examples scripts
+
+      - name: Verify no release/paid/identity authority supplied
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${RENDER_OPERATOR_READONLY_GET_EXPLICITLY_APPROVED}" = false
+          test "${RENDER_READONLY_HEALTH_GET_EXPLICITLY_APPROVED}" = false
+          test -z "${TELEGRAM_BOT_TOKEN}"
+          test -z "${RENDER_API_KEY}"
+          test -z "${OPENAI_API_KEY}"
+          test -z "${KELIVO_API_KEY}"
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
