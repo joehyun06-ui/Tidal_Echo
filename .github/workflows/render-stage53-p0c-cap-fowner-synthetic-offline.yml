@@ -1,0 +1,40 @@
+name: Render Stage53 P0C CAP_FOWNER SYNTHETIC OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-p0c:
+    name: "Stage53 P0C capability bit safety (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      GUITING_STAGE53_SYNTHETIC_ONLY: "true"
+      OPENAI_API_KEY: ""
+      RENDER_API_KEY: ""
+      TELEGRAM_BOT_TOKEN: ""
+      LLM_API_KEY: ""
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      CODEX_GENERATION_ENABLED: "false"
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Synthetic only, fake capability masks, no live capget
+        run: python -m unittest backend.tests._render_stage53_p0c_cap_fowner_worker -v
+      - name: Compile no production invocation
+        run: python -m compileall -q scripts/render_stage53_p0c_cap_fowner_readonly.py backend/tests/_render_stage53_p0c_cap_fowner_worker.py
