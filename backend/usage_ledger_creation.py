@@ -99,19 +99,43 @@ class ContinuationCreation:
                     self.uncertain(rid)
                     raise CreationError('continuation_creation_uncertain',503) from None
             with self.lock:
-                self.source(sid,version)
-                created=self.authority.row_for_session(target)
-                if self.authority.tombstone_for_session(target) or not created or created['provider']!=mode:
+                return self.finish(sid,row,text)
+
+    async def reconcile(self,sid,body):
+        """Resolve one saved request. Never reserve a UUID or call the factory."""
+        rid,version,text=self.parse(body)
+        async with self.gate:
+            with self.lock:
+                source,_=self.source(sid,version)
+                mode=source['provider'];target=mode+'-continuation-'+rid
+                with closing(self.receipts.ledger.connect()) as conn:
+                    saved=conn.execute('SELECT * FROM usage_ledger_continuation_creations WHERE request_id=?',(rid,)).fetchone()
+                if not saved:raise CreationError('continuation_receipt_unavailable',404)
+                row=dict(saved)
+                digest=self.receipts.digest(sid,target,mode,rid,text)
+                if ((row['source_id'],row['version_id'],row['target_id'],row['mode'],row['key_id'])
+                        !=(sid,version,target,mode,self.receipts.key_id) or not hmac.compare_digest(row['digest'],digest)):
+                    raise CreationError('continuation_request_conflict')
+                if row['phase'] not in {'creating','unknown','registered'}:
                     raise CreationError('continuation_creation_uncertain',503)
-                try:
-                    self.receipts.register(source_id=sid,target_id=target,mode=mode,request_id=rid,expected_text=text,
-                                           creation_receipt=(rid,row['created_at']))
-                except LedgerError: raise CreationError('continuation_registration_unconfirmed',503) from None
-                with closing(self.receipts.ledger.connect()) as conn,conn:
-                    receipt=conn.execute('SELECT 1 FROM usage_ledger_continuations WHERE request_id=? AND source_id=? AND target_id=?',(rid,sid,target)).fetchone()
-                    if not receipt: raise CreationError('continuation_registration_unconfirmed',503)
-                    conn.execute("UPDATE usage_ledger_continuation_creations SET phase='registered' WHERE request_id=?",(rid,))
-                return {'ok':True,'contract_version':1,'api_session':sid,'registered':True,'created':created}
+                return self.finish(sid,row,text)
+
+    def finish(self,sid,row,text):
+        # Called under the same authority lock by creation and explicit recovery.
+        self.source(sid,row['version_id'])
+        rid,target,mode=row['request_id'],row['target_id'],row['mode']
+        created=self.authority.row_for_session(target)
+        if self.authority.tombstone_for_session(target) or not created or created['provider']!=mode:
+            raise CreationError('continuation_creation_uncertain',503)
+        try:
+            self.receipts.register(source_id=sid,target_id=target,mode=mode,request_id=rid,expected_text=text,
+                                   creation_receipt=(rid,row['created_at']))
+        except LedgerError:raise CreationError('continuation_registration_unconfirmed',503) from None
+        with closing(self.receipts.ledger.connect()) as conn,conn:
+            receipt=conn.execute('SELECT 1 FROM usage_ledger_continuations WHERE request_id=? AND source_id=? AND target_id=?',(rid,sid,target)).fetchone()
+            if not receipt:raise CreationError('continuation_registration_unconfirmed',503)
+            conn.execute("UPDATE usage_ledger_continuation_creations SET phase='registered' WHERE request_id=?",(rid,))
+        return {'ok':True,'contract_version':1,'api_session':sid,'registered':True,'created':created}
 
     def uncertain(self,rid):
         with closing(self.receipts.ledger.connect()) as conn,conn:

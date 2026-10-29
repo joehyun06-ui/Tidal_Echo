@@ -61,13 +61,24 @@ def install_loop(app, legacy, integration, runtime, *, continuation_creator=None
         except CreationError as exc: return error(exc.category,exc.status)
         except (OSError,sqlite3.Error,ValueError,TypeError,WebSessionProviderAuthorityError): return error('continuation_creation_unavailable',503)
 
+    @app.post('/loop/sessions/{session_id}/continuation/reconcile')
+    async def reconcile_continuation(session_id:str,request:Request):
+        legacy.check_internal_auth(request)
+        if continuation_creator is None:return error('continuation_registration_unavailable',409)
+        try:
+            with integration._session_lock:session(session_id)
+            body=await read_continuation(request)
+            return await continuation_creator.reconcile(session_id,body)
+        except CreationError as exc:return error(exc.category,exc.status)
+        except (OSError,sqlite3.Error,ValueError,TypeError,WebSessionProviderAuthorityError):return error('continuation_creation_unavailable',503)
+
 
 def install_relay(relay):
     async def forward(sid,request,suffix):
         relay.check_auth(request)
         if not safe_id(sid): return error('context_session_unavailable',404)
         body=None
-        if request.method=='POST' and suffix=='continuation':
+        if request.method=='POST' and suffix in {'continuation','continuation/reconcile'}:
             try: body=await read_continuation(request)
             except CreationError as exc: return error(exc.category,exc.status)
         elif request.method=='POST':
@@ -96,6 +107,8 @@ def install_relay(relay):
     async def continuation(session_id:str,request:Request): return await forward(session_id,request,'continuation')
     @relay.app.post('/app/sessions/{session_id}/continuation')
     async def create_continuation(session_id:str,request:Request): return await forward(session_id,request,'continuation')
+    @relay.app.post('/app/sessions/{session_id}/continuation/reconcile')
+    async def reconcile_continuation(session_id:str,request:Request):return await forward(session_id,request,'continuation/reconcile')
 
 
 async def read_continuation(request):
