@@ -1,0 +1,40 @@
+name: Render Stage52 P0 anonymous root owner SYNTHETIC OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage52-p0:
+    name: "Stage52 P0 zero-directory-I/O privacy (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      GUITING_STAGE52_SYNTHETIC_ONLY: "true"
+      OPENAI_API_KEY: ""
+      RENDER_API_KEY: ""
+      TELEGRAM_BOT_TOKEN: ""
+      LLM_API_KEY: ""
+      TELEGRAM_ENABLED: "false"
+      CODEX_GENERATION_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+    steps:
+      - name: Checkout without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test temporary fake root only
+        run: python -m unittest backend.tests._render_stage52_p0_root_owner_metadata_worker -v
+      - name: Compile
+        run: python -m compileall -q scripts/render_stage52_p0_root_owner_metadata_readonly.py backend/tests/_render_stage52_p0_root_owner_metadata_worker.py
