@@ -14,7 +14,7 @@
 1. `PRAGMA integrity_check` 恰好一行 `ok`。
 2. `PRAGMA foreign_key_check` 无错误行。
 3. `channel_store.validate_core_schema_v1_v6(conn, require_relay_tables=True)` 不抛错。
-4. `channel_store.validate_memory_operator_schema_v1_v11(conn)` 不抛错，以覆盖完整 schema 后续版本。
+4. `channel_store.validate_memory_index_outbox_schema_v1_v11(conn)` 不抛错，以验证 v7–v11 的迁移表、索引、触发器与迁移标记。memory-operator 专用的精确对象集合校验器范围另有约束，本演练不冒充通过它。
 5. SQLite read-only/PRAGMA query_only 确认拒绝写入。
 
 ## 六个测试案例
