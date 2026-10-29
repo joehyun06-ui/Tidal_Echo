@@ -1,0 +1,41 @@
+name: Render Stage46 P0 attachments and config restore SYNTHETIC OFFLINE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  p0-synthetic-restore:
+    name: "Stage46 fake-data restore (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      TELEGRAM_BOT_TOKEN: ""
+      RENDER_API_KEY: ""
+      LLM_API_KEY: ""
+      OPENAI_API_KEY: ""
+      TELEGRAM_ENABLED: "false"
+      MEMORY_CORE_ENABLED: "false"
+      CODEX_CONTROL_ENABLED: "false"
+      GUITING_LEDGER_MODE: "disabled"
+      GUITING_STAGE46_SYNTHETIC_ONLY: "true"
+    steps:
+      - name: Checkout source, never persist credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run isolated fake-file restore tests without secrets or network
+        run: python -m unittest backend.tests._render_stage46_p0_synthetic_restore_worker -v
+      - name: Compile bounded source
+        run: python -m compileall -q scripts/render_stage46_p0_synthetic_restore.py backend/tests/_render_stage46_p0_synthetic_restore_worker.py
