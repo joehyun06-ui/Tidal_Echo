@@ -75,6 +75,83 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(CreationError,'uncertain'):await creator.create('a',self.body)
         self.assertEqual(factory.await_count,1)
 
+    async def test_recovery_after_restart_only_registers_exact_existing_target(self):
+        for sid in ('a','b'):
+            body={**self.body,'source_version_id':sid,'request_id':self.body['request_id'] if sid=='a' else '22222222-2222-4222-8222-222222222222'}
+            async def lost(**kwargs):
+                await self.integration.create_web_session(**kwargs)
+                raise OSError('synthetic lost factory result')
+            factory=AsyncMock(side_effect=lost)
+            with self.assertRaisesRegex(CreationError,'uncertain'):await self.make(factory).create(sid,body)
+            forbidden=AsyncMock(side_effect=AssertionError('recovery must not create'))
+            restarted=self.make(forbidden)
+            results=await asyncio.gather(*(restarted.reconcile(sid,body) for _ in range(3)))
+            self.assertEqual(len({r['created']['id'] for r in results}),1)
+            self.assertTrue(all(r['registered'] for r in results));forbidden.assert_not_awaited();self.assertEqual(factory.await_count,1)
+        with sqlite3.connect(self.relay) as conn:self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0],0)
+        with closing(self.ledger.connect()) as conn:self.assertEqual(conn.execute('SELECT COUNT(*) FROM usage_ledger_continuations').fetchone()[0],2)
+        self.assertNotIn(self.body['text'].encode(),Path(self.ledger.path).read_bytes())
+
+    async def test_recovery_without_saved_request_never_reserves_or_calls_factory(self):
+        factory=AsyncMock(side_effect=AssertionError('must not create'));creator=self.make(factory)
+        with self.assertRaisesRegex(CreationError,'receipt_unavailable'):await creator.reconcile('a',self.body)
+        with closing(self.ledger.connect()) as conn:self.assertEqual(conn.execute('SELECT COUNT(*) FROM usage_ledger_continuation_creations').fetchone()[0],0)
+        factory.assert_not_awaited()
+
+    async def test_crashed_creation_with_no_target_remains_unknown_on_recovery(self):
+        factory=AsyncMock(side_effect=OSError('synthetic before result'));creator=self.make(factory)
+        with self.assertRaises(CreationError):await creator.create('a',self.body)
+        with closing(self.ledger.connect()) as conn,conn:conn.execute("UPDATE usage_ledger_continuation_creations SET phase='creating'")
+        forbidden=AsyncMock(side_effect=AssertionError('must not recreate'))
+        for _ in range(2):
+            with self.assertRaisesRegex(CreationError,'uncertain'):await self.make(forbidden).reconcile('a',self.body)
+        forbidden.assert_not_awaited();self.assertEqual(factory.await_count,1)
+
+    async def test_recovery_rejects_changed_text_source_selection_and_purged_receipt(self):
+        await self.creator.create('a',self.body)
+        for sid,body in [('a',{**self.body,'text':'changed'}),('b',{**self.body,'source_version_id':'b'})]:
+            with self.assertRaisesRegex(CreationError,'conflict'):await self.creator.reconcile(sid,body)
+        self.ledger.purge_session('a')
+        with self.assertRaisesRegex(CreationError,'receipt_unavailable'):await self.creator.reconcile('a',self.body)
+
+    async def test_recovery_routes_are_authenticated_bounded_and_never_retry(self):
+        import httpx
+        from fastapi import FastAPI,HTTPException
+        from backend.web_context_actions_routes import install_loop,install_relay
+        def auth(request):
+            if request.headers.get('authorization')!='Bearer synthetic':raise HTTPException(401)
+        self.legacy.check_internal_auth=auth
+        await self.creator.create('a',self.body)
+        app=FastAPI();install_loop(app,self.legacy,self.integration,self.integration.runtime,continuation_creator=self.creator)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://offline.test') as client:
+            url='/loop/sessions/a/continuation/reconcile'
+            self.assertEqual((await client.post(url,json=self.body)).status_code,401)
+            client.headers['Authorization']='Bearer synthetic'
+            result=await client.post(url,json=self.body);self.assertEqual(result.status_code,200);self.assertTrue(result.json()['registered'])
+            self.assertEqual((await client.post(url,content=b'x'*(160*1024+1))).status_code,400)
+        calls=[]
+        def forward(path,**kw):calls.append((path,kw));raise HTTPException(503)
+        app=FastAPI();install_relay(SimpleNamespace(app=app,check_auth=auth,loop_json=forward))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://offline.test') as client:
+            url='/app/sessions/a/continuation/reconcile'
+            self.assertEqual((await client.post(url,json=self.body)).status_code,401);self.assertEqual(calls,[])
+            client.headers['Authorization']='Bearer synthetic'
+            result=await client.post(url,json=self.body);self.assertEqual(result.status_code,503);self.assertEqual(result.headers['cache-control'],'private, no-store')
+            self.assertEqual(calls,[('/loop/sessions/a/continuation/reconcile',{'method':'POST','body':self.body})])
+
+    async def test_recovery_requires_unchanged_selection_key_and_factory_marker(self):
+        await self.creator.create('a',self.body)
+        row=self.authority.new_row(provider='api',session_id='alt');self.authority.publish_row(row,activate=False)
+        with sqlite3.connect(self.relay) as conn:
+            conn.execute("INSERT INTO web_message_versions VALUES ('alt','a','a','regenerate')")
+            conn.execute("INSERT INTO web_version_selections VALUES ('a','alt')")
+        with self.assertRaisesRegex(CreationError,'selection_changed'):await self.creator.reconcile('a',self.body)
+        with sqlite3.connect(self.relay) as conn:conn.execute("DELETE FROM web_version_selections")
+        with closing(self.ledger.connect()) as conn,conn:conn.execute("UPDATE usage_ledger_continuation_creations SET phase='reserved'")
+        with self.assertRaisesRegex(CreationError,'uncertain'):await self.creator.reconcile('a',self.body)
+        with closing(self.ledger.connect()) as conn,conn:conn.execute("UPDATE usage_ledger_continuation_creations SET phase='unknown',key_id='synthetic-other-key'")
+        with self.assertRaisesRegex(CreationError,'conflict'):await self.creator.reconcile('a',self.body)
+
     async def test_cross_source_or_extra_fields_and_bad_utf16_are_rejected(self):
         for change in ({'provider':'codex'},{'target_id':'client-chosen'},{'text':' x '},{'text':'\ud800'},{'source_version_id':'b'}):
             with self.assertRaises(CreationError):await self.creator.create('a',{**self.body,**change})
