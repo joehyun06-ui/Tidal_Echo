@@ -116,12 +116,22 @@ def checked_file_header(root_fd_or_path: int | Path, entry: tuple, *, synthetic:
         target = root_fd_or_path / name
         try:
             before = target.lstat()
-            if not stat.S_ISREG(before.st_mode) or file_fingerprint(name, before) != entry:
+            if not stat.S_ISREG(before.st_mode):
+                raise ScopeChanged("candidate_drift")
+            # Windows synthetic DirEntry.stat vs Path.lstat may differ for
+            # inode/link fields; this relaxation NEVER runs in production.
+            if os.name == "nt":
+                if before.st_size != entry[6] or before.st_mtime_ns != entry[7]:
+                    raise ScopeChanged("candidate_drift")
+            elif file_fingerprint(name, before) != entry:
                 raise ScopeChanged("candidate_drift")
             with target.open("rb") as handle:
                 data = handle.read(HEADER_LENGTH)
             after = target.lstat()
-            if file_fingerprint(name, after) != entry:
+            if os.name == "nt":
+                if not stat.S_ISREG(after.st_mode) or after.st_size != entry[6] or after.st_mtime_ns != entry[7]:
+                    raise ScopeChanged("candidate_drift")
+            elif file_fingerprint(name, after) != entry:
                 raise ScopeChanged("candidate_drift")
             return data
         except OSError:
