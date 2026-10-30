@@ -14,6 +14,7 @@ import uuid
 from .usage_ledger import LedgerError, identifier
 from .usage_ledger_sources import MessageCounts
 from .web_continuation import preview
+from .usage_ledger_continuation import readonly
 
 
 class CreationError(ValueError):
@@ -51,6 +52,37 @@ class ContinuationCreation:
             row,selected=self.source(sid)
             result=preview(self.receipts.relay_db,selected,row['title'])
             return {**result,'api_session':sid,'registration':{'supported':True,'source_version_id':selected}}
+
+    def links(self,sid):
+        """Read confirmed creation relationships, never reconcile or create."""
+        identifier(sid)
+        now=datetime.now(timezone.utc).isoformat()
+        with self.lock,closing(self.receipts.ledger.connect()) as conn:
+            def visible(value,mode):
+                row=self.authority.row_for_session(value)
+                return bool(row and row.get('provider')==mode and not self.authority.tombstone_for_session(value)
+                            and not self.receipts.ledger.blocked(conn,mode,value,now))
+            current=self.authority.row_for_session(sid)
+            if not current or not visible(sid,current['provider']):raise CreationError('continuation_source_unavailable',404)
+            rows=conn.execute('''SELECT c.* FROM usage_ledger_continuation_creations c
+                JOIN usage_ledger_continuations r ON c.request_id=r.request_id AND c.source_id=r.source_id
+                  AND c.target_id=r.target_id AND c.mode=r.mode AND c.digest=r.digest AND c.key_id=r.key_id
+                WHERE c.phase='registered' AND (c.source_id=? OR c.target_id=?)
+                ORDER BY c.created_at DESC,c.request_id DESC LIMIT 201''',(sid,sid)).fetchall()
+            links=[]
+            with closing(readonly(self.receipts.relay_db)) as relay:
+                has_versions=relay.execute("SELECT 1 FROM sqlite_master WHERE name='web_message_versions'").fetchone()
+                for row in rows[:200]:
+                    source,target,version,mode=row['source_id'],row['target_id'],row['version_id'],row['mode']
+                    if mode!=current['provider'] or source==target or not visible(source,mode) or not visible(target,mode):continue
+                    version_ok=version==source
+                    if not version_ok and has_versions and visible(version,mode):
+                        edge=relay.execute('SELECT root_id FROM web_message_versions WHERE version_id=?',(version,)).fetchone()
+                        version_ok=bool(edge and edge['root_id']==source)
+                    links.append({'source_id':source,'source_version_id':version if version_ok else None,
+                                  'target_id':target,'provider':mode,'created_at':row['created_at']})
+            return {'ok':True,'contract_version':1,'api_session':sid,'supported':True,
+                    'partial':len(rows)>200,'relations':links}
 
     def parse(self,body):
         if not isinstance(body,dict) or set(body)!={'request_id','source_version_id','text'}: raise CreationError('continuation_request_invalid',400)
