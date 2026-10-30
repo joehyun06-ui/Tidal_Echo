@@ -31,6 +31,8 @@ def install_loop(app, legacy, integration, runtime, *, continuation_creator=None
             body=await legacy.read_internal_json(request) if action in {'start','reconcile'} else None
             with integration._session_lock:
                 row=session(sid)
+                if action=='links':
+                    return continuation_creator.links(sid) if continuation_creator is not None else {'ok':True,'contract_version':1,'api_session':sid,'supported':False,'partial':False,'relations':[]}
                 if action=='preview': return continuation_creator.preview(sid) if continuation_creator is not None else preview(legacy.RELAY_DB,sid,row['title'])
                 if row['provider']!='codex' or not runtime.generation_enabled:
                     if action: raise CompactionError('compaction_not_supported',409)
@@ -49,6 +51,9 @@ def install_loop(app, legacy, integration, runtime, *, continuation_creator=None
     async def reconcile(session_id:str,request:Request): return await operation(session_id,request,action='reconcile')
     @app.get('/loop/sessions/{session_id}/continuation')
     async def continuation(session_id:str,request:Request): return await operation(session_id,request,action='preview')
+
+    @app.get('/loop/sessions/{session_id}/continuation/links')
+    async def continuation_links(session_id:str,request:Request): return await operation(session_id,request,action='links')
 
     @app.post('/loop/sessions/{session_id}/continuation')
     async def create_continuation(session_id:str,request:Request):
@@ -105,6 +110,8 @@ def install_relay(relay):
     async def reconcile(session_id:str,request:Request): return await forward(session_id,request,'compact/reconcile')
     @relay.app.get('/app/sessions/{session_id}/continuation')
     async def continuation(session_id:str,request:Request): return await forward(session_id,request,'continuation')
+    @relay.app.get('/app/sessions/{session_id}/continuation/links')
+    async def continuation_links(session_id:str,request:Request): return await forward(session_id,request,'continuation/links')
     @relay.app.post('/app/sessions/{session_id}/continuation')
     async def create_continuation(session_id:str,request:Request): return await forward(session_id,request,'continuation')
     @relay.app.post('/app/sessions/{session_id}/continuation/reconcile')

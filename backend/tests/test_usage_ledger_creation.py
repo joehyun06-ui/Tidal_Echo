@@ -40,6 +40,68 @@ class CreationTests(unittest.IsolatedAsyncioTestCase):
 
     def make(self,factory=None):return ContinuationCreation(self.receipts,authority=self.authority,session_lock=self.lock,create_session=factory or self.integration.create_web_session)
 
+    async def test_links_are_bidirectional_same_provider_and_do_not_send_or_reconcile(self):
+        for sid,mode,rid in [('a','api',self.body['request_id']),('b','codex','22222222-2222-4222-8222-222222222222')]:
+            result=await self.creator.create(sid,{**self.body,'source_version_id':sid,'request_id':rid});target=result['created']['id']
+            with patch.object(self.creator,'factory',side_effect=AssertionError('no factory')),patch.object(self.receipts,'register',side_effect=AssertionError('no registration')),patch.object(self.receipts,'reconcile',side_effect=AssertionError('no reconciliation')):
+                outgoing=self.creator.links(sid);incoming=self.creator.links(target)
+            self.assertEqual(outgoing['relations'],incoming['relations']);link,=outgoing['relations']
+            self.assertEqual((link['source_id'],link['source_version_id'],link['target_id'],link['provider']),(sid,sid,target,mode))
+            self.assertNotIn('request_id',link);self.assertNotIn('digest',link);self.assertNotIn('text',link)
+        with sqlite3.connect(self.relay) as conn:self.assertEqual(conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0],0)
+
+    async def test_links_keep_historical_version_and_mark_unavailable_without_exposing_deleted_id(self):
+        row=self.authority.new_row(provider='api',session_id='alt');self.authority.publish_row(row,activate=False)
+        with sqlite3.connect(self.relay) as conn:
+            conn.execute("INSERT INTO web_message_versions VALUES ('alt','a','a','regenerate')")
+            conn.execute("INSERT INTO web_version_selections VALUES ('a','alt')")
+        result=await self.creator.create('a',{**self.body,'source_version_id':'alt'});target=result['created']['id']
+        with sqlite3.connect(self.relay) as conn:conn.execute("DELETE FROM web_version_selections")
+        self.assertEqual(self.make().links(target)['relations'][0]['source_version_id'],'alt')
+        self.cfg['sessions']=[s for s in self.cfg['sessions'] if s['id']!='alt']
+        self.assertIsNone(self.creator.links(target)['relations'][0]['source_version_id'])
+        self.assertNotIn('alt',json.dumps(self.creator.links(target)))
+
+    async def test_links_exclude_unknown_mismatched_cross_mode_deleted_and_purged_relations(self):
+        result=await self.creator.create('a',self.body);target=result['created']['id']
+        for column,value in [('phase','unknown'),('digest','different'),('mode','codex')]:
+            with closing(self.ledger.connect()) as conn,conn:
+                old=conn.execute('SELECT '+column+' FROM usage_ledger_continuation_creations').fetchone()[0]
+                conn.execute('UPDATE usage_ledger_continuation_creations SET '+column+'=?',(value,))
+            self.assertEqual(self.creator.links('a')['relations'],[])
+            with closing(self.ledger.connect()) as conn,conn:conn.execute('UPDATE usage_ledger_continuation_creations SET '+column+'=?',(old,))
+        self.cfg['sessions']=[s for s in self.cfg['sessions'] if s['id']!=target]
+        self.assertEqual(self.creator.links('a')['relations'],[])
+        self.ledger.purge_session('a')
+        self.assertEqual(self.creator.links('a')['relations'],[])
+        self.ledger.purge_session('a',retire=True)
+        with self.assertRaisesRegex(CreationError,'unavailable'):self.creator.links('a')
+
+    async def test_links_routes_are_authenticated_default_off_and_proxy_reads_only(self):
+        import httpx
+        from fastapi import FastAPI,HTTPException
+        from backend.web_context_actions_routes import install_loop,install_relay
+        def auth(request):
+            if request.headers.get('authorization')!='Bearer synthetic':raise HTTPException(401)
+        self.legacy.check_internal_auth=auth
+        await self.creator.create('a',self.body)
+        for creator in [None,self.creator]:
+            app=FastAPI();install_loop(app,self.legacy,self.integration,self.integration.runtime,continuation_creator=creator)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://offline.test') as client:
+                url='/loop/sessions/a/continuation/links';self.assertEqual((await client.get(url)).status_code,401)
+                client.headers['Authorization']='Bearer synthetic'
+                data=(await client.get(url)).json();self.assertEqual(data['supported'],creator is not None)
+                self.assertEqual(len(data['relations']),int(creator is not None))
+                self.assertEqual((await client.get('/loop/sessions/missing/continuation/links')).status_code,404)
+        calls=[]
+        def forward(path,**kw):calls.append((path,kw));return self.creator.links('a')
+        app=FastAPI();install_relay(SimpleNamespace(app=app,check_auth=auth,loop_json=forward))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://offline.test') as client:
+            url='/app/sessions/a/continuation/links';self.assertEqual((await client.get(url)).status_code,401)
+            client.headers['Authorization']='Bearer synthetic';result=await client.get(url)
+            self.assertEqual(result.status_code,200);self.assertEqual(result.headers['cache-control'],'private, no-store')
+            self.assertEqual(calls,[('/loop/sessions/a/continuation/links',{'method':'GET','body':None})])
+
     async def test_api_and_codex_use_real_factory_target_and_register_without_sending(self):
         for sid,mode in [('a','api'),('b','codex')]:
             body={**self.body,'source_version_id':sid,'request_id':self.body['request_id'] if sid=='a' else '22222222-2222-4222-8222-222222222222'}
