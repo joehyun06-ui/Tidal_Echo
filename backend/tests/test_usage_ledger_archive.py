@@ -161,6 +161,19 @@ class ArchiveTests(unittest.TestCase):
         changed, _ = archive._seal(self.frozen, self.key, self.key_id)
         self.denied(changed)
 
+    def test_application_user_version_change_is_also_a_compatibility_boundary(self):
+        with closing(sqlite3.connect(self.frozen)) as conn:
+            conn.execute('PRAGMA user_version=7')
+        changed, _ = archive._seal(self.frozen, self.key, self.key_id)
+        self.denied(changed)
+
+    def test_invalid_timestamp_and_sqlite_version_metadata_rejected(self):
+        for key, value in (('created_at', {}), ('created_at', 'invalid-date'),
+                           ('created_at', '2026-11-04T10:00:00'),
+                           ('sqlite_version', 123), ('sqlite_version', 'unknown')):
+            with self.subTest(key=key, value=value):
+                self.denied(self.forged(lambda m, d: m.update({key: value})))
+
     def test_nonledger_table_in_source_is_rejected(self):
         with closing(sqlite3.connect(self.frozen)) as conn, conn:
             conn.execute('CREATE TABLE messages(text TEXT)')

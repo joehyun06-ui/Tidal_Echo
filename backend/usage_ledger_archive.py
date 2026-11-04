@@ -104,9 +104,10 @@ def _inspect(path):
             if not re.fullmatch(r'usage_ledger[a-z_]*|sqlite_sequence', name):
                 _deny()
             counts[name] = conn.execute('SELECT COUNT(*) FROM "' + name + '"').fetchone()[0]
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
         return {'snapshot_sha256': hashlib.sha256(data).hexdigest(), 'snapshot_size': len(data),
-                'schema_sha256': hashlib.sha256(_json(schema)).hexdigest(),
-                'user_version': conn.execute('PRAGMA user_version').fetchone()[0],
+                'schema_sha256': hashlib.sha256(_json([user_version, schema])).hexdigest(),
+                'user_version': user_version,
                 'table_counts': counts}, data
 
 
@@ -144,8 +145,13 @@ def _decode(blob, key, key_id, expected_schema):
             or manifest['schema_sha256'] != expected_schema
             or type(manifest['snapshot_size']) is not int
             or type(manifest['user_version']) is not int
+            or not isinstance(manifest['created_at'], str) or len(manifest['created_at']) > 64
+            or not isinstance(manifest['sqlite_version'], str)
+            or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', manifest['sqlite_version'])
             or not isinstance(manifest['table_counts'], dict)
             or any(type(v) is not int or v < 0 for v in manifest['table_counts'].values())):
+        _deny()
+    if datetime.fromisoformat(manifest['created_at']).utcoffset() is None:
         _deny()
     data = plaintext[4 + size:]
     if (not 0 < len(data) <= MAX_DB or len(data) != manifest['snapshot_size']

@@ -37,7 +37,7 @@ GM-00B 的现场内存 round-trip PASS 沿用交接证据，本轮没有重跑�
 | manifest | 原工具仅返回校验摘要 | DB SHA-256/长度、完整 schema hash、user_version、所有表计数及创建信息 | 合成已验证 |
 | 完成标志 / 半成品 | 原工具不保证崩溃无残留 | `.partial-*` 不参与恢复；完整文件独占发布；同步失败不得回报成功 | 故障注入已验证 |
 | 隔离磁盘恢复 | 已有临时目录恢复 | 先认证解密，再仅写新临时目录；校验时不调用会修改 schema/WAL 的 Ledger 构造器 | 合成已验证 |
-| 版本兼容 | 只有必需表/列最小集 | archive v1 + 外部期望 schema 精确匹配；默认拒绝未知/旧 schema，不做隐式迁移 | 合成已验证 |
+| 版本兼容 | 只有必需表/列最小集 | archive v1 + 外部期望 schema（包含 user_version）精确匹配；默认拒绝未知/旧 schema，不做隐式迁移 | 合成已验证 |
 | 私有独立故障域 | 未建立验收证据 | 本轮模拟 vault 仍在同机临时目录，明确不算离机或介质隔离 | 待选目标、待授权 |
 | 密钥备份 / 轮换 | 未建立本轮证据 | 原型只用临时随机合成密钥；没有真实密钥托管与回收 | 待设计、待授权 |
 | 保留、频率、RPO/RTO | 未批准 | 仅给候选参数，不设生产计划 | 待用户决定 |
@@ -83,7 +83,7 @@ AEAD 只能校验持密钥者提供的归档，不能建立独立可信 C、不�
 
 - `backend/usage_ledger_archive.py`：只暴露 `--mock`；无生产路径、密钥、恢复目标、网络上传、
   环境变量或调度参数。私有辅助函数仅供合成测试，不是已获准的生产运维 API。
-- `backend/tests/test_usage_ledger_archive.py`：31 项合成测试；不访问真实账户、数据库或模型。
+- `backend/tests/test_usage_ledger_archive.py`：33 项合成测试；不访问真实账户、数据库或模型。
 - 本设计文档。现有 Python CI 使用 `test_*.py` 发现新测试，不修改部署或 CI 配置。
 
 本轮本地环境：Python 3.12.14、SQLite 3.53.1、cryptography 50.0.2；不代表 Render 运行时版本。
@@ -97,13 +97,14 @@ python -m unittest \
   backend.tests.test_usage_ledger_archive
 ```
 
-**本地结果：73/73 PASS = 新增 31 + 既有账本/存储核心 42。** 原有 backup mock rehearsal
+**本地结果：75/75 PASS = 新增 33 + 既有账本/存储核心 42。** 原有 backup mock rehearsal
 在新增测试中再次执行通过。两个新 Python 文件语法解析通过；基础依赖源码与固定 commit 的
 Git blob SHA 已逐一核对。不是完整仓库测试通过声明。
 
 曾尝试三个完整测试模块，共 75 项：72 PASS，3 项路由集成测试因本地缺少 `httpx` 和部分
 路由/会话源码未能运行。随后新增 1 项序号验证并明确运行上述 73 项核心集合；未把那 3 项
-环境缺项改成 skip 或通过。完整仓库路由/端到端回归结果以本轮 Draft PR 的 CI 为准。
+环境缺项改成 skip 或通过。之后再收紧 user_version、时间戳与 SQLite 版本元数据契约，增加 2 项测试，
+最终上述集合为 75 项。完整仓库路由/端到端回归结果以本轮 Draft PR 的 CI 为准。
 
 | 测试组 | 拒绝 / 成功门槛 |
 |---|---|
