@@ -14,6 +14,7 @@ from typing import ContextManager, Protocol
 from .g3_projection import _valid_id, _validate_event, build_projection_card
 from .g3_projection_contract import AccessScope, G3Event, G3SourceRef, ProjectionCard, ProjectionError
 from .g3_projection_feed import _binding
+from .web_session_provider_authority import _safe_session_id, WebSessionProviderAuthorityError
 
 
 class LifecycleError(ValueError):
@@ -34,6 +35,15 @@ def _ids(values, limit=128):
     if (not isinstance(values, tuple) or len(values) > limit
             or not all(_valid_id(v) for v in values) or len(set(values)) != len(values)):
         _deny()
+
+
+def _session_id(value):
+    # Canonical Web IDs allow periods and up to 160 chars; G3 IDs are narrower.
+    try:
+        _safe_session_id(value)
+        return True
+    except WebSessionProviderAuthorityError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -194,8 +204,8 @@ class SessionLifecycle:
 
     def _snapshot(self, snapshot, cid):
         if (not isinstance(snapshot, SessionSnapshot) or snapshot.conversation_id != cid
-                or not all(_valid_id(v) for v in (snapshot.conversation_id, snapshot.version_id,
-                                      snapshot.window_id, snapshot.model_run_id, snapshot.stamp))
+                or not all(_session_id(v) for v in (snapshot.conversation_id, snapshot.version_id))
+                or not all(_valid_id(v) for v in (snapshot.window_id, snapshot.model_run_id, snapshot.stamp))
                 or snapshot.provider not in ('api', 'codex')
                 or type(snapshot.context_epoch) is not int or snapshot.context_epoch < 0
                 or type(snapshot.message_head) is not int or type(snapshot.observed_message_cursor) is not int
@@ -264,7 +274,7 @@ class SessionLifecycle:
     def _run(self, cid, rid, op, payload, access, handler):
         if not self.enabled:
             _deny('lifecycle_disabled')
-        if not _valid_id(cid) or not _valid_id(rid):
+        if not _session_id(cid) or not _valid_id(rid):
             _deny()
         binding = _binding(access)
         digest = hashlib.sha256(_json([op, cid, binding, payload])).hexdigest()
@@ -442,7 +452,7 @@ class SessionLifecycle:
     def packet(self, cid, *, access):
         if not self.enabled:
             _deny('lifecycle_disabled')
-        if not _valid_id(cid):
+        if not _session_id(cid):
             _deny()
         binding = _binding(access)
         try:

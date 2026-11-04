@@ -289,6 +289,13 @@ class LifecycleTests(unittest.TestCase):
         engine = SessionLifecycle(None, None, None, None)
         self.rejects(lambda: engine.closeout(CID, 'x', window_id='w', context_epoch=0, access=CTX), 'lifecycle_disabled')
 
+    def test_snapshot_uses_existing_web_session_identifier_contract(self):
+        cid = 'api.example.' + 'a' * 148  # Existing authority permits 160 chars and periods.
+        snapshot = replace(self.h.snapshot(CID, CTX), conversation_id=cid, version_id=cid)
+        self.assertIsNone(self.h.engine._snapshot(snapshot, cid))
+        bad = replace(snapshot, conversation_id=cid+'a', version_id=cid+'a')
+        self.rejects(lambda: self.h.engine._snapshot(bad, cid+'a'), 'lifecycle_invalid')
+
     def test_closeout_is_durable_idempotent_and_does_not_copy_messages(self):
         before = self.h.conn.execute('SELECT * FROM messages').fetchall()
         first = self.closeout(); second = self.closeout()
