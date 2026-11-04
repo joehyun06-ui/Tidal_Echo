@@ -87,6 +87,7 @@ class ProjectionRefresh:
     changed_events: int
     projection_count: int
     rebuilt_for_authorization: bool
+    rebuilt_for_invalidated_read: bool = False
     authority: str = "derived"
 
 
@@ -102,6 +103,7 @@ class RebuildableProjectionIndex:
         self._context = None
         self._generation = None
         self._authorization = None
+        self._needs_rebuild = False
         self._cursor = 0
         self._cards: dict[str, ProjectionCard] = {}
 
@@ -119,6 +121,7 @@ class RebuildableProjectionIndex:
             self._bound(_binding(access))
             self._cards = {}
             self._context = self._generation = self._authorization = None
+            self._needs_rebuild = False
             self._cursor = 0
             self._serial += 1
 
@@ -147,10 +150,11 @@ class RebuildableProjectionIndex:
             self._bound(binding)
             serial, cursor = self._serial, self._cursor
             generation, authorization = self._generation, self._authorization
+            invalidated_read = self._needs_rebuild
             cards = dict(self._cards)
         scan = self._scan(adapter, cursor, access, binding, generation)
         rebuilt = authorization is not None and authorization != scan.authorization_epoch
-        if rebuilt:
+        if rebuilt or invalidated_read:
             cards = {}
             cursor = 0
             scan = self._scan(adapter, 0, access, binding, generation)
@@ -208,8 +212,9 @@ class RebuildableProjectionIndex:
             self._cards, self._cursor = cards, cursor
             self._context, self._generation = binding, scan.source_generation
             self._authorization = scan.authorization_epoch
+            self._needs_rebuild = False
             self._serial += 1
-        return ProjectionRefresh(cursor, pages, len(changed), len(cards), rebuilt)
+        return ProjectionRefresh(cursor, pages, len(changed), len(cards), rebuilt, invalidated_read)
 
     def read(self, adapter: PagedG3ReadOnlySourceAdapter, event_id: str, *, access: AccessScope) -> ProjectionCard:
         if not _valid_id(event_id):
@@ -230,6 +235,7 @@ class RebuildableProjectionIndex:
             with self._lock:
                 if self._cards.get(event_id) is card:
                     self._cards = {key: value for key, value in self._cards.items() if key != event_id}
+                    self._needs_rebuild = True
                     self._serial += 1
             raise
         with self._lock:

@@ -22,7 +22,7 @@ GM-00C 的真实持久备份/隔离恢复仍未执行；它是上线前的独立
 | 文件 | 变更 | 作用 |
 |---|---|---|
 | `backend/g3_projection_feed.py` | 新增 | 只读分页协议、受限扫描、可清空的内存派生索引、每次读回源验证 |
-| `backend/tests/test_g3_projection_feed.py` | 新增 | 36 项合成测试，包含权限/并发/分页故障和完整性声明的反例 |
+| `backend/tests/test_g3_projection_feed.py` | 新增 | 37 项合成测试，包含权限/并发/分页故障和完整性声明的反例 |
 | `docs/gm-01a2-paged-projection-rebuild-20261104.md` | 新增 | 契约、测试、边界与下一断点 |
 | `backend/g3_projection.py` | 一行修正 | 固定锚点的人工审核条件只约束 active 投影；撤销墓碑无需再次取得锚点审核才能使旧卡失效 |
 
@@ -65,6 +65,7 @@ GM-00C 的真实持久备份/隔离恢复仍未执行；它是上线前的独立
    游标早于旧进度的事件。事件可见范围改变必须被适配器计入授权 epoch。
 6. 每次 `read()` 都检查来源 generation、回源核对当前 revision/SHA-256/权限，再做扫描 epoch
    终检。权限撤回、修订、撤销、来源字节/卡片篡改都拒绝并移除本次命中的旧卡；不退回缓存。
+   读失败同时标记需重建，下次 refresh 从 0 扫描，避免临时来源故障恢复后因游标未变而永久漏卡。
 7. `clear()` 只清除内存中的派生卡、绑定和游标。原始来源不变；重新扫描能重建相同
    `projection_card_id` 与 `source_refs`，不同 page size 不改变派生结果。
 
@@ -92,7 +93,7 @@ python -m unittest \
   backend.tests.test_g3_projection_feed
 ```
 
-**本地：76/76 PASS = #199 原有 40 + 本轮新增 36。** 这是独立开发集合，不是 G3-QU 正式门槛。
+**本地：77/77 PASS = #199 原有 40 + 本轮新增 37。** 这是独立开发集合，不是 G3-QU 正式门槛。
 
 | 测试组 | 证据 |
 |---|---|

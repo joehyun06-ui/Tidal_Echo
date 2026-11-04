@@ -312,6 +312,16 @@ class ProjectionFeedTests(unittest.TestCase):
         self.index._cards['event_A'] = replace(self.index._cards['event_A'], projection_text='synthetic forged')
         self.rejects(self.read, 'projection_card_tampered_or_stale')
 
+    def test_transient_source_failure_can_rebuild_without_a_new_source_event(self):
+        self.refresh()
+        expected = self.read()
+        with patch.object(self.adapter, 'open_source', side_effect=ProjectionError('projection_source_unavailable')):
+            self.rejects(self.read, 'projection_source_unavailable')
+        self.assertEqual(self.progress().projection_count, 0)
+        result = self.refresh()
+        self.assertTrue(result.rebuilt_for_invalidated_read)
+        self.assertEqual((result.cursor, self.read()), (1, expected))
+
     def test_final_scan_validation_must_be_boolean_true(self):
         with patch.object(self.adapter, 'validate_scan', return_value=1):
             self.rejects(self.refresh, 'projection_scan_changed')
