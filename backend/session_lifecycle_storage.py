@@ -3,7 +3,7 @@
 SQLite state/receipts are atomic. File checks detect observed config conflicts,
 but DO NOT fence uncooperative writers or establish cross-store atomicity.
 """
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
@@ -282,12 +282,21 @@ class SQLiteLifecycleRepository:
     production_supported = False
     cross_store_atomic = False
 
-    def __init__(self, connect_canonical, config_reader, *, enabled=False):
+    def __init__(self, connect_canonical, config_reader, *, enabled=False, coordinator=None):
         self._connect, self._reader, self.enabled = connect_canonical, config_reader, enabled is True
+        self._coordinator = coordinator
 
     @contextmanager
     def transaction(self, conversation_id):
         if not self.enabled: fail('lifecycle_disabled')
+        # Cooperative gate spans capture, SQLite commit, and both file checks.
+        # No coordinator is installed or enabled implicitly.
+        with self._coordinator.fence() if self._coordinator is not None else nullcontext():
+            with self._transaction(conversation_id) as tx:
+                yield tx
+
+    @contextmanager
+    def _transaction(self, conversation_id):
         view = self._reader.capture(conversation_id)
         tx = None
         try:
