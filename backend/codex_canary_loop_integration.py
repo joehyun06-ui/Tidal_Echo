@@ -187,8 +187,14 @@ class CodexCanaryLoopIntegration:
                     activate=activate,
                 )
 
-        def patch_session(session_id, body):
+        def patch_session(session_id, body, *, coordinated=None, request_id=None, access=None):
             with self._session_lock:
+                if coordinated is not None:
+                    coordinated.assert_session_lock(self._session_lock)
+                    return self._authority_call(
+                        self.session_authority.patch_session, session_id, body,
+                        coordinated=coordinated, request_id=request_id, access=access,
+                    )
                 return self._authority_call(
                     self.session_authority.patch_session,
                     session_id,

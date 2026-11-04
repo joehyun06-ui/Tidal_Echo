@@ -327,7 +327,13 @@ class WebSessionProviderAuthority:
         self,
         session_id: str,
         body: Mapping[str, object],
+        *,
+        coordinated=None,
+        request_id=None,
+        access=None,
     ) -> dict[str, Any]:
+        if coordinated is not None:
+            return coordinated.patch_session(request_id, session_id, body, access=access)
         session_id = _safe_session_id(session_id)
         if self.tombstone_for_session(session_id) is not None:
             raise WebSessionProviderAuthorityError("web_session_deleted")
