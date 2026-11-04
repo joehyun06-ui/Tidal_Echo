@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 
 from backend import (
     channel_store,
+    loop_config_mutations,
     memory_evidence_readonly,
     memory_session_write_guard,
     codex_app_server_control,
@@ -260,7 +261,9 @@ def create_session(title: str = "New chat", since_id: int = 0, activate: bool = 
     return row
 
 
-def patch_session(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+def patch_session(session_id: str, body: dict[str, Any], *, coordinated=None, request_id=None, access=None) -> dict[str, Any]:
+    if coordinated is not None:
+        return coordinated.patch_session(request_id, session_id, body, access=access)
     rows = session_rows()
     found = False
     for item in rows:
@@ -407,51 +410,19 @@ def public_config() -> dict[str, Any]:
     }
 
 
-def update_config(body: dict[str, Any]) -> dict[str, Any]:
+def update_config(body: dict[str, Any], *, coordinated=None, request_id=None, access=None) -> dict[str, Any]:
+    if coordinated is not None:
+        return coordinated.update_config(request_id, body, access=access)
     try:
         deployment_config.validate_loop_config_update_request(body, render_mvp=RENDER_TELEGRAM_MVP)
     except deployment_config.DeploymentConfigError as exc:
         raise HTTPException(status_code=400, detail=exc.category) from None
-    cfg = load_config()
-    if "history_n" in body:
-        cfg["history_n"] = max(0, min(int(body.get("history_n") or 0), 200))
-    if isinstance(body.get("main_chain"), list):
-        old = main_chain()
-        new_chain = []
-        for pos, item in enumerate(body["main_chain"]):
-            if not isinstance(item, dict):
-                if RENDER_TELEGRAM_MVP:
-                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
-                continue
-            if RENDER_TELEGRAM_MVP:
-                allowed = {"index", "model", "url", "key"}
-                if not set(item).issubset(allowed):
-                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
-                if "index" in item and (not isinstance(item["index"], int) or isinstance(item["index"], bool)):
-                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
-                if any(name in item and not isinstance(item[name], str) for name in ("model", "url", "key")):
-                    raise HTTPException(status_code=400, detail="invalid_loop_model_route")
-            old_idx = int(item.get("index", pos) or 0)
-            prev = old[old_idx] if 0 <= old_idx < len(old) else {}
-            entry = {
-                "model": str(item.get("model") or prev.get("model") or "").strip(),
-                "url": str(item.get("url") or prev.get("url") or "").strip().rstrip("/"),
-                "key": str(item.get("key") or prev.get("key") or ""),
-            }
-            if not (entry["model"] and entry["url"] and entry["key"]):
-                raise HTTPException(status_code=400, detail=f"row {pos + 1}: model/url/key required")
-            new_chain.append(entry)
-        if new_chain:
-            cfg["main_chain"] = new_chain
-        elif RENDER_TELEGRAM_MVP:
-            raise HTTPException(status_code=400, detail="invalid_loop_model_route")
-    elif RENDER_TELEGRAM_MVP and "main_chain" in body:
-        raise HTTPException(status_code=400, detail="invalid_loop_config_structure")
-    if RENDER_TELEGRAM_MVP:
-        try:
-            deployment_config.validate_loop_config_payload(cfg, render_mvp=True)
-        except deployment_config.DeploymentConfigError as exc:
-            raise HTTPException(status_code=400, detail=exc.category) from None
+    try:
+        cfg = loop_config_mutations.updated_config(
+            load_config(), body, render_mvp=RENDER_TELEGRAM_MVP, fallback_routes=env_routes(),
+        )
+    except loop_config_mutations.LoopConfigMutationError as exc:
+        raise HTTPException(status_code=400, detail=exc.category) from None
     save_config(cfg)
     return public_config()
 

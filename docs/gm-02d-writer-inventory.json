@@ -1,0 +1,912 @@
+{
+  "contract": "guiting.config.writer.audit.v1",
+  "baseline_commit": "034a13a5f72d6059ff39c2c733d468df209ffc30",
+  "source_filter": "all tracked .py blobs whose path does not contain /tests/",
+  "source_count": 222,
+  "source_blobs": [
+    {
+      "path": "backend/api_mcp_model.py",
+      "sha": "93c66145b48b0f252ea7559a03d5bfb690c36490"
+    },
+    {
+      "path": "backend/api_web_generation.py",
+      "sha": "4ae12c50bfab715fbfb3936cdcf125ce2415f86c"
+    },
+    {
+      "path": "backend/api_web_generation_relay.py",
+      "sha": "c59f705f1fd63aa4e10190d0a60bad7fa1825c41"
+    },
+    {
+      "path": "backend/app.py",
+      "sha": "27599ace3be8a57145fdb2c5f39b8be3bfa30fda"
+    },
+    {
+      "path": "backend/autonomous_wake_session_guard.py",
+      "sha": "03453513658b511248fe8c4233f35c808eb85619"
+    },
+    {
+      "path": "backend/channel_store.py",
+      "sha": "ae8e612bc027b58e67c093582d4bcac43b7b1ba2"
+    },
+    {
+      "path": "backend/codex_0147_wire_compat.py",
+      "sha": "4f2939aa3d233bcc723f07eb6f369f48137ad8a1"
+    },
+    {
+      "path": "backend/codex_account_control_facade.py",
+      "sha": "5baf74d5e3befc1503a7e293afcda1e896db9aec"
+    },
+    {
+      "path": "backend/codex_app_server_control.py",
+      "sha": "2ab550aec4f03d788f8c3b344695da2c3b37adc3"
+    },
+    {
+      "path": "backend/codex_app_server_control_base.py",
+      "sha": "df32de4be6177676184755a35d7c0d56fd33ab4c"
+    },
+    {
+      "path": "backend/codex_app_server_shared_transport.py",
+      "sha": "c0716c8e9a8cdd2f059ee02bdd9d38c51d2d62b0"
+    },
+    {
+      "path": "backend/codex_canary_admin_proxy.py",
+      "sha": "9b5c2d214ee55ab19d2bc5080c304c1623e0c86d"
+    },
+    {
+      "path": "backend/codex_canary_controller.py",
+      "sha": "c1f4bb1bb1455f3a9ca605e5ccfd2cf388978c9d"
+    },
+    {
+      "path": "backend/codex_canary_ingress.py",
+      "sha": "1947de5c1fa7901f1e3ea47518e95d4c9ead1a7c"
+    },
+    {
+      "path": "backend/codex_canary_loop_integration.py",
+      "sha": "2f2e9d61badbed621e22eee0657a0a5a4828fe6f"
+    },
+    {
+      "path": "backend/codex_canary_recovery_admin.py",
+      "sha": "e30fad6cff1ed8dfaf7424a1c0c6e3cdccc54d14"
+    },
+    {
+      "path": "backend/codex_canary_relay_app.py",
+      "sha": "6513ac2d409796691382255af30e56fccd0c13d8"
+    },
+    {
+      "path": "backend/codex_canary_relay_integration.py",
+      "sha": "f5e3e770c9ec32130e121b06f6d88e5adc0fd515"
+    },
+    {
+      "path": "backend/codex_generation_hardening_transport.py",
+      "sha": "b51e63cf316f72e9481bfeebe8560a8a5afb8eef"
+    },
+    {
+      "path": "backend/codex_generation_images.py",
+      "sha": "579b564cd477a634ad33cedc8e3a8f8467ee0ec0"
+    },
+    {
+      "path": "backend/codex_generation_live_reliability.py",
+      "sha": "038617946197381ae78fedee88e36abc91016b46"
+    },
+    {
+      "path": "backend/codex_generation_observability.py",
+      "sha": "d02c5711a7b83c29467d4f9ce021a072d7e95316"
+    },
+    {
+      "path": "backend/codex_generation_progress.py",
+      "sha": "da9b0d6e8b9ad1386524c429939b8f835a2401a0"
+    },
+    {
+      "path": "backend/codex_generation_protocol.py",
+      "sha": "8b2e3337f1830016d6b8c14c20ab7759166ea74c"
+    },
+    {
+      "path": "backend/codex_generation_provider_binding.py",
+      "sha": "2e3d97dcd08acfcdc56c3a8cedfd626decaf584d"
+    },
+    {
+      "path": "backend/codex_generation_routes.py",
+      "sha": "b010604c8a621c65f25f820dbec5d2dfbfae44d2"
+    },
+    {
+      "path": "backend/codex_generation_runtime.py",
+      "sha": "cc2f8215ced97a4068bb1218a13e8bae758c6da4"
+    },
+    {
+      "path": "backend/codex_generation_runtime_config.py",
+      "sha": "0da3832547267ca5db6120663cbeed56503b0c8a"
+    },
+    {
+      "path": "backend/codex_generation_store.py",
+      "sha": "d217f138eb6638cf50b8c4b66c2345f49d6e5f39"
+    },
+    {
+      "path": "backend/codex_generation_streaming.py",
+      "sha": "20273c9326d69891ed716ce5d940f07e734a82ef"
+    },
+    {
+      "path": "backend/codex_generation_subscription_reliability.py",
+      "sha": "d8e6a6384b445f9ee00226282f1d92e13219482a"
+    },
+    {
+      "path": "backend/codex_generation_worker.py",
+      "sha": "f5162b01c50ab359f50545abac99d557d7efe613"
+    },
+    {
+      "path": "backend/codex_mcp_chat.py",
+      "sha": "f89f1a6283851bfe980f0388f9b06c2176da9eaa"
+    },
+    {
+      "path": "backend/codex_model_catalog.py",
+      "sha": "19c5bc08e559928841d0a94e4de25ae170e946f4"
+    },
+    {
+      "path": "backend/codex_session_model.py",
+      "sha": "18acfa2cd38425547306a7d7bdccc177e8f93fa0"
+    },
+    {
+      "path": "backend/codex_shared_provider_foundation.py",
+      "sha": "fbb51b35948faa1a4755999e033a4467359a7a5a"
+    },
+    {
+      "path": "backend/codex_web_completion.py",
+      "sha": "cebd4c84d6699bcabcfb3e182dd7092f4a169094"
+    },
+    {
+      "path": "backend/continuity_context.py",
+      "sha": "cf46ff42faca3ecd7554a3690b355b9b37917512"
+    },
+    {
+      "path": "backend/cors_config.py",
+      "sha": "8e290124d1f5ca3cf50935335e2020b5de5ac475"
+    },
+    {
+      "path": "backend/deployment_config.py",
+      "sha": "0a7746d35f3e888ea6cfb10d4faa94e2816d4d16"
+    },
+    {
+      "path": "backend/g3_projection.py",
+      "sha": "3584663fddf408a66cc8ad8c1cd53924dd357f02"
+    },
+    {
+      "path": "backend/g3_projection_contract.py",
+      "sha": "a31a46d4b6abfd34be482b224f0586773482806e"
+    },
+    {
+      "path": "backend/g3_projection_feed.py",
+      "sha": "34def51a661ce8dbec1735a7aaf9d6b4ba62474e"
+    },
+    {
+      "path": "backend/heartbeat_service.py",
+      "sha": "ce9c9e9300aad40ccd18e50f9d7f121ff81573ef"
+    },
+    {
+      "path": "backend/kelivo_current_turn_vision.py",
+      "sha": "db7cf051bac78ac6d6d187e79ceb30a1cebeb7f4"
+    },
+    {
+      "path": "backend/kelivo_service.py",
+      "sha": "6b67dad1953ed30f49e0b0d1bcb72fae87c55853"
+    },
+    {
+      "path": "backend/legacy_chat_bridge_app.py",
+      "sha": "4f541eefb9122eee13b447aa0add1637cbfd03ad"
+    },
+    {
+      "path": "backend/memory_action_ledger.py",
+      "sha": "b03c2dc8e6fa7a6928355441e0ba29adb0b25d1e"
+    },
+    {
+      "path": "backend/memory_auth_epoch_store.py",
+      "sha": "6240758ee53d1d6fc24e3ef38819c1175e493561"
+    },
+    {
+      "path": "backend/memory_browser_consent_review.py",
+      "sha": "18bae64ef4a2ada8cbfa39d0850be5483c620773"
+    },
+    {
+      "path": "backend/memory_browser_session_registry.py",
+      "sha": "231443b66e6616d2f4dd737cf4e0714fd4176761"
+    },
+    {
+      "path": "backend/memory_candidate_decision_adapters.py",
+      "sha": "15c4a1690f63b76af5b679e0be95b5a18caf21a8"
+    },
+    {
+      "path": "backend/memory_candidate_decision_adapters_v2.py",
+      "sha": "048edfdde2384a6c503069819da6c87e0cf4a759"
+    },
+    {
+      "path": "backend/memory_candidate_decision_composition.py",
+      "sha": "4ed40ca97f4719ef886bf21cdfd3ad235bc056e4"
+    },
+    {
+      "path": "backend/memory_candidate_decision_ledger.py",
+      "sha": "c3f28e34209757f4fbaca449af5eadcab514a94c"
+    },
+    {
+      "path": "backend/memory_candidate_decision_v2.py",
+      "sha": "35c3684b5668fd1b4c219cf6491743d5c0fa77a0"
+    },
+    {
+      "path": "backend/memory_candidate_integrity.py",
+      "sha": "3f2a35866a0223e9dc3d8fa73cf5f3e3f1960abc"
+    },
+    {
+      "path": "backend/memory_candidate_integrity_v2.py",
+      "sha": "cdefdf65b8f348aa33596ec0ab6dcdfba2cc9e40"
+    },
+    {
+      "path": "backend/memory_candidate_persistence_v2.py",
+      "sha": "d53a206350e1d1e31660374f1c1bf9bda9ff6108"
+    },
+    {
+      "path": "backend/memory_candidate_review.py",
+      "sha": "1f4b957e3c361846d54a0b12172c23053f3b407f"
+    },
+    {
+      "path": "backend/memory_candidate_review_adapters.py",
+      "sha": "4195b5bd030a98e2ace652b2f13a2918d8ac9d91"
+    },
+    {
+      "path": "backend/memory_candidate_review_composition.py",
+      "sha": "69b54e17e37887cb63b5647c6b7aaa22f5dac179"
+    },
+    {
+      "path": "backend/memory_candidate_review_v2.py",
+      "sha": "a87aec77cea6a7633dd8fdf6ee48c380d7895bdd"
+    },
+    {
+      "path": "backend/memory_confirmation_uow_gate.py",
+      "sha": "29989af8b70b14833a12b0b96919a3e77a2a69bd"
+    },
+    {
+      "path": "backend/memory_context.py",
+      "sha": "cc0d2291541d078fd79899d81a6a6b849e37051b"
+    },
+    {
+      "path": "backend/memory_context_integration.py",
+      "sha": "2dc10562e61d954f6c3e9710577098d62a7a883c"
+    },
+    {
+      "path": "backend/memory_context_v2.py",
+      "sha": "1d665daf0f42d169d9d51abf9bea9e50c45dd21e"
+    },
+    {
+      "path": "backend/memory_durable_consent_audit.py",
+      "sha": "3b93112d890557c8440b899f5ee6faf0856eebf7"
+    },
+    {
+      "path": "backend/memory_evidence_coverage.py",
+      "sha": "51139d7a4a902814966f620d40ac149caee828f6"
+    },
+    {
+      "path": "backend/memory_evidence_readonly.py",
+      "sha": "e79514bd5891d2b9a810701f5b87a1d28b67f530"
+    },
+    {
+      "path": "backend/memory_explicit_actions.py",
+      "sha": "9ed7770b33848f10fc00e38e5e51f669e3106fff"
+    },
+    {
+      "path": "backend/memory_formation.py",
+      "sha": "0d0fd17c5a5f8578b29bf5b1b6c1ed26c86b5251"
+    },
+    {
+      "path": "backend/memory_formation_extractor.py",
+      "sha": "f52021f07c33327f937af0a74f0881120a2760a7"
+    },
+    {
+      "path": "backend/memory_formation_extractor_v2.py",
+      "sha": "fc21e851db9784409cd0a1ad5b2771b1e8fa7e83"
+    },
+    {
+      "path": "backend/memory_formation_integration.py",
+      "sha": "19b96e4ad6ae98c9d23b5eb3108bf144d39b7776"
+    },
+    {
+      "path": "backend/memory_formation_integration_v2.py",
+      "sha": "9e2be24bd0030d292bf83bda2134a501b8ceb1cc"
+    },
+    {
+      "path": "backend/memory_formation_v2.py",
+      "sha": "8fe8fc48fd7edbf2cb81e1d977d190b6f70e528f"
+    },
+    {
+      "path": "backend/memory_formation_v2_authority.py",
+      "sha": "a543d4b86948c97231dd1fbc240f6572da3ff290"
+    },
+    {
+      "path": "backend/memory_formation_v2_loopback.py",
+      "sha": "4689bf5b217a09c883a93b6adf49b759585f6ee6"
+    },
+    {
+      "path": "backend/memory_formation_v2_runtime_patch.py",
+      "sha": "fd36f7f87efec8491c45a725389515837b6dc408"
+    },
+    {
+      "path": "backend/memory_hierarchy_baseline.py",
+      "sha": "d749c6f13d3417baacbad78d253cea6c2ba76e5b"
+    },
+    {
+      "path": "backend/memory_hierarchy_episode_refinement.py",
+      "sha": "b6b9044de3f5681818bafb8f9abdccba1c53f6ac"
+    },
+    {
+      "path": "backend/memory_hierarchy_episode_refinement_extractor.py",
+      "sha": "6dff73467bd2b14808491d1a6c5b8b07ef6f95c8"
+    },
+    {
+      "path": "backend/memory_hierarchy_live_refresh_shadow.py",
+      "sha": "cd03e96110048ed1e1e5d1d398aff88bc6650bc5"
+    },
+    {
+      "path": "backend/memory_hierarchy_projection.py",
+      "sha": "b1041120d764dfaebdd04d2f04d2e4b5cb351af7"
+    },
+    {
+      "path": "backend/memory_hierarchy_projection_store.py",
+      "sha": "eaf88602843a0b93ee4fc100e0a5df190307c615"
+    },
+    {
+      "path": "backend/memory_hierarchy_rebuild.py",
+      "sha": "7d6b77e07588d858eef530fe8bb27b31fb824296"
+    },
+    {
+      "path": "backend/memory_hierarchy_refinement.py",
+      "sha": "3e5f087d755980315767b5a0bcc5c6aa393e35c8"
+    },
+    {
+      "path": "backend/memory_hierarchy_refinement_extractor.py",
+      "sha": "bb2f11b8cc40171aeced6969f48bf228907b6f4f"
+    },
+    {
+      "path": "backend/memory_hierarchy_refinement_loopback.py",
+      "sha": "ad4b4e466fa70f59e2069f456bea97c404a9c756"
+    },
+    {
+      "path": "backend/memory_hierarchy_semantic_rebuild.py",
+      "sha": "009d94379caedc66712f7f78978b439e25a8c199"
+    },
+    {
+      "path": "backend/memory_hierarchy_snapshot.py",
+      "sha": "7dbf3dc481fe868cd70e23f0460bc23849a5e083"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary.py",
+      "sha": "e020d5d02bdb5d2aa9da7523c558aa984b466b22"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_extractor.py",
+      "sha": "b318aa3730c01a3eb37f7c450d36a1f94a628793"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_extractor_v2.py",
+      "sha": "f2803b68778f164eb838b7ba7dc9d381262960cd"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_loopback_v2.py",
+      "sha": "199a385df3dd8f9022c757de88bfd862965568bf"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_rebuild.py",
+      "sha": "ab596a5832c14362572a33e9685c47483f07ce7c"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_rebuild_v2.py",
+      "sha": "f1be94e15a8777a10eb406ce54748bbed322c502"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_runtime_shadow.py",
+      "sha": "fc6ed6ad7f572daa4a474f636171d4b4715a7943"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_store.py",
+      "sha": "cf485edcc7cfe33b9cd93bc7e5ebb88ffe7cb2ee"
+    },
+    {
+      "path": "backend/memory_hierarchy_summary_store_v2.py",
+      "sha": "d1fbfc9f185b096d94b56d7824dd0463106bc6c0"
+    },
+    {
+      "path": "backend/memory_index_outbox_consumer.py",
+      "sha": "e88fe1a7ea3d2a271e6e80fcec076007cd31adcc"
+    },
+    {
+      "path": "backend/memory_index_refresh_observability.py",
+      "sha": "e983508c9d0c96dd3e262b0bf83652c5f6440773"
+    },
+    {
+      "path": "backend/memory_index_refresh_worker.py",
+      "sha": "fa02f1a1bfa5794127d38626952160ba024d80bf"
+    },
+    {
+      "path": "backend/memory_oidc_browser_callback_review.py",
+      "sha": "ab7c8548b31e967ae8aff3341127ecaabc8c35a0"
+    },
+    {
+      "path": "backend/memory_oidc_https_sender_review.py",
+      "sha": "4297b4e660e3b627a9002ae0fcf8b2d78d85f49c"
+    },
+    {
+      "path": "backend/memory_oidc_id_token_review.py",
+      "sha": "26315444277612c8f20f44eb71a2b34792219d1b"
+    },
+    {
+      "path": "backend/memory_oidc_isolated_asgi_review.py",
+      "sha": "499fd77c740db17ea72d13bad205db87adf46f51"
+    },
+    {
+      "path": "backend/memory_oidc_pinned_origin_adapter_offline.py",
+      "sha": "e9007d420e1e6fa216d4090134e495fee43d99da"
+    },
+    {
+      "path": "backend/memory_oidc_pkce_flow_review.py",
+      "sha": "ea5aa8c25d4161bfbb5f8b05b6015af1ab72bc6e"
+    },
+    {
+      "path": "backend/memory_oidc_render_drift_review.py",
+      "sha": "c5d6289b5a040238494fddb6dd4d75a7cda68736"
+    },
+    {
+      "path": "backend/memory_oidc_token_exchange_review.py",
+      "sha": "9ab0f4a2e97200e02996630fa5da0ca4dbcdb7dd"
+    },
+    {
+      "path": "backend/memory_oidc_trusted_proxy_review.py",
+      "sha": "3c7be0fb062c60aa09ae91ad3741c116b951bbd5"
+    },
+    {
+      "path": "backend/memory_operator_cli.py",
+      "sha": "266ac5935de0455114c79587b7825bb8d5bc60e7"
+    },
+    {
+      "path": "backend/memory_operator_composition.py",
+      "sha": "5a0b7b17df7fe7c0b0edcff36da01edb45206be8"
+    },
+    {
+      "path": "backend/memory_policy.py",
+      "sha": "5fbcac84dce8b812614de85fdc4608604d079440"
+    },
+    {
+      "path": "backend/memory_request_identity_boundary.py",
+      "sha": "5482e6037294e67f0a7501377fac427afefbaa6a"
+    },
+    {
+      "path": "backend/memory_retrieval.py",
+      "sha": "f20f854c9dd16611c56e1f1915ef835617226381"
+    },
+    {
+      "path": "backend/memory_retrieval_bm25.py",
+      "sha": "041f1e6bb4f3199cfeff1517008dd87356fcab48"
+    },
+    {
+      "path": "backend/memory_retrieval_bm25_rebuild.py",
+      "sha": "3ef5166bafb45c8dd609d722a803fe02e78181b1"
+    },
+    {
+      "path": "backend/memory_retrieval_bm25_store.py",
+      "sha": "1436a4548bc6eb4ad13ec6b286295a5811e36093"
+    },
+    {
+      "path": "backend/memory_retrieval_embedding_openai.py",
+      "sha": "7f660e02560d61252e612be88cf25a3f6e644d81"
+    },
+    {
+      "path": "backend/memory_retrieval_hierarchy_routing.py",
+      "sha": "f81eec5babeb6a493e9d66b04cd2d4a1c9c41140"
+    },
+    {
+      "path": "backend/memory_retrieval_hierarchy_source.py",
+      "sha": "b65a573a26eb299eacd7fde3d598e1d6a6d396e9"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_active.py",
+      "sha": "7a3994055cb2f5ecca6af8c0aaf91fee5a31c907"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_fusion.py",
+      "sha": "d1d73af546a646966ad9baeff838a8811757f3d6"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_observability.py",
+      "sha": "2e6dd4c76f24db79855e63ad72f8da83a1b4fa73"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_provider_wire.py",
+      "sha": "e4ce94fdfe279d6e266310e7655ffdfbc25f7552"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_query.py",
+      "sha": "421fe85f65677cfa2cbe4d65d466c4b1fadc42ed"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_relevance.py",
+      "sha": "17fcbc58fda5b7cfa4627cc5c910fe58808dd495"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_runtime_active.py",
+      "sha": "5c78e808aba2dafbbe8bfa8fe2e2aec6504c4092"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_runtime_composition.py",
+      "sha": "c288554f372c259411a8061a669a2f32591feeb1"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_runtime_shadow.py",
+      "sha": "bf535b50b2b2d1db31f22392f6eaa992eb883e7f"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_shadow.py",
+      "sha": "8a47b530045871c4673c01db6e951fca93f9a5c2"
+    },
+    {
+      "path": "backend/memory_retrieval_hybrid_source.py",
+      "sha": "2ae18a4331274b0c5064d93eb2b440386edaa127"
+    },
+    {
+      "path": "backend/memory_retrieval_v2.py",
+      "sha": "230df94888277d9b78b608dfea849b21b213ac44"
+    },
+    {
+      "path": "backend/memory_retrieval_v2_active.py",
+      "sha": "2b3d0a0b6192a7632396ff95aa2e7835548bdd24"
+    },
+    {
+      "path": "backend/memory_retrieval_v2_shadow.py",
+      "sha": "7357a1cffcc736e222e905af5327cf51b05b1f2d"
+    },
+    {
+      "path": "backend/memory_retrieval_vector.py",
+      "sha": "b64b058fa2ce3b53d54ab0c935c6a7615cf7cdec"
+    },
+    {
+      "path": "backend/memory_retrieval_vector_rebuild.py",
+      "sha": "ee9f0b9f74d0a3294abea113c4a04f09c18d8b78"
+    },
+    {
+      "path": "backend/memory_retrieval_vector_store.py",
+      "sha": "296c152234194e126f69f792237eb1ade165c39f"
+    },
+    {
+      "path": "backend/memory_runtime.py",
+      "sha": "ae844b351101bcdc63b3775504fb1abe6c09a635"
+    },
+    {
+      "path": "backend/memory_service.py",
+      "sha": "6b087fb06e6bcc64ae34cb5c02b5dab3219566fd"
+    },
+    {
+      "path": "backend/memory_session_confirmation.py",
+      "sha": "d1841374effb5e3b22f6aec31aec251fd536e20c"
+    },
+    {
+      "path": "backend/memory_session_write_guard.py",
+      "sha": "39d5599cd0a4aa1cfac9907d4d479d10c91e444e"
+    },
+    {
+      "path": "backend/memory_shared_confirmation_ticket.py",
+      "sha": "02ed823c7797d2b8ae6c53f90c68d5587059a890"
+    },
+    {
+      "path": "backend/memory_store.py",
+      "sha": "970465ba6885edf67baefc7036de0171881305de"
+    },
+    {
+      "path": "backend/multimodal_patch.py",
+      "sha": "7ae5c14c163c2a7f3cd530724ffc67833d7bc217"
+    },
+    {
+      "path": "backend/p3_codex_relay_app.py",
+      "sha": "0535e9878d841a4e75074ee5f5adf65311307577"
+    },
+    {
+      "path": "backend/p3_provider_status.py",
+      "sha": "d9e3f118b8ca0f49c2d104f0717cff64ea2176cb"
+    },
+    {
+      "path": "backend/p3_relay_app.py",
+      "sha": "f2d03ca82acd58a6ddfa6d2e06599984d7988324"
+    },
+    {
+      "path": "backend/p3_session_retire.py",
+      "sha": "66f70ba61257358123f55fb47fa15c28dde081a5"
+    },
+    {
+      "path": "backend/provider_chat_liveness_probe.py",
+      "sha": "deb82882e4f1043106e0d1276694a58d0c50b395"
+    },
+    {
+      "path": "backend/provider_model_capability_probe.py",
+      "sha": "54b1511b9429a8f817d910cfcd39d83aad6c4ab2"
+    },
+    {
+      "path": "backend/provider_model_migration.py",
+      "sha": "4bfbe92896fddba5948a7ca9f0c0a2bc1a8b22c8"
+    },
+    {
+      "path": "backend/provider_route_classification_probe.py",
+      "sha": "f8ee0680b2d0c6d37c5ca526b9793d92bf47edc2"
+    },
+    {
+      "path": "backend/provider_settings.py",
+      "sha": "90f0e31cc2a3880a3f2b5c12a38370329ebff36f"
+    },
+    {
+      "path": "backend/session_lifecycle.py",
+      "sha": "5bcd1fb6cbc959ad99cdad15e94260f0dac23f99"
+    },
+    {
+      "path": "backend/session_lifecycle_codec.py",
+      "sha": "fc62a14aba5b107b1ad7ebca659442fab221ca8c"
+    },
+    {
+      "path": "backend/session_lifecycle_coordination.py",
+      "sha": "8c5df5ddbdfe44aa711f8d84d2ef3985dd7415e4"
+    },
+    {
+      "path": "backend/session_lifecycle_observation.py",
+      "sha": "5989cd0a456096a649d1e76a69136c8cca739812"
+    },
+    {
+      "path": "backend/session_lifecycle_storage.py",
+      "sha": "e22ad09b77a0cdcc992a780ff38c0a8221bbdab4"
+    },
+    {
+      "path": "backend/sinus_wake.py",
+      "sha": "be3af9ecec0413588d52548979d9a6636346a1ff"
+    },
+    {
+      "path": "backend/telegram_image_followup_coalesce.py",
+      "sha": "e6391fcb8e6e6e7d4bdb40ae5113ac1c8dd20989"
+    },
+    {
+      "path": "backend/telegram_integration.py",
+      "sha": "462fab54f25928b0e21825d191b77684e651fc28"
+    },
+    {
+      "path": "backend/usage_ledger.py",
+      "sha": "53d27e6fa32773b1360b2df7fcd7778da2f39c92"
+    },
+    {
+      "path": "backend/usage_ledger_backup.py",
+      "sha": "3b92d18f40a3b98a3da3353d20e418a24423b0b5"
+    },
+    {
+      "path": "backend/usage_ledger_capture.py",
+      "sha": "04976ced1fb10f9940992051aa8f5b760d25fa3d"
+    },
+    {
+      "path": "backend/usage_ledger_codex.py",
+      "sha": "522115e19bde32bdc9ca891760e69e87c3da4d30"
+    },
+    {
+      "path": "backend/usage_ledger_compaction.py",
+      "sha": "60f6966a5875694b43a7ae8aa4bce8439879f487"
+    },
+    {
+      "path": "backend/usage_ledger_composition.py",
+      "sha": "f4c8268524de164116b891f2f4aa12c2f111a681"
+    },
+    {
+      "path": "backend/usage_ledger_continuation.py",
+      "sha": "cec5e7193ea14c53269fcd4e7050677e26a6173c"
+    },
+    {
+      "path": "backend/usage_ledger_creation.py",
+      "sha": "18a3c285eb7b28617bdc34b620459daa928a2065"
+    },
+    {
+      "path": "backend/usage_ledger_entrypoint.py",
+      "sha": "60305c102dce255065f3a578a913e22986699019"
+    },
+    {
+      "path": "backend/usage_ledger_journal.py",
+      "sha": "41c75cc8e4c6fb1a8220051c4f9734891999c667"
+    },
+    {
+      "path": "backend/usage_ledger_paths.py",
+      "sha": "be2e450a94262de526e1d640b8751b4a572fc906"
+    },
+    {
+      "path": "backend/usage_ledger_preflight.py",
+      "sha": "f045a5566773eec477a63e5e5de44f786c690bfd"
+    },
+    {
+      "path": "backend/usage_ledger_proxy.py",
+      "sha": "98b4737c0a8a19dc27572327823b6508de6e24a9"
+    },
+    {
+      "path": "backend/usage_ledger_report.py",
+      "sha": "d168491d6665a764f37745b4189323a99a655be7"
+    },
+    {
+      "path": "backend/usage_ledger_rollover.py",
+      "sha": "f7d377fef9ad1eca238e977d960541035d7e73bd"
+    },
+    {
+      "path": "backend/usage_ledger_routes.py",
+      "sha": "9161098883d99b766f4f95307fa4f4b02c0481da"
+    },
+    {
+      "path": "backend/usage_ledger_secret_files.py",
+      "sha": "3d126df0247359fdf97afc42e78d34b4ece92e83"
+    },
+    {
+      "path": "backend/usage_ledger_sources.py",
+      "sha": "6472bfcff8de6bfc037513d01b1be0e34e52b166"
+    },
+    {
+      "path": "backend/usage_ledger_startup.py",
+      "sha": "853399324d12336b4e28ef4575163e405ecfd455"
+    },
+    {
+      "path": "backend/usage_ledger_storage.py",
+      "sha": "91f19285841c266cea85cb1bbeda729f39db68ed"
+    },
+    {
+      "path": "backend/web_codex_compaction.py",
+      "sha": "7cc51eeb02091671da496c4ebd2b52f63241ee79"
+    },
+    {
+      "path": "backend/web_codex_fork.py",
+      "sha": "06096fe8204065e11f990ee9b7a1fc87085a27ea"
+    },
+    {
+      "path": "backend/web_context_actions_routes.py",
+      "sha": "ec981fe9a13a96e59b5bd442d7e94ea03dd67f61"
+    },
+    {
+      "path": "backend/web_context_budget.py",
+      "sha": "1f776642535abf3da4b10e83fdc7eb9a50975f95"
+    },
+    {
+      "path": "backend/web_context_budget_routes.py",
+      "sha": "a24cf219a640510b1f6e933e4508fe3668e04bb5"
+    },
+    {
+      "path": "backend/web_continuation.py",
+      "sha": "cdc3ebc6866c66cb17ccb6d3349d39632ee13517"
+    },
+    {
+      "path": "backend/web_mcp_chat.py",
+      "sha": "7a898a6a7029aa4d42775cb34ea030251699a6c6"
+    },
+    {
+      "path": "backend/web_mcp_chat_routes.py",
+      "sha": "aecd3b5c66e3a2e2aa63fd6386058a3194e9d799"
+    },
+    {
+      "path": "backend/web_mcp_credentials.py",
+      "sha": "b32bf27625b77273552e4a3b68ad17cb6552979e"
+    },
+    {
+      "path": "backend/web_mcp_inspection.py",
+      "sha": "afb5468080c79a7a014bb7d6ff460dc4f4168362"
+    },
+    {
+      "path": "backend/web_mcp_oauth.py",
+      "sha": "604b04433895ee1e7c193a64c2983d7781a8a31b"
+    },
+    {
+      "path": "backend/web_mcp_oauth_http.py",
+      "sha": "ed956a8404b7ca3c08e66d39460a217de2fc32bc"
+    },
+    {
+      "path": "backend/web_mcp_settings.py",
+      "sha": "8ff283bc7df281068d34aada489746d9e3cb131f"
+    },
+    {
+      "path": "backend/web_mcp_settings_routes.py",
+      "sha": "f82c73fb14e302c870dd5a95c77a6489d0ae5acc"
+    },
+    {
+      "path": "backend/web_message_versions.py",
+      "sha": "edb8c7995a9e03140b728e54ebbf549cf0749719"
+    },
+    {
+      "path": "backend/web_provider_capabilities.py",
+      "sha": "5496dd84ad614501e64b068df2dec14eec98c981"
+    },
+    {
+      "path": "backend/web_send_receipt.py",
+      "sha": "7282acc14639db4a366bfbb40642b76c7e49d89b"
+    },
+    {
+      "path": "backend/web_session_context.py",
+      "sha": "f4057dbdfd2fa0ba99b4c0735a1fad3c9bac3cc3"
+    },
+    {
+      "path": "backend/web_session_context_routes.py",
+      "sha": "d9a379543562c8aa3a2017c098ae1d636464b8f2"
+    },
+    {
+      "path": "backend/web_session_delete.py",
+      "sha": "a63f7a64c58e30a9746617a6e4f9131f27e63986"
+    },
+    {
+      "path": "backend/web_session_fork.py",
+      "sha": "6043e3808e7cb7ceef477364369d685b4746c919"
+    },
+    {
+      "path": "backend/web_session_fork_routes.py",
+      "sha": "e53a98bb3ff6a7201cad30f9a9cbc8704dee0147"
+    },
+    {
+      "path": "backend/web_session_provider_authority.py",
+      "sha": "c4cef0dfa5e58e511262fdb3195a7c5726eace61"
+    },
+    {
+      "path": "examples/api_loop.py",
+      "sha": "baa6fcf624d025cdc97cfaab5d6d8c15d8fa8c75"
+    },
+    {
+      "path": "examples/api_loop_codex_canary.py",
+      "sha": "893a0ffdb252b8f9356a7df7f023cc220a59f977"
+    },
+    {
+      "path": "examples/api_loop_provider_guard.py",
+      "sha": "627c21055b41f8c759d73059c015d5d6b99cf98b"
+    },
+    {
+      "path": "examples/bridge_any_llm.py",
+      "sha": "26cf52ba74ba8125672939af4f365abaa1c933ef"
+    },
+    {
+      "path": "examples/confirm_dev_channel_win.py",
+      "sha": "75837ed9ed7865f88c4e2f53e30efa5ea6243438"
+    },
+    {
+      "path": "scripts/__init__.py",
+      "sha": "2d9f44d7e10f8fa154e6ad7def7cfde2bd6d081c"
+    },
+    {
+      "path": "scripts/autonomous_wake_worker.py",
+      "sha": "44d66a5a3e60cdd565658e4d36e3426eca3a53ed"
+    },
+    {
+      "path": "scripts/autonomous_wake_worker_notification_compat.py",
+      "sha": "b5c0b3f42c7b933cdc14a1317ca4496ff80c65f8"
+    },
+    {
+      "path": "scripts/codex_live_qualification.py",
+      "sha": "5234b5bd17e73a3cf19efdef3aff8e6007a8eb92"
+    },
+    {
+      "path": "scripts/configure_telegram_webhook.py",
+      "sha": "d781342f7ffa807a5465693f59026034332b5e4b"
+    },
+    {
+      "path": "scripts/memory_oidc_render_drift_check_offline.py",
+      "sha": "bb0e7dc59b9edbfdb4116c9bc2503a1bc70064e5"
+    },
+    {
+      "path": "scripts/render_start.py",
+      "sha": "6d493fcc95cad56cdf2c4aa3048a1d8d8c0ce97b"
+    },
+    {
+      "path": "scripts/render_start_codex_canary.py",
+      "sha": "0479097ff7bdf03719125dc856b8226e33f51c99"
+    },
+    {
+      "path": "scripts/render_start_p3.py",
+      "sha": "1d61d61264626ae82bbbd0ebccffebad882d1685"
+    }
+  ],
+  "candidate_bindings": [
+    "examples/api_loop.py:patch_session (explicit coordinated argument only)",
+    "examples/api_loop.py:update_config (explicit coordinated argument only)",
+    "backend/web_session_provider_authority.py:patch_session (explicit coordinated argument only)",
+    "backend/codex_canary_loop_integration.py:install_legacy_globals.patch_session (exact session lock binding)"
+  ],
+  "unintegrated_writers": [
+    "examples/api_loop.py:save_config/save_sessions/create_session and HTTP callers without candidate dependency",
+    "backend/web_session_provider_authority.py:save_sessions/create_api_session/publish_row",
+    "backend/web_session_delete.py:_delete_conversation (both JSON-save branches)",
+    "backend/provider_model_migration.py:migrate_primary_provider_model/_restore_original",
+    "composite fork/delete/retire/native creation and operator/manual writers"
+  ],
+  "all_writers_integrated": false,
+  "http_integrated": false,
+  "method": "Static candidate scan for save_config/save_sessions/publish/create/LOOP_CONFIG/atomic_write_text plus review of matching callers and runtime evidence. Not a proof against aliases, generated code, external operators or manual writes."
+}

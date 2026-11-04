@@ -235,7 +235,7 @@ class SharedSessionCoordinator:
         try: os.fsync(fd)
         finally: os.close(fd)
 
-    def mutate(self, request_id, parameters, callback):
+    def mutate(self, request_id, parameters, callback, *, guard=None):
         """Whole RMW under gate. A committed replay does not invoke callback.
 
         After a durable intent, exceptions mean outcome unknown: recover(id),
@@ -248,6 +248,7 @@ class SharedSessionCoordinator:
         if type(parameters) is not dict: fail('coordination_invalid')
         input_sha = digest(encode(parameters))
         with self._locked(write=True):
+            if guard is not None: guard()
             raw = private_read(self.config)
             with self._db() as conn:
                 generation, old_sha = self._ready(conn, raw)
@@ -258,6 +259,7 @@ class SharedSessionCoordinator:
             legacy = _BufferedLegacy(parse(raw))
             callback(legacy)
             self.validate(deepcopy(legacy.config))
+            if guard is not None: guard()
             new = encode(legacy.config)
             # Validation/callback may call arbitrary trusted code; recheck before intent.
             if private_read(self.config) != raw: fail('coordination_external_change')
@@ -275,19 +277,23 @@ class SharedSessionCoordinator:
                 # A commit exception can have an uncertain outcome. Keep the stage;
                 # only explicit recovery may decide whether a durable intent exists.
                 raise
-            return self._recover(request_id, replayed=False)
+            return self._recover(request_id, replayed=False, guard=guard)
 
-    def recover(self, request_id):
+    def recover(self, request_id, *, expected_parameters=None, guard=None):
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', request_id):
             fail('coordination_invalid')
-        with self._locked(write=True): return self._recover(request_id, replayed=True)
+        expected_sha = digest(encode(expected_parameters)) if expected_parameters is not None else None
+        with self._locked(write=True):
+            if guard is not None: guard()
+            return self._recover(request_id, replayed=True, expected_sha=expected_sha, guard=guard)
 
-    def _recover(self, request_id, *, replayed):
+    def _recover(self, request_id, *, replayed, expected_sha=None, guard=None):
         with self._db() as conn:
             generation, sha = self._meta(conn)
-            row = conn.execute('SELECT base_generation,old_sha,new_sha,stage,status FROM session_coordination_ops WHERE request_id=?', (request_id,)).fetchone()
+            row = conn.execute('SELECT base_generation,old_sha,new_sha,stage,status,input_sha FROM session_coordination_ops WHERE request_id=?', (request_id,)).fetchone()
             if not row: fail('coordination_request_missing')
-            base, old_sha, new_sha, stage, status = row
+            base, old_sha, new_sha, stage, status, input_sha = row
+            if expected_sha is not None and expected_sha != input_sha: fail('coordination_request_conflict')
             if not re.fullmatch(r'config-[A-Za-z0-9_-]+\.stage', stage):
                 fail('coordination_journal_invalid')
             if status == 'committed':
@@ -299,6 +305,7 @@ class SharedSessionCoordinator:
                     or not re.fullmatch('[0-9a-f]{64}', new_sha)):
                 fail('coordination_journal_invalid')
         current_sha = digest(private_read(self.config))
+        if guard is not None: guard()
         if current_sha == old_sha and current_sha != new_sha:
             try: new = private_read(self.directory / stage)
             except OSError: raise LifecycleError('coordination_stage_unavailable') from None
