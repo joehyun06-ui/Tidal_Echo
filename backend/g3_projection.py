@@ -56,7 +56,7 @@ def _validate_event(event: G3Event, access: AccessScope) -> None:
     except (ValueError, TypeError, AttributeError):
         raise ProjectionError("projection_source_invalid") from None
     _validate_access(access, r.scope)
-    if event.layer == "fixed" and not event.reviewed:
+    if event.status == "active" and event.layer == "fixed" and not event.reviewed:
         raise ProjectionError("projection_unreviewed_anchor")
 
 
