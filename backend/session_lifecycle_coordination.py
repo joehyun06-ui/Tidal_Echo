@@ -119,6 +119,11 @@ class _BufferedLegacy:
     def save_config(self, config): self.config = deepcopy(config)
 
 
+class _ReadonlyLegacy:
+    def __init__(self, config): self._config = deepcopy(config)
+    def load_config(self): return deepcopy(self._config)
+
+
 class SharedSessionCoordinator:
     production_supported = False
     all_writers_integrated = False
@@ -179,6 +184,7 @@ class SharedSessionCoordinator:
         with closing(self._connect()) as conn:
             if conn.in_transaction or conn.isolation_level is not None: fail('coordination_connection_invalid')
             try:
+                if not write: conn.execute('PRAGMA query_only=ON')
                 conn.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
                 _source_schema(conn)
                 yield conn
@@ -236,6 +242,25 @@ class SharedSessionCoordinator:
             with self._db(write=False) as conn: self._ready(conn, private_read(self.config))
             yield
             with self._db(write=False) as conn: self._ready(conn, private_read(self.config))
+
+    def observe_config(self, observer, *, guard=None):
+        """Trusted read-only projection under the cooperative gate, no intent.
+
+        The callback receives a private copy and generation, not a connection or
+        writable legacy API. Its return value must be scoped/redacted by caller.
+        Factories must still target the existing canonical database. This is not
+        a transaction with uncooperative writers, runtime or external authority.
+        """
+        with self._locked():
+            if guard is not None: guard()
+            raw = private_read(self.config)
+            with self._db(write=False) as conn:
+                generation, sha = self._ready(conn, raw)
+                result = observer(_ReadonlyLegacy(parse(raw)), generation)
+                if guard is not None: guard()
+                if private_read(self.config) != raw or self._ready(conn, raw) != (generation, sha):
+                    fail('coordination_external_change')
+                return result
 
     def _sync_directory(self):
         fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

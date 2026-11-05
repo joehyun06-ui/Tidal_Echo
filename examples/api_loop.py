@@ -239,7 +239,15 @@ def active_session_id() -> str:
     return rows[-1]["id"] if rows else ""
 
 
-def save_sessions(rows: list[dict[str, Any]], active: str | None = None) -> dict[str, Any]:
+def save_sessions(rows: list[dict[str, Any]], active: str | None = None, *, coordinated=None,
+                  request_id=None, access=None, expected_generation=None, expected_snapshot_sha=None,
+                  recover=False) -> dict[str, Any]:
+    if coordinated is not None:
+        return coordinated.save_sessions(request_id, rows, active, access=access,
+            expected_generation=expected_generation, expected_snapshot_sha=expected_snapshot_sha, recover=recover)
+    if (request_id is not None or access is not None or expected_generation is not None
+            or expected_snapshot_sha is not None or recover is not False):
+        raise HTTPException(status_code=409, detail='session_coordination_required')
     cfg = load_config()
     cfg["sessions"] = rows
     if active is not None:

@@ -201,8 +201,15 @@ class CodexCanaryLoopIntegration:
                     body,
                 )
 
-        def save_sessions(rows, active=None):
+        def save_sessions(rows, active=None, *, coordinated=None, request_id=None, access=None,
+                          expected_generation=None, expected_snapshot_sha=None, recover=False):
             with self._session_lock:
+                if (coordinated is not None or request_id is not None or access is not None
+                        or expected_generation is not None or expected_snapshot_sha is not None or recover is not False):
+                    if coordinated is not None: coordinated.assert_session_lock(self._session_lock)
+                    return self._authority_call(self.session_authority.save_sessions, rows, active,
+                        coordinated=coordinated, request_id=request_id, access=access,
+                        expected_generation=expected_generation, expected_snapshot_sha=expected_snapshot_sha, recover=recover)
                 return self._authority_call(
                     self.session_authority.save_sessions,
                     rows,

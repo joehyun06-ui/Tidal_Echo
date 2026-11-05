@@ -246,7 +246,20 @@ class WebSessionProviderAuthority:
         self,
         rows: list[Mapping[str, object]],
         active: str | None = None,
+        *,
+        coordinated=None,
+        request_id=None,
+        access=None,
+        expected_generation=None,
+        expected_snapshot_sha=None,
+        recover=False,
     ) -> dict[str, Any]:
+        if coordinated is not None:
+            return coordinated.save_sessions(request_id, rows, active, access=access,
+                expected_generation=expected_generation, expected_snapshot_sha=expected_snapshot_sha, recover=recover)
+        if (request_id is not None or access is not None or expected_generation is not None
+                or expected_snapshot_sha is not None or recover is not False):
+            raise WebSessionProviderAuthorityError('web_session_coordination_required')
         normalized = [self.normalize_row(item) for item in rows]
         ids = [row["id"] for row in normalized]
         if len(ids) != len(set(ids)):
