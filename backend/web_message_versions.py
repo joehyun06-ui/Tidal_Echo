@@ -136,7 +136,19 @@ def public_state(authority, *, relay_db):
         if root in rows and (target == root or valid.get(target) == root)]}
 
 
-def select_version(authority, root_id, body, *, relay_db):
+def select_version(authority, root_id, body, *, relay_db, coordinated=None, session_lock=None,
+                   request_id=None, access=None, expected_generation=None,
+                   expected_snapshot_sha=None, expected_graph_sha=None, expected_group_ids=None, recover=False):
+    if coordinated is not None:
+        coordinated.assert_session_lock(session_lock)
+        coordinated.assert_config_path(getattr(authority.legacy,'LOOP_CONFIG',None))
+        coordinated.assert_database_path(relay_db)
+        return coordinated.select_version(root_id,body,request_id=request_id,access=access,
+            expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,
+            expected_graph_sha=expected_graph_sha,expected_group_ids=expected_group_ids,recover=recover)
+    if (session_lock is not None or request_id is not None or access is not None or expected_generation is not None
+            or expected_snapshot_sha is not None or expected_graph_sha is not None or expected_group_ids is not None or recover is not False):
+        raise ForkError('version_coordination_required')
     if not isinstance(body, dict) or set(body) != {'version_id'} or not isinstance(body['version_id'], str):
         raise ForkError('invalid_version_selection', 400)
     state = public_state(authority, relay_db=relay_db)
