@@ -20,7 +20,21 @@ class ForkError(Exception):
         self.category, self.status = category, status
 
 
-def fork_conversation(authority, session_id: str, body: object, *, relay_db: str) -> dict:
+def fork_conversation(authority, session_id: str, body: object, *, relay_db: str,
+                      coordinated=None, session_lock=None, title=None, created_at=None, access=None,
+                      expected_generation=None, expected_snapshot_sha=None,
+                      expected_source_sha=None, expected_copy_sha=None, recover=False) -> dict:
+    if coordinated is not None:
+        coordinated.assert_session_lock(session_lock)
+        coordinated.assert_config_path(getattr(authority.legacy, 'LOOP_CONFIG', None))
+        coordinated.assert_database_path(relay_db)
+        return coordinated.fork_conversation(session_id, body, title=title, created_at=created_at,
+            access=access, expected_generation=expected_generation, expected_snapshot_sha=expected_snapshot_sha,
+            expected_source_sha=expected_source_sha, expected_copy_sha=expected_copy_sha, recover=recover)
+    if (session_lock is not None or title is not None or created_at is not None or access is not None or expected_generation is not None
+            or expected_snapshot_sha is not None or expected_source_sha is not None
+            or expected_copy_sha is not None or recover is not False):
+        raise ForkError('fork_coordination_required')
     if not isinstance(body, dict) or set(body) != {"request_id", "message_id", "mode"}:
         raise ForkError("invalid_fork_request", 400)
     try:

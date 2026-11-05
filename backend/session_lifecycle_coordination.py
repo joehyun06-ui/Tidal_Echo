@@ -251,12 +251,20 @@ class SharedSessionCoordinator:
         Factories must still target the existing canonical database. This is not
         a transaction with uncooperative writers, runtime or external authority.
         """
+        return self._observe(observer, guard=guard, canonical=False)
+
+    def observe_canonical(self, observer, *, guard=None):
+        """Trusted projection of config and query-only canonical DB, no intent."""
+        return self._observe(observer, guard=guard, canonical=True)
+
+    def _observe(self, observer, *, guard, canonical):
         with self._locked():
             if guard is not None: guard()
             raw = private_read(self.config)
             with self._db(write=False) as conn:
                 generation, sha = self._ready(conn, raw)
-                result = observer(_ReadonlyLegacy(parse(raw)), generation)
+                legacy = _ReadonlyLegacy(parse(raw))
+                result = observer(legacy, generation, conn) if canonical else observer(legacy, generation)
                 if guard is not None: guard()
                 if private_read(self.config) != raw or self._ready(conn, raw) != (generation, sha):
                     fail('coordination_external_change')
@@ -313,7 +321,8 @@ class SharedSessionCoordinator:
                 fail('coordination_session_namespace_conflict')
 
     def mutate(self, request_id, parameters, callback, *, guard=None,
-               expected_generation=None, require_operation=None, require_fresh_session=None):
+               expected_generation=None, require_operation=None, require_fresh_session=None,
+               canonical_effect=None, pending_validator=None):
         """Whole RMW under gate. A committed replay does not invoke callback.
 
         After a durable intent, exceptions mean outcome unknown: recover(id),
@@ -322,10 +331,18 @@ class SharedSessionCoordinator:
         must bind the complete action/target/payload; no route/auth is added here.
         Optional CAS/proof preconditions must also be bound into parameters by
         the caller. Committed replay is historical and does not reapply CAS.
+        canonical_effect is trusted transaction-local SQL only: no commits,
+        external IO, models or dispatch. It commits with the pending intent,
+        never reruns in recovery/replay. pending_validator verifies those
+        effects before an unpublished intent becomes visible. Callers bind
+        both contracts and all effect digests into parameters. Not an atomic
+        transaction with JSON, native state or uncooperative runtime ingress.
         """
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', request_id):
             fail('coordination_invalid')
         if type(parameters) is not dict: fail('coordination_invalid')
+        if canonical_effect is not None and (not callable(canonical_effect) or not callable(pending_validator)):
+            fail('coordination_invalid')
         input_sha = digest(encode(parameters))
         with self._locked(write=True):
             if guard is not None: guard()
@@ -343,6 +360,8 @@ class SharedSessionCoordinator:
             self.validate(deepcopy(legacy.config))
             if guard is not None: guard()
             new = encode(legacy.config)
+            if canonical_effect is not None and digest(new) == digest(raw):
+                fail('coordination_effect_requires_config_change')
             # Validation/callback may call arbitrary trusted code; recheck before intent.
             if private_read(self.config) != raw: fail('coordination_external_change')
             fd, stage = tempfile.mkstemp(prefix='config-', suffix='.stage', dir=self.directory)
@@ -355,6 +374,9 @@ class SharedSessionCoordinator:
                         fail('coordination_external_change')
                     self._preconditions(conn, generation, old_sha, expected_generation, require_operation)
                     self._fresh_session(conn, require_fresh_session)
+                    if canonical_effect is not None:
+                        canonical_effect(conn)
+                        if guard is not None: guard()
                     conn.execute('INSERT INTO session_coordination_ops VALUES (?,?,?,?,?,?,\'pending\')',
                                  (request_id, input_sha, generation, old_sha, digest(new), Path(stage).name))
             except BaseException:
@@ -363,10 +385,12 @@ class SharedSessionCoordinator:
                 raise
             return self._recover(request_id, replayed=False, guard=guard,
                                  expected_generation=expected_generation, require_operation=require_operation,
-                                 require_fresh_session=require_fresh_session)
+                                 require_fresh_session=None if canonical_effect is not None else require_fresh_session,
+                                 pending_validator=pending_validator)
 
     def recover(self, request_id, *, expected_parameters=None, guard=None,
-                expected_generation=None, require_operation=None, require_fresh_session=None):
+                expected_generation=None, require_operation=None, require_fresh_session=None,
+                pending_validator=None):
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', request_id):
             fail('coordination_invalid')
         expected_sha = digest(encode(expected_parameters)) if expected_parameters is not None else None
@@ -374,10 +398,11 @@ class SharedSessionCoordinator:
             if guard is not None: guard()
             return self._recover(request_id, replayed=True, expected_sha=expected_sha, guard=guard,
                                  expected_generation=expected_generation, require_operation=require_operation,
-                                 require_fresh_session=require_fresh_session)
+                                 require_fresh_session=require_fresh_session, pending_validator=pending_validator)
 
     def _recover(self, request_id, *, replayed, expected_sha=None, guard=None,
-                 expected_generation=None, require_operation=None, require_fresh_session=None):
+                 expected_generation=None, require_operation=None, require_fresh_session=None,
+                 pending_validator=None):
         with self._db() as conn:
             generation, sha = self._meta(conn)
             row = conn.execute('SELECT base_generation,old_sha,new_sha,stage,status,input_sha FROM session_coordination_ops WHERE request_id=?', (request_id,)).fetchone()
@@ -400,6 +425,9 @@ class SharedSessionCoordinator:
             if (require_fresh_session is not None and old_sha != new_sha
                     and digest(private_read(self.config)) == old_sha):
                 self._fresh_session(conn, require_fresh_session)
+            if (pending_validator is not None and old_sha != new_sha
+                    and digest(private_read(self.config)) == old_sha):
+                pending_validator(conn)
         current_sha = digest(private_read(self.config))
         if guard is not None: guard()
         if current_sha == old_sha and current_sha != new_sha:
