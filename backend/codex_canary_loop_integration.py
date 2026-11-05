@@ -173,6 +173,8 @@ class CodexCanaryLoopIntegration:
             since_id=0,
             activate=True,
             provider=web_session_provider_authority.API_PROVIDER,
+            *, coordinated=None, session_id=None, created_at=None, request_id=None, access=None,
+            expected_generation=None, expected_snapshot_sha=None, recover=False,
         ):
             if provider != web_session_provider_authority.API_PROVIDER:
                 raise CodexCanaryLoopIntegrationError(
@@ -180,6 +182,16 @@ class CodexCanaryLoopIntegration:
                     status_code=409,
                 )
             with self._session_lock:
+                if (coordinated is not None or session_id is not None or created_at is not None
+                        or request_id is not None or access is not None or expected_generation is not None
+                        or expected_snapshot_sha is not None or recover is not False):
+                    if coordinated is None:
+                        raise CodexCanaryLoopIntegrationError('web_session_coordination_required',status_code=409)
+                    coordinated.assert_session_lock(self._session_lock)
+                    return self._authority_call(self.session_authority.create_api_session,
+                        title=title,since_id=since_id,activate=activate,session_id=session_id,
+                        coordinated=coordinated,created_at=created_at,request_id=request_id,access=access,
+                        expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,recover=recover)
                 return self._authority_call(
                     self.session_authority.create_api_session,
                     title=title,
@@ -382,6 +394,8 @@ class CodexCanaryLoopIntegration:
         since_id: int = 0,
         activate: bool = True,
         session_id: str | None = None,
+        coordinated=None, created_at=None, request_id=None, access=None,
+        expected_generation=None, expected_snapshot_sha=None, recover=False,
     ) -> Mapping[str, object]:
         try:
             provider = web_session_provider_authority.normalize_provider(provider)
@@ -390,6 +404,18 @@ class CodexCanaryLoopIntegration:
                 exc.category,
                 status_code=_authority_status(exc.category),
             ) from None
+        if coordinated is not None:
+            if provider != web_session_provider_authority.API_PROVIDER:
+                raise CodexCanaryLoopIntegrationError('coordination_native_creation_unsupported',status_code=409)
+            with self._session_lock:
+                coordinated.assert_session_lock(self._session_lock)
+                return self._authority_call(self.session_authority.create_api_session,
+                    title=title,since_id=since_id,activate=activate,session_id=session_id,
+                    coordinated=coordinated,created_at=created_at,request_id=request_id,access=access,
+                    expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,recover=recover)
+        if (created_at is not None or request_id is not None or access is not None
+                or expected_generation is not None or expected_snapshot_sha is not None or recover is not False):
+            raise CodexCanaryLoopIntegrationError('web_session_coordination_required',status_code=409)
         if provider == web_session_provider_authority.API_PROVIDER:
             with self._session_lock:
                 return self._authority_call(
