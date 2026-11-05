@@ -275,6 +275,51 @@ class SharedSessionCoordinator:
         try: os.fsync(fd)
         finally: os.close(fd)
 
+    def mutate_canonical(self, request_id, parameters, effect, *, guard=None, expected_generation=None):
+        """Trusted SQL-only effect, generation and committed receipt in one txn.
+
+        Config stays byte-identical. The effect receives a read-only legacy
+        config and must not commit, use external IO or dispatch. A private empty
+        stage preserves the existing journal/cleanup format; it is not a JSON
+        publication intent. Crash before commit rolls everything back; after
+        commit replay/recover returns the historical receipt without rerunning
+        SQL. This does not atomically fence external config/auth/runtime writers.
+        """
+        if (type(request_id) is not str or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}',request_id)
+                or type(parameters) is not dict or not callable(effect)): fail('coordination_invalid')
+        input_sha = digest(encode(parameters))
+        with self._locked(write=True):
+            if guard is not None: guard()
+            raw = private_read(self.config)
+            with self._db() as conn:
+                generation, sha = self._ready(conn,raw)
+                old = conn.execute('SELECT input_sha,base_generation,stage,status FROM session_coordination_ops WHERE request_id=?',
+                                   (request_id,)).fetchone()
+                if old:
+                    if old[0] != input_sha: fail('coordination_request_conflict')
+                    if old[3] != 'committed': fail('coordination_recovery_required')
+                    stage = old[2]
+                    if type(stage) is not str or not re.fullmatch(r'config-[A-Za-z0-9_-]+\.stage',stage):
+                        fail('coordination_journal_invalid')
+                    receipt = WriteReceipt(old[1]+1,True)
+                else:
+                    self._preconditions(conn,generation,sha,expected_generation,None)
+                    effect(conn,_ReadonlyLegacy(parse(raw)))
+                    if guard is not None: guard()
+                    if private_read(self.config) != raw: fail('coordination_external_change')
+                    fd, path = tempfile.mkstemp(prefix='config-',suffix='.stage',dir=self.directory)
+                    try: os.fsync(fd)
+                    finally: os.close(fd)
+                    self._sync_directory()
+                    stage = Path(path).name
+                    conn.execute("INSERT INTO session_coordination_ops VALUES (?,?,?,?,?,?,'committed')",
+                                 (request_id,input_sha,generation,sha,sha,stage))
+                    conn.execute('UPDATE session_coordination_meta SET generation=? WHERE id=1',(generation+1,))
+                    receipt = WriteReceipt(generation+1,False)
+            (self.directory/stage).unlink(missing_ok=True)
+            self._sync_directory()
+            return receipt
+
     def _preconditions(self, conn, generation, sha, expected_generation, require_operation):
         if expected_generation is not None:
             if type(expected_generation) is not int or not 0 <= expected_generation < 2**63 - 1:
