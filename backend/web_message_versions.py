@@ -92,6 +92,23 @@ def prepare(authority, session_id, body, *, relay_db):
         return edge
 
 
+def create_api_version(authority, session_id, body, *, root_id, relay_db,
+                       coordinated=None, session_lock=None, title=None, created_at=None,
+                       select=True, access=None, expected_generation=None,
+                       expected_snapshot_sha=None, expected_graph_sha=None, expected_group_ids=None,
+                       expected_source_sha=None, expected_copy_sha=None, recover=False):
+    """Explicit composite candidate, not the legacy prepare/fork/finish sequence."""
+    if coordinated is None: raise ForkError('version_creation_coordination_required')
+    coordinated.assert_session_lock(session_lock)
+    coordinated.assert_config_path(getattr(authority.legacy,'LOOP_CONFIG',None))
+    coordinated.assert_database_path(relay_db)
+    return coordinated.create_api_version(root_id,session_id,body,title=title,created_at=created_at,
+        select=select,access=access,expected_generation=expected_generation,
+        expected_snapshot_sha=expected_snapshot_sha,expected_graph_sha=expected_graph_sha,
+        expected_group_ids=expected_group_ids,expected_source_sha=expected_source_sha,
+        expected_copy_sha=expected_copy_sha,recover=recover)
+
+
 def finish(authority, target, *, relay_db, select=False):
     """Annotate copied prefixes; safe on replay and after a process restart."""
     with closing(connect(relay_db)) as conn:
