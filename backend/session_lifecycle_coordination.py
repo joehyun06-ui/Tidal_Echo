@@ -105,6 +105,13 @@ class WriteReceipt:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class CommittedOperationProof:
+    request_id: str
+    input_sha: str
+    base_generation: int
+
+
 class _BufferedLegacy:
     """Only the JSON portion of the legacy interface; callback is trusted/pure."""
     def __init__(self, config): self.config = deepcopy(config)
@@ -235,13 +242,34 @@ class SharedSessionCoordinator:
         try: os.fsync(fd)
         finally: os.close(fd)
 
-    def mutate(self, request_id, parameters, callback, *, guard=None):
+    def _preconditions(self, conn, generation, sha, expected_generation, require_operation):
+        if expected_generation is not None:
+            if type(expected_generation) is not int or not 0 <= expected_generation < 2**63 - 1:
+                fail('coordination_invalid')
+            if generation != expected_generation: fail('coordination_cas_conflict')
+        if require_operation is not None:
+            proof = require_operation
+            if (type(proof) is not CommittedOperationProof or type(proof.request_id) is not str
+                    or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', proof.request_id)
+                    or type(proof.input_sha) is not str or not re.fullmatch('[0-9a-f]{64}', proof.input_sha)
+                    or type(proof.base_generation) is not int or not 0 <= proof.base_generation < 2**63 - 1):
+                fail('coordination_invalid')
+            row = conn.execute('SELECT input_sha,base_generation,new_sha,status FROM session_coordination_ops WHERE request_id=?',
+                               (proof.request_id,)).fetchone()
+            if (not row or tuple(row) != (proof.input_sha, proof.base_generation, sha, 'committed')
+                    or generation != proof.base_generation + 1):
+                fail('coordination_operation_conflict')
+
+    def mutate(self, request_id, parameters, callback, *, guard=None,
+               expected_generation=None, require_operation=None):
         """Whole RMW under gate. A committed replay does not invoke callback.
 
         After a durable intent, exceptions mean outcome unknown: recover(id),
         then replay the same ID. Before that intent, pure computation may repeat
         after a crash. A callback must only edit its buffered config. Parameters
         must bind the complete action/target/payload; no route/auth is added here.
+        Optional CAS/proof preconditions must also be bound into parameters by
+        the caller. Committed replay is historical and does not reapply CAS.
         """
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', request_id):
             fail('coordination_invalid')
@@ -256,6 +284,7 @@ class SharedSessionCoordinator:
                 if old:
                     if old[0] != input_sha: fail('coordination_request_conflict')
                     return WriteReceipt(old[1] + 1, True)
+                self._preconditions(conn, generation, old_sha, expected_generation, require_operation)
             legacy = _BufferedLegacy(parse(raw))
             callback(legacy)
             self.validate(deepcopy(legacy.config))
@@ -271,23 +300,28 @@ class SharedSessionCoordinator:
                 with self._db() as conn:
                     if self._ready(conn, private_read(self.config)) != (generation, old_sha):
                         fail('coordination_external_change')
+                    self._preconditions(conn, generation, old_sha, expected_generation, require_operation)
                     conn.execute('INSERT INTO session_coordination_ops VALUES (?,?,?,?,?,?,\'pending\')',
                                  (request_id, input_sha, generation, old_sha, digest(new), Path(stage).name))
             except BaseException:
                 # A commit exception can have an uncertain outcome. Keep the stage;
                 # only explicit recovery may decide whether a durable intent exists.
                 raise
-            return self._recover(request_id, replayed=False, guard=guard)
+            return self._recover(request_id, replayed=False, guard=guard,
+                                 expected_generation=expected_generation, require_operation=require_operation)
 
-    def recover(self, request_id, *, expected_parameters=None, guard=None):
+    def recover(self, request_id, *, expected_parameters=None, guard=None,
+                expected_generation=None, require_operation=None):
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', request_id):
             fail('coordination_invalid')
         expected_sha = digest(encode(expected_parameters)) if expected_parameters is not None else None
         with self._locked(write=True):
             if guard is not None: guard()
-            return self._recover(request_id, replayed=True, expected_sha=expected_sha, guard=guard)
+            return self._recover(request_id, replayed=True, expected_sha=expected_sha, guard=guard,
+                                 expected_generation=expected_generation, require_operation=require_operation)
 
-    def _recover(self, request_id, *, replayed, expected_sha=None, guard=None):
+    def _recover(self, request_id, *, replayed, expected_sha=None, guard=None,
+                 expected_generation=None, require_operation=None):
         with self._db() as conn:
             generation, sha = self._meta(conn)
             row = conn.execute('SELECT base_generation,old_sha,new_sha,stage,status,input_sha FROM session_coordination_ops WHERE request_id=?', (request_id,)).fetchone()
@@ -301,6 +335,7 @@ class SharedSessionCoordinator:
                 (self.directory / stage).unlink(missing_ok=True)
                 self._sync_directory()
                 return WriteReceipt(base + 1, True)
+            self._preconditions(conn, generation, sha, expected_generation, require_operation)
             if (generation != base or sha != old_sha or not re.fullmatch(r'config-[A-Za-z0-9_-]+\.stage', stage)
                     or not re.fullmatch('[0-9a-f]{64}', new_sha)):
                 fail('coordination_journal_invalid')
@@ -317,6 +352,7 @@ class SharedSessionCoordinator:
         with self._db() as conn:
             if self._meta(conn) != (base, old_sha) or digest(private_read(self.config)) != new_sha:
                 fail('coordination_external_change')
+            self._preconditions(conn, base, old_sha, expected_generation, require_operation)
             conn.execute('UPDATE session_coordination_meta SET generation=?,config_sha=? WHERE id=1', (base + 1, new_sha))
             conn.execute("UPDATE session_coordination_ops SET status='committed' WHERE request_id=? AND status='pending'", (request_id,))
         (self.directory / stage).unlink(missing_ok=True)

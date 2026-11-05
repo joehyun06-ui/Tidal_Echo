@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
@@ -236,7 +237,7 @@ def _verified_projection(
 
 
 def _restore_original(path: Path, original_raw: str | None) -> None:
-    """Best-effort rollback to exact prior file bytes or prior file absence."""
+    """Legacy-only best-effort restore; not used by coordinated commands."""
 
     try:
         if original_raw is None:
@@ -247,11 +248,41 @@ def _restore_original(path: Path, original_raw: str | None) -> None:
         pass
 
 
+def prepare_model_only_change(current: object, payload: object) -> tuple[dict, str]:
+    """Pure candidate on an existing materialized route; no env/file fallback.
+
+    This supports explicit coordinated commands, not legacy restore or dispatch.
+    """
+    model = validate_model_request(payload)
+    try:
+        deployment_config.validate_loop_config_payload(current, render_mvp=True)
+        if type(current) is not dict: _raise(CONFIG_UNAVAILABLE)
+        chain = current.get('main_chain')
+        if (type(chain) is not list or len(chain) != 1 or type(chain[0]) is not dict
+                or set(chain[0]) != {'url', 'key', 'model'}):
+            _raise(CONFIG_UNAVAILABLE)
+        route = chain[0]
+        candidate = deepcopy(current)
+        candidate['main_chain'][0]['model'] = model
+        _verified_projection(candidate, model=model, original_route=route, expected_payload=candidate)
+        return candidate, route['model']
+    except ProviderModelMigrationError:
+        raise
+    except (TypeError, ValueError, deployment_config.DeploymentConfigError):
+        _raise(CONFIG_UNAVAILABLE)
+
+
 def migrate_primary_provider_model(
     loop_config: str | Path,
     payload: object,
     *,
     environ: Mapping[str, str] | None = None,
+    coordinated=None,
+    request_id=None,
+    access=None,
+    expected_generation=None,
+    expected_model=None,
+    recover=False,
 ) -> dict[str, object]:
     """Atomically replace only the authoritative primary provider model.
 
@@ -260,8 +291,20 @@ def migrate_primary_provider_model(
     route is used server-side to create one. Existing URL/key values never leave
     the server. Verification failure restores exact prior bytes, or restores
     prior file absence when the migration created the file.
+
+    An explicit coordinated dependency instead returns a durable WriteReceipt
+    on an existing materialized config, with CAS and no legacy file restore.
+    No HTTP composition supplies this dependency automatically.
     """
 
+    if coordinated is not None:
+        return coordinated.migrate_primary_provider_model(
+            loop_config, payload, request_id=request_id, access=access,
+            expected_generation=expected_generation, expected_model=expected_model, recover=recover,
+        )
+    if (request_id is not None or access is not None or expected_generation is not None
+            or expected_model is not None or recover is not False):
+        _raise(INVALID_REQUEST)
     model = validate_model_request(payload)
     path = Path(loop_config)
     original_raw, current, route = _load_authoritative_route(path, environ)
