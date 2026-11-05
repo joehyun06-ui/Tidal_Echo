@@ -260,7 +260,17 @@ def sessions_public() -> dict[str, Any]:
     return {"active_session": active_session_id(), "sessions": session_rows()}
 
 
-def create_session(title: str = "New chat", since_id: int = 0, activate: bool = True) -> dict[str, Any]:
+def create_session(title: str = "New chat", since_id: int = 0, activate: bool = True, *, coordinated=None,
+                    session_id=None, created_at=None, request_id=None, access=None,
+                    expected_generation=None, expected_snapshot_sha=None, recover=False) -> dict[str, Any]:
+    if coordinated is not None:
+        coordinated.assert_config_path(LOOP_CONFIG)
+        return coordinated.create_api_session(title=title,since_id=since_id,activate=activate,
+            session_id=session_id,created_at=created_at,request_id=request_id,access=access,
+            expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,recover=recover)
+    if (session_id is not None or created_at is not None or request_id is not None or access is not None
+            or expected_generation is not None or expected_snapshot_sha is not None or recover is not False):
+        raise HTTPException(status_code=409,detail='session_coordination_required')
     rows = session_rows()
     sid = "api-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
     row = {"id": sid, "title": title or "New chat", "since_id": int(since_id or 0), "created_at": now_iso()}

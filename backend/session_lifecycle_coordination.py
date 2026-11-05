@@ -21,7 +21,7 @@ import threading
 import time
 
 from .deployment_config import LOOP_CONFIG_MAX_BYTES, atomic_write_text
-from .session_lifecycle import LifecycleError
+from .session_lifecycle import LifecycleError, _session_id
 from .session_lifecycle_storage import _unique, _source_schema
 
 FORMAT = 'guiting.coordination.v1'
@@ -285,8 +285,35 @@ class SharedSessionCoordinator:
                     or generation != proof.base_generation + 1):
                 fail('coordination_operation_conflict')
 
+    def _fresh_session(self, conn, sid):
+        if sid is None: return
+        if not _session_id(sid): fail('coordination_invalid')
+        invalid = conn.execute("SELECT 1 FROM messages WHERE CASE WHEN json_valid(meta) THEN "
+            "json_type(meta)!='object' OR COALESCE(json_type(meta,'$.api_session') NOT IN ('text','null'),0) "
+            "ELSE 1 END LIMIT 1").fetchone()
+        if invalid: fail('coordination_namespace_invalid')
+        if conn.execute("SELECT 1 FROM messages WHERE json_extract(meta,'$.api_session')=? LIMIT 1",(sid,)).fetchone():
+            fail('coordination_session_namespace_conflict')
+        scopes = {
+            'web_message_versions':('version_id','root_id','parent_id'),
+            'web_version_selections':('root_id','version_id'),
+            'web_session_forks':('target',),
+            'web_session_context':('root_id',),
+            'api_web_generations':('session_id',),
+            'api_web_closed_sessions':('session_id',),
+            'session_lifecycle_records':('conversation_id',),
+        }
+        for table, columns in scopes.items():
+            kind = conn.execute('SELECT type FROM sqlite_master WHERE name=?',(table,)).fetchone()
+            if not kind: continue
+            actual = {row[1] for row in conn.execute('PRAGMA table_info('+table+')')}
+            if kind[0] != 'table' or not set(columns) <= actual: fail('coordination_namespace_invalid')
+            where = ' OR '.join(column+'=?' for column in columns)  # identifiers are fixed above
+            if conn.execute('SELECT 1 FROM '+table+' WHERE '+where+' LIMIT 1',(sid,)*len(columns)).fetchone():
+                fail('coordination_session_namespace_conflict')
+
     def mutate(self, request_id, parameters, callback, *, guard=None,
-               expected_generation=None, require_operation=None):
+               expected_generation=None, require_operation=None, require_fresh_session=None):
         """Whole RMW under gate. A committed replay does not invoke callback.
 
         After a durable intent, exceptions mean outcome unknown: recover(id),
@@ -310,6 +337,7 @@ class SharedSessionCoordinator:
                     if old[0] != input_sha: fail('coordination_request_conflict')
                     return WriteReceipt(old[1] + 1, True)
                 self._preconditions(conn, generation, old_sha, expected_generation, require_operation)
+                self._fresh_session(conn, require_fresh_session)
             legacy = _BufferedLegacy(parse(raw))
             callback(legacy)
             self.validate(deepcopy(legacy.config))
@@ -326,6 +354,7 @@ class SharedSessionCoordinator:
                     if self._ready(conn, private_read(self.config)) != (generation, old_sha):
                         fail('coordination_external_change')
                     self._preconditions(conn, generation, old_sha, expected_generation, require_operation)
+                    self._fresh_session(conn, require_fresh_session)
                     conn.execute('INSERT INTO session_coordination_ops VALUES (?,?,?,?,?,?,\'pending\')',
                                  (request_id, input_sha, generation, old_sha, digest(new), Path(stage).name))
             except BaseException:
@@ -333,20 +362,22 @@ class SharedSessionCoordinator:
                 # only explicit recovery may decide whether a durable intent exists.
                 raise
             return self._recover(request_id, replayed=False, guard=guard,
-                                 expected_generation=expected_generation, require_operation=require_operation)
+                                 expected_generation=expected_generation, require_operation=require_operation,
+                                 require_fresh_session=require_fresh_session)
 
     def recover(self, request_id, *, expected_parameters=None, guard=None,
-                expected_generation=None, require_operation=None):
+                expected_generation=None, require_operation=None, require_fresh_session=None):
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', request_id):
             fail('coordination_invalid')
         expected_sha = digest(encode(expected_parameters)) if expected_parameters is not None else None
         with self._locked(write=True):
             if guard is not None: guard()
             return self._recover(request_id, replayed=True, expected_sha=expected_sha, guard=guard,
-                                 expected_generation=expected_generation, require_operation=require_operation)
+                                 expected_generation=expected_generation, require_operation=require_operation,
+                                 require_fresh_session=require_fresh_session)
 
     def _recover(self, request_id, *, replayed, expected_sha=None, guard=None,
-                 expected_generation=None, require_operation=None):
+                 expected_generation=None, require_operation=None, require_fresh_session=None):
         with self._db() as conn:
             generation, sha = self._meta(conn)
             row = conn.execute('SELECT base_generation,old_sha,new_sha,stage,status,input_sha FROM session_coordination_ops WHERE request_id=?', (request_id,)).fetchone()
@@ -364,6 +395,11 @@ class SharedSessionCoordinator:
             if (generation != base or sha != old_sha or not re.fullmatch(r'config-[A-Za-z0-9_-]+\.stage', stage)
                     or not re.fullmatch('[0-9a-f]{64}', new_sha)):
                 fail('coordination_journal_invalid')
+            # After publication normal API history may exist. Do not confuse
+            # finishing that intent with a new claim that the ID is unused.
+            if (require_fresh_session is not None and old_sha != new_sha
+                    and digest(private_read(self.config)) == old_sha):
+                self._fresh_session(conn, require_fresh_session)
         current_sha = digest(private_read(self.config))
         if guard is not None: guard()
         if current_sha == old_sha and current_sha != new_sha:

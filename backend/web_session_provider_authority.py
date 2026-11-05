@@ -312,7 +312,17 @@ class WebSessionProviderAuthority:
         since_id: int = 0,
         activate: bool = True,
         session_id: str | None = None,
+        coordinated=None, request_id=None, access=None, created_at=None,
+        expected_generation=None, expected_snapshot_sha=None, recover=False,
     ) -> dict[str, Any]:
+        if coordinated is not None:
+            coordinated.assert_config_path(getattr(self.legacy,'LOOP_CONFIG',None))
+            return coordinated.create_api_session(title=title,since_id=since_id,activate=activate,
+                session_id=session_id,created_at=created_at,request_id=request_id,access=access,
+                expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,recover=recover)
+        if (request_id is not None or access is not None or created_at is not None
+                or expected_generation is not None or expected_snapshot_sha is not None or recover is not False):
+            raise WebSessionProviderAuthorityError('web_session_coordination_required')
         rows = self.session_rows()
         row = self.new_row(
             title=title,
@@ -324,7 +334,16 @@ class WebSessionProviderAuthority:
         self.save_sessions(rows, row["id"] if activate else None)
         return row
 
-    def publish_row(self, row: Mapping[str, object], *, activate: bool) -> dict[str, Any]:
+    def publish_row(self, row: Mapping[str, object], *, activate: bool, coordinated=None,
+                    request_id=None, access=None, expected_generation=None,
+                    expected_snapshot_sha=None, recover=False) -> dict[str, Any]:
+        if coordinated is not None:
+            coordinated.assert_config_path(getattr(self.legacy,'LOOP_CONFIG',None))
+            return coordinated.publish_row(row,activate=activate,request_id=request_id,access=access,
+                expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,recover=recover)
+        if (request_id is not None or access is not None or expected_generation is not None
+                or expected_snapshot_sha is not None or recover is not False):
+            raise WebSessionProviderAuthorityError('web_session_coordination_required')
         normalized = self.normalize_row(row)
         rows = self.session_rows()
         if (
