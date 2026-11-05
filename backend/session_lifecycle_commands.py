@@ -21,6 +21,16 @@ class ConfigCommandAccess:
     principal_id: str
 
 
+def authorize_config_command(authorize, access, action, target):
+    if (type(access) is not ConfigCommandAccess or type(access.principal_id) is not str
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}', access.principal_id)
+            or not callable(authorize)):
+        raise LifecycleError('coordination_access_denied')
+    try: allowed = authorize(access, action, target)
+    except Exception: raise LifecycleError('coordination_access_unavailable') from None
+    if allowed is not True: raise LifecycleError('coordination_access_denied')
+
+
 class CoordinatedConfigCommands:
     production_supported = False
     all_writers_integrated = False
@@ -36,13 +46,7 @@ class CoordinatedConfigCommands:
         if lock is not self.session_lock: raise LifecycleError('coordination_lock_mismatch')
 
     def _guard(self, access, action, target):
-        if (type(access) is not ConfigCommandAccess or type(access.principal_id) is not str
-                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}', access.principal_id)
-                or not callable(self._authorize)):
-            raise LifecycleError('coordination_access_denied')
-        try: allowed = self._authorize(access, action, target)
-        except Exception: raise LifecycleError('coordination_access_unavailable') from None
-        if allowed is not True: raise LifecycleError('coordination_access_denied')
+        authorize_config_command(self._authorize, access, action, target)
 
     def execute(self, request_id, action, target, body, *, access, recover=False):
         if not self.enabled: raise LifecycleError('lifecycle_disabled')
