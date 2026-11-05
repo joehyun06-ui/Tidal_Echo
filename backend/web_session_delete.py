@@ -157,8 +157,8 @@ def _referenced_message_ids(conn: sqlite3.Connection, message_ids: list[int]) ->
             pragma = f"PRAGMA foreign_key_list({_quote_identifier(table)})"
             for foreign_key in conn.execute(pragma):
                 if (
-                    str(foreign_key["table"]) == "messages"
-                    and str(foreign_key["to"]) == "id"
+                    str(foreign_key["table"]).casefold() == "messages"
+                    and (foreign_key["to"] is None or str(foreign_key["to"]).casefold() == "id")
                 ):
                     reference_columns.append((table, str(foreign_key["from"])))
         for chunk in _chunks(message_ids):
@@ -420,7 +420,28 @@ def _append_tombstone(
     cfg[web_session_provider_authority.DELETED_SESSIONS_KEY] = tombstones
 
 
-def delete_conversation(authority,session_id,*,relay_db,upload_dir,codex_store,usage_ledger=None):
+def delete_conversation(authority,session_id,*,relay_db,upload_dir,codex_store,usage_ledger=None,
+                        coordinated=None,session_lock=None,request_id=None,access=None,deleted_at=None,
+                        next_active=None,expected_generation=None,expected_snapshot_sha=None,
+                        expected_state_sha=None,expected_message_ids=None,expected_redacted_ids=None,
+                        expected_retained_sha=None,recover=False):
+    if coordinated is not None:
+        coordinated.assert_session_lock(session_lock)
+        coordinated.assert_config_path(getattr(authority.legacy,'LOOP_CONFIG',None))
+        coordinated.assert_database_path(relay_db)
+        if upload_dir is not None or codex_store is not None or usage_ledger is not None:
+            from .session_lifecycle import LifecycleError
+            raise LifecycleError('coordination_delete_external_cleanup_unsupported')
+        return coordinated.delete_conversation(session_id,request_id=request_id,access=access,
+            deleted_at=deleted_at,next_active=next_active,expected_generation=expected_generation,
+            expected_snapshot_sha=expected_snapshot_sha,expected_state_sha=expected_state_sha,
+            expected_message_ids=expected_message_ids,expected_redacted_ids=expected_redacted_ids,
+            expected_retained_sha=expected_retained_sha,recover=recover)
+    if (session_lock is not None or request_id is not None or access is not None or deleted_at is not None
+            or next_active is not None or expected_generation is not None or expected_snapshot_sha is not None
+            or expected_state_sha is not None or expected_message_ids is not None or expected_redacted_ids is not None
+            or expected_retained_sha is not None or recover is not False):
+        _raise('web_session_coordination_required')
     result=_delete_conversation(authority,session_id,relay_db=relay_db,upload_dir=upload_dir,codex_store=codex_store)
     if usage_ledger is not None:
         detail=result['deleted']
