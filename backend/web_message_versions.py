@@ -179,13 +179,38 @@ def select_version(authority, root_id, body, *, relay_db, coordinated=None, sess
     return {'ok': True, 'root_id': root_id, 'version_id': target['id']}
 
 
-def delete_versions(authority, root_id, *, relay_db, upload_dir=None, codex_store=None, usage_ledger=None):
+def delete_versions(authority, root_id, *, relay_db, upload_dir=None, codex_store=None, usage_ledger=None,
+                    coordinated=None,session_lock=None,request_id=None,access=None,deleted_at=None,next_active=None,
+                    expected_generation=None,expected_snapshot_sha=None,expected_graph_sha=None,expected_group_ids=None,
+                    expected_state_sha=None,expected_message_ids=None,expected_redacted_ids=None,expected_retained_sha=None,
+                    recover=False):
     """Delete every internal alternative, keeping explicit branches independent.
+
+    An explicitly injected API candidate commits whole-group SQL effects and
+    intent together, then publishes one buffered configuration. It does not
+    enter the legacy per-member path below or claim cross-store atomicity.
 
     The caller holds the session lock and, for Codex, the runtime activity gate.
     Preflight all native jobs before retirement/deletion. Root is removed last,
     so a storage failure can be retried without losing the group membership.
     """
+    if coordinated is not None:
+        coordinated.assert_session_lock(session_lock)
+        coordinated.assert_config_path(getattr(authority.legacy,'LOOP_CONFIG',None))
+        coordinated.assert_database_path(relay_db)
+        if upload_dir is not None or codex_store is not None or usage_ledger is not None:
+            from .session_lifecycle import LifecycleError
+            raise LifecycleError('coordination_group_external_cleanup_unsupported')
+        return coordinated.delete_api_group(root_id,request_id=request_id,access=access,deleted_at=deleted_at,
+            next_active=next_active,expected_generation=expected_generation,expected_snapshot_sha=expected_snapshot_sha,
+            expected_graph_sha=expected_graph_sha,expected_group_ids=expected_group_ids,expected_state_sha=expected_state_sha,
+            expected_message_ids=expected_message_ids,expected_redacted_ids=expected_redacted_ids,
+            expected_retained_sha=expected_retained_sha,recover=recover)
+    if (session_lock is not None or request_id is not None or access is not None or deleted_at is not None
+            or next_active is not None or expected_generation is not None or expected_snapshot_sha is not None
+            or expected_graph_sha is not None or expected_group_ids is not None or expected_state_sha is not None
+            or expected_message_ids is not None or expected_redacted_ids is not None or expected_retained_sha is not None
+            or recover is not False):raise ForkError('group_delete_coordination_required')
     from . import codex_generation_store as store
     from .web_session_delete import delete_conversation
     with closing(connect(relay_db)) as conn:
