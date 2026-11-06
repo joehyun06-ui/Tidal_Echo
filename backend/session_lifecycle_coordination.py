@@ -128,9 +128,10 @@ class SharedSessionCoordinator:
     production_supported = False
     all_writers_integrated = False
 
-    def __init__(self, connect_canonical, config_path, gate_dir, *, validate, enabled=False, timeout=5):
+    def __init__(self, connect_canonical, config_path, gate_dir, *, validate, enabled=False, timeout=5, canonical_path=None):
         self._connect, self.config, self.directory = connect_canonical, Path(config_path), Path(gate_dir)
         self.validate, self.enabled, self.timeout = validate, enabled is True, timeout
+        self.canonical_path = canonical_path
         # Constructors have no IO; defaults never open a file or database.
 
     @contextmanager
@@ -197,6 +198,13 @@ class SharedSessionCoordinator:
         rows = conn.execute('PRAGMA database_list').fetchall()
         path = next((r[2] for r in rows if r[1] == 'main'), '')
         if not path or Path(path).resolve() != Path(path): fail('coordination_connection_invalid')
+        if self.canonical_path is not None:
+            try:
+                expected = Path(self.canonical_path)
+                if (not expected.is_absolute() or '..' in expected.parts or expected.resolve() != expected
+                        or str(expected) != path): fail('coordination_resource_mismatch')
+            except (TypeError, ValueError, OSError, RuntimeError):
+                raise LifecycleError('coordination_resource_mismatch') from None
         return digest(encode([path, str(self.config), str(self.directory)]))
 
     def _meta(self, conn):
