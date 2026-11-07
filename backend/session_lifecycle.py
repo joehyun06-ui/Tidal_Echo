@@ -271,7 +271,7 @@ class SessionLifecycle:
         if not set(state.pending) <= set(snapshot.pending) | set(snapshot.settled):
             _deny('lifecycle_pending_unaccounted')
 
-    def _run(self, cid, rid, op, payload, access, handler):
+    def _run(self, cid, rid, op, payload, access, handler, *, transaction_guard=None):
         if not self.enabled:
             _deny('lifecycle_disabled')
         if not _session_id(cid) or not _valid_id(rid):
@@ -284,6 +284,8 @@ class SessionLifecycle:
                 with self.repository.transaction(cid) as tx:
                     state = tx.load()
                     self._bound(state, snapshot, binding)
+                    if transaction_guard is not None:
+                        transaction_guard(tx, state, snapshot, binding)
                     old = tx.receipt(rid)
                     if old is not None:
                         if (not isinstance(old, LifecycleReceipt) or old.request_id != rid
@@ -301,6 +303,8 @@ class SessionLifecycle:
                     revision = (state.revision if state else 0) + 1
                     updated = replace(updated, revision=revision)
                     receipt = LifecycleReceipt(rid, digest, revision, updated.phase, confirmed, *counts)
+                    if transaction_guard is not None:
+                        transaction_guard(tx, state, snapshot, binding)
                     if self.authority.validate(snapshot, access=access) is not True:
                         _deny('lifecycle_authority_changed')
                     if not tx.save(revision - 1, updated, receipt):
@@ -472,7 +476,8 @@ class SessionLifecycle:
         except ProjectionError:
             raise LifecycleError('lifecycle_evidence_unavailable') from None
 
-    def activate(self, cid, request_id, *, packet_sha256, access):
+    def activate(self, cid, request_id, *, packet_sha256, access,
+                 _attempt_guard=None, _attempt_request_id=None):
         if not isinstance(packet_sha256, str) or len(packet_sha256) != 64:
             _deny()
         def apply(state, snapshot, _):
@@ -502,4 +507,7 @@ class SessionLifecycle:
                     target_window_id=None, context_epoch=state.context_epoch + 1,
                     used_windows=state.used_windows + (state.target_window_id,),
                     used_model_runs=state.used_model_runs + (ack.model_run_id,)), True, (0, 0)
-        return self._run(cid, request_id, 'activate', packet_sha256, access, apply)
+        op = 'activate_recorded' if _attempt_guard is not None else 'activate'
+        payload = [packet_sha256, _attempt_request_id] if _attempt_guard is not None else packet_sha256
+        return self._run(cid, request_id, op, payload, access, apply,
+                         transaction_guard=_attempt_guard)
