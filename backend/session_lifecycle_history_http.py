@@ -10,6 +10,7 @@ from .session_lifecycle_commands import ConfigCommandAccess
 from .session_lifecycle_coordination import parse
 from .session_lifecycle_history_packet import PrivateHistorySetting
 from .session_lifecycle_request_packets import PacketReference
+from .session_lifecycle_history_status import inspect_history
 
 HEADERS={'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer'}
 PREFIX='/loop/lifecycle/history'
@@ -24,13 +25,13 @@ def install(app, adapter, *, authenticate, enabled=False):
     if enabled is not True:return False
     if type(adapter) is not PrivateHistorySetting or not callable(authenticate) or inspect.iscoroutinefunction(authenticate):
         raise ValueError('lifecycle_http_binding_invalid')
-    paths={PREFIX+'/prepare',PREFIX+'/execute'}
+    paths={PREFIX+'/prepare',PREFIX+'/execute',PREFIX+'/status'}
     if any(getattr(r,'path',None) in paths for r in app.routes):
         raise ValueError('lifecycle_http_route_conflict')
 
     def response(body,status=200):return JSONResponse(body,status_code=status,headers=HEADERS)
 
-    async def handle(request, preparing):
+    async def handle(request, operation):
         try:
             tokens=request.headers.getlist('x-api-loop-internal-token')
             if len(tokens)!=1 or not tokens[0]:return response({'ok':False,'error':'unauthorized'},401)
@@ -43,10 +44,14 @@ def install(app, adapter, *, authenticate, enabled=False):
                 raw.extend(chunk)
                 if len(raw)>4096:return response({'ok':False,'error':'request_too_large'},413)
             body=parse(bytes(raw))
-            if preparing:
+            if operation=='prepare':
                 if set(body)!={'request_id','history_n'}:raise LifecycleError('coordination_invalid')
                 ref=await asyncio.to_thread(adapter.prepare,body['history_n'],request_id=body['request_id'],access=access)
                 return response({'ok':True,'request_id':ref.request_id,'packet_sha':ref.packet_sha,'state':'prepared'})
+            if operation=='status':
+                if set(body)!={'request_id','packet_sha'}:raise LifecycleError('coordination_invalid')
+                result=await asyncio.to_thread(inspect_history,adapter,PacketReference(body['request_id'],body['packet_sha']),access=access,enabled=True)
+                return response({'ok':True,**result})
             if set(body)!={'request_id','packet_sha','recover'} or type(body['recover']) is not bool:
                 raise LifecycleError('coordination_invalid')
             ref=PacketReference(body['request_id'],body['packet_sha'])
@@ -68,10 +73,13 @@ def install(app, adapter, *, authenticate, enabled=False):
             return response({'ok':False,'error':'outcome_unconfirmed'},503)
 
     @app.post(PREFIX+'/prepare')
-    async def prepare(request:Request):return await handle(request,True)
+    async def prepare(request:Request):return await handle(request,'prepare')
 
     @app.post(PREFIX+'/execute')
-    async def execute(request:Request):return await handle(request,False)
+    async def execute(request:Request):return await handle(request,'execute')
+
+    @app.post(PREFIX+'/status')
+    async def status(request:Request):return await handle(request,'status')
     return True
 
 
