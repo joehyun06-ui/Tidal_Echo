@@ -72,6 +72,7 @@ def install(app, journal, *, authenticate, enabled=False):
             return response({'ok': False, 'error': 'status_unavailable'}, 503)
         except (OSError, sqlite3.Error, ValueError, TypeError, RuntimeError):
             return response({'ok': False, 'error': 'status_unavailable'}, 503)
+    app.state.lifecycle_activation_status_installed = True
     return True
 
 

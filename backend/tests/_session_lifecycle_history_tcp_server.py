@@ -12,7 +12,7 @@ TOKEN='synthetic-internal-'+'x'*48
 
 
 def serve(path,directory,mode):
-    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish','aliases_bound','runtime_locked'):raise ValueError('invalid_test_mode')
+    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish','aliases_bound','runtime_locked','activation_status','activation_status_blocked'):raise ValueError('invalid_test_mode')
     path=Path(path)
     os.environ.update({'API_LOOP_INTERNAL_TOKEN':TOKEN,'RELAY_SECRET':'synthetic-relay-'+'x'*48,
         'LOOP_CONFIG':str(path.with_suffix('.json')),'RELAY_DB':str(path),
@@ -38,13 +38,22 @@ def serve(path,directory,mode):
         adapter=binding(path,Path(directory))
         install_api_loop(loop,adapter,principal_id='synthetic_owner',enabled=mode!='disabled')
         aliases={name:getattr(loop,name) for name in ('load_config','history_n','save_config','update_config','patch_session','create_session','save_sessions')}
-        if mode in ('direct_bound','direct_bound_fail_publish','aliases_bound','runtime_locked'):
+        if mode in ('direct_bound','direct_bound_fail_publish','aliases_bound','runtime_locked','activation_status','activation_status_blocked'):
             from backend.session_lifecycle_loop_config_io import install_api_loop_config_io
             from backend.session_lifecycle_commands import ConfigCommandAccess
             install_api_loop_config_io(loop,adapter,access=ConfigCommandAccess('synthetic_owner'),enabled=True)
-        if mode=='runtime_locked':
+        if mode in ('runtime_locked','activation_status','activation_status_blocked'):
             from backend.session_lifecycle_runtime_interlock import install_api_loop_runtime_interlock
             install_api_loop_runtime_interlock(loop,enabled=True)
+        status_fixture=None
+        if mode in ('activation_status','activation_status_blocked'):
+            from backend.tests.test_session_lifecycle_storage import FileHarness
+            from backend.tests.test_session_lifecycle import CTX
+            from backend.session_window_attempts import WindowAttemptJournal
+            from backend.session_window_activation_http import install_api_loop as install_status
+            status_fixture=FileHarness(path,seed=False)
+            status_fixture.repo._coordinator=adapter.commands.coordinator
+            install_status(loop,WindowAttemptJournal(status_fixture.repo,enabled=True),access=CTX,enabled=True)
         aliases_guarded=False
         if mode=='aliases_bound':
             from fastapi import HTTPException
@@ -57,9 +66,11 @@ def serve(path,directory,mode):
                     if e.status_code!=423:raise
                 else:raise AssertionError('captured_write_alias_bypassed')
             aliases_guarded=True
-        if mode in ('interlocked','strict'):
+        if mode in ('interlocked','strict','activation_status','activation_status_blocked'):
             from backend.session_lifecycle_http_interlock import install_api_loop_interlock
-            install_api_loop_interlock(loop,enabled=True,strict_reads=mode=='strict')
+            install_api_loop_interlock(loop,enabled=True,
+                strict_reads=mode in ('strict','activation_status','activation_status_blocked'),
+                allow_activation_status=mode=='activation_status')
         listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
         listener.bind(('127.0.0.1',0));listener.listen(16)
         config=uvicorn.Config(loop.app,host='127.0.0.1',port=0,loop='asyncio',http='h11',
@@ -70,7 +81,7 @@ def serve(path,directory,mode):
         server.capture_signals=nullcontext
         async def run():
             runtime_guarded=False
-            if mode=='runtime_locked':
+            if mode in ('runtime_locked','activation_status','activation_status_blocked'):
                 from fastapi import HTTPException
                 for call in (lambda:loop.run_model([]),lambda:loop.complete_chat({},[]),lambda:loop.relay_out({})):
                     try:await call()
@@ -91,7 +102,8 @@ def serve(path,directory,mode):
             else:raise RuntimeError('test_server_start_timeout')
             print(json.dumps({'port':listener.getsockname()[1],'application':'examples.api_loop',
                 'lifespan':'started','external_connect_blocked':True,'captured_aliases_guarded':aliases_guarded,
-                'runtime_entrypoints_guarded':runtime_guarded}),flush=True)
+                'runtime_entrypoints_guarded':runtime_guarded,
+                'activation_status_allowed':mode=='activation_status'}),flush=True)
             await task
             print(json.dumps({'lifespan':'stopped'}),flush=True)
         try:
@@ -99,7 +111,9 @@ def serve(path,directory,mode):
                 with patch('backend.session_lifecycle_coordination.atomic_write_text',side_effect=OSError('synthetic interrupted publication')):
                     asyncio.run(run())
             else:asyncio.run(run())
-        finally:listener.close()
+        finally:
+            listener.close()
+            if status_fixture is not None:status_fixture.conn.close()
 
 
 if __name__=='__main__':
