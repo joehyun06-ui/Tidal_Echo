@@ -10,11 +10,13 @@ from .session_window_attempts import WindowAttemptJournal
 
 
 def record_validated_attempt(engine, journal, cid, request_id, *, packet_sha256,
-                             expected_revision, access, enabled=False, _on_recorded=None):
+                             expected_revision, access, enabled=False, _on_recorded=None,
+                             _packet_callback=None):
     if enabled is not True:
         raise LifecycleError('lifecycle_disabled')
     if (type(engine) is not SessionLifecycle or type(journal) is not WindowAttemptJournal
-            or not engine.enabled or not journal.enabled or engine.repository is not journal.repository):
+            or not engine.enabled or not journal.enabled or engine.repository is not journal.repository
+            or (_on_recorded is not None and _packet_callback is not None)):
         raise LifecycleError('lifecycle_attempt_binding_invalid')
     binding = journal._check(cid, request_id, access)
     try:
@@ -23,16 +25,19 @@ def record_validated_attempt(engine, journal, cid, request_id, *, packet_sha256,
             if snapshot.provider != 'api':
                 raise LifecycleError('lifecycle_provider_unsupported')
 
+            current_packet = []
+
             def validate(state):
                 engine._bound(state, snapshot, binding)
                 engine._current(state, snapshot)
-                _, digest = engine._packet(state, snapshot, access)
+                packet, digest = engine._packet(state, snapshot, access)
                 if digest != state.packet_sha256 or digest != packet_sha256:
                     raise LifecycleError('lifecycle_packet_changed')
                 if state.revision != expected_revision:
                     raise LifecycleError('lifecycle_attempt_state_changed')
                 if engine.authority.validate(snapshot, access=access) is not True:
                     raise LifecycleError('lifecycle_authority_changed')
+                current_packet[:] = [packet]
 
             result = journal.record_attempt(cid, request_id, packet_sha256=packet_sha256,
                 expected_revision=expected_revision, access=access, _guard=validate)
@@ -42,6 +47,8 @@ def record_validated_attempt(engine, journal, cid, request_id, *, packet_sha256,
                 raise LifecycleError('lifecycle_authority_changed_after_commit')
             if not result.replayed and _on_recorded is not None:
                 _on_recorded(result)
+            if not result.replayed and _packet_callback is not None:
+                _packet_callback(result, current_packet[0])
             return result
     except ProjectionError:
         raise LifecycleError('lifecycle_evidence_unavailable') from None
