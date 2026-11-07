@@ -11,6 +11,7 @@ from .session_lifecycle_coordination import parse
 from .session_lifecycle_history_packet import PrivateHistorySetting
 from .session_lifecycle_request_packets import PacketReference
 from .session_lifecycle_history_status import inspect_history
+from .session_lifecycle_history_read import read_history
 
 HEADERS={'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer'}
 PREFIX='/loop/lifecycle/history'
@@ -25,7 +26,7 @@ def install(app, adapter, *, authenticate, enabled=False):
     if enabled is not True:return False
     if type(adapter) is not PrivateHistorySetting or not callable(authenticate) or inspect.iscoroutinefunction(authenticate):
         raise ValueError('lifecycle_http_binding_invalid')
-    paths={PREFIX+'/prepare',PREFIX+'/execute',PREFIX+'/status'}
+    paths={PREFIX,PREFIX+'/prepare',PREFIX+'/execute',PREFIX+'/status'}
     if any(getattr(r,'path',None) in paths for r in app.routes):
         raise ValueError('lifecycle_http_route_conflict')
 
@@ -43,6 +44,10 @@ def install(app, adapter, *, authenticate, enabled=False):
             async for chunk in request.stream():
                 raw.extend(chunk)
                 if len(raw)>4096:return response({'ok':False,'error':'request_too_large'},413)
+            if operation=='read':
+                if raw or request.scope.get('query_string',b''):raise LifecycleError('coordination_invalid')
+                result=await asyncio.to_thread(read_history,adapter,access=access,enabled=True)
+                return response({'ok':True,**result})
             body=parse(bytes(raw))
             if operation=='prepare':
                 if set(body)!={'request_id','history_n'}:raise LifecycleError('coordination_invalid')
@@ -68,9 +73,9 @@ def install(app, adapter, *, authenticate, enabled=False):
             if exc.category in ('coordination_packet_conflict','coordination_packet_changed','coordination_request_conflict',
                                 'coordination_request_missing','coordination_packet_missing','coordination_recovery_required'):
                 return response({'ok':False,'error':'request_conflict'},409)
-            return response({'ok':False,'error':'outcome_unconfirmed'},503)
+            return response({'ok':False,'error':'read_unavailable' if operation=='read' else 'outcome_unconfirmed'},503)
         except (OSError,sqlite3.Error,ValueError,TypeError,RuntimeError):
-            return response({'ok':False,'error':'outcome_unconfirmed'},503)
+            return response({'ok':False,'error':'read_unavailable' if operation=='read' else 'outcome_unconfirmed'},503)
 
     @app.post(PREFIX+'/prepare')
     async def prepare(request:Request):return await handle(request,'prepare')
@@ -80,6 +85,9 @@ def install(app, adapter, *, authenticate, enabled=False):
 
     @app.post(PREFIX+'/status')
     async def status(request:Request):return await handle(request,'status')
+
+    @app.get(PREFIX)
+    async def read(request:Request):return await handle(request,'read')
     return True
 
 

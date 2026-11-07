@@ -12,7 +12,7 @@ TOKEN='synthetic-internal-'+'x'*48
 
 
 def serve(path,directory,mode):
-    if mode not in ('normal','disabled','fail_publish','interlocked'):raise ValueError('invalid_test_mode')
+    if mode not in ('normal','disabled','fail_publish','interlocked','strict'):raise ValueError('invalid_test_mode')
     path=Path(path)
     os.environ.update({'API_LOOP_INTERNAL_TOKEN':TOKEN,'RELAY_SECRET':'synthetic-relay-'+'x'*48,
         'LOOP_CONFIG':str(path.with_suffix('.json')),'RELAY_DB':str(path),
@@ -37,9 +37,9 @@ def serve(path,directory,mode):
         from backend.tests.test_session_lifecycle_history_packet import binding
         adapter=binding(path,Path(directory))
         install_api_loop(loop,adapter,principal_id='synthetic_owner',enabled=mode!='disabled')
-        if mode=='interlocked':
+        if mode in ('interlocked','strict'):
             from backend.session_lifecycle_http_interlock import install_api_loop_interlock
-            install_api_loop_interlock(loop,enabled=True)
+            install_api_loop_interlock(loop,enabled=True,strict_reads=mode=='strict')
         listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
         listener.bind(('127.0.0.1',0));listener.listen(16)
         config=uvicorn.Config(loop.app,host='127.0.0.1',port=0,loop='asyncio',http='h11',
