@@ -12,7 +12,7 @@ TOKEN='synthetic-internal-'+'x'*48
 
 
 def serve(path,directory,mode):
-    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish'):raise ValueError('invalid_test_mode')
+    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish','aliases_bound'):raise ValueError('invalid_test_mode')
     path=Path(path)
     os.environ.update({'API_LOOP_INTERNAL_TOKEN':TOKEN,'RELAY_SECRET':'synthetic-relay-'+'x'*48,
         'LOOP_CONFIG':str(path.with_suffix('.json')),'RELAY_DB':str(path),
@@ -37,10 +37,23 @@ def serve(path,directory,mode):
         from backend.tests.test_session_lifecycle_history_packet import binding
         adapter=binding(path,Path(directory))
         install_api_loop(loop,adapter,principal_id='synthetic_owner',enabled=mode!='disabled')
-        if mode in ('direct_bound','direct_bound_fail_publish'):
+        aliases={name:getattr(loop,name) for name in ('load_config','history_n','save_config','update_config','patch_session','create_session','save_sessions')}
+        if mode in ('direct_bound','direct_bound_fail_publish','aliases_bound'):
             from backend.session_lifecycle_loop_config_io import install_api_loop_config_io
             from backend.session_lifecycle_commands import ConfigCommandAccess
             install_api_loop_config_io(loop,adapter,access=ConfigCommandAccess('synthetic_owner'),enabled=True)
+        aliases_guarded=False
+        if mode=='aliases_bound':
+            from fastapi import HTTPException
+            old=aliases['load_config']()
+            if aliases['history_n']()!=old['history_n']:raise AssertionError('alias_read_failed')
+            for fn,args in ((aliases['save_config'],(old,)),(aliases['update_config'],({'history_n':3},)),
+                (aliases['patch_session'],('synthetic',{'pinned':True})),(aliases['create_session'],()),(aliases['save_sessions'],([],))):
+                try:fn(*args)
+                except HTTPException as e:
+                    if e.status_code!=423:raise
+                else:raise AssertionError('captured_write_alias_bypassed')
+            aliases_guarded=True
         if mode in ('interlocked','strict'):
             from backend.session_lifecycle_http_interlock import install_api_loop_interlock
             install_api_loop_interlock(loop,enabled=True,strict_reads=mode=='strict')
@@ -61,7 +74,7 @@ def serve(path,directory,mode):
                 await asyncio.sleep(.01)
             else:raise RuntimeError('test_server_start_timeout')
             print(json.dumps({'port':listener.getsockname()[1],'application':'examples.api_loop',
-                'lifespan':'started','external_connect_blocked':True}),flush=True)
+                'lifespan':'started','external_connect_blocked':True,'captured_aliases_guarded':aliases_guarded}),flush=True)
             await task
             print(json.dumps({'lifespan':'stopped'}),flush=True)
         try:

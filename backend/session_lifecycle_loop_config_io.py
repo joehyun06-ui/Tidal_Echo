@@ -13,13 +13,15 @@ NAMES=('load_config','history_n','save_config','update_config','patch_session','
 
 def install_api_loop_config_io(loop,adapter,*,access,enabled=False):
     """Install before traffic on an unwrapped module; no startup invocation.
-    Not an OS/file capability boundary. Captured old function aliases, native/
-    external processes and whole multi-call transactions are not fenced here.
+    Current-source captured aliases use the original entry guards. This is not
+    an OS/file capability boundary; pre-upgrade bytecode, native/external
+    processes and whole multi-call transactions are not fenced here.
     """
     if enabled is not True:return False
     if (type(loop) is not ModuleType or type(adapter) is not PrivateHistorySetting
             or type(access) is not ConfigCommandAccess
-            or getattr(loop,'session_lifecycle_config_io_bound',False)):
+            or getattr(loop,'session_lifecycle_config_io_bound',False)
+            or getattr(loop,'_session_lifecycle_config_io',None) is not None):
         raise ValueError('lifecycle_config_io_binding_invalid')
     adapter._admit(None,access)
     writer=adapter.commands;c=writer.coordinator;bound_lock=adapter.session_lock
@@ -76,11 +78,18 @@ def install_api_loop_config_io(loop,adapter,*,access,enabled=False):
             resource()
             return original(*args,**kwargs)
         return run
+    def guard_write(name,coordinated):
+        if name not in ('update_config','patch_session') or coordinated is not writer:
+            raise HTTPException(status_code=423,detail='lifecycle_direct_write_blocked')
+        resource()
     # Plain ModuleType and all validation precede assignment. Startup assembly
     # must not race running code; no runtime install/uninstall or lease is added.
     replacements={'load_config':load_config,'history_n':history_n,'save_config':refused,
         'update_config':checked(originals['update_config']),'patch_session':checked(originals['patch_session']),
         'create_session':refused,'save_sessions':refused}
     for name,value in replacements.items():setattr(loop,name,value)
+    # Original functions resolve this through their own module globals, including
+    # references captured before installation from this source version.
+    loop._session_lifecycle_config_io={'load_config':load_config,'history_n':history_n,'guard_write':guard_write}
     loop.session_lifecycle_config_io_bound=True
     return True

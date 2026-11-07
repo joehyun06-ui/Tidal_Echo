@@ -48,7 +48,7 @@ class HistoryTcpTests(unittest.TestCase):
             self.assertTrue(selector.select(timeout=10),'server readiness timeout')
             line=self.process.stdout.readline()
         self.assertTrue(line,'server exited before readiness')
-        ready=json.loads(line);self.port=ready['port']
+        ready=json.loads(line);self.ready=ready;self.port=ready['port']
         self.assertEqual(ready['application'],'examples.api_loop');self.assertEqual(ready['lifespan'],'started')
         self.assertTrue(ready['external_connect_blocked'])
     def request(self,suffix,body,token=TOKEN):
