@@ -10,7 +10,7 @@ from .session_window_attempts import WindowAttemptJournal
 
 
 def record_validated_attempt(engine, journal, cid, request_id, *, packet_sha256,
-                             expected_revision, access, enabled=False):
+                             expected_revision, access, enabled=False, _on_recorded=None):
     if enabled is not True:
         raise LifecycleError('lifecycle_disabled')
     if (type(engine) is not SessionLifecycle or type(journal) is not WindowAttemptJournal
@@ -40,6 +40,8 @@ def record_validated_attempt(engine, journal, cid, request_id, *, packet_sha256,
             # never infer rollback or send/re-record under a new request ID.
             if engine.authority.validate(snapshot, access=access) is not True:
                 raise LifecycleError('lifecycle_authority_changed_after_commit')
+            if not result.replayed and _on_recorded is not None:
+                _on_recorded(result)
             return result
     except ProjectionError:
         raise LifecycleError('lifecycle_evidence_unavailable') from None
