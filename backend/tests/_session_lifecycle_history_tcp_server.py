@@ -12,7 +12,7 @@ TOKEN='synthetic-internal-'+'x'*48
 
 
 def serve(path,directory,mode):
-    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish','aliases_bound'):raise ValueError('invalid_test_mode')
+    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish','aliases_bound','runtime_locked'):raise ValueError('invalid_test_mode')
     path=Path(path)
     os.environ.update({'API_LOOP_INTERNAL_TOKEN':TOKEN,'RELAY_SECRET':'synthetic-relay-'+'x'*48,
         'LOOP_CONFIG':str(path.with_suffix('.json')),'RELAY_DB':str(path),
@@ -38,10 +38,13 @@ def serve(path,directory,mode):
         adapter=binding(path,Path(directory))
         install_api_loop(loop,adapter,principal_id='synthetic_owner',enabled=mode!='disabled')
         aliases={name:getattr(loop,name) for name in ('load_config','history_n','save_config','update_config','patch_session','create_session','save_sessions')}
-        if mode in ('direct_bound','direct_bound_fail_publish','aliases_bound'):
+        if mode in ('direct_bound','direct_bound_fail_publish','aliases_bound','runtime_locked'):
             from backend.session_lifecycle_loop_config_io import install_api_loop_config_io
             from backend.session_lifecycle_commands import ConfigCommandAccess
             install_api_loop_config_io(loop,adapter,access=ConfigCommandAccess('synthetic_owner'),enabled=True)
+        if mode=='runtime_locked':
+            from backend.session_lifecycle_runtime_interlock import install_api_loop_runtime_interlock
+            install_api_loop_runtime_interlock(loop,enabled=True)
         aliases_guarded=False
         if mode=='aliases_bound':
             from fastapi import HTTPException
@@ -66,6 +69,19 @@ def serve(path,directory,mode):
         # does not hide successful lifespan shutdown behind exit code -SIGTERM.
         server.capture_signals=nullcontext
         async def run():
+            runtime_guarded=False
+            if mode=='runtime_locked':
+                from fastapi import HTTPException
+                for call in (lambda:loop.run_model([]),lambda:loop.complete_chat({},[]),lambda:loop.relay_out({})):
+                    try:await call()
+                    except HTTPException as e:
+                        if e.status_code!=423:raise
+                    else:raise AssertionError('runtime_entry_bypassed')
+                try:loop._provider_client()
+                except HTTPException as e:
+                    if e.status_code!=423:raise
+                else:raise AssertionError('provider_client_bypassed')
+                runtime_guarded=True
             asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,lambda:setattr(server,'should_exit',True))
             task=asyncio.create_task(server.serve(sockets=[listener]))
             for _ in range(500):
@@ -74,7 +90,8 @@ def serve(path,directory,mode):
                 await asyncio.sleep(.01)
             else:raise RuntimeError('test_server_start_timeout')
             print(json.dumps({'port':listener.getsockname()[1],'application':'examples.api_loop',
-                'lifespan':'started','external_connect_blocked':True,'captured_aliases_guarded':aliases_guarded}),flush=True)
+                'lifespan':'started','external_connect_blocked':True,'captured_aliases_guarded':aliases_guarded,
+                'runtime_entrypoints_guarded':runtime_guarded}),flush=True)
             await task
             print(json.dumps({'lifespan':'stopped'}),flush=True)
         try:
