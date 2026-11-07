@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hmac
+import functools
 import json
 import os
 import re
@@ -467,6 +468,9 @@ def update_config(body: dict[str, Any], *, coordinated=None, request_id=None, ac
 
 
 async def relay_out(payload: dict[str, Any]) -> tuple[bool, Any, bool]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     if not RELAY_SECRET:
         return False, {"error": "relay_secret_missing"}, False
     try:
@@ -678,8 +682,22 @@ def _responses_event_error_metadata(event: dict[str, Any]) -> tuple[str | None, 
     )
 
 
+def _lifecycle_runtime_guarded(fn):
+    @functools.wraps(fn)
+    async def guarded(*args, **kwargs):
+        guard = globals().get('_session_lifecycle_runtime_interlock')
+        if guard is not None:
+            guard()
+        return await fn(*args, **kwargs)
+    return guarded
+
+
+@_lifecycle_runtime_guarded
 @usage_ledger_capture.observe_api(protocol='responses')
 async def stream_responses(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     body = usage_ledger_capture.prepare_body(_responses_body(route, messages, stream=True), responses=True)
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
@@ -753,6 +771,7 @@ async def stream_responses(route: dict[str, str], messages: list[dict[str, str]]
     return {"text": "".join(text_parts).strip(), "usage": usage}
 
 
+@_lifecycle_runtime_guarded
 @usage_ledger_capture.observe_api(protocol='responses')
 async def complete_responses(
     route: dict[str, str],
@@ -760,6 +779,9 @@ async def complete_responses(
     *,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     body = usage_ledger_capture.prepare_body(_responses_body(route, messages, stream=False, max_tokens=max_tokens), responses=True)
     try:
         async with _provider_client(timeout=LOOP_MODEL_TOTAL_TIMEOUT_SECONDS, trust_env=False) as client:
@@ -830,8 +852,12 @@ async def complete_responses(
     return {"text": text, "usage": data.get("usage") or {}}
 
 
+@_lifecycle_runtime_guarded
 @usage_ledger_capture.observe_api(protocol='chat')
 async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     body = usage_ledger_capture.prepare_body(_chat_completion_body(route, messages, stream=True))
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
@@ -882,9 +908,13 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
     return {"text": "".join(text_parts).strip(), "usage": usage}
 
 
+@_lifecycle_runtime_guarded
 @usage_ledger_capture.observe_api(protocol='chat')
 async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *,
                         temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     body = _chat_completion_body(
         route,
         messages,
@@ -951,10 +981,16 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *
 
 
 def _provider_client(**kwargs):
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     return httpx.AsyncClient(**kwargs)
 
 
 async def _stream_provider(route: dict[str, str], messages: list[dict[str, str]], sink) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     if _uses_responses_api(route):
         return await stream_responses(route, messages, sink)
     return await stream_chat(route, messages, sink)
@@ -967,6 +1003,9 @@ async def _complete_provider(
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     if _uses_responses_api(route):
         if max_tokens is None:
             return await complete_responses(route, messages)
@@ -980,6 +1019,9 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
                     emit_stream: bool = False, allow_fallback: bool = True,
                     temperature: float | None = None, max_tokens: int | None = None,
                     progress_sink=None, on_route=None) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     tried: list[str] = []
 
     async def execute() -> dict[str, Any]:
@@ -1036,6 +1078,9 @@ async def run_kelivo_provider_contract(
     provider_model: str, messages: list[dict[str, str]], *, temperature: float, max_tokens: int,
 ) -> dict[str, Any]:
     """Execute exactly the authenticated frozen Kelivo contract without fallback/default resolution."""
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     try:
         allowed = deployment_config.resolve_kelivo_provider_contract_defaults(os.environ, LOOP_CONFIG)
         route = kelivo_primary_route(provider_model)
@@ -1082,6 +1127,9 @@ async def handle_ingest(
     channel_account: str = "",
     channel_conversation: str = "",
 ) -> dict[str, Any]:
+    guard = globals().get('_session_lifecycle_runtime_interlock')
+    if guard is not None:
+        guard()
     stream_id = stream_id or ("api-" + uuid.uuid4().hex[:16])
     messages = build_ingest_messages(text, msg_id=msg_id, session_id=session_id)
     out = await run_model(messages, stream_id=stream_id, session_id=session_id, emit_stream=not dry)

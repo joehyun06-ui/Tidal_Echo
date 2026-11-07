@@ -7,6 +7,7 @@ import ast
 import __future__
 import asyncio
 import copy
+import functools
 import json
 import socket
 import sqlite3
@@ -31,7 +32,7 @@ RAW = {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120,
 
 
 def provider_functions(handler):
-    names = {'ModelRouteError', '_safe_provider_http_status', '_safe_provider_error_identifier',
+    names = {'_lifecycle_runtime_guarded', 'ModelRouteError', '_safe_provider_http_status', '_safe_provider_error_identifier',
              '_provider_error_metadata', '_read_provider_error_metadata', '_check_provider_response',
              '_responses_event_error_metadata', '_chat_completion_body', '_responses_body', '_responses_text',
              'stream_responses', 'stream_chat', 'complete_responses', 'complete_chat', '_provider_client',
@@ -39,7 +40,7 @@ def provider_functions(handler):
     source = ast.parse((ROOT/'examples/api_loop.py').read_text())
     nodes = [n for n in source.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in names]
     if len(nodes) != len(names): raise AssertionError('provider test source contract changed')
-    ns = {'asyncio': asyncio, 'json': json, 'Any': object, 'usage_ledger_capture': capture,
+    ns = {'functools': functools, 'asyncio': asyncio, 'json': json, 'Any': object, 'usage_ledger_capture': capture,
           'httpx': SimpleNamespace(AsyncClient=lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw)),
           'deployment_config': SimpleNamespace(parse_strict_bool=lambda value, _: value == '1'),
           'os': SimpleNamespace(environ={}), 'MAX_TOKENS': 100, 'TEMPERATURE': 0.7, 'STREAM_OUTPUT': True,
