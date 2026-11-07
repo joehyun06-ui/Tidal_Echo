@@ -153,13 +153,15 @@ class WindowAttemptJournal:
             fail('lifecycle_access_denied')
         return AttemptObservation(*row[:5], replayed)
 
-    def record_attempt(self, cid, request_id, *, packet_sha256, expected_revision, access):
+    def record_attempt(self, cid, request_id, *, packet_sha256, expected_revision, access, _guard=None):
         binding = self._check(cid, request_id, access)
         if (not _hex(packet_sha256) or type(expected_revision) is not int
                 or not 1 <= expected_revision <= 2**63-1):
             fail()
         with self.repository.transaction(cid) as tx:
             state = self._bound(tx, binding)
+            if _guard is not None:
+                _guard(state)
             old = _row(tx.conn, cid, request_id=request_id)
             if old is not None:
                 if (old[3], old[4], old[5]) != (packet_sha256, expected_revision, binding):
@@ -177,6 +179,8 @@ class WindowAttemptJournal:
             # The repository owns commit and its config checks. No observation
             # escapes to the caller if commit/post-check acknowledgement fails.
             result = self._observation((*values, _checksum(values)), binding, replayed=False)
+            if _guard is not None:
+                _guard(state)
         return result
 
     def inspect(self, cid, request_id, *, access):
