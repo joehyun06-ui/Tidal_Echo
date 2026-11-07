@@ -218,8 +218,9 @@ def _binding(conn, view, state):
 
 
 class _Transaction:
-    def __init__(self, conn, view):
+    def __init__(self, conn, view, *, readonly=False):
         self.conn, self.view, self.active, self.saved = conn, view, True, False
+        self.readonly = readonly
 
     def _check(self):
         if not self.active: fail('lifecycle_transaction_closed')
@@ -251,6 +252,7 @@ class _Transaction:
 
     def save(self, expected_revision, state, receipt):
         self._check(); integer(expected_revision)
+        if self.readonly: fail('lifecycle_readonly')
         if self.saved: fail('lifecycle_commit_conflict')
         record_json, receipt_json = encode_record(state), encode_receipt(receipt)
         if (state.revision != expected_revision + 1 or receipt.revision_applied != state.revision
@@ -296,16 +298,25 @@ class SQLiteLifecycleRepository:
                 yield tx
 
     @contextmanager
-    def _transaction(self, conversation_id):
+    def observation(self, conversation_id):
+        """Read-only canonical observation; no intent or automatic recovery."""
+        if not self.enabled: fail('lifecycle_disabled')
+        with self._coordinator.fence() if self._coordinator is not None else nullcontext():
+            with self._transaction(conversation_id, readonly=True) as tx:
+                yield tx
+
+    @contextmanager
+    def _transaction(self, conversation_id, *, readonly=False):
         view = self._reader.capture(conversation_id)
         tx = None
         try:
             with closing(self._connect()) as conn:
                 if conn.in_transaction or conn.isolation_level is not None: fail('lifecycle_connection_invalid')
                 try:
-                    conn.execute('BEGIN IMMEDIATE'); _source_schema(conn); _owned(conn)
+                    if readonly: conn.execute('PRAGMA query_only=ON')
+                    conn.execute('BEGIN' if readonly else 'BEGIN IMMEDIATE'); _source_schema(conn); _owned(conn)
                     _selected(conn, view)
-                    tx = _Transaction(conn, view)
+                    tx = _Transaction(conn, view, readonly=readonly)
                     yield tx
                     _owned(conn)
                     if not self._reader.is_current(view): fail('lifecycle_authority_changed')
