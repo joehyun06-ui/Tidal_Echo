@@ -12,7 +12,7 @@ TOKEN='synthetic-internal-'+'x'*48
 
 
 def serve(path,directory,mode):
-    if mode not in ('normal','disabled','fail_publish','interlocked','strict'):raise ValueError('invalid_test_mode')
+    if mode not in ('normal','disabled','fail_publish','interlocked','strict','direct_bound','direct_bound_fail_publish'):raise ValueError('invalid_test_mode')
     path=Path(path)
     os.environ.update({'API_LOOP_INTERNAL_TOKEN':TOKEN,'RELAY_SECRET':'synthetic-relay-'+'x'*48,
         'LOOP_CONFIG':str(path.with_suffix('.json')),'RELAY_DB':str(path),
@@ -37,6 +37,10 @@ def serve(path,directory,mode):
         from backend.tests.test_session_lifecycle_history_packet import binding
         adapter=binding(path,Path(directory))
         install_api_loop(loop,adapter,principal_id='synthetic_owner',enabled=mode!='disabled')
+        if mode in ('direct_bound','direct_bound_fail_publish'):
+            from backend.session_lifecycle_loop_config_io import install_api_loop_config_io
+            from backend.session_lifecycle_commands import ConfigCommandAccess
+            install_api_loop_config_io(loop,adapter,access=ConfigCommandAccess('synthetic_owner'),enabled=True)
         if mode in ('interlocked','strict'):
             from backend.session_lifecycle_http_interlock import install_api_loop_interlock
             install_api_loop_interlock(loop,enabled=True,strict_reads=mode=='strict')
@@ -61,7 +65,7 @@ def serve(path,directory,mode):
             await task
             print(json.dumps({'lifespan':'stopped'}),flush=True)
         try:
-            if mode=='fail_publish':
+            if mode in ('fail_publish','direct_bound_fail_publish'):
                 with patch('backend.session_lifecycle_coordination.atomic_write_text',side_effect=OSError('synthetic interrupted publication')):
                     asyncio.run(run())
             else:asyncio.run(run())
