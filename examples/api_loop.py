@@ -151,6 +151,9 @@ def mask_key(key: str) -> str:
 
 
 def load_config() -> dict[str, Any]:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        return binding['load_config']()
     try:
         data = json.loads(LOOP_CONFIG.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -171,6 +174,9 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(cfg: dict[str, Any]) -> None:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        binding['guard_write']('save_config', None)
     deployment_config.validate_loop_config_payload(cfg, render_mvp=RENDER_TELEGRAM_MVP)
     deployment_config.atomic_write_text(
         LOOP_CONFIG, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
@@ -206,6 +212,9 @@ def kelivo_primary_route(provider_model: str) -> dict[str, str] | None:
 
 
 def history_n() -> int:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        return binding['history_n']()
     try:
         return max(0, min(int(load_config().get("history_n", HISTORY_N)), 200))
     except Exception:
@@ -242,6 +251,9 @@ def active_session_id() -> str:
 def save_sessions(rows: list[dict[str, Any]], active: str | None = None, *, coordinated=None,
                   request_id=None, access=None, expected_generation=None, expected_snapshot_sha=None,
                   recover=False) -> dict[str, Any]:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        binding['guard_write']('save_sessions', coordinated)
     if coordinated is not None:
         return coordinated.save_sessions(request_id, rows, active, access=access,
             expected_generation=expected_generation, expected_snapshot_sha=expected_snapshot_sha, recover=recover)
@@ -263,6 +275,9 @@ def sessions_public() -> dict[str, Any]:
 def create_session(title: str = "New chat", since_id: int = 0, activate: bool = True, *, coordinated=None,
                     session_id=None, created_at=None, request_id=None, access=None,
                     expected_generation=None, expected_snapshot_sha=None, recover=False) -> dict[str, Any]:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        binding['guard_write']('create_session', coordinated)
     if coordinated is not None:
         coordinated.assert_config_path(LOOP_CONFIG)
         return coordinated.create_api_session(title=title,since_id=since_id,activate=activate,
@@ -280,6 +295,9 @@ def create_session(title: str = "New chat", since_id: int = 0, activate: bool = 
 
 
 def patch_session(session_id: str, body: dict[str, Any], *, coordinated=None, request_id=None, access=None) -> dict[str, Any]:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        binding['guard_write']('patch_session', coordinated)
     if coordinated is not None:
         return coordinated.patch_session(request_id, session_id, body, access=access)
     rows = session_rows()
@@ -429,6 +447,9 @@ def public_config() -> dict[str, Any]:
 
 
 def update_config(body: dict[str, Any], *, coordinated=None, request_id=None, access=None) -> dict[str, Any]:
+    binding = globals().get('_session_lifecycle_config_io')
+    if binding is not None:
+        binding['guard_write']('update_config', coordinated)
     if coordinated is not None:
         return coordinated.update_config(request_id, body, access=access)
     try:
