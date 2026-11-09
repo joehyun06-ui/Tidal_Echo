@@ -13,7 +13,7 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         files={'/':b'<!doctype html><html lang="zh"><meta charset="utf-8"><title>Recovery test</title><div id="root"></div></html>'}
-        for name in ('lifecycle_recovery_client.mjs','lifecycle_recovery_panel.mjs'):
+        for name in ('lifecycle_recovery_client.mjs','lifecycle_recovery_panel.mjs','lifecycle_recovery_reference_store.mjs'):
             files['/'+name]=(ROOT/'examples'/name).read_bytes()
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args):pass
@@ -82,5 +82,69 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator('img').count(),0);self.assertFalse(button.is_disabled())
         button.click();self.page.get_by_role('status').filter(has_text='身份或权限已变化').wait_for()
         self.assertTrue(button.is_disabled());self.assertEqual(self.page.evaluate('calls'),2)
+
+    def test_reference_survives_reload_without_automatic_request(self):
+        value=self.page.evaluate('''async()=>{
+          const {createRecoveryReferenceStore}=await import('/lifecycle_recovery_reference_store.mjs');
+          window.store=createRecoveryReferenceStore({enabled:true,indexedDB});
+          await store.save('owner',ref);return ref;
+        }''')
+        self.page.reload()
+        restored=self.page.evaluate('''async()=>{
+          const {createRecoveryReferenceStore}=await import('/lifecycle_recovery_reference_store.mjs');
+          window.store=createRecoveryReferenceStore({enabled:true,indexedDB});
+          window.saved=await store.load('owner','synthetic_chat');return saved;
+        }''')
+        self.assertEqual(restored,value)
+        self.page.evaluate('''async()=>{
+          window.calls=0;const {mountRecoveryPanel}=await import('/lifecycle_recovery_panel.mjs');
+          window.panel=mountRecoveryPanel(document.querySelector('#root'),{enabled:true,observe:async()=>{calls++;throw Error('synthetic');}});
+          panel.bind('owner',saved);
+        }''')
+        self.assertEqual(self.page.evaluate('calls'),0)
+        self.page.get_by_role('button',name='核对原请求').click()
+        self.page.get_by_role('status').filter(has_text='原请求已保留').wait_for()
+        self.assertEqual(self.page.evaluate('calls'),1)
+
+    def test_reference_scope_conflict_and_explicit_account_cleanup(self):
+        result=self.page.evaluate('''async()=>{
+          const {createRecoveryReferenceStore}=await import('/lifecycle_recovery_reference_store.mjs');
+          const store=createRecoveryReferenceStore({enabled:true,indexedDB});
+          await Promise.all([store.save('owner',ref),store.save('owner',ref)]);
+          let conflict;try{await store.save('owner',{...ref,attempt_request_id:'other'});}catch(e){conflict=e.message;}
+          const old=await store.load('owner',ref.conversation_id),absent=await store.load('other',ref.conversation_id);
+          await store.save('other',ref);await store.clearIdentity('owner');
+          const cleared=await store.load('owner',ref.conversation_id),remaining=await store.load('other',ref.conversation_id);
+          await store.remove('other',ref.conversation_id);
+          return {conflict,old,absent,cleared,remaining,removed:await store.load('other',ref.conversation_id)};
+        }''')
+        self.assertEqual(result['conflict'],'reference_conflict');self.assertEqual(result['old'],result['remaining'])
+        for key in ('absent','cleared','removed'):self.assertIsNone(result[key])
+
+    def test_corrupt_reference_is_not_repaired_or_treated_as_success(self):
+        result=self.page.evaluate('''async()=>{
+          const {createRecoveryReferenceStore}=await import('/lifecycle_recovery_reference_store.mjs');
+          const store=createRecoveryReferenceStore({enabled:true,indexedDB});await store.save('owner',ref);
+          await new Promise((resolve,reject)=>{
+            const r=indexedDB.open('guiting-lifecycle-recovery-v1',1);r.onsuccess=()=>{
+              const db=r.result,t=db.transaction('pendingReferences','readwrite');
+              t.objectStore('pendingReferences').put({version:2,reference:ref},['owner',ref.conversation_id]);
+              t.oncomplete=()=>{db.close();resolve();};t.onabort=reject;
+            };
+          });
+          let load,save;try{await store.load('owner',ref.conversation_id);}catch(e){load=e.message;}
+          try{await store.save('owner',ref);}catch(e){save=e.message;}
+          return {load,save};
+        }''')
+        self.assertEqual(result,{'load':'reference_storage_unavailable','save':'reference_storage_unavailable'})
+
+    def test_default_reference_store_has_no_indexeddb_io(self):
+        value=self.page.evaluate('''async()=>{
+          const {createRecoveryReferenceStore}=await import('/lifecycle_recovery_reference_store.mjs');
+          let calls=0;const store=createRecoveryReferenceStore({indexedDB:{open(){calls++;throw Error('forbidden');}}});
+          await store.save(null,null);await store.load(null,null);await store.remove(null,null);await store.clearIdentity(null);
+          return calls;
+        }''')
+        self.assertEqual(value,0)
 
 if __name__=='__main__':unittest.main()

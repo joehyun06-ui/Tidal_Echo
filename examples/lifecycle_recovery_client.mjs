@@ -16,6 +16,7 @@ function reference(value) {
   }
   return Object.freeze(Object.fromEntries(refKeys.map(key => [key, value[key]])));
 }
+export {reference as validateRecoveryReference};
 
 function valid(body) {
   if (!exact(body, keys) || body.ok !== true || body.current_window_confirmed !== false
