@@ -116,6 +116,10 @@ class RecoveryStatusContextProvider:
             registry.assert_current_in_read_transaction(conn, login.epoch)
             config = legacy.load_config()
             rows = config.get('sessions'); tombstones = config.get('deleted_sessions', [])
+            # Preserve WebSessionProviderAuthority's existing None-as-empty
+            # tombstone contract without rewriting the canonical JSON.
+            if tombstones is None:
+                tombstones = []
             if (type(rows) is not list or len(rows) > 512
                     or type(tombstones) is not list or len(tombstones) > 512):
                 raise HTTPException(503)

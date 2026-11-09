@@ -186,6 +186,15 @@ class StatusContextTests(unittest.IsolatedAsyncioTestCase):
         self.c.mutate('delete-root',{},remove)
         await self.denied(lambda:self.provider.binding(request(),CID),403)
 
+    async def test_existing_null_tombstone_representation_remains_read_only(self):
+        def legacy_null(legacy):
+            config=legacy.load_config();config['deleted_sessions']=None;legacy.save_config(config)
+        self.c.mutate('legacy-null-tombstones',{},legacy_null)
+        before=list(self.h.conn.iterdump());raw=self.h.config_path.read_bytes()
+        binding=await self.provider.binding(request(),CID)
+        self.assertEqual(binding.context.access,CTX)
+        self.assertEqual(raw,self.h.config_path.read_bytes());self.assertEqual(before,list(self.h.conn.iterdump()))
+
     async def test_selected_version_requires_its_own_grant(self):
         def version(legacy):
             config=legacy.load_config();row=dict(config['sessions'][0]);row['id']='version_2';
