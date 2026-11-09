@@ -42,6 +42,7 @@ def install(app, journal, *, authenticate, enabled=False):
             access = authenticate(request)
             if type(access) is not AccessScope:
                 return response({'ok': False, 'error': 'unauthorized'}, 401)
+            binding = _binding(access)
             if request.scope.get('query_string', b''):
                 return response({'ok': False, 'error': 'invalid_request'}, 400)
             encodings = request.headers.getlist('content-encoding')
@@ -59,6 +60,9 @@ def install(app, journal, *, authenticate, enabled=False):
                 body['conversation_id'], body['activation_request_id'],
                 attempt_request_id=body['attempt_request_id'], packet_sha256=body['packet_sha256'],
                 access=access, enabled=True)
+            current_access = authenticate(request)
+            if type(current_access) is not AccessScope or _binding(current_access) != binding:
+                return response({'ok': False, 'error': 'access_denied'}, 403)
             return response({'ok': True, **result})
         except HTTPException as exc:
             return response({'ok': False, 'error': 'unauthorized'}, 403 if exc.status_code == 403 else 401)
