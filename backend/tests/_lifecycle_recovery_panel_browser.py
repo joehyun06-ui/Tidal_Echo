@@ -5,6 +5,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 import threading
 import unittest
+from urllib.parse import unquote
 from playwright.sync_api import sync_playwright
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -14,7 +15,8 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         files={'/':b'<!doctype html><html lang="zh"><meta charset="utf-8"><title>Recovery test</title><div id="root"></div></html>'}
         for name in ('lifecycle_recovery_client.mjs','lifecycle_recovery_panel.mjs',
-                     'lifecycle_recovery_reference_store.mjs','lifecycle_recovery_restore.mjs'):
+                     'lifecycle_recovery_reference_store.mjs','lifecycle_recovery_restore.mjs',
+                     'lifecycle_recovery_transport.mjs'):
             files['/'+name]=(ROOT/'examples'/name).read_bytes()
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args):pass
@@ -23,6 +25,31 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
                 self.send_response(200 if value is not None else 404)
                 self.send_header('Content-Type','text/javascript; charset=utf-8' if self.path.endswith('.mjs') else 'text/html; charset=utf-8')
                 self.end_headers();self.wfile.write(value or b'')
+            def do_POST(self):
+                # Browser-only loopback fixture. The real gateway/authorization
+                # and internal journal are exercised separately by ASGI tests.
+                length=int(self.headers.get('content-length','0'))
+                raw=self.rfile.read(min(length,4097))
+                try:body=json.loads(raw)
+                except (ValueError,UnicodeError):body=None
+                cls.proxy_requests.append({'path':self.path,'headers':dict(self.headers),'body':body})
+                mode=self.headers.get('x-synthetic-mode','confirmed');code=200
+                if self.headers.get('authorization')!='Bearer synthetic-browser-credential':code=401
+                elif mode=='revoked':code=403
+                if code!=200:data=b'<img src=x onerror=alert(1)> raw private error'
+                elif mode=='oversize':data=b'x'*4097
+                else:
+                    data=json.dumps({'ok':True,'state':'historical_confirmed','historical':True,
+                        'revision_applied':3,'window_confirmed_at_apply':True,'current_window_confirmed':False,
+                        'reply_completed':False,'retry_authorized':mode=='overclaim'}).encode()
+                if (not isinstance(body,dict) or unquote(self.path)!=
+                        '/app/sessions/'+body.get('conversation_id','')+'/lifecycle/activation/status'):
+                    code=400;data=b'{}'
+                self.send_response(code);self.send_header('content-type','application/json')
+                self.send_header('content-length',str(len(data)));self.send_header('cache-control','private, no-store')
+                self.end_headers()
+                try:self.wfile.write(data)
+                except (BrokenPipeError,ConnectionResetError):pass
         cls.server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True);cls.thread.start()
         cls.origin='http://127.0.0.1:'+str(cls.server.server_port)
@@ -34,6 +61,7 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
         cls.browser.close();cls.playwright.stop();cls.server.shutdown();cls.server.server_close();cls.thread.join(5)
 
     def setUp(self):
+        self.__class__.proxy_requests=[]
         self.context=self.browser.new_context(viewport={'width':390,'height':844});self.addCleanup(self.context.close)
         self.external=[]
         def route(request):
@@ -300,5 +328,55 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
         self.assertTrue(self.page.get_by_role('button',name='核对原请求').is_disabled())
         self.assertEqual(self.page.locator('button').count(),1)
         self.assertNotIn('原请求曾完成激活确认。',self.page.locator('#root').inner_text())
+
+    def test_status_transport_actual_http_uses_browser_auth_and_no_automatic_query(self):
+        self.page.evaluate('''async()=>{
+          const {createRecoveryStatusTransport}=await import('/lifecycle_recovery_transport.mjs');
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          const {createRecoveryReferenceStore}=await import('/lifecycle_recovery_reference_store.mjs');
+          const store=createRecoveryReferenceStore({enabled:true,indexedDB});await store.save('owner',ref);
+          window.observe=createRecoveryStatusTransport({enabled:true,request:(path,options)=>fetch(path,{
+            ...options,headers:{...options.headers,Authorization:'Bearer synthetic-browser-credential'},
+          })});
+          window.restore=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+            loadReference:(owner,chat)=>store.load(owner,chat),observe});
+          await restore.bind({identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'});
+        }''')
+        self.assertEqual(self.proxy_requests,[])
+        self.page.get_by_role('button',name='核对原请求').click()
+        self.page.get_by_role('status').filter(has_text='原请求曾完成激活确认。').wait_for()
+        self.assertEqual(len(self.proxy_requests),1)
+        request=self.proxy_requests[0]
+        self.assertEqual(request['body'],self.page.evaluate('ref'))
+        headers={k.lower():v for k,v in request['headers'].items()}
+        self.assertEqual(headers['authorization'],'Bearer synthetic-browser-credential')
+        self.assertNotIn('x-api-loop-internal-token',headers)
+        self.assertEqual(request['path'],'/app/sessions/synthetic_chat/lifecycle/activation/status')
+        self.assertIn('当前窗口可用性仍需单独确认',self.page.locator('#root').inner_text())
+
+    def test_status_transport_rejects_http_oversize_overclaim_and_revocation(self):
+        self.page.evaluate('''async()=>{
+          const {createRecoveryStatusTransport}=await import('/lifecycle_recovery_transport.mjs');
+          window.mode='oversize';
+          const observe=createRecoveryStatusTransport({enabled:true,request:(path,options)=>fetch(path,{
+            ...options,headers:{...options.headers,Authorization:'Bearer synthetic-browser-credential','X-Synthetic-Mode':mode},
+          })});
+          window.panel=mount(document.querySelector('#root'),{enabled:true,observe});panel.bind('owner',ref);
+        }''')
+        button=self.page.get_by_role('button',name='核对原请求');button.click()
+        self.page.get_by_role('status').filter(has_text='原请求已保留').wait_for()
+        self.assertEqual(len(self.proxy_requests),1);self.assertFalse(button.is_disabled())
+        self.page.evaluate("mode='overclaim'");button.click()
+        self.page.get_by_role('status').filter(has_text='原请求已保留').wait_for()
+        self.assertEqual(len(self.proxy_requests),2);self.assertFalse(button.is_disabled())
+        self.page.evaluate("mode='confirmed'");button.click()
+        self.page.get_by_role('status').filter(has_text='原请求曾完成激活确认。').wait_for()
+        self.page.evaluate("mode='revoked'");button.click()
+        self.page.get_by_role('status').filter(has_text='身份或权限已变化').wait_for()
+        self.assertTrue(button.is_disabled());self.assertEqual(len(self.proxy_requests),4)
+        for request in self.proxy_requests:self.assertEqual(request['body'],self.page.evaluate('ref'))
+        self.assertEqual(self.page.locator('img').count(),0)
+        self.assertNotIn('raw private error',self.page.locator('#root').inner_text())
+        self.assertFalse(self.page.evaluate('document.documentElement.scrollWidth>innerWidth'))
 
 if __name__=='__main__':unittest.main()
