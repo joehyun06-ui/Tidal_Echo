@@ -28,6 +28,11 @@ function valid(body) {
       : body.revision_applied === null);
 }
 
+export function validateRecoveryStatus(body) {
+  if(!valid(body))throw Error('invalid_status');
+  return Object.freeze(Object.fromEntries(keys.map(key=>[key,body[key]])));
+}
+
 export function createRecoveryController({enabled = false, observe} = {}) {
   const active = enabled === true;
   if (active && typeof observe !== 'function') throw new Error('invalid_transport');
