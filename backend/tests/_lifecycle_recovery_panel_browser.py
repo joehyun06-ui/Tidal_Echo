@@ -13,7 +13,8 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         files={'/':b'<!doctype html><html lang="zh"><meta charset="utf-8"><title>Recovery test</title><div id="root"></div></html>'}
-        for name in ('lifecycle_recovery_client.mjs','lifecycle_recovery_panel.mjs','lifecycle_recovery_reference_store.mjs'):
+        for name in ('lifecycle_recovery_client.mjs','lifecycle_recovery_panel.mjs',
+                     'lifecycle_recovery_reference_store.mjs','lifecycle_recovery_restore.mjs'):
             files['/'+name]=(ROOT/'examples'/name).read_bytes()
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args):pass
@@ -97,9 +98,11 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
         }''')
         self.assertEqual(restored,value)
         self.page.evaluate('''async()=>{
-          window.calls=0;const {mountRecoveryPanel}=await import('/lifecycle_recovery_panel.mjs');
-          window.panel=mountRecoveryPanel(document.querySelector('#root'),{enabled:true,observe:async()=>{calls++;throw Error('synthetic');}});
-          panel.bind('owner',saved);
+          window.calls=0;const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          window.restore=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+            loadReference:(owner,chat)=>store.load(owner,chat),observe:async()=>{calls++;throw Error('synthetic');}});
+          await restore.bind({identity:'owner',conversationId:'synthetic_chat',contextVersion:'epoch:1'});
+          if(restore.getState().phase!=='ready')throw Error('not restored');
         }''')
         self.assertEqual(self.page.evaluate('calls'),0)
         self.page.get_by_role('button',name='核对原请求').click()
@@ -146,5 +149,156 @@ class RecoveryPanelBrowserTests(unittest.TestCase):
           return calls;
         }''')
         self.assertEqual(value,0)
+
+    def test_restore_disabled_same_turn_cancellation_and_sibling_ownership(self):
+        result=self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          const root=document.querySelector('#root');const sibling=document.createElement('p');sibling.textContent='keep';root.append(sibling);
+          let loads=0;const c=mountRecoveryRestore(root,{loadReference:async()=>{loads++;return ref;},observe:async()=>{calls++;return reply();}});
+          await c.bind(null);const off=root.querySelectorAll('section').length;
+          c.setEnabled(true);const pending=c.bind({identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'});
+          c.setEnabled(false);await pending;c.setEnabled(true);
+          const idle=c.getState().phase,buttonDisabled=root.querySelector('button').disabled;
+          c.dispose();c.setEnabled(true);await c.bind({});
+          return {off,loads,calls,idle,buttonDisabled,children:root.children.length,text:root.textContent,phase:c.getState().phase};
+        }''')
+        self.assertEqual(result,{'off':0,'loads':0,'calls':0,'idle':'idle','buttonDisabled':True,
+                                 'children':1,'text':'keep','phase':'disabled'})
+
+    def test_restore_reverse_completion_and_aba_never_bind_old_context(self):
+        result=self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          const jobs=[];let last;
+          const c=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+            loadReference:(owner,chat,{signal})=>new Promise((resolve,reject)=>jobs.push({owner,chat,signal,resolve,reject})),
+            observe:async r=>{calls++;last=r;return reply();}});
+          const a={identity:'account:connection1',conversationId:ref.conversation_id,contextVersion:'v1'};
+          const first=c.bind(a);await Promise.resolve();a.identity='mutated';
+          const second=c.bind({identity:'account:connection2',conversationId:'other_chat',contextVersion:'v2'});await Promise.resolve();
+          const third=c.bind({identity:'account:connection1',conversationId:ref.conversation_id,contextVersion:'v1'});await Promise.resolve();
+          jobs[2].resolve({...ref,attempt_request_id:'latest'});await third;
+          jobs[0].resolve({...ref,attempt_request_id:'stale'});await first;
+          jobs[1].reject(Error('<img src=x onerror=alert(1)>'));await second;
+          document.querySelector('button').click();await new Promise(resolve=>setTimeout(resolve,0));
+          return {phase:c.getState().phase,attempt:last.attempt_request_id,calls,
+            aborted:jobs.slice(0,2).every(j=>j.signal.aborted),owner:jobs[0].owner,
+            raw:document.body.textContent.includes('<img'),images:document.querySelectorAll('img').length};
+        }''')
+        self.assertEqual(result,{'phase':'ready','attempt':'latest','calls':1,'aborted':True,
+                                 'owner':'account:connection1','raw':False,'images':0})
+        self.page.get_by_role('status').filter(has_text='原请求曾完成激活确认。').wait_for()
+        self.assertFalse(self.page.evaluate('document.documentElement.scrollWidth>innerWidth'))
+
+    def test_restore_each_scope_dimension_invalidates_old_load(self):
+        result=self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          const results=[];
+          for(const delta of [{identity:'other:connection'},{conversationId:'other_chat'},{contextVersion:'v2'}]){
+            const jobs=[];const c=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+              loadReference:()=>new Promise(resolve=>jobs.push(resolve)),observe:async()=>{calls++;return reply();}});
+            const a={identity:'owner:connection',conversationId:ref.conversation_id,contextVersion:'v1'};
+            const old=c.bind(a);await Promise.resolve();
+            const next=c.bind({...a,...delta});await Promise.resolve();
+            jobs[0](ref);await old;
+            const blocked=document.querySelector('button').disabled,phase=c.getState().phase;
+            jobs[1]({...ref,conversation_id:delta.conversationId||ref.conversation_id});await next;
+            results.push({blocked,phase,ready:c.getState().phase});c.dispose();
+          }
+          return {results,calls};
+        }''')
+        self.assertEqual(result,{'results':[{'blocked':True,'phase':'loading','ready':'ready'}]*3,'calls':0})
+
+    def test_restore_clear_off_dispose_ignore_late_success_and_failure(self):
+        result=self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          const outcomes=[];
+          for(const action of ['clear','off','dispose'])for(const rejected of [false,true]){
+            let finish,fail,signal;const c=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+              loadReference:(_,__,o)=>{signal=o.signal;return new Promise((resolve,reject)=>{finish=resolve;fail=reject;});},
+              observe:async()=>{calls++;return reply();}});
+            const pending=c.bind({identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'});await Promise.resolve();
+            if(action==='off')c.setEnabled(false);else c[action]();
+            const snapshot=c.getState();if(rejected)fail(Error('private failure'));else finish(ref);await pending;
+            outcomes.push({same:snapshot===c.getState(),aborted:signal.aborted,
+              enabledButtons:[...document.querySelectorAll('button')].filter(b=>!b.disabled).length,
+              sections:document.querySelectorAll('section').length});c.dispose();
+          }
+          return {outcomes,calls};
+        }''')
+        expected=[{'same':True,'aborted':True,'enabledButtons':0,'sections':count}
+                  for count in (2,2,0,0,0,0)]
+        self.assertEqual(result,{'outcomes':expected,'calls':0})
+
+    def test_restore_missing_invalid_rejected_and_wrong_chat_never_bind(self):
+        result=self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          const phases=[];
+          for(const value of [null,undefined,{...ref,extra:true},{...ref,conversation_id:'wrong'},'reject']){
+            const c=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+              loadReference:async()=>{if(value==='reject')throw Error('<img src=x onerror=alert(1)>');return value;},
+              observe:async()=>{calls++;return reply();}});
+            await c.bind({identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'});
+            phases.push([c.getState().phase,document.querySelector('button').disabled]);c.dispose();
+          }
+          return {phases,calls,images:document.querySelectorAll('img').length};
+        }''')
+        self.assertEqual(result,{'phases':[['missing',True]]+[['unavailable',True]]*4,'calls':0,'images':0})
+
+    def test_restore_invalid_binding_withdraws_old_reference_without_load(self):
+        result=self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');let loads=0;
+          const c=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+            loadReference:async()=>{loads++;return ref;},observe:async()=>{calls++;return reply();}});
+          const scope={identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'};
+          await c.bind(scope);const phases=[];
+          for(const invalid of [null,{...scope,contextVersion:''},{...scope,identity:''},
+              {...scope,conversationId:'../chat'},{...scope,extra:true}]){
+            await c.bind(invalid);phases.push([c.getState().phase,document.querySelector('button').disabled]);
+          }
+          return {loads,calls,phases};
+        }''')
+        self.assertEqual(result,{'loads':1,'calls':0,'phases':[['invalid_context',True]]*5})
+
+    def test_restore_pending_query_switch_and_revocation_require_explicit_binding(self):
+        self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          window.queryJobs=[];window.loads=0;
+          window.restore=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+            loadReference:async()=>{loads++;return ref;},observe:(_,o)=>{calls++;return new Promise(resolve=>queryJobs.push({resolve,signal:o.signal}));}});
+          window.scope={identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'};
+          await restore.bind(scope);
+        }''')
+        button=self.page.get_by_role('button',name='核对原请求');button.click()
+        self.page.evaluate('''async()=>{
+          await restore.bind({...scope,contextVersion:'v2'});queryJobs[0].resolve(reply());
+          await Promise.resolve();await Promise.resolve();
+        }''')
+        self.assertTrue(self.page.evaluate('queryJobs[0].signal.aborted'))
+        self.page.get_by_role('status').filter(has_text='尚未核对。').wait_for()
+        button.click();self.page.evaluate('queryJobs[1].resolve({status:403})')
+        self.page.get_by_role('status').filter(has_text='身份或权限已变化').wait_for()
+        self.assertTrue(button.is_disabled());self.page.evaluate('restore.setEnabled(true)')
+        self.assertEqual(self.page.evaluate('[calls,loads]'),[2,2]);self.assertTrue(button.is_disabled())
+        self.page.evaluate('restore.bind({...scope,contextVersion:"reauthorized"})')
+        self.page.get_by_role('status').filter(has_text='尚未核对。').wait_for()
+        self.assertFalse(button.is_disabled());self.assertEqual(self.page.evaluate('[calls,loads]'),[2,3])
+
+    def test_restore_query_singleflight_and_disabling_rejects_old_query(self):
+        self.page.evaluate('''async()=>{
+          const {mountRecoveryRestore}=await import('/lifecycle_recovery_restore.mjs');
+          window.restore=mountRecoveryRestore(document.querySelector('#root'),{enabled:true,
+            loadReference:async()=>ref,observe:(_,o)=>{calls++;window.querySignal=o.signal;return new Promise(resolve=>window.finishQuery=resolve);}});
+          await restore.bind({identity:'owner',conversationId:ref.conversation_id,contextVersion:'v1'});
+          const b=document.querySelector('button');b.click();b.click();b.click();
+        }''')
+        self.assertEqual(self.page.evaluate('calls'),1)
+        self.assertEqual(self.page.get_by_role('region',name='接续结果核对',exact=True).get_attribute('aria-busy'),'true')
+        self.page.evaluate('''async()=>{
+          restore.setEnabled(false);restore.setEnabled(true);finishQuery(reply());await Promise.resolve();await Promise.resolve();
+        }''')
+        self.assertTrue(self.page.evaluate('querySignal.aborted'))
+        self.assertTrue(self.page.get_by_role('button',name='核对原请求').is_disabled())
+        self.assertEqual(self.page.locator('button').count(),1)
+        self.assertNotIn('原请求曾完成激活确认。',self.page.locator('#root').inner_text())
 
 if __name__=='__main__':unittest.main()
