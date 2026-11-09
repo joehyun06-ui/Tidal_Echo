@@ -115,6 +115,10 @@ class StatusProxyTests(unittest.IsolatedAsyncioTestCase):
                 install(FastAPI(), **{**common, **change})
         with self.assertRaisesRegex(ValueError, 'route_conflict'):
             install(self.app, **common)
+        alias = FastAPI()
+        alias.add_api_route(PATH.replace('{conversation_id}', '{sid}'), lambda: {}, methods=['POST'])
+        with self.assertRaisesRegex(ValueError, 'route_conflict'):
+            install(alias, **common)
         self.assertEqual(self.sent, [])
 
     async def test_actual_three_states_are_read_only_and_rechecked(self):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import inspect
+import re
 from urllib.parse import urlsplit
 
 import httpx
@@ -110,7 +111,8 @@ def install(app, *, enabled=False, authenticate=None, expected_access=None,
         expected_binding = _binding(expected_access)
     except ValueError:
         raise ValueError('lifecycle_status_proxy_binding_invalid') from None
-    if any(getattr(route, 'path', None) == PATH for route in app.routes):
+    normalize = lambda path: re.sub(r'\{[^}]+\}', '{}', path)
+    if any(normalize(getattr(route, 'path', '')) == normalize(PATH) for route in app.routes):
         raise ValueError('lifecycle_status_proxy_route_conflict')
 
     async def authorize(request, cid):
