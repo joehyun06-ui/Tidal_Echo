@@ -353,6 +353,7 @@ codex_session_model.install(app, legacy, RUNTIME, INTEGRATION)
 
 from backend import web_session_fork_routes
 web_session_fork_routes.install(app, legacy, INTEGRATION.session_authority, INTEGRATION._session_lock, runtime=RUNTIME,
+    rewrite_runtime=API_GENERATIONS,
     **(LEDGER_SERVICES.deletion_kwargs() if LEDGER_SERVICES is not None else {}))
 
 if LEDGER_SERVICES is not None:
