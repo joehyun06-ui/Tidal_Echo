@@ -20,7 +20,8 @@ class ForkError(Exception):
         self.category, self.status = category, status
 
 
-def fork_conversation(authority, session_id: str, body: object, *, relay_db: str) -> dict:
+def fork_conversation(authority, session_id: str, body: object, *, relay_db: str,
+                      rewritten_reply: dict | None = None) -> dict:
     if not isinstance(body, dict) or set(body) != {"request_id", "message_id", "mode"}:
         raise ForkError("invalid_fork_request", 400)
     try:
@@ -38,11 +39,21 @@ def fork_conversation(authority, session_id: str, body: object, *, relay_db: str
     target = "api-fork-" + request_id.replace("-", "")
     if authority.tombstone_for_session(target):
         raise ForkError("web_session_deleted", 410)
-    fingerprint = hashlib.sha256(json.dumps([session_id, message_id, mode]).encode()).hexdigest()
+    identity = [session_id, message_id, mode]
+    if rewritten_reply is not None:
+        identity.append(rewritten_reply)
+    fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     with closing(sqlite3.connect(relay_db, timeout=20)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("CREATE TABLE IF NOT EXISTS web_session_forks (target TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)")
+        if rewritten_reply is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            from .api_web_generation import ApiGenerationError, assert_idle
+            try:
+                assert_idle(conn, session_id)
+            except ApiGenerationError as error:
+                raise ForkError(error.category, error.status_code) from None
         receipt = conn.execute("SELECT fingerprint FROM web_session_forks WHERE target=?", (target,)).fetchone()
         existing = next((s for s in authority.session_rows() if s["id"] == target), None)
         suffix = {"branch": " · 分支", "edit": " · 编辑", "regenerate": " · 新回答"}[mode]
@@ -67,6 +78,11 @@ def fork_conversation(authority, session_id: str, body: object, *, relay_db: str
         if not rows or rows[-1]["id"] != message_id:
             raise ForkError("fork_message_not_found", 404)
         selected = rows[-1]
+        if rewritten_reply is not None and (
+            mode != "branch" or selected["direction"] != "out" or selected["kind"] != "reply"
+            or selected["text"] != rewritten_reply["source"]
+        ):
+            raise ForkError("rewrite_source_changed")
         if mode == "edit" and selected["direction"] != "in":
             raise ForkError("fork_message_role_invalid")
         if mode == "regenerate":
@@ -88,10 +104,15 @@ def fork_conversation(authority, session_id: str, body: object, *, relay_db: str
             for row in rows:
                 original = json.loads(row["meta"])
                 meta = {"api_session": target, "source": "web_fork", "branch_origin": {"session_id": session_id, "message_id": row["id"]}}
+                text, ts = row["text"], row["ts"]
+                if rewritten_reply is not None and row["id"] == message_id:
+                    text, ts = rewritten_reply["text"], new["created_at"]
+                    meta = {"api_session": target, "source": "web_rewrite",
+                            "version_key": rewritten_reply["version_key"], "version_usage": None}
                 if isinstance(original.get("attachments"), list):
                     meta["attachments"] = original["attachments"]
                 conn.execute("INSERT INTO messages (ts,direction,kind,text,meta) VALUES (?,?,?,?,?)",
-                    (row["ts"], row["direction"], row["kind"], row["text"], json.dumps(meta, ensure_ascii=False)))
+                    (ts, row["direction"], row["kind"], text, json.dumps(meta, ensure_ascii=False)))
         try:
             authority.publish_row(new, activate=False)
         except Exception:

@@ -11,7 +11,7 @@ from .codex_generation_protocol import CodexGenerationError
 from .codex_generation_store import CodexGenerationStoreError
 
 
-def install(app, legacy, authority, lock, *, runtime=None, usage_ledger=None):
+def install(app, legacy, authority, lock, *, runtime=None, usage_ledger=None, rewrite_runtime=None):
     fork_lock = asyncio.Lock()
     async def perform(session_id, body, *, version=False):
         try:
@@ -65,6 +65,30 @@ def install(app, legacy, authority, lock, *, runtime=None, usage_ledger=None):
             return JSONResponse({"ok": False, "error": "codex_session_unavailable"}, status_code=409)
         except (OSError, sqlite3.Error, ValueError, TypeError):
             return JSONResponse({"ok": False, "error": "version_storage_unavailable"}, status_code=503)
+
+    if rewrite_runtime is not None:
+        from . import web_message_rewrite as rewrite
+
+        @app.post("/loop/sessions/{session_id}/rewrite/preview")
+        async def preview_rewrite(session_id: str, request: Request):
+            legacy.check_internal_auth(request)
+            body = await legacy.read_internal_json(request)
+            try:
+                return await rewrite.preview(legacy, authority, lock, session_id, body,
+                                             collector=rewrite_runtime.usage_collector)
+            except ForkError as error:
+                return JSONResponse({"ok": False, "error": error.category}, status_code=error.status)
+            except WebSessionProviderAuthorityError as error:
+                return JSONResponse({"ok": False, "error": error.category}, status_code=409)
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                return JSONResponse({"ok": False, "error": "rewrite_storage_unavailable"}, status_code=503)
+
+        @app.post("/loop/sessions/{session_id}/rewrite/versions")
+        async def save_rewrite(session_id: str, request: Request):
+            legacy.check_internal_auth(request)
+            body = await legacy.read_internal_json(request)
+            async with fork_lock:
+                return version_call(lambda: rewrite.save(authority, session_id, body, relay_db=legacy.RELAY_DB))
 
     @app.get("/loop/conversation-versions")
     async def list_versions(request: Request):
