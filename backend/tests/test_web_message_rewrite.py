@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from backend import web_message_versions as versions
+from backend.usage_ledger import Ledger
+from backend.usage_ledger_report import build_report
 from backend.web_session_fork_routes import install
 from backend.web_session_provider_authority import WebSessionProviderAuthority
 
@@ -124,3 +126,22 @@ class RewriteTests(unittest.TestCase):
         self.model.side_effect = change
         self.assertEqual(self.post("preview", self.command(instructions="")).json()["error"], "rewrite_source_changed")
         self.model.assert_awaited_once()
+
+    def test_rewrite_request_counts_for_consumption_without_advancing_chat_stats(self):
+        ledger = Ledger(self.path + ".usage")
+        base = {"mode": "api", "provider_id": "synthetic", "session_id": "source", "model": "first",
+                "status": "completed", "usage_complete": True, "dialect": "openai_chat"}
+        ledger.append({**base, "request_id": "chat-1", "turn_id": "api-gen-1",
+                       "at": "2026-11-12T01:00:00Z", "raw_usage": {"prompt_tokens": 100, "completion_tokens": 10},
+                       "context": {"tokens": 100, "limit": 1000, "stale": False, "source": "synthetic"}})
+        ledger.append({**base, "request_id": "rewrite-request-1", "turn_id": "rewrite-preview-1", "model": "second",
+                       "at": "2026-11-12T02:00:00Z", "raw_usage": {"prompt_tokens": 20, "completion_tokens": 5}})
+        report = build_report(ledger, "api", "source")
+        self.assertEqual(report["summary"]["requests"], 2)
+        self.assertEqual(report["summary"]["observed_turns"], 1)
+        self.assertEqual(report["summary"]["metrics"]["input"]["value"], 120)
+        self.assertEqual(report["last_round"]["metrics"]["input"]["value"], 100)
+        self.assertEqual(report["context"]["tokens"], 100)
+        self.assertIs(report["context"]["stale"], False)
+        self.assertEqual(report["configuration_changes"], [])
+        self.assertEqual(report["recent_requests"][-1]["turn_id"], "rewrite-preview-1")
