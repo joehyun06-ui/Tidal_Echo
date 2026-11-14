@@ -35,11 +35,7 @@ class AuthenticatedRecoveryLogin:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class RecoveryStatusBinding:
-    """Server result. Only identity is suitable for future browser binding.
-
-    identity is not a credential or grant; context stays server-side. No HTTP
-    endpoint or browser publication is provided by this module.
-    """
+    """Server result with an opaque identity and private status context."""
     identity: str
     context: TrustedStatusContext
 

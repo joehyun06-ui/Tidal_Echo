@@ -1,8 +1,9 @@
 # GM-02AS: request-scoped recovery context from durable epochs and canonical reads
 
-Development/offline step after AR. Default off, production HOLD. No login,
-credential issuer, new DB/schema, HTTP route, bootstrap, frontend or deployment
-is installed. This does not complete real login or full GM-02 acceptance.
+Development/offline step after AR. Default off, production HOLD. The binding
+route has an explicit installer for a host that provides authentication and
+current scope. No production entrypoint invokes it. Login issuance, database
+schema, bootstrap and frontend integration remain outside this change.
 
 ## Reused authority
 
@@ -89,9 +90,23 @@ retry permission. The key needs an explicit durable provisioning/rotation plan
 before real installation; this step does not create a production secret.
 
 binding(request, conversation_id) returns a server-only RecoveryStatusBinding.
-Only its identity is intended for a future separately authenticated capability
-response. Its context stays server-side; no metadata endpoint is added here.
 authenticate(request, conversation_id) directly implements AR's callback.
+
+## Recovery binding endpoint
+
+`session_lifecycle_recovery_binding_http.install` takes the same provider,
+expected origin and independently verified AccessScope used for status checks.
+The host may explicitly install it before starting its FastAPI app.
+`POST /app/sessions/{conversation_id}/lifecycle/activation/binding` takes an
+empty body and rejects query parameters. The provider verifies current login,
+epoch, root, selected version and scope. The response is private and non-cacheable.
+
+The response contains exactly `identity`, `conversationId` and
+`contextVersion`, matching the existing restore component's binding shape.
+The identity remains stable across re-login. The context version combines the
+provider's authorization and conversation labels, so either changing invalidates
+a captured scope. Raw epoch, principal, ACL and internal token stay on the server.
+Each status query still uses the status gateway and its own authorization checks.
 
 ## Validation and limits
 
@@ -116,8 +131,8 @@ be independently verified against AR's expected_access. Runtime/provider consume
 cursors, current-window confirmation, safe automatic switching and reply completion
 remain separate work.
 
-Next: a reviewed real-login adapter and server-owned capability/binding response
-for the stable identity, then formal frontend/PWA wiring and runtime acceptance.
+Next: connect a reviewed real-login adapter and current ACL, then verify the
+binding and status routes together in the intended host.
 No merge/deploy, production DB/JSON/env/WAL/Journal change, real model API, G3 write
 or actual chat. G3 source/event/revision remain authority, ProjectionCard derived;
 commercial C is not a daily dependency. Frozen 36/36,108/108,OpenAI 7/7 unchanged.

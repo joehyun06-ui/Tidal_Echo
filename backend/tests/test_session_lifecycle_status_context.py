@@ -18,6 +18,7 @@ from starlette.requests import Request
 from backend.g3_projection_contract import AccessScope
 from backend.memory_auth_epoch_store import AuthenticatedLogin, ServerIssuedEpoch, AuthEpochRegistry, AuthEpochError
 from backend.session_lifecycle_codec import encode_record, checksum
+from backend import session_lifecycle_recovery_binding_http as recovery_binding
 from backend.session_lifecycle_status_context import AuthenticatedRecoveryLogin, RecoveryStatusContextProvider
 from backend.session_lifecycle_status_proxy import install, PATH
 from backend.session_window_activation_http import install as install_internal
@@ -378,6 +379,77 @@ class StatusContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent),1);self.assertGreaterEqual(self.login_calls,6)
         self.assertEqual(before,list(self.h.conn.iterdump()));self.assertEqual(config,self.h.config_path.read_bytes())
         self.assertNotIn(self.login.epoch.value,result.text);self.assertNotIn(TOKEN,result.text)
+
+    def binding_client(self, *, access=CTX):
+        app = FastAPI()
+        recovery_binding.install(app, enabled=True, provider=self.provider,
+                                 expected_access=access, expected_origin=ORIGIN)
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url='https://relay.synthetic.invalid',
+            headers={'Origin': ORIGIN, 'Authorization': BROWSER},
+        )
+
+    async def test_recovery_binding_route_is_opt_in_and_rejects_conflicts(self):
+        app = FastAPI()
+        self.assertFalse(recovery_binding.install(app, provider=object()))
+        self.assertFalse(any(r.path == recovery_binding.PATH for r in app.routes))
+        app.get(recovery_binding.PATH.replace('{conversation_id}', '{other}'))(lambda: {})
+        with self.assertRaisesRegex(ValueError, 'route_conflict'):
+            recovery_binding.install(app, enabled=True, provider=self.provider,
+                                     expected_access=CTX, expected_origin=ORIGIN)
+
+    async def test_recovery_binding_exposes_only_restore_fields_and_relogin_changes_version(self):
+        path = recovery_binding.PATH.replace('{conversation_id}', CID)
+        before = list(self.h.conn.iterdump())
+        config = self.h.config_path.read_bytes()
+        async with self.binding_client() as client:
+            response = await client.post(path)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.headers['cache-control'], 'private, no-store')
+            self.assertEqual(response.headers['referrer-policy'], 'no-referrer')
+            first = response.json()
+            self.assertEqual(set(first), {'identity', 'conversationId', 'contextVersion'})
+            self.assertEqual(first['conversationId'], CID)
+            self.assertRegex(first['identity'], r'^recovery:[0-9a-f]{64}$')
+            self.assertRegex(first['contextVersion'], r'^recovery-context:[0-9a-f]{64}$')
+            self.assertEqual((await client.post(path)).json(), first)
+            self.assertEqual(list(self.h.conn.iterdump()), before)
+            self.assertEqual(self.h.config_path.read_bytes(), config)
+            self.assertNotIn(self.login.epoch.value, response.text)
+            self.assertNotIn(self.login_identity.principal_id, response.text)
+            self.login = replace(self.login, epoch=self.registry.issue_after_authenticated_login())
+            second = (await client.post(path)).json()
+            self.assertEqual(first['identity'], second['identity'])
+            self.assertNotEqual(first['contextVersion'], second['contextVersion'])
+            self.registry.revoke_before_logout()
+            revoked = await client.post(path)
+            self.assertEqual(revoked.status_code, 403)
+            self.assertEqual(revoked.json(), {'ok': False, 'error': 'access_denied'})
+
+    async def test_recovery_binding_rejects_nonempty_requests_and_untrusted_origin(self):
+        path = recovery_binding.PATH.replace('{conversation_id}', CID)
+        async with self.binding_client() as client:
+            for response, code in (
+                (await client.post(path, headers={'Origin': 'https://other.synthetic.invalid'}), 403),
+                (await client.post(path, json={'identity': 'supplied'}), 400),
+                (await client.post(path + '?identity=supplied'), 400),
+                (await client.post(path, headers={'X-API-Loop-Internal-Token': TOKEN}), 400),
+            ):
+                self.assertEqual(response.status_code, code, response.text)
+                self.assertEqual(set(response.json()), {'ok', 'error'})
+            self.assertEqual(self.login_calls, 0)
+            response = await client.post(path, headers={'Authorization': 'invalid'})
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json(), {'ok': False, 'error': 'auth_required'})
+
+    async def test_recovery_binding_rejects_scope_different_from_status_gateway(self):
+        path = recovery_binding.PATH.replace('{conversation_id}', CID)
+        other_access = replace(CTX, allowed_scopes=frozenset({'unrelated'}))
+        async with self.binding_client(access=other_access) as client:
+            response = await client.post(path)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {'ok': False, 'error': 'access_denied'})
 
     async def test_gateway_refuses_epoch_rotation_after_upstream_observation(self):
         internal=FastAPI();check=original_auth()
