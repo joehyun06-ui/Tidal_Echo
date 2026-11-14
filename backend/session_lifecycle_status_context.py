@@ -168,6 +168,9 @@ class RecoveryStatusContextProvider:
             after = await asyncio.to_thread(self._capture, first, conversation_id)
             if before != after:
                 raise HTTPException(403)
+            # A WAL snapshot cannot observe a logout committed by another
+            # worker after that snapshot began.
+            await asyncio.to_thread(registry.assert_current, first.epoch)
             access_binding = _binding(after.access)
             identity = 'recovery:' + self._mac('status-identity-v1', [first.identity.principal_id])
             auth_epoch = 'auth:' + self._mac('status-auth-v1', [first.identity.principal_id,

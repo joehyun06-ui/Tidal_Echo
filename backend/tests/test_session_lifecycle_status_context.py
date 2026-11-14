@@ -236,6 +236,30 @@ class StatusContextTests(unittest.IsolatedAsyncioTestCase):
         self.login_hook=rotate
         await self.denied(lambda:self.provider.binding(request(),CID),403)
 
+    async def test_logout_during_final_wal_snapshot_refuses_binding(self):
+        self.assertEqual(self.h.conn.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+        original_capture = self.provider._capture
+        captures = 0
+        revoked = []
+
+        def capture(login, cid):
+            nonlocal captures
+            captures += 1
+            if captures == 2:
+                def logout_during_read(_):
+                    # The historical provider runs after the canonical read
+                    # transaction is pinned. WAL lets another worker log out.
+                    if not revoked:
+                        revoked.append(self.registry.revoke_before_logout())
+                    return 'api'
+                with patch.object(self.provider, '_history', logout_during_read):
+                    return original_capture(login, cid)
+            return original_capture(login, cid)
+
+        with patch.object(self.provider, '_capture', capture):
+            await self.denied(lambda: self.provider.binding(request(), CID), 403)
+        self.assertEqual(revoked, [True])
+
     async def test_grant_revocation_during_canonical_projection_refuses_result(self):
         def revoke(count):
             if count==3:self.allowed.clear()
