@@ -124,6 +124,17 @@ canonical fixtures/coordinator are POSIX; this is not Windows provider acceptanc
 No browser code changes: existing Chromium/WebKit recovery tests are regression
 checks, not a browser-to-real-login/provider end-to-end test.
 
+The offline restart rehearsal opens the same disposable canonical database in
+fresh processes with read-only connections. It checks that the binding and
+historical activation receipt survive process replacement and that a durable
+revocation stops both requests before forwarding. A second case restores a
+SQLite online backup at the original canonical path with its original private
+config. It verifies that a commit still in WAL is present in the backup by
+contrasting the result with a main-file-only read before checkpointing. This
+covers a local paired fixture, with the writer stopped for restore. It does not
+establish live backup consistency across SQLite and JSON, production volume
+recovery, or immunity to restoring an old authorization snapshot.
+
 Cooperative generation is not an independent rollback/latestness bound, and
 the two read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must
