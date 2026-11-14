@@ -260,6 +260,31 @@ class StatusContextTests(unittest.IsolatedAsyncioTestCase):
             await self.denied(lambda: self.provider.binding(request(), CID), 403)
         self.assertEqual(revoked, [True])
 
+    async def test_host_login_expiring_during_final_snapshot_refuses_binding(self):
+        now = 0
+        expires_at = 1
+        original_capture = self.provider._capture
+        captures = 0
+
+        async def authenticate(incoming):
+            if now >= expires_at:
+                raise HTTPException(401)
+            return await self.login_provider(incoming)
+
+        def capture(login, cid):
+            nonlocal captures, now
+            snapshot = original_capture(login, cid)
+            captures += 1
+            if captures == 2:
+                now = expires_at
+            return snapshot
+
+        provider = self.build(login_provider=authenticate)
+        with patch.object(provider, '_capture', capture):
+            await self.denied(lambda: provider.binding(request(), CID), 401)
+        self.assertEqual(captures, 2)
+        self.registry.assert_current(self.login.epoch)
+
     async def test_grant_revocation_during_canonical_projection_refuses_result(self):
         def revoke(count):
             if count==3:self.allowed.clear()

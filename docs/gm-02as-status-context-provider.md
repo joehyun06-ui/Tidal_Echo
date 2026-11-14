@@ -64,8 +64,9 @@ physically cancel every SQLite read or host callback.
 For each binding the provider authenticates and verifies the durable epoch,
 captures canonical state, resamples the authenticated login, verifies epoch again,
 and captures canonical state again. Login/epoch or snapshot differences deny the
-binding. After the final snapshot closes, a fresh read checks the epoch again
-to observe a logout or rotation committed while that WAL snapshot was open.
+binding. After the final snapshot closes, the provider checks host
+authentication again to catch expiry or a credential change. A fresh epoch
+read then observes logout or rotation committed while that WAL snapshot was open.
 AR already calls authenticate before body, after body and after upstream
 observation; its comparisons therefore use these real provider labels.
 
