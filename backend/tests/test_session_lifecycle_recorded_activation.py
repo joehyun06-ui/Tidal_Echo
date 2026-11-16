@@ -147,6 +147,33 @@ class RecordedActivationTests(unittest.TestCase):
         self.assertEqual(delivered,[('attempt_1','window_1')])
         self.assertEqual(self.h.record().conversation_id,CID)
 
+    def test_first_packet_dispatch_requires_source_window_but_replay_can_observe_target(self):
+        delivered = []
+
+        def dispatch(attempt, packet):
+            delivered.append((attempt.request_id, packet.target_window_id))
+            self.h.confirm()
+
+        def handoff():
+            return attempt_packet_dispatch_once(
+                self.h.engine, self.journal, CID, 'attempt_1',
+                packet_sha256=self.state.packet_sha256, expected_revision=self.state.revision,
+                access=CTX, dispatch=dispatch, enabled=True,
+            )
+
+        source = self.h.get('runtime')
+        self.h.confirm()
+        self.rejects(handoff, 'lifecycle_window_changed')
+        self.assertEqual(delivered, [])
+        self.assertIsNone(self.journal.inspect(CID, 'attempt_1', access=CTX))
+
+        self.h.put('runtime', source)
+        self.assertFalse(handoff().replayed)
+        self.assertTrue(handoff().replayed)
+        self.assertEqual(delivered, [('attempt_1', 'window_1')])
+        self.assertTrue(self.activate().window_confirmed)
+        self.assertEqual(self.h.record().conversation_id, CID)
+
     def test_new_process_reconciles_same_durable_activation(self):
         self.record();self.h.confirm();self.activate()
         result=subprocess.run([sys.executable,'-c',

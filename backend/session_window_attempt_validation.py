@@ -27,9 +27,15 @@ def record_validated_attempt(engine, journal, cid, request_id, *, packet_sha256,
 
             current_packet = []
 
-            def validate(state):
+            def validate(state, *, replayed):
                 engine._bound(state, snapshot, binding)
                 engine._current(state, snapshot)
+                # The prepared target can be observed during activation or
+                # replay. A new handoff must still originate at the source.
+                if not replayed and (
+                    snapshot.window_id, snapshot.model_run_id, snapshot.context_epoch
+                ) != (state.window_id, state.model_run_id, state.context_epoch):
+                    raise LifecycleError('lifecycle_window_changed')
                 packet, digest = engine._packet(state, snapshot, access)
                 if digest != state.packet_sha256 or digest != packet_sha256:
                     raise LifecycleError('lifecycle_packet_changed')

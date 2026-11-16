@@ -150,6 +150,13 @@ reference and gets the original revision. Both checks leave canonical rows
 and config unchanged. This uses an injected stream error, not live network
 failure or model runtime validation.
 
+Validated first handoff also requires the observed window, run ID and
+context epoch to match the prepared record's source. If the provider already
+reports the target as current, first handoff stops before creating an attempt
+or calling the sender. The same recorded attempt may still be replayed
+without calling the sender, and activation still uses its separate receipt
+and consumed-cursor checks.
+
 Cooperative generation is not an independent rollback/latestness bound, and
 the two read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must

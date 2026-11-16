@@ -160,9 +160,9 @@ class WindowAttemptJournal:
             fail()
         with self.repository.transaction(cid) as tx:
             state = self._bound(tx, binding)
-            if _guard is not None:
-                _guard(state)
             old = _row(tx.conn, cid, request_id=request_id)
+            if _guard is not None:
+                _guard(state, replayed=old is not None)
             if old is not None:
                 if (old[3], old[4], old[5]) != (packet_sha256, expected_revision, binding):
                     fail('lifecycle_attempt_request_conflict')
@@ -180,7 +180,7 @@ class WindowAttemptJournal:
             # escapes to the caller if commit/post-check acknowledgement fails.
             result = self._observation((*values, _checksum(values)), binding, replayed=False)
             if _guard is not None:
-                _guard(state)
+                _guard(state, replayed=False)
         return result
 
     def inspect(self, cid, request_id, *, access):
