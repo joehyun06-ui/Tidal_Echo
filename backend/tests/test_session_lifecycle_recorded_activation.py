@@ -174,6 +174,67 @@ class RecordedActivationTests(unittest.TestCase):
         self.assertTrue(self.activate().window_confirmed)
         self.assertEqual(self.h.record().conversation_id, CID)
 
+    def append_message(self):
+        return self.h.conn.execute(
+            "INSERT INTO messages(ts,kind,direction,text,meta) VALUES "
+            "('2026-11-16T00:00:00Z','user','in','synthetic late message',?)",
+            (json.dumps({'api_session': CID}),),
+        ).lastrowid
+
+    def test_first_dispatch_refuses_late_message_missing_from_runtime_snapshot(self):
+        mid = self.append_message()
+        self.h.snapshot_hook = lambda snapshot: replace(
+            snapshot, message_head=self.state.message_cursor,
+        )
+        delivered = []
+
+        def dispatch(attempt, packet):
+            delivered.append(packet)
+
+        def handoff(state):
+            return attempt_packet_dispatch_once(
+                self.h.engine, self.journal, CID, 'attempt_1',
+                packet_sha256=state.packet_sha256, expected_revision=state.revision,
+                access=CTX, dispatch=dispatch, enabled=True,
+            )
+
+        before = list(self.h.conn.iterdump())
+        self.rejects(lambda: handoff(self.state), 'lifecycle_delta_required')
+        self.assertEqual(delivered, [])
+        self.assertIsNone(self.journal.inspect(CID, 'attempt_1', access=CTX))
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+
+        self.h.snapshot_hook = None
+        self.h.engine.reentry_delta(CID, 'delta_1', after_source=self.state.source_cursor,
+            after_message=self.state.message_cursor, access=CTX)
+        updated = self.h.record()
+        self.assertFalse(handoff(updated).replayed)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0].canonical_message_ids, (mid,))
+
+    def test_activation_refuses_late_message_despite_matching_runtime_receipt(self):
+        self.record()
+        self.h.confirm()
+        self.append_message()
+        self.h.snapshot_hook = lambda snapshot: replace(
+            snapshot, message_head=self.state.message_cursor,
+        )
+        before = list(self.h.conn.iterdump())
+
+        self.rejects(self.activate, 'lifecycle_delta_required')
+        self.assertEqual(self.h.record(), self.state)
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+
+    def test_historical_activation_replay_survives_later_canonical_message(self):
+        self.record()
+        self.h.confirm()
+        original = self.activate()
+        self.append_message()
+        before = list(self.h.conn.iterdump())
+
+        self.assertEqual(self.activate(), replace(original, replayed=True))
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+
     def test_new_process_reconciles_same_durable_activation(self):
         self.record();self.h.confirm();self.activate()
         result=subprocess.run([sys.executable,'-c',

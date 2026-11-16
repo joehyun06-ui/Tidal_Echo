@@ -232,6 +232,17 @@ def _verify_prepared_messages(conn, old, state, receipt):
         fail('lifecycle_message_delta_incomplete')
 
 
+def _require_current_message_cursor(conn, state):
+    """Check the selected version in the caller's canonical write transaction."""
+    newer = conn.execute(
+        "SELECT 1 FROM messages WHERE id>? AND kind IN ('user','voice','reply') "
+        "AND json_extract(meta,'$.api_session')=? LIMIT 1",
+        (state.message_cursor, state.version_id),
+    ).fetchone()
+    if newer is not None:
+        fail('lifecycle_delta_required')
+
+
 class _Transaction:
     def __init__(self, conn, view, *, readonly=False):
         self.conn, self.view, self.active, self.saved = conn, view, True, False
@@ -279,6 +290,8 @@ class _Transaction:
             if old is None or old.phase not in ('closed', 'prepared'):
                 fail('lifecycle_phase_conflict')
             _verify_prepared_messages(self.conn, old, state, receipt)
+        elif state.phase == 'active' and old is not None and old.phase == 'prepared':
+            _require_current_message_cursor(self.conn, state)
         if self.receipt(receipt.request_id) is not None: fail('lifecycle_request_conflict')
         args = (state.revision, record_json, checksum(record_json), state.conversation_id)
         if expected_revision:

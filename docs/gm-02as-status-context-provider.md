@@ -164,6 +164,13 @@ reported head behind that canonical range aborts both the packet and its
 operation receipt. This checks newly persisted deltas and neither audits old
 packets nor establishes provider consumption of message or G3 source cursors.
 
+The first attempt write and a new activation commit also check the selected
+version for messages newer than the prepared cursor in their SQLite writer
+transactions. A stale runtime snapshot or otherwise matching receipt cannot
+advance a packet that missed a committed message. A historical replay can
+still return its original receipt. The attempt check ends at commit; the
+external sender still relies on the host's existing authority fence.
+
 Cooperative generation is not an independent rollback/latestness bound, and
 the two read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must

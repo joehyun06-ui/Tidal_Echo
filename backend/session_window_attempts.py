@@ -13,7 +13,9 @@ import sqlite3
 from .g3_projection import _valid_id
 from .g3_projection_feed import _binding
 from .session_lifecycle import LifecycleError, _json, _session_id
-from .session_lifecycle_storage import SQLiteLifecycleRepository, _owned, _source_schema
+from .session_lifecycle_storage import (
+    SQLiteLifecycleRepository, _owned, _require_current_message_cursor, _source_schema,
+)
 
 FORMAT = 'guiting.window-attempt.v1'
 DDL = (
@@ -173,6 +175,7 @@ class WindowAttemptJournal:
                 fail('lifecycle_phase_conflict')
             if (state.packet_sha256, state.revision) != (packet_sha256, expected_revision):
                 fail('lifecycle_attempt_state_changed')
+            _require_current_message_cursor(tx.conn, state)
             values = (cid, state.closeout_id, request_id, packet_sha256, expected_revision, binding)
             tx.conn.execute('INSERT INTO session_window_attempts VALUES (?,?,?,?,?,?,?)',
                             (*values, _checksum(values)))
