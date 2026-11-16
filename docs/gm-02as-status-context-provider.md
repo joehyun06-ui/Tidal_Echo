@@ -164,6 +164,14 @@ reported head behind that canonical range aborts both the packet and its
 operation receipt. This checks newly persisted deltas and neither audits old
 packets nor establishes provider consumption of message or G3 source cursors.
 
+Preparing or refreshing a packet now requires a paged G3 read-only adapter.
+The lifecycle checks the feed's access binding, source generation and upper
+cursor, then compares its ordered visible revisions with the session-side
+delta. An empty page can advance through ACL-filtered events when both reads
+agree. The feed is revalidated after building the packet; a changed source
+or authorization epoch prevents the commit. The feed remains a trusted read
+contract, with no independent proof against omissions by the G3 adapter itself.
+
 The first attempt write and a new activation commit also check the selected
 version for messages newer than the prepared cursor in their SQLite writer
 transactions. A stale runtime snapshot or otherwise matching receipt cannot

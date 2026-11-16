@@ -72,6 +72,33 @@ class PagedG3ReadOnlySourceAdapter(G3ReadOnlySourceAdapter, Protocol):
     def validate_scan(self, scan: G3Scan, *, access: AccessScope) -> bool: ...
 
 
+def _begin_scan(adapter, after, access, binding, generation):
+    scan = adapter.begin_scan(after_cursor=after, access=access)
+    if (not isinstance(scan, G3Scan)
+            or not all(_valid_id(value) for value in (scan.scan_id, scan.source_generation,
+                           scan.source_epoch, scan.authorization_epoch))
+            or scan.access_binding != binding or type(scan.after_cursor) is not int
+            or type(scan.upper_cursor) is not int or scan.after_cursor != after
+            or scan.upper_cursor < after):
+        _deny()
+    if generation is not None and scan.source_generation != generation:
+        _deny("projection_source_generation_changed")
+    return scan
+
+
+def _scan_page(adapter, scan, cursor, page_size, access):
+    page = adapter.read_page(scan, after_cursor=cursor, limit=page_size, access=access)
+    if (not isinstance(page, G3FeedPage) or page.scan_id != scan.scan_id
+            or type(page.after_cursor) is not int or page.after_cursor != cursor
+            or type(page.next_cursor) is not int or type(page.done) is not bool
+            or not isinstance(page.events, tuple) or len(page.events) > page_size
+            or not cursor <= page.next_cursor <= scan.upper_cursor
+            or (page.done and page.next_cursor != scan.upper_cursor)
+            or (not page.done and not cursor < page.next_cursor < scan.upper_cursor)):
+        _deny()
+    return page
+
+
 @dataclass(frozen=True)
 class ProjectionIndexProgress:
     """Derived operational counters only, not evidence of current source ACL."""
@@ -125,20 +152,6 @@ class RebuildableProjectionIndex:
             self._cursor = 0
             self._serial += 1
 
-    @staticmethod
-    def _scan(adapter, after, access, binding, generation):
-        scan = adapter.begin_scan(after_cursor=after, access=access)
-        if (not isinstance(scan, G3Scan)
-                or not all(_valid_id(value) for value in (scan.scan_id, scan.source_generation,
-                               scan.source_epoch, scan.authorization_epoch))
-                or scan.access_binding != binding or type(scan.after_cursor) is not int
-                or type(scan.upper_cursor) is not int or scan.after_cursor != after
-                or scan.upper_cursor < after):
-            _deny()
-        if generation is not None and scan.source_generation != generation:
-            _deny("projection_source_generation_changed")
-        return scan
-
     def refresh(self, adapter: PagedG3ReadOnlySourceAdapter, *, access: AccessScope,
                 page_size=100, max_pages=100, max_changes=10000) -> ProjectionRefresh:
         if (type(page_size) is not int or not 1 <= page_size <= 200
@@ -152,27 +165,19 @@ class RebuildableProjectionIndex:
             generation, authorization = self._generation, self._authorization
             invalidated_read = self._needs_rebuild
             cards = dict(self._cards)
-        scan = self._scan(adapter, cursor, access, binding, generation)
+        scan = _begin_scan(adapter, cursor, access, binding, generation)
         rebuilt = authorization is not None and authorization != scan.authorization_epoch
         if rebuilt or invalidated_read:
             cards = {}
             cursor = 0
-            scan = self._scan(adapter, 0, access, binding, generation)
+            scan = _begin_scan(adapter, 0, access, binding, generation)
         changed = {}
         total = pages = 0
         while True:
             if pages >= max_pages:
                 _deny("projection_scan_budget_exceeded")
-            page = adapter.read_page(scan, after_cursor=cursor, limit=page_size, access=access)
+            page = _scan_page(adapter, scan, cursor, page_size, access)
             pages += 1
-            if (not isinstance(page, G3FeedPage) or page.scan_id != scan.scan_id
-                    or type(page.after_cursor) is not int or page.after_cursor != cursor
-                    or type(page.next_cursor) is not int or type(page.done) is not bool
-                    or not isinstance(page.events, tuple) or len(page.events) > page_size
-                    or not cursor <= page.next_cursor <= scan.upper_cursor
-                    or (page.done and page.next_cursor != scan.upper_cursor)
-                    or (not page.done and not cursor < page.next_cursor < scan.upper_cursor)):
-                _deny()
             last = cursor
             for event in page.events:
                 _validate_event(event, access)
@@ -227,7 +232,7 @@ class RebuildableProjectionIndex:
         if card is None:
             _deny("projection_not_indexed")
         try:
-            scan = self._scan(adapter, cursor, access, binding, generation)
+            scan = _begin_scan(adapter, cursor, access, binding, generation)
             verified = verify_projection_card(adapter, card, access=access)
             if adapter.validate_scan(scan, access=access) is not True:
                 _deny("projection_scan_changed")

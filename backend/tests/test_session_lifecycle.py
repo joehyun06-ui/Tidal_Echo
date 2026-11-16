@@ -89,6 +89,7 @@ class Harness:
                               (2, 'anchor_1', b'synthetic reviewed anchor', json.dumps({'layer':'fixed','reviewed':True})))
             runtime = self.get('runtime'); runtime['observed_source'] = 2; self.put('runtime', runtime)
         self.g3 = SyntheticPagedG3()
+        self.g3.generation = self.get('runtime')['generation']
         for cursor, eid, body, options in self.conn.execute('SELECT * FROM fixture_g3 ORDER BY cursor'):
             self.g3.add_revision(eid, body, cursor=cursor, **json.loads(options))
         self.g3._denied = set(tuple(v) for v in self.get('runtime')['denied'])
@@ -450,6 +451,47 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.h.record(), old)
         self.h.page_hook = None
         self.assertEqual(self.delta().source_changes, 2)
+
+    def test_visible_source_revision_cannot_be_skipped_by_advancing_delta_page(self):
+        self.prepare()
+        old = self.h.record()
+        skipped = self.h.source('event_2', 'synthetic skipped')
+        self.h.source('event_3', 'synthetic last')
+        self.h.page_hook = lambda page: replace(
+            page, source_events=tuple(event for event in page.source_events if event != skipped),
+        )
+        before = list(self.h.conn.iterdump())
+
+        self.rejects(self.delta, 'lifecycle_source_delta_incomplete')
+        self.assertEqual(self.h.record(), old)
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+        self.h.page_hook = None
+        self.assertEqual(self.delta().source_changes, 2)
+
+    def test_acl_filtered_source_page_may_advance_without_counting_hidden_event(self):
+        self.prepare()
+        hidden = self.h.source('event_hidden', 'synthetic hidden', scope='private_B')
+        self.assertEqual(self.delta().source_changes, 0)
+        self.assertEqual(self.h.record().source_cursor.position, hidden.cursor)
+
+    def test_source_head_must_match_read_only_g3_scan(self):
+        self.prepare()
+        old = self.h.record()
+        self.h.source('event_2', 'synthetic new evidence')
+        self.h.snapshot_hook = lambda snapshot: replace(snapshot, source_head=old.source_cursor)
+        self.rejects(self.delta, 'lifecycle_source_delta_incomplete')
+        self.assertEqual(self.h.record(), old)
+
+    def test_g3_authorization_change_before_commit_leaves_prepared_record_unchanged(self):
+        self.prepare()
+        old = self.h.record()
+        self.h.source('event_2', 'synthetic new evidence')
+        self.h.g3.validate_hook = lambda: self.h.g3.deny(CTX.principal_id, 'private_A')
+        before = list(self.h.conn.iterdump())
+
+        self.rejects(self.delta, 'lifecycle_authority_changed')
+        self.assertEqual(self.h.record(), old)
+        self.assertEqual(list(self.h.conn.iterdump()), before)
 
     def test_duplicate_skipped_reordered_and_boolean_delta_pages_rejected(self):
         self.prepare(); self.h.message(); self.h.source('event_2', 'synthetic 2')

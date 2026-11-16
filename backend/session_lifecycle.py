@@ -13,7 +13,7 @@ from typing import ContextManager, Protocol
 
 from .g3_projection import _valid_id, _validate_event, build_projection_card
 from .g3_projection_contract import AccessScope, G3Event, G3SourceRef, ProjectionCard, ProjectionError
-from .g3_projection_feed import _binding
+from .g3_projection_feed import _begin_scan, _binding, _scan_page
 from .web_session_provider_authority import _safe_session_id, WebSessionProviderAuthorityError
 
 
@@ -197,6 +197,7 @@ class LifecycleRuntime(Protocol):
 
 
 class SessionLifecycle:
+    """Reentry requires a paged read-only G3 evidence adapter."""
     def __init__(self, repository: LifecycleRepository, authority: LifecycleAuthority, evidence, runtime: LifecycleRuntime,
                  *, enabled=False, supported_providers=frozenset()):
         self.repository, self.authority, self.evidence, self.runtime = repository, authority, evidence, runtime
@@ -353,8 +354,7 @@ class SessionLifecycle:
 
     def _catch_up(self, state, snapshot, access):
         source, message = state.source_cursor.position, state.message_cursor
-        seen, revisions, message_refs = set(), {}, []
-        source_count = 0
+        seen, revisions, message_refs, source_events = set(), {}, [], []
         for _ in range(100):
             page = self.authority.read_delta(snapshot, source_after=source, message_after=message, access=access)
             if (not isinstance(page, LifecycleDeltaPage) or page.stamp != snapshot.stamp
@@ -376,16 +376,43 @@ class SessionLifecycle:
                         or event.ref.revision <= revisions.get(event.ref.event_id, 0)):
                     _deny('lifecycle_delta_invalid')
                 seen.add(key); revisions[event.ref.event_id] = event.ref.revision
-                source = event.cursor; source_count += 1
+                source = event.cursor
+                source_events.append(event)
             for mid in page.message_ids:
                 if type(mid) is not int or not message < mid <= page.message_next:
                     _deny('lifecycle_delta_invalid')
                 message_refs.append(mid); message = mid
             source, message = page.source_next, page.message_next
-            if source_count > 1000 or len(message_refs) + len(state.message_refs) > 128:
+            if len(source_events) > 1000 or len(message_refs) + len(state.message_refs) > 128:
                 _deny('lifecycle_budget_exceeded')
             if page.done:
-                return source_count, tuple(message_refs)
+                return tuple(source_events), tuple(message_refs)
+        _deny('lifecycle_budget_exceeded')
+
+    def _verify_source_delta(self, state, snapshot, access, events):
+        adapter = self.evidence
+        if not all(callable(getattr(adapter, method, None))
+                   for method in ('begin_scan', 'read_page', 'validate_scan')):
+            _deny('lifecycle_evidence_unavailable')
+        cursor = state.source_cursor.position
+        scan = _begin_scan(adapter, cursor, access, state.access_binding,
+                           snapshot.source_head.generation)
+        if scan.upper_cursor != snapshot.source_head.position:
+            _deny('lifecycle_source_delta_incomplete')
+
+        matched = 0
+        for _ in range(100):
+            page = _scan_page(adapter, scan, cursor, 100, access)
+            end = matched + len(page.events)
+            if page.events != events[matched:end] or any(
+                not cursor < event.cursor <= page.next_cursor for event in page.events
+            ):
+                _deny('lifecycle_source_delta_incomplete')
+            matched, cursor = end, page.next_cursor
+            if page.done:
+                if matched != len(events):
+                    _deny('lifecycle_source_delta_incomplete')
+                return scan
         _deny('lifecycle_budget_exceeded')
 
     def _cards(self, snapshot, access):
@@ -411,14 +438,17 @@ class SessionLifecycle:
         return packet, hashlib.sha256(raw).hexdigest()
 
     def _prepare(self, state, snapshot, access, target, budget):
-        changes, mids = self._catch_up(state, snapshot, access)
+        events, mids = self._catch_up(state, snapshot, access)
+        scan = self._verify_source_delta(state, snapshot, access, events)
         anchors, recent = self._cards(snapshot, access)
         updated = replace(state, phase='prepared', target_window_id=target, source_cursor=snapshot.source_head,
                 message_cursor=snapshot.message_head, pending=snapshot.pending,
                 anchor_refs=tuple(c.source_refs[0] for c in anchors), recent_refs=tuple(c.source_refs[0] for c in recent),
                 message_refs=state.message_refs + mids, packet_budget_bytes=budget)
         _, digest = self._packet(updated, snapshot, access)
-        return replace(updated, packet_sha256=digest), False, (changes, len(mids))
+        if self.evidence.validate_scan(scan, access=access) is not True:
+            _deny('lifecycle_authority_changed')
+        return replace(updated, packet_sha256=digest), False, (len(events), len(mids))
 
     def reentry(self, cid, request_id, *, closeout_id, target_window_id, packet_budget_bytes=32768, access):
         if (not _valid_id(closeout_id) or not _valid_id(target_window_id)
