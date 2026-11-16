@@ -81,16 +81,29 @@ async def observe(path, data):
     install_internal(internal, journal, authenticate=internal_auth, enabled=True)
     install_binding(app, enabled=True, provider=provider, expected_access=CTX,
                     expected_origin=ORIGIN)
-    forwarded = []
+    upstream_results = []
+
+    class InterruptedBody(httpx.AsyncByteStream):
+        def __init__(self, prefix):
+            self.prefix = prefix
+
+        async def __aiter__(self):
+            yield self.prefix
+            raise httpx.ReadError('synthetic interrupted status response')
+
+    class ObservedTransport(httpx.ASGITransport):
+        async def handle_async_request(self, request):
+            response = await super().handle_async_request(request)
+            upstream_results.append(response.status_code)
+            if data.get('interrupt_response') and len(upstream_results) == 1:
+                prefix = (await response.aread())[:10]
+                await response.aclose()
+                return httpx.Response(response.status_code, headers=response.headers,
+                                      stream=InterruptedBody(prefix))
+            return response
 
     def factory(**options):
-        async def record(request):
-            forwarded.append(request.url.path)
-        return httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=internal),
-            event_hooks={'request': [record]},
-            **options,
-        )
+        return httpx.AsyncClient(transport=ObservedTransport(app=internal), **options)
 
     install_proxy(
         app, enabled=True, authenticate=provider.authenticate, expected_access=CTX,
@@ -106,7 +119,8 @@ async def observe(path, data):
     return {
         'binding': [binding.status_code, binding.json()],
         'status': [status.status_code, status.json()],
-        'forwarded': len(forwarded),
+        'forwarded': len(upstream_results),
+        'upstream_results': upstream_results,
     }
 
 
@@ -176,12 +190,13 @@ class RecoveryRestartTests(unittest.TestCase):
             input=json.dumps(self.reference), capture_output=True, text=True, timeout=20,
         )
 
-    def observe_new_process(self):
+    def observe_new_process(self, *, interrupt_response=False):
         result = subprocess.run(
             [sys.executable, '-c',
              'import sys; from backend.tests.test_session_lifecycle_recovery_restart '
              'import worker; worker(sys.argv[1])', str(self.path)],
-            input=json.dumps({'epoch': self.epoch.value, 'reference': self.reference}),
+            input=json.dumps({'epoch': self.epoch.value, 'reference': self.reference,
+                              'interrupt_response': interrupt_response}),
             capture_output=True, text=True, check=True, timeout=20,
         )
         return json.loads(result.stdout)
@@ -276,3 +291,23 @@ class RecoveryRestartTests(unittest.TestCase):
         self.assertEqual(list(self.h.conn.iterdump()), rows)
         self.assertEqual(self.h.conn.execute('SELECT * FROM messages ORDER BY id').fetchall(), messages)
         self.assertEqual(self.path.with_suffix('.json').read_bytes(), config)
+
+    def test_interrupted_status_body_requires_explicit_recheck_of_same_receipt(self):
+        activate(self.h, self.journal, self.reference)
+        rows = list(self.h.conn.iterdump())
+        config_path = self.path.with_suffix('.json')
+        config = config_path.read_bytes()
+
+        interrupted = self.observe_new_process(interrupt_response=True)
+        self.assertEqual(interrupted['binding'][0], 200, interrupted)
+        self.assertEqual(interrupted['upstream_results'], [200])
+        self.assertEqual(interrupted['forwarded'], 1)
+        self.assertEqual(interrupted['status'], [503, {'ok': False, 'error': 'status_unavailable'}])
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+
+        rechecked = self.observe_new_process()
+        self.assert_historical(rechecked)
+        self.assertEqual(rechecked['binding'], interrupted['binding'])
+        self.assertEqual(rechecked['upstream_results'], [200])
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+        self.assertEqual(config_path.read_bytes(), config)

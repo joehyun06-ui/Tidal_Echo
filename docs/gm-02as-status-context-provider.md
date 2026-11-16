@@ -143,6 +143,13 @@ historical result. Replaying that same activation ID returns its original
 revision with no additional writes. Both cases use a synthetic runtime
 receipt and keep the original logical conversation.
 
+An offline transport test interrupts the response body after the internal
+status route finds the historical receipt. The proxy returns unavailable
+after one upstream query. A fresh process explicitly rechecks the same
+reference and gets the original revision. Both checks leave canonical rows
+and config unchanged. This uses an injected stream error, not live network
+failure or model runtime validation.
+
 Cooperative generation is not an independent rollback/latestness bound, and
 the two read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must
