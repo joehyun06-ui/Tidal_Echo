@@ -217,6 +217,21 @@ def _binding(conn, view, state):
             fail('lifecycle_message_scope_changed')
 
 
+def _verify_prepared_messages(conn, old, state, receipt):
+    """Check the complete canonical delta before persisting a prepared packet."""
+    rows = conn.execute(
+        "SELECT id FROM messages WHERE id>? AND kind IN ('user','voice','reply') "
+        "AND json_extract(meta,'$.api_session')=? ORDER BY id LIMIT 129",
+        (old.message_cursor, state.version_id),
+    )
+    # One row beyond the reference budget is enough to reject a truncated page.
+    ids = tuple(row[0] for row in rows)
+    head = ids[-1] if ids else old.message_cursor
+    if (state.message_cursor != head or state.message_refs != old.message_refs + ids
+            or receipt.new_message_refs != len(ids)):
+        fail('lifecycle_message_delta_incomplete')
+
+
 class _Transaction:
     def __init__(self, conn, view, *, readonly=False):
         self.conn, self.view, self.active, self.saved = conn, view, True, False
@@ -260,6 +275,10 @@ class _Transaction:
         _binding(self.conn, self.view, state)
         old = self.load()
         if (old.revision if old else 0) != expected_revision: return False
+        if state.phase == 'prepared':
+            if old is None or old.phase not in ('closed', 'prepared'):
+                fail('lifecycle_phase_conflict')
+            _verify_prepared_messages(self.conn, old, state, receipt)
         if self.receipt(receipt.request_id) is not None: fail('lifecycle_request_conflict')
         args = (state.revision, record_json, checksum(record_json), state.conversation_id)
         if expected_revision:

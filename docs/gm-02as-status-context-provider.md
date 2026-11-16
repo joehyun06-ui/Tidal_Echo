@@ -157,6 +157,13 @@ or calling the sender. The same recorded attempt may still be replayed
 without calling the sender, and activation still uses its separate receipt
 and consumed-cursor checks.
 
+Before storing a new or refreshed reentry packet, the canonical SQLite
+transaction compares its message delta with the ordered user, voice and reply
+IDs for the selected version after the previous cursor. A missing ID or a
+reported head behind that canonical range aborts both the packet and its
+operation receipt. This checks newly persisted deltas and neither audits old
+packets nor establishes provider consumption of message or G3 source cursors.
+
 Cooperative generation is not an independent rollback/latestness bound, and
 the two read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must
