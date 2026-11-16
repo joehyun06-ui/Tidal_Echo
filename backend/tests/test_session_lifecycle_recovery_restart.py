@@ -30,6 +30,7 @@ from backend.tests.test_session_lifecycle_activation_http import fixture
 from backend.tests.test_session_lifecycle_coordination import validator
 from backend.tests.test_session_lifecycle_history_http import TOKEN, original_auth
 from backend.tests.test_session_lifecycle_status_context import BROWSER, KEY, ORIGIN
+from backend.tests.test_session_lifecycle_storage import FileHarness, Proxy
 
 
 LOGIN = AuthenticatedLogin(CTX.principal_id, 'L' * 32)
@@ -116,13 +117,38 @@ def worker(path):
         print(json.dumps(asyncio.run(observe(Path(path), data))))
 
 
+def activate(harness, journal, reference):
+    return activate_recorded_attempt(
+        harness.engine, journal, CID, reference['activation_request_id'],
+        attempt_request_id=reference['attempt_request_id'],
+        packet_sha256=reference['packet_sha256'], access=CTX, enabled=True,
+    )
+
+
+def activation_worker(path, checkpoint):
+    reference = json.load(sys.stdin)
+    with patch.object(socket.socket, 'connect', side_effect=AssertionError('offline')), \
+            patch('socket.getaddrinfo', side_effect=AssertionError('offline')):
+        harness = FileHarness(path, seed=False)
+        try:
+            journal = WindowAttemptJournal(harness.repo, enabled=True)
+            if checkpoint != 'replay':
+                harness.connection_wrapper = lambda conn: Proxy(
+                    conn, **{checkpoint: lambda: os._exit(71)},
+                )
+            receipt = activate(harness, journal, reference)
+            print(json.dumps({'replayed': receipt.replayed, 'revision': receipt.revision_applied}))
+        finally:
+            harness.conn.close()
+
+
 @unittest.skipUnless(os.name == 'posix', 'canonical coordinator uses POSIX locks')
 class RecoveryRestartTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / 'canonical.sqlite'
-        self.h, journal, self.reference = fixture(self.path)
+        self.h, self.journal, self.reference = fixture(self.path)
         self.addCleanup(self.h.conn.close)
         self.enterContext(patch.dict(os.environ, {'MEMORY_TRUSTED_AUTH_EPOCH_ENABLED': 'true'}))
         with closing(channel_store.connect(self.path)) as database:
@@ -134,17 +160,21 @@ class RecoveryRestartTests(unittest.TestCase):
         self.registry = AuthEpochRegistry(path=self.path, identity_provider=lambda: LOGIN)
         self.epoch = self.registry.issue_after_authenticated_login()
         state = self.h.record()
-        journal.record_attempt(
+        self.journal.record_attempt(
             CID, self.reference['attempt_request_id'], packet_sha256=state.packet_sha256,
             expected_revision=state.revision, access=CTX,
         )
         self.h.confirm()
-        activate_recorded_attempt(
-            self.h.engine, journal, CID, self.reference['activation_request_id'],
-            attempt_request_id=self.reference['attempt_request_id'],
-            packet_sha256=state.packet_sha256, access=CTX, enabled=True,
+        self.revision = state.revision + 1
+
+    def run_activation(self, checkpoint):
+        return subprocess.run(
+            [sys.executable, '-c',
+             'import sys; from backend.tests.test_session_lifecycle_recovery_restart '
+             'import activation_worker; activation_worker(sys.argv[1], sys.argv[2])',
+             str(self.path), checkpoint],
+            input=json.dumps(self.reference), capture_output=True, text=True, timeout=20,
         )
-        self.revision = self.h.record().revision
 
     def observe_new_process(self):
         result = subprocess.run(
@@ -168,6 +198,7 @@ class RecoveryRestartTests(unittest.TestCase):
         self.assertEqual(result['forwarded'], 1)
 
     def test_restart_preserves_binding_and_historical_receipt_then_refuses_revoked_epoch(self):
+        activate(self.h, self.journal, self.reference)
         rows = list(self.h.conn.iterdump())
         config = self.path.with_suffix('.json').read_bytes()
         first = self.observe_new_process()
@@ -183,6 +214,7 @@ class RecoveryRestartTests(unittest.TestCase):
         self.assertEqual(revoked['forwarded'], 0)
 
     def test_online_backup_restores_wal_receipt_at_original_canonical_path(self):
+        activate(self.h, self.journal, self.reference)
         rows = list(self.h.conn.iterdump())
         config_path = self.path.with_suffix('.json')
         config = config_path.read_bytes()
@@ -206,3 +238,41 @@ class RecoveryRestartTests(unittest.TestCase):
         with closing(channel_store.connect_read_only(self.path, timeout_seconds=3)) as database:
             self.assertEqual(list(database.iterdump()), rows)
         self.assertEqual(config_path.read_bytes(), config)
+
+    def test_process_exit_before_activation_commit_keeps_prepared_state_and_messages(self):
+        before = list(self.h.conn.iterdump())
+        config = self.path.with_suffix('.json').read_bytes()
+        crashed = self.run_activation('before')
+        self.assertEqual(crashed.returncode, 71, crashed.stderr)
+        self.assertEqual(crashed.stdout, '')
+
+        observed = self.observe_new_process()
+        self.assertEqual(observed['binding'][0], 200, observed)
+        self.assertEqual(observed['status'][0], 200, observed)
+        self.assertEqual(observed['status'][1]['state'], 'unconfirmed')
+        self.assertIs(observed['status'][1]['retry_authorized'], False)
+        self.assertEqual(self.h.record().phase, 'prepared')
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+        self.assertEqual(self.path.with_suffix('.json').read_bytes(), config)
+
+    def test_process_exit_after_activation_commit_recovers_without_duplicate_write(self):
+        before = self.h.record()
+        messages = self.h.conn.execute('SELECT * FROM messages ORDER BY id').fetchall()
+        config = self.path.with_suffix('.json').read_bytes()
+        crashed = self.run_activation('after')
+        self.assertEqual(crashed.returncode, 71, crashed.stderr)
+        self.assertEqual(crashed.stdout, '')
+
+        observed = self.observe_new_process()
+        self.assert_historical(observed)
+        committed = self.h.record()
+        self.assertEqual(committed.conversation_id, CID)
+        self.assertEqual(committed.window_id, before.target_window_id)
+        self.assertEqual(committed.pending, before.pending)
+        rows = list(self.h.conn.iterdump())
+        replay = self.run_activation('replay')
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(json.loads(replay.stdout), {'replayed': True, 'revision': self.revision})
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+        self.assertEqual(self.h.conn.execute('SELECT * FROM messages ORDER BY id').fetchall(), messages)
+        self.assertEqual(self.path.with_suffix('.json').read_bytes(), config)

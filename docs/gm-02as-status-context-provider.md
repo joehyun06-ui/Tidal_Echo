@@ -135,6 +135,14 @@ covers a local paired fixture, with the writer stopped for restore. It does not
 establish live backup consistency across SQLite and JSON, production volume
 recovery, or immunity to restoring an old authorization snapshot.
 
+Two process fault cases stop a disposable writer at the actual activation
+commit boundary. Before commit, the next process reports unconfirmed and the
+prepared state and original message rows remain intact. After commit, before
+the caller receives an acknowledgement, the next process reports the persisted
+historical result. Replaying that same activation ID returns its original
+revision with no additional writes. Both cases use a synthetic runtime
+receipt and keep the original logical conversation.
+
 Cooperative generation is not an independent rollback/latestness bound, and
 the two read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must
