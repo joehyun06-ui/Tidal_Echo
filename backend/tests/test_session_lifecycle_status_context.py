@@ -451,6 +451,60 @@ class StatusContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json(), {'ok': False, 'error': 'access_denied'})
 
+    async def test_recovery_binding_refuses_grant_removed_at_last_host_login_check(self):
+        def revoke(count):
+            if count == 3:
+                self.allowed.remove(CID)
+
+        self.login_hook = revoke
+        path = recovery_binding.PATH.replace('{conversation_id}', CID)
+        async with self.binding_client() as client:
+            response = await client.post(path)
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json(), {'ok': False, 'error': 'access_denied'})
+
+    async def test_binding_refuses_canonical_change_at_last_host_login_check(self):
+        def change(count):
+            if count == 3:
+                self.patch_config('final-login-change', pinned=True)
+
+        self.login_hook = change
+        await self.denied(lambda: self.provider.binding(request(), CID), 403)
+
+    async def test_gateway_refuses_late_grant_removal_without_returning_status(self):
+        upstream_requests = []
+        calls_after_lookup = 0
+
+        def revoke(count):
+            nonlocal calls_after_lookup
+            if upstream_requests:
+                calls_after_lookup += 1
+                if calls_after_lookup == 3:
+                    self.allowed.remove(CID)
+
+        async def upstream(incoming):
+            upstream_requests.append(incoming)
+            return httpx.Response(200, json={
+                'ok': True, 'state': 'attempt_missing', 'historical': False,
+                'revision_applied': None, 'window_confirmed_at_apply': False,
+                'current_window_confirmed': False, 'reply_completed': False,
+                'retry_authorized': False,
+            })
+
+        self.login_hook = revoke
+        app = FastAPI()
+        install(app, enabled=True, authenticate=self.provider.authenticate, expected_access=CTX,
+                expected_origin=ORIGIN, base_url='http://127.0.0.1:3020', internal_token=TOKEN,
+                client_factory=lambda **options: httpx.AsyncClient(
+                    transport=httpx.MockTransport(upstream), **options))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url='https://relay.synthetic.invalid') as client:
+            response = await client.post(PATH.replace('{conversation_id}', CID), json=self.body,
+                                         headers={'authorization': BROWSER, 'origin': ORIGIN})
+        self.assertEqual(len(upstream_requests), 1)
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json(), {'ok': False, 'error': 'access_denied'})
+
     async def test_gateway_refuses_epoch_rotation_after_upstream_observation(self):
         internal=FastAPI();check=original_auth()
         def internal_auth(incoming):check(incoming);return CTX

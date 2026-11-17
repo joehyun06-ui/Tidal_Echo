@@ -166,6 +166,11 @@ class RecoveryStatusContextProvider:
                 raise HTTPException(403)
             if await self._login(request) != first:
                 raise HTTPException(403)
+            # Host authentication can yield while a different worker changes
+            # session ownership, selected version, or grants. Recheck under
+            # the same canonical read gate after that await.
+            if await asyncio.to_thread(self._capture, first, conversation_id) != after:
+                raise HTTPException(403)
             # A WAL snapshot cannot observe a logout committed by another
             # worker after that snapshot began.
             await asyncio.to_thread(registry.assert_current, first.epoch)

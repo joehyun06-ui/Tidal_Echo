@@ -21,7 +21,7 @@ main table cannot silently fall back to an attached database.
 
 The provider requires coordinator.canonical_path and epoch_path to match. The
 same SQLite read transaction observes the epoch and canonical state; the existing
-cooperative gate fences private JSON/config and known writers. Both canonical
+cooperative gate fences private JSON/config and known writers. All canonical
 captures are query-only, and the provider never bootstraps, repairs, recovers or
 issues an epoch. Existing epoch write APIs are used only in test setup/fault
 injection, never in provider code.
@@ -65,9 +65,10 @@ physically cancel every SQLite read or host callback.
 For each binding the provider authenticates and verifies the durable epoch,
 captures canonical state, resamples the authenticated login, verifies epoch again,
 and captures canonical state again. Login/epoch or snapshot differences deny the
-binding. After the final snapshot closes, the provider checks host
-authentication again to catch expiry or a credential change. A fresh epoch
-read then observes logout or rotation committed while that WAL snapshot was open.
+binding. The provider then rechecks host authentication for expiry or a credential
+change and takes one more canonical snapshot to detect grants or session state
+that changed during that check. A fresh epoch read observes logout or rotation
+committed while the last WAL snapshot was open.
 AR already calls authenticate before body, after body and after upstream
 observation; its comparisons therefore use these real provider labels.
 
@@ -180,7 +181,7 @@ still return its original receipt. The attempt check ends at commit; the
 external sender still relies on the host's existing authority fence.
 
 Cooperative generation is not an independent rollback/latestness bound, and
-the two read transactions plus final response check are not a durable write grant
+the read transactions plus final response check are not a durable write grant
 or atomic revocation lock through HTTP delivery. The upstream scope still must
 be independently verified against AR's expected_access. Runtime/provider consumed
 cursors, current-window confirmation, safe automatic switching and reply completion
