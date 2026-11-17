@@ -300,7 +300,7 @@ class SessionLifecycle:
                         if self.authority.validate(snapshot, access=access) is not True:
                             _deny('lifecycle_authority_changed')
                         return replace(old, replayed=True)
-                    updated, confirmed, counts = handler(state, snapshot, binding)
+                    updated, confirmed, counts, source_scan = handler(state, snapshot, binding)
                     revision = (state.revision if state else 0) + 1
                     updated = replace(updated, revision=revision)
                     receipt = LifecycleReceipt(rid, digest, revision, updated.phase, confirmed, *counts)
@@ -308,6 +308,8 @@ class SessionLifecycle:
                         transaction_guard(tx, state, snapshot, binding)
                     if self.authority.validate(snapshot, access=access) is not True:
                         _deny('lifecycle_authority_changed')
+                    if source_scan is not None:
+                        self._check_source_scan(source_scan, access)
                     if not tx.save(revision - 1, updated, receipt):
                         _deny('lifecycle_commit_conflict')
                 return receipt
@@ -349,7 +351,7 @@ class SessionLifecycle:
                     closeout_checks=('stream_idle', 'tool_idle', 'dispatch_known'),
                     closeout_evidence_candidates=snapshot.anchor_event_ids + snapshot.recent_event_ids,
                     summary_candidates=summary_candidates)
-            return record, False, (0, 0)
+            return record, False, (0, 0), None
         return self._run(cid, request_id, 'closeout', [window_id, context_epoch, active_state, summary_candidates], access, apply)
 
     def _catch_up(self, state, snapshot, access):
@@ -389,18 +391,28 @@ class SessionLifecycle:
                 return tuple(source_events), tuple(message_refs)
         _deny('lifecycle_budget_exceeded')
 
+    def _start_source_scan(self, state, snapshot, access, *, mismatch='lifecycle_delta_required'):
+        if not all(callable(getattr(self.evidence, method, None))
+                   for method in ('begin_scan', 'validate_scan')):
+            _deny('lifecycle_evidence_unavailable')
+        scan = _begin_scan(self.evidence, state.source_cursor.position, access,
+                           state.access_binding, snapshot.source_head.generation)
+        if scan.upper_cursor != snapshot.source_head.position:
+            _deny(mismatch)
+        return scan
+
+    def _check_source_scan(self, scan, access, *, changed='lifecycle_authority_changed'):
+        if self.evidence.validate_scan(scan, access=access) is not True:
+            _deny(changed)
+
     def _verify_source_delta(self, state, snapshot, access, events):
         adapter = self.evidence
-        if not all(callable(getattr(adapter, method, None))
-                   for method in ('begin_scan', 'read_page', 'validate_scan')):
+        if not callable(getattr(adapter, 'read_page', None)):
             _deny('lifecycle_evidence_unavailable')
-        cursor = state.source_cursor.position
-        scan = _begin_scan(adapter, cursor, access, state.access_binding,
-                           snapshot.source_head.generation)
-        if scan.upper_cursor != snapshot.source_head.position:
-            _deny('lifecycle_source_delta_incomplete')
+        scan = self._start_source_scan(state, snapshot, access,
+                                       mismatch='lifecycle_source_delta_incomplete')
 
-        matched = 0
+        matched, cursor = 0, scan.after_cursor
         for _ in range(100):
             page = _scan_page(adapter, scan, cursor, 100, access)
             end = matched + len(page.events)
@@ -446,9 +458,7 @@ class SessionLifecycle:
                 anchor_refs=tuple(c.source_refs[0] for c in anchors), recent_refs=tuple(c.source_refs[0] for c in recent),
                 message_refs=state.message_refs + mids, packet_budget_bytes=budget)
         _, digest = self._packet(updated, snapshot, access)
-        if self.evidence.validate_scan(scan, access=access) is not True:
-            _deny('lifecycle_authority_changed')
-        return replace(updated, packet_sha256=digest), False, (len(events), len(mids))
+        return replace(updated, packet_sha256=digest), False, (len(events), len(mids)), scan
 
     def reentry(self, cid, request_id, *, closeout_id, target_window_id, packet_budget_bytes=32768, access):
         if (not _valid_id(closeout_id) or not _valid_id(target_window_id)
@@ -497,11 +507,13 @@ class SessionLifecycle:
                     if state is None:
                         _deny('lifecycle_phase_conflict')
                     self._bound(state, snapshot, binding); self._current(state, snapshot)
+                    scan = self._start_source_scan(state, snapshot, access)
                     packet, digest = self._packet(state, snapshot, access)
                     if digest != state.packet_sha256:
                         _deny('lifecycle_packet_changed')
                     if self.authority.validate(snapshot, access=access) is not True:
                         _deny('lifecycle_authority_changed')
+                    self._check_source_scan(scan, access)
                     return packet
         except ProjectionError:
             raise LifecycleError('lifecycle_evidence_unavailable') from None
@@ -514,6 +526,7 @@ class SessionLifecycle:
             if state is None:
                 _deny('lifecycle_phase_conflict')
             self._current(state, snapshot)
+            scan = self._start_source_scan(state, snapshot, access)
             _, digest = self._packet(state, snapshot, access)
             if digest != state.packet_sha256 or packet_sha256 != digest:
                 _deny('lifecycle_packet_changed')
@@ -536,7 +549,7 @@ class SessionLifecycle:
             return replace(state, phase='active', window_id=state.target_window_id, model_run_id=ack.model_run_id,
                     target_window_id=None, context_epoch=state.context_epoch + 1,
                     used_windows=state.used_windows + (state.target_window_id,),
-                    used_model_runs=state.used_model_runs + (ack.model_run_id,)), True, (0, 0)
+                    used_model_runs=state.used_model_runs + (ack.model_run_id,)), True, (0, 0), scan
         op = 'activate_recorded' if _attempt_guard is not None else 'activate'
         payload = [packet_sha256, _attempt_request_id] if _attempt_guard is not None else packet_sha256
         return self._run(cid, request_id, op, payload, access, apply,

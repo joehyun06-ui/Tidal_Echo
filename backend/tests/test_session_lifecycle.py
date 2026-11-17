@@ -576,6 +576,38 @@ class LifecycleTests(unittest.TestCase):
         self.delta('delta_2')
         self.assertEqual(self.h.engine.packet(CID, access=CTX).recent, ())
 
+    def test_prepare_does_not_commit_if_g3_authorization_changes_at_final_validation(self):
+        self.closeout()
+        before = self.h.record()
+        self.h.validation_hook = self.bump_g3_authorization
+        self.rejects(lambda: self.h.engine.reentry(CID, 'prepare_1', closeout_id='close_1',
+                     target_window_id='window_1', access=CTX), 'lifecycle_authority_changed')
+        self.assertEqual(self.h.record(), before)
+        self.h.validation_hook = None
+        receipt = self.h.engine.reentry(CID, 'prepare_1', closeout_id='close_1',
+                                       target_window_id='window_1', access=CTX)
+        self.assertFalse(receipt.replayed)
+
+    def bump_g3_authorization(self):
+        # An independent provider can advance its grant version even when the
+        # canonical session snapshot still has the same visible metadata.
+        self.h.g3.authorization += 1
+
+    def test_packet_refuses_g3_authorization_change_during_final_validation(self):
+        self.prepare()
+        self.h.validation_hook = self.bump_g3_authorization
+        self.rejects(lambda: self.h.engine.packet(CID, access=CTX), 'lifecycle_authority_changed')
+
+    def test_activation_does_not_commit_when_g3_authorization_changes_during_validation(self):
+        self.prepare()
+        self.h.confirm()
+        before = self.h.record()
+        self.h.validation_hook = self.bump_g3_authorization
+        self.rejects(self.activate, 'lifecycle_authority_changed')
+        self.assertEqual(self.h.record(), before)
+        self.h.validation_hook = None
+        self.assertFalse(self.activate().replayed)
+
     def test_source_generation_and_cursor_rollback_are_rejected(self):
         self.prepare()
         runtime = self.h.get('runtime'); runtime['generation'] = 'different'; self.h.put('runtime', runtime)

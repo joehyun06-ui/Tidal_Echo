@@ -121,6 +121,25 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(self.run_attempt().replayed)
         self.assertEqual(self.calls,[])
 
+    def test_postcommit_g3_authorization_change_has_no_callback_and_keeps_record(self):
+        parent = self.h.validate
+        calls = []
+
+        def validate(snapshot, *, access):
+            calls.append(1)
+            if len(calls) == 3:
+                self.h.g3.authorization += 1
+            return parent(snapshot, access=access)
+
+        with patch.object(self.h, 'validate', side_effect=validate):
+            self.rejects(self.run_attempt, 'lifecycle_authority_changed_after_commit')
+        self.assertEqual(self.calls, [])
+        observation = self.journal.inspect(CID, 'attempt_1', access=CTX)
+        self.assertEqual(observation.outcome, 'unknown')
+        self.assertFalse(observation.dispatch_authorized)
+        self.assertTrue(self.run_attempt().replayed)
+        self.assertEqual(self.calls, [])
+
     def test_stale_packet_or_busy_runtime_has_no_callback(self):
         self.h.source('event_2','synthetic new evidence')
         self.rejects(self.run_attempt,'lifecycle_delta_required')
