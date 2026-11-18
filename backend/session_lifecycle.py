@@ -139,7 +139,11 @@ class ReentryPacket:
     recent: tuple[ProjectionCard, ...]
     summary_candidates: tuple[str, ...] = ()
     authority: str = 'derived'
-    source_authorization_epoch: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class AuthorityBoundReentryPacket(ReentryPacket):
+    source_authorization_epoch: str
 
 
 @dataclass(frozen=True)
@@ -449,15 +453,16 @@ class SessionLifecycle:
         if (tuple(c.source_refs[0] for c in anchors) != state.anchor_refs
                 or tuple(c.source_refs[0] for c in recent) != state.recent_refs):
             _deny('lifecycle_delta_required')
-        packet = ReentryPacket(state.conversation_id, state.provider, state.version_id, state.window_id,
+        packet_type = ReentryPacket
+        authority_binding = {}
+        if state.source_authorization_epoch is not None:
+            packet_type = AuthorityBoundReentryPacket
+            authority_binding['source_authorization_epoch'] = state.source_authorization_epoch
+        packet = packet_type(state.conversation_id, state.provider, state.version_id, state.window_id,
                 state.target_window_id, state.context_epoch + 1, state.source_cursor, state.message_cursor,
-                state.pending, state.active_state, state.message_refs, anchors, recent)
-        packet = replace(packet, summary_candidates=state.summary_candidates,
-                         source_authorization_epoch=state.source_authorization_epoch)
-        payload = asdict(packet)
-        if packet.source_authorization_epoch is None:
-            del payload['source_authorization_epoch']
-        raw = _json(payload)
+                state.pending, state.active_state, state.message_refs, anchors, recent,
+                summary_candidates=state.summary_candidates, **authority_binding)
+        raw = _json(asdict(packet))
         if len(raw) > state.packet_budget_bytes:
             _deny('lifecycle_budget_exceeded')
         return packet, hashlib.sha256(raw).hexdigest()
