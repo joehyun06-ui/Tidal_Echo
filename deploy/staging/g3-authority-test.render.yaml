@@ -1,0 +1,23 @@
+services:
+  - type: pserv
+    name: g3-authority-test
+    runtime: python
+    region: oregon
+    plan: 0.5c-512mb
+    branch: codex/g3-authority-test-20261118
+    autoDeployTrigger: 'off'
+    buildCommand: python -m compileall -q services/g3_authority
+    startCommand: python -m services.g3_authority.start
+    disk:
+      name: g3-authority-test-data
+      mountPath: /var/data/g3-authority-test
+      sizeGB: 1
+    envVars:
+      - key: G3_AUTHORITY_TEST
+        value: '1'
+      - key: G3_TEST_ACCEPTANCE
+        value: '1'
+      - key: G3_TEST_READER_TOKEN
+        generateValue: true
+      - key: G3_TEST_ADMIN_TOKEN
+        generateValue: true

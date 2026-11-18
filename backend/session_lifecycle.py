@@ -119,6 +119,7 @@ class LifecycleRecord:
     message_refs: tuple[int, ...] = ()
     packet_sha256: str | None = None
     packet_budget_bytes: int = 32768
+    source_authorization_epoch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,7 @@ class ReentryPacket:
     recent: tuple[ProjectionCard, ...]
     summary_candidates: tuple[str, ...] = ()
     authority: str = 'derived'
+    source_authorization_epoch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -300,7 +302,7 @@ class SessionLifecycle:
                         if self.authority.validate(snapshot, access=access) is not True:
                             _deny('lifecycle_authority_changed')
                         return replace(old, replayed=True)
-                    updated, confirmed, counts, source_scan = handler(state, snapshot, binding)
+                    updated, confirmed, counts, source_scan = handler(tx, state, snapshot, binding)
                     revision = (state.revision if state else 0) + 1
                     updated = replace(updated, revision=revision)
                     receipt = LifecycleReceipt(rid, digest, revision, updated.phase, confirmed, *counts)
@@ -332,7 +334,7 @@ class SessionLifecycle:
         if (not isinstance(summary_candidates, tuple) or len(summary_candidates) > 8
                 or any(not isinstance(text, str) or len(text) > 2048 for text in summary_candidates)):
             _deny()
-        def apply(state, snapshot, binding):
+        def apply(_tx, state, snapshot, binding):
             if state is not None and state.phase != 'active':
                 _deny('lifecycle_phase_conflict')
             if (snapshot.window_id != window_id or snapshot.context_epoch != context_epoch
@@ -391,7 +393,8 @@ class SessionLifecycle:
                 return tuple(source_events), tuple(message_refs)
         _deny('lifecycle_budget_exceeded')
 
-    def _start_source_scan(self, state, snapshot, access, *, mismatch='lifecycle_delta_required'):
+    def _start_source_scan(self, state, snapshot, access, *, mismatch='lifecycle_delta_required',
+                           preparing=False):
         if not all(callable(getattr(self.evidence, method, None))
                    for method in ('begin_scan', 'validate_scan')):
             _deny('lifecycle_evidence_unavailable')
@@ -399,6 +402,12 @@ class SessionLifecycle:
                            state.access_binding, snapshot.source_head.generation)
         if scan.upper_cursor != snapshot.source_head.position:
             _deny(mismatch)
+        if not preparing:
+            epoch = state.source_authorization_epoch
+            if epoch is None and getattr(self.evidence, 'require_authorization_epoch', False) is True:
+                _deny('lifecycle_source_authorization_changed')
+            if epoch is not None and epoch != scan.authorization_epoch:
+                _deny('lifecycle_source_authorization_changed')
         return scan
 
     def _check_source_scan(self, scan, access, *, changed='lifecycle_authority_changed'):
@@ -410,7 +419,7 @@ class SessionLifecycle:
         if not callable(getattr(adapter, 'read_page', None)):
             _deny('lifecycle_evidence_unavailable')
         scan = self._start_source_scan(state, snapshot, access,
-                                       mismatch='lifecycle_source_delta_incomplete')
+                                       mismatch='lifecycle_source_delta_incomplete', preparing=True)
 
         matched, cursor = 0, scan.after_cursor
         for _ in range(100):
@@ -443,8 +452,12 @@ class SessionLifecycle:
         packet = ReentryPacket(state.conversation_id, state.provider, state.version_id, state.window_id,
                 state.target_window_id, state.context_epoch + 1, state.source_cursor, state.message_cursor,
                 state.pending, state.active_state, state.message_refs, anchors, recent)
-        packet = replace(packet, summary_candidates=state.summary_candidates)
-        raw = _json(asdict(packet))
+        packet = replace(packet, summary_candidates=state.summary_candidates,
+                         source_authorization_epoch=state.source_authorization_epoch)
+        payload = asdict(packet)
+        if packet.source_authorization_epoch is None:
+            del payload['source_authorization_epoch']
+        raw = _json(payload)
         if len(raw) > state.packet_budget_bytes:
             _deny('lifecycle_budget_exceeded')
         return packet, hashlib.sha256(raw).hexdigest()
@@ -453,10 +466,13 @@ class SessionLifecycle:
         events, mids = self._catch_up(state, snapshot, access)
         scan = self._verify_source_delta(state, snapshot, access, events)
         anchors, recent = self._cards(snapshot, access)
+        epoch = (scan.authorization_epoch
+                 if getattr(self.evidence, 'require_authorization_epoch', False) is True else None)
         updated = replace(state, phase='prepared', target_window_id=target, source_cursor=snapshot.source_head,
                 message_cursor=snapshot.message_head, pending=snapshot.pending,
                 anchor_refs=tuple(c.source_refs[0] for c in anchors), recent_refs=tuple(c.source_refs[0] for c in recent),
-                message_refs=state.message_refs + mids, packet_budget_bytes=budget)
+                message_refs=state.message_refs + mids, packet_budget_bytes=budget,
+                source_authorization_epoch=epoch)
         _, digest = self._packet(updated, snapshot, access)
         return replace(updated, packet_sha256=digest), False, (len(events), len(mids)), scan
 
@@ -464,7 +480,7 @@ class SessionLifecycle:
         if (not _valid_id(closeout_id) or not _valid_id(target_window_id)
                 or type(packet_budget_bytes) is not int or not 1 <= packet_budget_bytes <= 65536):
             _deny()
-        def apply(state, snapshot, _):
+        def apply(_tx, state, snapshot, _binding):
             if state is None or state.phase != 'closed' or state.closeout_id != closeout_id:
                 _deny('lifecycle_phase_conflict')
             if target_window_id in state.used_windows or len(state.used_windows) >= 128:
@@ -477,7 +493,7 @@ class SessionLifecycle:
                 or type(after_source.position) is not int or after_source.position < 0
                 or type(after_message) is not int or after_message < 0):
             _deny()
-        def apply(state, snapshot, _):
+        def apply(_tx, state, snapshot, _binding):
             if state is None or state.phase != 'prepared':
                 _deny('lifecycle_phase_conflict')
             if (state.source_cursor, state.message_cursor) != (after_source, after_message):
@@ -494,15 +510,20 @@ class SessionLifecycle:
             _deny('lifecycle_delta_required')
 
     def packet(self, cid, *, access):
+        return self._read_packet(cid, access=access)
+
+    def _read_packet(self, cid, *, access, materialize=None):
+        """Run optional context assembly in the canonical read snapshot."""
         if not self.enabled:
             _deny('lifecycle_disabled')
         if not _session_id(cid):
             _deny()
         binding = _binding(access)
+        read = self.repository.transaction if materialize is None else self.repository.observation
         try:
             with self.authority.fence(cid, access=access) as snapshot:
                 self._snapshot(snapshot, cid)
-                with self.repository.transaction(cid) as tx:
+                with read(cid) as tx:
                     state = tx.load()
                     if state is None:
                         _deny('lifecycle_phase_conflict')
@@ -511,10 +532,11 @@ class SessionLifecycle:
                     packet, digest = self._packet(state, snapshot, access)
                     if digest != state.packet_sha256:
                         _deny('lifecycle_packet_changed')
+                    result = packet if materialize is None else materialize(tx, packet, digest)
                     if self.authority.validate(snapshot, access=access) is not True:
                         _deny('lifecycle_authority_changed')
                     self._check_source_scan(scan, access)
-                    return packet
+                    return result
         except ProjectionError:
             raise LifecycleError('lifecycle_evidence_unavailable') from None
 
@@ -522,15 +544,17 @@ class SessionLifecycle:
                  _attempt_guard=None, _attempt_request_id=None):
         if not isinstance(packet_sha256, str) or len(packet_sha256) != 64:
             _deny()
-        def apply(state, snapshot, _):
+        def apply(tx, state, snapshot, _binding):
             if state is None:
                 _deny('lifecycle_phase_conflict')
             self._current(state, snapshot)
             scan = self._start_source_scan(state, snapshot, access)
-            _, digest = self._packet(state, snapshot, access)
+            packet, digest = self._packet(state, snapshot, access)
             if digest != state.packet_sha256 or packet_sha256 != digest:
                 _deny('lifecycle_packet_changed')
-            ack = self.runtime.read_receipt(digest, access=access)
+            in_transaction = getattr(self.runtime, "read_receipt_in_transaction", None)
+            ack = (self.runtime.read_receipt(digest, access=access) if in_transaction is None
+                   else in_transaction(tx, packet, digest, access=access))
             if not isinstance(ack, WindowReceipt) or ack.status == 'unknown':
                 _deny('lifecycle_confirmation_unknown')
             if ack.status != 'confirmed':
