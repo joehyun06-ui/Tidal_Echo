@@ -1,0 +1,7 @@
+{
+  "name": "guiting-g3-formal-test-issuer",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "dependencies": {"oidc-provider": "9.15.0"}
+}
