@@ -71,6 +71,18 @@ def _valid_string(value: object, pattern: re.Pattern[str]) -> bool:
     return type(value) is str and pattern.fullmatch(value) is not None
 
 
+def _assert_epoch_row(conn, identity, epoch):
+    row = conn.execute(
+        """SELECT epoch_sha256, revoked FROM main.memory_auth_epoch_v1
+           WHERE principal_id=? AND login_id=?""",
+        (identity.principal_id, identity.login_id),
+    ).fetchone()
+    digest = hashlib.sha256(epoch.value.encode('ascii')).hexdigest()
+    if (row is None or row[1] != 0 or type(row[0]) is not str
+            or not hmac.compare_digest(digest, row[0])):
+        raise AuthEpochError()
+
+
 class AuthEpochRegistry:
     """SQLite-backed lifecycle for *already-authenticated* server logins.
 
@@ -169,20 +181,33 @@ class AuthEpochRegistry:
         try:
             conn = sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True, timeout=3)
             try:
-                row = conn.execute(
-                    """SELECT epoch_sha256, revoked FROM memory_auth_epoch_v1
-                       WHERE principal_id=? AND login_id=?""",
-                    (identity.principal_id, identity.login_id),
-                ).fetchone()
+                _assert_epoch_row(conn, identity, epoch)
             finally:
                 conn.close()
-            digest = hashlib.sha256(epoch.value.encode("ascii")).hexdigest()
-            if (
-                row is None or row[1] != 0 or type(row[0]) is not str
-                or not hmac.compare_digest(digest, row[0])
-            ):
-                raise AuthEpochError()
         except (sqlite3.Error, ValueError, TypeError):
+            raise AuthEpochError() from None
+
+    def assert_current_in_read_transaction(self, conn, epoch: ServerIssuedEpoch) -> None:
+        """Verify in a caller-owned query-only transaction on THIS database.
+
+        No BEGIN/COMMIT, DDL or writes. This is a point-in-time read, not a
+        commit-time permission, login proof or an independent rollback bound.
+        The caller owns connection lifetime and canonical-data read fencing.
+        """
+        identity = self._identity()
+        if type(epoch) is not ServerIssuedEpoch or not _valid_string(epoch.value, _EPOCH):
+            raise AuthEpochError()
+        try:
+            if (not isinstance(conn, sqlite3.Connection) or not conn.in_transaction
+                    or conn.execute('PRAGMA query_only').fetchone()[0] != 1):
+                raise AuthEpochError()
+            path = next((row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main'), '')
+            if not path or Path(path).resolve() != self._path.resolve():
+                raise AuthEpochError()
+            _assert_epoch_row(conn, identity, epoch)
+            if identity != self._identity():
+                raise AuthEpochError()
+        except (sqlite3.Error, ValueError, TypeError, OSError, RuntimeError):
             raise AuthEpochError() from None
 
     def revoke_before_logout(self) -> bool:

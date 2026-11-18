@@ -89,6 +89,7 @@ class Harness:
                               (2, 'anchor_1', b'synthetic reviewed anchor', json.dumps({'layer':'fixed','reviewed':True})))
             runtime = self.get('runtime'); runtime['observed_source'] = 2; self.put('runtime', runtime)
         self.g3 = SyntheticPagedG3()
+        self.g3.generation = self.get('runtime')['generation']
         for cursor, eid, body, options in self.conn.execute('SELECT * FROM fixture_g3 ORDER BY cursor'):
             self.g3.add_revision(eid, body, cursor=cursor, **json.loads(options))
         self.g3._denied = set(tuple(v) for v in self.get('runtime')['denied'])
@@ -451,6 +452,47 @@ class LifecycleTests(unittest.TestCase):
         self.h.page_hook = None
         self.assertEqual(self.delta().source_changes, 2)
 
+    def test_visible_source_revision_cannot_be_skipped_by_advancing_delta_page(self):
+        self.prepare()
+        old = self.h.record()
+        skipped = self.h.source('event_2', 'synthetic skipped')
+        self.h.source('event_3', 'synthetic last')
+        self.h.page_hook = lambda page: replace(
+            page, source_events=tuple(event for event in page.source_events if event != skipped),
+        )
+        before = list(self.h.conn.iterdump())
+
+        self.rejects(self.delta, 'lifecycle_source_delta_incomplete')
+        self.assertEqual(self.h.record(), old)
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+        self.h.page_hook = None
+        self.assertEqual(self.delta().source_changes, 2)
+
+    def test_acl_filtered_source_page_may_advance_without_counting_hidden_event(self):
+        self.prepare()
+        hidden = self.h.source('event_hidden', 'synthetic hidden', scope='private_B')
+        self.assertEqual(self.delta().source_changes, 0)
+        self.assertEqual(self.h.record().source_cursor.position, hidden.cursor)
+
+    def test_source_head_must_match_read_only_g3_scan(self):
+        self.prepare()
+        old = self.h.record()
+        self.h.source('event_2', 'synthetic new evidence')
+        self.h.snapshot_hook = lambda snapshot: replace(snapshot, source_head=old.source_cursor)
+        self.rejects(self.delta, 'lifecycle_source_delta_incomplete')
+        self.assertEqual(self.h.record(), old)
+
+    def test_g3_authorization_change_before_commit_leaves_prepared_record_unchanged(self):
+        self.prepare()
+        old = self.h.record()
+        self.h.source('event_2', 'synthetic new evidence')
+        self.h.g3.validate_hook = lambda: self.h.g3.deny(CTX.principal_id, 'private_A')
+        before = list(self.h.conn.iterdump())
+
+        self.rejects(self.delta, 'lifecycle_authority_changed')
+        self.assertEqual(self.h.record(), old)
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+
     def test_duplicate_skipped_reordered_and_boolean_delta_pages_rejected(self):
         self.prepare(); self.h.message(); self.h.source('event_2', 'synthetic 2')
         for changes in ({'message_after':0}, {'source_after':0}, {'message_next':True},
@@ -533,6 +575,38 @@ class LifecycleTests(unittest.TestCase):
         self.rejects(lambda: self.h.engine.packet(CID, access=CTX), 'lifecycle_delta_required')
         self.delta('delta_2')
         self.assertEqual(self.h.engine.packet(CID, access=CTX).recent, ())
+
+    def test_prepare_does_not_commit_if_g3_authorization_changes_at_final_validation(self):
+        self.closeout()
+        before = self.h.record()
+        self.h.validation_hook = self.bump_g3_authorization
+        self.rejects(lambda: self.h.engine.reentry(CID, 'prepare_1', closeout_id='close_1',
+                     target_window_id='window_1', access=CTX), 'lifecycle_authority_changed')
+        self.assertEqual(self.h.record(), before)
+        self.h.validation_hook = None
+        receipt = self.h.engine.reentry(CID, 'prepare_1', closeout_id='close_1',
+                                       target_window_id='window_1', access=CTX)
+        self.assertFalse(receipt.replayed)
+
+    def bump_g3_authorization(self):
+        # An independent provider can advance its grant version even when the
+        # canonical session snapshot still has the same visible metadata.
+        self.h.g3.authorization += 1
+
+    def test_packet_refuses_g3_authorization_change_during_final_validation(self):
+        self.prepare()
+        self.h.validation_hook = self.bump_g3_authorization
+        self.rejects(lambda: self.h.engine.packet(CID, access=CTX), 'lifecycle_authority_changed')
+
+    def test_activation_does_not_commit_when_g3_authorization_changes_during_validation(self):
+        self.prepare()
+        self.h.confirm()
+        before = self.h.record()
+        self.h.validation_hook = self.bump_g3_authorization
+        self.rejects(self.activate, 'lifecycle_authority_changed')
+        self.assertEqual(self.h.record(), before)
+        self.h.validation_hook = None
+        self.assertFalse(self.activate().replayed)
 
     def test_source_generation_and_cursor_rollback_are_rejected(self):
         self.prepare()

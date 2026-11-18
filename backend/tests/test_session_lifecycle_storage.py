@@ -318,6 +318,56 @@ class StorageTests(unittest.TestCase):
         self.h.conn.execute('DELETE FROM messages WHERE id=1')
         self.rejects(load, 'lifecycle_message_scope_changed')
 
+    def add_canonical_message(self, session_id=CID):
+        return self.h.conn.execute(
+            "INSERT INTO messages(ts,kind,direction,text,meta) VALUES "
+            "('2026-11-07T00:00:00Z','user','in','synthetic message',?)",
+            (json.dumps({'api_session': session_id}),),
+        ).lastrowid
+
+    def test_prepare_refuses_pages_that_skip_a_canonical_message(self):
+        self.closeout()
+        first = self.add_canonical_message()
+        skipped = self.add_canonical_message()
+        self.add_canonical_message('another_session')
+        last = self.add_canonical_message()
+        self.h.page_hook = lambda page: replace(
+            page, message_ids=tuple(mid for mid in page.message_ids if mid != skipped),
+        )
+        before = list(self.h.conn.iterdump())
+
+        def prepare():
+            return self.h.engine.reentry(
+                CID, 'prepare_1', closeout_id='close_1', target_window_id='window_1', access=CTX,
+            )
+
+        self.rejects(prepare, 'lifecycle_message_delta_incomplete')
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+        self.h.page_hook = None
+        self.assertEqual(prepare().new_message_refs, 3)
+        self.assertEqual(self.h.record().message_refs, (first, skipped, last))
+
+    def test_delta_refuses_an_outdated_observed_message_head(self):
+        self.prepare()
+        previous = self.h.record()
+        last = self.add_canonical_message()
+        self.h.snapshot_hook = lambda snapshot: replace(
+            snapshot, message_head=previous.message_cursor,
+        )
+        before = list(self.h.conn.iterdump())
+
+        def delta():
+            return self.h.engine.reentry_delta(
+                CID, 'delta_1', after_source=previous.source_cursor,
+                after_message=previous.message_cursor, access=CTX,
+            )
+
+        self.rejects(delta, 'lifecycle_message_delta_incomplete')
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+        self.h.snapshot_hook = None
+        self.assertEqual(delta().new_message_refs, 1)
+        self.assertEqual(self.h.record().message_refs, (last,))
+
     def test_current_config_provider_mismatch_rejected_before_stored_receipt(self):
         self.closeout()
         config = self.h.get('legacy'); config['sessions'][0]['provider']='codex'; self.h.put('legacy',config)

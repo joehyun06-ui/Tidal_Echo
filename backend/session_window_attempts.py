@@ -13,7 +13,9 @@ import sqlite3
 from .g3_projection import _valid_id
 from .g3_projection_feed import _binding
 from .session_lifecycle import LifecycleError, _json, _session_id
-from .session_lifecycle_storage import SQLiteLifecycleRepository, _owned, _source_schema
+from .session_lifecycle_storage import (
+    SQLiteLifecycleRepository, _owned, _require_current_message_cursor, _source_schema,
+)
 
 FORMAT = 'guiting.window-attempt.v1'
 DDL = (
@@ -160,9 +162,9 @@ class WindowAttemptJournal:
             fail()
         with self.repository.transaction(cid) as tx:
             state = self._bound(tx, binding)
-            if _guard is not None:
-                _guard(state)
             old = _row(tx.conn, cid, request_id=request_id)
+            if _guard is not None:
+                _guard(state, replayed=old is not None)
             if old is not None:
                 if (old[3], old[4], old[5]) != (packet_sha256, expected_revision, binding):
                     fail('lifecycle_attempt_request_conflict')
@@ -173,6 +175,7 @@ class WindowAttemptJournal:
                 fail('lifecycle_phase_conflict')
             if (state.packet_sha256, state.revision) != (packet_sha256, expected_revision):
                 fail('lifecycle_attempt_state_changed')
+            _require_current_message_cursor(tx.conn, state)
             values = (cid, state.closeout_id, request_id, packet_sha256, expected_revision, binding)
             tx.conn.execute('INSERT INTO session_window_attempts VALUES (?,?,?,?,?,?,?)',
                             (*values, _checksum(values)))
@@ -180,7 +183,7 @@ class WindowAttemptJournal:
             # escapes to the caller if commit/post-check acknowledgement fails.
             result = self._observation((*values, _checksum(values)), binding, replayed=False)
             if _guard is not None:
-                _guard(state)
+                _guard(state, replayed=False)
         return result
 
     def inspect(self, cid, request_id, *, access):

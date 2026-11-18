@@ -1,0 +1,313 @@
+"""GM-02AS rehearsal against a disposable canonical database and WAL."""
+import asyncio
+from contextlib import closing
+import json
+import os
+from pathlib import Path
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from fastapi import FastAPI, HTTPException
+import httpx
+
+from backend import channel_store
+from backend.memory_auth_epoch_store import AuthenticatedLogin, AuthEpochRegistry, ServerIssuedEpoch
+from backend.session_lifecycle_coordination import SharedSessionCoordinator
+from backend.session_lifecycle_recovery_binding_http import PATH as BINDING_PATH, install as install_binding
+from backend.session_lifecycle_status_context import AuthenticatedRecoveryLogin, RecoveryStatusContextProvider
+from backend.session_lifecycle_status_proxy import PATH as STATUS_PATH, install as install_proxy
+from backend.session_lifecycle_storage import JsonSessionReader, SQLiteLifecycleRepository
+from backend.session_window_activation_http import install as install_internal
+from backend.session_window_attempt_activation import activate_recorded_attempt
+from backend.session_window_attempts import WindowAttemptJournal
+from backend.tests.test_session_lifecycle import CID, CTX
+from backend.tests.test_session_lifecycle_activation_http import fixture
+from backend.tests.test_session_lifecycle_coordination import validator
+from backend.tests.test_session_lifecycle_history_http import TOKEN, original_auth
+from backend.tests.test_session_lifecycle_status_context import BROWSER, KEY, ORIGIN
+from backend.tests.test_session_lifecycle_storage import FileHarness, Proxy
+
+
+LOGIN = AuthenticatedLogin(CTX.principal_id, 'L' * 32)
+
+
+def resources(path, *, readonly):
+    def connect():
+        if readonly:
+            return channel_store.connect_read_only(path, timeout_seconds=3)
+        return channel_store.connect(path)
+
+    coordinator = SharedSessionCoordinator(
+        connect, path.with_suffix('.json'), path.parent / 'gate',
+        validate=validator, enabled=True, canonical_path=path,
+    )
+    return connect, coordinator
+
+
+async def observe(path, data):
+    connect, coordinator = resources(path, readonly=True)
+    history = lambda _: 'api'
+    reader = JsonSessionReader(path.with_suffix('.json'), historical_provider=history)
+    repository = SQLiteLifecycleRepository(connect, reader, enabled=True,
+                                           coordinator=coordinator)
+    journal = WindowAttemptJournal(repository, enabled=True)
+    login = AuthenticatedRecoveryLogin(LOGIN, ServerIssuedEpoch(data['epoch']))
+
+    def authenticate(request):
+        if request.headers.getlist('authorization') != [BROWSER]:
+            raise HTTPException(401)
+        return login
+
+    def authorize(identity, cid):
+        return CTX if identity == LOGIN and cid == CID else None
+
+    provider = RecoveryStatusContextProvider(
+        enabled=True, coordinator=coordinator, epoch_path=path,
+        login_provider=authenticate, authorize=authorize, historical_provider=history,
+        identity_key=KEY, connection_namespace='synthetic-restart',
+    )
+    app, internal = FastAPI(), FastAPI()
+    check = original_auth()
+
+    def internal_auth(request):
+        check(request)
+        return CTX
+
+    install_internal(internal, journal, authenticate=internal_auth, enabled=True)
+    install_binding(app, enabled=True, provider=provider, expected_access=CTX,
+                    expected_origin=ORIGIN)
+    upstream_results = []
+
+    class InterruptedBody(httpx.AsyncByteStream):
+        def __init__(self, prefix):
+            self.prefix = prefix
+
+        async def __aiter__(self):
+            yield self.prefix
+            raise httpx.ReadError('synthetic interrupted status response')
+
+    class ObservedTransport(httpx.ASGITransport):
+        async def handle_async_request(self, request):
+            response = await super().handle_async_request(request)
+            upstream_results.append(response.status_code)
+            if data.get('interrupt_response') and len(upstream_results) == 1:
+                prefix = (await response.aread())[:10]
+                await response.aclose()
+                return httpx.Response(response.status_code, headers=response.headers,
+                                      stream=InterruptedBody(prefix))
+            return response
+
+    def factory(**options):
+        return httpx.AsyncClient(transport=ObservedTransport(app=internal), **options)
+
+    install_proxy(
+        app, enabled=True, authenticate=provider.authenticate, expected_access=CTX,
+        expected_origin=ORIGIN, base_url='http://127.0.0.1:3020',
+        internal_token=TOKEN, client_factory=factory,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url='https://relay.synthetic.invalid',
+        headers={'Origin': ORIGIN, 'Authorization': BROWSER},
+    ) as client:
+        binding = await client.post(BINDING_PATH.replace('{conversation_id}', CID))
+        status = await client.post(STATUS_PATH.replace('{conversation_id}', CID), json=data['reference'])
+    return {
+        'binding': [binding.status_code, binding.json()],
+        'status': [status.status_code, status.json()],
+        'forwarded': len(upstream_results),
+        'upstream_results': upstream_results,
+    }
+
+
+def worker(path):
+    data = json.load(sys.stdin)
+    with patch.object(socket.socket, 'connect', side_effect=AssertionError('offline')), \
+            patch('socket.getaddrinfo', side_effect=AssertionError('offline')):
+        print(json.dumps(asyncio.run(observe(Path(path), data))))
+
+
+def activate(harness, journal, reference):
+    return activate_recorded_attempt(
+        harness.engine, journal, CID, reference['activation_request_id'],
+        attempt_request_id=reference['attempt_request_id'],
+        packet_sha256=reference['packet_sha256'], access=CTX, enabled=True,
+    )
+
+
+def activation_worker(path, checkpoint):
+    reference = json.load(sys.stdin)
+    with patch.object(socket.socket, 'connect', side_effect=AssertionError('offline')), \
+            patch('socket.getaddrinfo', side_effect=AssertionError('offline')):
+        harness = FileHarness(path, seed=False)
+        try:
+            journal = WindowAttemptJournal(harness.repo, enabled=True)
+            if checkpoint != 'replay':
+                harness.connection_wrapper = lambda conn: Proxy(
+                    conn, **{checkpoint: lambda: os._exit(71)},
+                )
+            receipt = activate(harness, journal, reference)
+            print(json.dumps({'replayed': receipt.replayed, 'revision': receipt.revision_applied}))
+        finally:
+            harness.conn.close()
+
+
+@unittest.skipUnless(os.name == 'posix', 'canonical coordinator uses POSIX locks')
+class RecoveryRestartTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / 'canonical.sqlite'
+        self.h, self.journal, self.reference = fixture(self.path)
+        self.addCleanup(self.h.conn.close)
+        self.enterContext(patch.dict(os.environ, {'MEMORY_TRUSTED_AUTH_EPOCH_ENABLED': 'true'}))
+        with closing(channel_store.connect(self.path)) as database:
+            self.assertEqual(database.execute('PRAGMA journal_mode=WAL').fetchall()[0][0], 'wal')
+            self.assertEqual(database.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()[0][0], 0)
+        (self.path.parent / 'gate').mkdir(mode=0o700)
+        _, coordinator = resources(self.path, readonly=False)
+        coordinator.bootstrap()
+        self.registry = AuthEpochRegistry(path=self.path, identity_provider=lambda: LOGIN)
+        self.epoch = self.registry.issue_after_authenticated_login()
+        state = self.h.record()
+        self.journal.record_attempt(
+            CID, self.reference['attempt_request_id'], packet_sha256=state.packet_sha256,
+            expected_revision=state.revision, access=CTX,
+        )
+        self.h.confirm()
+        self.revision = state.revision + 1
+
+    def run_activation(self, checkpoint):
+        return subprocess.run(
+            [sys.executable, '-c',
+             'import sys; from backend.tests.test_session_lifecycle_recovery_restart '
+             'import activation_worker; activation_worker(sys.argv[1], sys.argv[2])',
+             str(self.path), checkpoint],
+            input=json.dumps(self.reference), capture_output=True, text=True, timeout=20,
+        )
+
+    def observe_new_process(self, *, interrupt_response=False):
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'import sys; from backend.tests.test_session_lifecycle_recovery_restart '
+             'import worker; worker(sys.argv[1])', str(self.path)],
+            input=json.dumps({'epoch': self.epoch.value, 'reference': self.reference,
+                              'interrupt_response': interrupt_response}),
+            capture_output=True, text=True, check=True, timeout=20,
+        )
+        return json.loads(result.stdout)
+
+    def assert_historical(self, result):
+        self.assertEqual(result['binding'][0], 200, result)
+        self.assertEqual(result['binding'][1]['conversationId'], CID)
+        self.assertEqual(result['status'][0], 200, result)
+        status = result['status'][1]
+        self.assertEqual(status['state'], 'historical_confirmed')
+        self.assertEqual(status['revision_applied'], self.revision)
+        for key in ('current_window_confirmed', 'reply_completed', 'retry_authorized'):
+            self.assertIs(status[key], False)
+        self.assertEqual(result['forwarded'], 1)
+
+    def test_restart_preserves_binding_and_historical_receipt_then_refuses_revoked_epoch(self):
+        activate(self.h, self.journal, self.reference)
+        rows = list(self.h.conn.iterdump())
+        config = self.path.with_suffix('.json').read_bytes()
+        first = self.observe_new_process()
+        self.assert_historical(first)
+        self.assertEqual(self.observe_new_process(), first)
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+        self.assertEqual(self.path.with_suffix('.json').read_bytes(), config)
+
+        self.assertTrue(self.registry.revoke_before_logout())
+        revoked = self.observe_new_process()
+        self.assertEqual(revoked['binding'], [403, {'ok': False, 'error': 'access_denied'}])
+        self.assertEqual(revoked['status'], revoked['binding'])
+        self.assertEqual(revoked['forwarded'], 0)
+
+    def test_online_backup_restores_wal_receipt_at_original_canonical_path(self):
+        activate(self.h, self.journal, self.reference)
+        rows = list(self.h.conn.iterdump())
+        config_path = self.path.with_suffix('.json')
+        config = config_path.read_bytes()
+        original = self.observe_new_process()
+        self.assert_historical(original)
+        # Confirm that copying only the live main file would miss the commits.
+        with closing(sqlite3.connect(self.path.as_uri() + '?immutable=1', uri=True)) as base:
+            self.assertEqual(base.execute('SELECT count(*) FROM session_window_attempts').fetchone()[0], 0)
+        backup = self.path.with_name('backup.sqlite')
+        with closing(sqlite3.connect(backup)) as destination:
+            self.h.conn.backup(destination)
+            self.assertEqual(destination.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            self.assertEqual(list(destination.iterdump()), rows)
+        self.h.conn.close()
+        self.assertFalse(self.path.with_name(self.path.name + '-wal').exists())
+        self.path.rename(self.path.with_name('before-restore.sqlite'))
+        backup.rename(self.path)
+
+        restored = self.observe_new_process()
+        self.assertEqual(restored, original)
+        with closing(channel_store.connect_read_only(self.path, timeout_seconds=3)) as database:
+            self.assertEqual(list(database.iterdump()), rows)
+        self.assertEqual(config_path.read_bytes(), config)
+
+    def test_process_exit_before_activation_commit_keeps_prepared_state_and_messages(self):
+        before = list(self.h.conn.iterdump())
+        config = self.path.with_suffix('.json').read_bytes()
+        crashed = self.run_activation('before')
+        self.assertEqual(crashed.returncode, 71, crashed.stderr)
+        self.assertEqual(crashed.stdout, '')
+
+        observed = self.observe_new_process()
+        self.assertEqual(observed['binding'][0], 200, observed)
+        self.assertEqual(observed['status'][0], 200, observed)
+        self.assertEqual(observed['status'][1]['state'], 'unconfirmed')
+        self.assertIs(observed['status'][1]['retry_authorized'], False)
+        self.assertEqual(self.h.record().phase, 'prepared')
+        self.assertEqual(list(self.h.conn.iterdump()), before)
+        self.assertEqual(self.path.with_suffix('.json').read_bytes(), config)
+
+    def test_process_exit_after_activation_commit_recovers_without_duplicate_write(self):
+        before = self.h.record()
+        messages = self.h.conn.execute('SELECT * FROM messages ORDER BY id').fetchall()
+        config = self.path.with_suffix('.json').read_bytes()
+        crashed = self.run_activation('after')
+        self.assertEqual(crashed.returncode, 71, crashed.stderr)
+        self.assertEqual(crashed.stdout, '')
+
+        observed = self.observe_new_process()
+        self.assert_historical(observed)
+        committed = self.h.record()
+        self.assertEqual(committed.conversation_id, CID)
+        self.assertEqual(committed.window_id, before.target_window_id)
+        self.assertEqual(committed.pending, before.pending)
+        rows = list(self.h.conn.iterdump())
+        replay = self.run_activation('replay')
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(json.loads(replay.stdout), {'replayed': True, 'revision': self.revision})
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+        self.assertEqual(self.h.conn.execute('SELECT * FROM messages ORDER BY id').fetchall(), messages)
+        self.assertEqual(self.path.with_suffix('.json').read_bytes(), config)
+
+    def test_interrupted_status_body_requires_explicit_recheck_of_same_receipt(self):
+        activate(self.h, self.journal, self.reference)
+        rows = list(self.h.conn.iterdump())
+        config_path = self.path.with_suffix('.json')
+        config = config_path.read_bytes()
+
+        interrupted = self.observe_new_process(interrupt_response=True)
+        self.assertEqual(interrupted['binding'][0], 200, interrupted)
+        self.assertEqual(interrupted['upstream_results'], [200])
+        self.assertEqual(interrupted['forwarded'], 1)
+        self.assertEqual(interrupted['status'], [503, {'ok': False, 'error': 'status_unavailable'}])
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+
+        rechecked = self.observe_new_process()
+        self.assert_historical(rechecked)
+        self.assertEqual(rechecked['binding'], interrupted['binding'])
+        self.assertEqual(rechecked['upstream_results'], [200])
+        self.assertEqual(list(self.h.conn.iterdump()), rows)
+        self.assertEqual(config_path.read_bytes(), config)
