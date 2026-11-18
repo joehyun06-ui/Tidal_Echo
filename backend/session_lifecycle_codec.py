@@ -80,6 +80,10 @@ def validate_record(state):
     for mid in state.message_refs:
         integer(mid, previous + 1, state.message_cursor); previous = mid
     integer(state.packet_budget_bytes, 1, 65536)
+    if state.source_authorization_epoch is not None and (
+        state.phase == 'closed' or not _valid_id(state.source_authorization_epoch)
+    ):
+        corrupt()
     if state.phase == 'prepared':
         if not _valid_id(state.target_window_id) or state.target_window_id in state.used_windows:
             corrupt()
@@ -142,9 +146,14 @@ def _decode(raw, kind, cls):
         if (not isinstance(obj, dict) or set(obj) != {'schema_version','kind','data'}
                 or type(obj['schema_version']) is not int or obj['schema_version'] != 1
                 or obj['kind'] != kind or not isinstance(obj['data'], dict)
-                or set(obj['data']) != {f.name for f in fields(cls)} or _canonical(obj) != raw):
+                or _canonical(obj) != raw):
             corrupt()
         value = obj['data']
+        expected = {f.name for f in fields(cls)}
+        if kind == 'record' and 'source_authorization_epoch' not in value:
+            expected.remove('source_authorization_epoch')
+        if set(value) != expected:
+            corrupt()
         if kind == 'record':
             if not isinstance(value['source_cursor'], dict) or set(value['source_cursor']) != {'generation','position'}:
                 corrupt()
