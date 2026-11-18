@@ -19,6 +19,7 @@ DATASET = "gm02as-g3-test"
 PRINCIPAL = "gm02as-g3-reader"
 ACCESS = AccessScope(PRINCIPAL, frozenset({DATASET}))
 DISK = Path("/var/data/g3-authority-test")
+SERVICE_ID = "srv-dbunin0m7kps73cvgbdg"
 ID = re.compile(r"test-[0-9a-f]{32}\Z")
 
 
@@ -44,10 +45,10 @@ class AuthorityStore:
 
     @classmethod
     def deployed(cls):
-        if (os.environ.get("G3_AUTHORITY_TEST") != "1"
-                or os.environ.get("RENDER_SERVICE_NAME") != "g3-authority-test"
-                or os.environ.get("RENDER_EXTERNAL_URL")):
-            raise RuntimeError("g3_test_service_required")
+        if os.environ.get("G3_AUTHORITY_TEST") != "1":
+            raise RuntimeError("g3_test_environment_flag_required")
+        if os.environ.get("RENDER_SERVICE_ID") != SERVICE_ID:
+            raise RuntimeError("g3_test_service_id_mismatch")
         mounts = Path("/proc/self/mountinfo").read_text().splitlines()
         if not any(line.split()[4] == str(DISK) for line in mounts):
             raise RuntimeError("g3_test_dedicated_disk_required")
