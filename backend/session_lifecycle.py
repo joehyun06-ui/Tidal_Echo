@@ -389,11 +389,22 @@ class Lifecycle:
         return self._operation(target, key, 'close', payload, reserve, perform,
                                lambda db: self._body(db, 'closeout', key), fault)
 
+    @staticmethod
+    def _recovery_body(close, refs):
+        body = dict(close)
+        body.update(previous_window=close['window_id'], previous_epoch=close['context_epoch'],
+                    window_id=close['candidate'], context_epoch=close['context_epoch'] + 1,
+                    source_refs=refs, source_cursor=len(refs),
+                    context_budget={'usage': 'unknown', 'automatic_threshold': False})
+        return body
+
     def _package(self, db, target, key):
         body = self._body(db, 'package', key)
         h = self._handoff(db, target, key)
         require(body['candidate'] == h['candidate'], 'candidate')
-        require(body['source_refs'] == self._refs(db, target), 'source drift')
+        refs = self._refs(db, target)
+        close = self._body(db, 'closeout', key)
+        require(body == self._recovery_body(close, refs), 'package drift')
         return dict(**body, version=digest(body))
 
     def reentry(self, target, key, *, fault=noop):
@@ -404,8 +415,7 @@ class Lifecycle:
         def perform(db):
             close = self._body(db, 'closeout', key)
             refs = self._refs(db, target)
-            body = dict(**close, next_epoch=target.epoch + 1, source_refs=refs,
-                        context_budget={'usage': 'unknown', 'automatic_threshold': False})
+            body = self._recovery_body(close, refs)
             db.execute('INSERT INTO package VALUES(?,?,?)', (key, encode(body), digest(body)))
 
         def result(db):
@@ -472,7 +482,7 @@ class Lifecycle:
             check('not_active', h['candidate'] not in (target.window, first) and not db.execute(
                 'SELECT 1 FROM final WHERE window=?', (h['candidate'],)).fetchone())
             check('package_verified', phases.get('prepare') == 'COMMITTED' and
-                  all(package[k] == v for k, v in close.items() if k != 'source_cursor'))
+                  package == self._recovery_body(close, package['source_refs']))
             refs = self._refs(db, target)
             check('source_valid', refs == package['source_refs'])
             upper = db.execute('SELECT coalesce(max(cursor),0) FROM source').fetchone()[0]
@@ -495,6 +505,12 @@ class Lifecycle:
             row = db.execute('SELECT * FROM operation WHERE id=? AND kind=? ORDER BY crossed DESC,rowid DESC LIMIT 1', (key, kind)).fetchone()
             require(row, 'no operation evidence')
             final = db.execute('SELECT * FROM final WHERE id=?', (key,)).fetchone()
+            if row['phase'] == 'COMMITTED':
+                if kind == 'switch':
+                    require(final and final['window'] == h['candidate'] and final['epoch'] == h['epoch'] + 1,
+                            'inconsistent final evidence')
+                else:
+                    self._body(db, 'closeout' if kind == 'close' else 'package', key)
             return dict(**dict(row), candidate=h['candidate'], old_window=h['old'],
                         last_confirmed_phase=row['evidence'], mutation_boundary_crossed=bool(row['crossed']),
                         reconcile_only=row['phase'] == 'UNKNOWN_POST_BOUNDARY',

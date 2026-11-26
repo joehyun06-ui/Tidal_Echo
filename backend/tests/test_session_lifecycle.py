@@ -391,3 +391,15 @@ db.closeout(Target('conversation','alice','w0',0), 'c1',
         self.assertFalse(self.db.send_allowed(Target('conversation','alice','uncreated',1)))
         with self.assertRaisesRegex(Denied, 'unknown'):
             self.close()
+
+    def test_ready_package_names_new_window_but_does_not_activate_it(self):
+        p = self.ready()
+        self.assertEqual((p['previous_window'], p['previous_epoch']), ('w0', 0))
+        self.assertEqual((p['window_id'], p['context_epoch']), (p['candidate'], 1))
+        self.assertEqual(self.db.head(self.target), dict(window='w0', epoch=0))
+        self.assertEqual(p['conversation_id'], self.target.conversation)
+
+    def test_reentry_on_consumed_epoch_rejected(self):
+        self.commit(self.ready())
+        with self.assertRaisesRegex(Denied, 'stale window'):
+            self.db.reentry(self.target, 'c1')

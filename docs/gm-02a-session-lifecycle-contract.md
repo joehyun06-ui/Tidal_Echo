@@ -43,3 +43,11 @@ closeout 保存 state/version、pending、active_state、recent_anchors、derive
 ## 持久性与余下门槛
 
 本轮验收措辞为 **process-restart persistence verified in synthetic SQLite fixture**。只覆盖进程退出、重新打开、事务并发与回执找回。断电、文件系统/fsync、真实备份和隔离恢复属于 GM-00C。GM-01B 真实 source/ACL/revision、生产 ownership 与 provider window 映射、真实完成证据和安全发送入口仍待验收。Production HOLD 继续；自动换窗、线上启用及生产就绪均不在本轮。
+
+## 证据的读取方法
+
+`reconcile(target, closeout_id, kind)` 以只读连接返回固定候选、请求摘要、最后确认阶段、是否越界、是否只许对账及已存在的 final receipt。已提交的 closeout 可以按原请求找回。prepare 只在原 epoch 仍是当前 epoch 时返回包。包的 `window_id/context_epoch` 表示拟进入的目标；`previous_window/previous_epoch` 表示尚未切换的旧窗。只有 head 视图给出已提交的路由。
+
+从同一 closeout 补齐一页 delta 会产生新的包版本。旧版本无法覆盖新版本。同一版本若已记录 dispatch intent 且无进一步证据，停止在只读对账；只有能证明本地事务已回滚的尝试才可重新提交。合成来源记录持有事件引用和摘要；fixture 的权限标志和完成证据均属于测试输入。
+
+本地回归包括 web session provider/context/fork、continuity context、usage ledger creation/continuation/compaction 和两组 G3 projection 测试。
