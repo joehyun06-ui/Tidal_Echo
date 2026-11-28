@@ -11,6 +11,12 @@ from .usage_ledger_journal import coverage
 from .usage_ledger_rollover import preview as rollover_preview
 
 
+def is_chat_turn(record):
+    # Rewrite previews are billable requests against a selected passage.
+    # They do not advance the conversation or replace its context reading.
+    return record['mode']!='api' or not record['turn_id'].startswith('rewrite-')
+
+
 class Summary:
     def __init__(self):
         self.n=0;self.turns=set();self.metrics={k:[0,0] for k in METRICS};self.complete=True
@@ -18,7 +24,8 @@ class Summary:
         self.latency_n=0;self.latency=0;self.status_n=0;self.errors=0;self.timeouts=0;self.limited=0;self.retries=0;self.retry_known=True;self.codex=False
 
     def add(self,r):
-        self.n+=1;self.turns.add((r['session_id'],r['turn_id']));self.codex=r['mode']=='codex'
+        self.n+=1;self.codex=r['mode']=='codex'
+        if is_chat_turn(r):self.turns.add((r['session_id'],r['turn_id']))
         self.complete &= r['usage_complete']
         for k in METRICS:
             v=r['normalized']['metrics'][k]
@@ -65,20 +72,24 @@ def build_report(ledger,mode,sid,*,all_sessions=False,model=None,zone='Asia/Shan
             if local.date()==now.date():daily.add(r)
             if (local.year,local.month)==(now.year,now.month):monthly.add(r)
             if not all_sessions and r['session_id']!=sid:continue
-            latest_scope=r;models.add(r['model'])
+            chat_turn=is_chat_turn(r)
+            if chat_turn:latest_scope=r
+            models.add(r['model'])
             if model is not None and r['model']!=model:continue
-            last=r;total.add(r);recent.append({k:v for k,v in r.items() if k not in {'raw_usage','usage_baseline'}})
-            key=(r['session_id'],r['provider_id']);old=prior.get(key)
-            limit=(r.get('context') or {}).get('limit')
-            if old:
-                changed=[k for k in ('model','cache_policy','price','config_revision') if old.get(k)!=r.get(k)]
-                if old['context_limit']!=limit:changed.append('context_limit')
-                if changed:changes.append({'at':r['at'],'session_id':r['session_id'],'provider_id':r['provider_id'],'changed':changed,'before_model':old['model'],'model':r['model'],'price':r.get('price'),'context_limit':limit,'cache_policy':r.get('cache_policy')})
-                a,b=old['rate'],r['normalized']['cache_hit_rate']
-                if a is not None and b is not None and a-b>=.3:
-                    reasons=['stable_prefix_changed'] if old.get('prefix_fingerprint') and r.get('prefix_fingerprint') and old['prefix_fingerprint']!=r['prefix_fingerprint'] else []
-                    anomalies.append({'at':r['at'],'request_id':r['request_id'],'from_rate':a,'to_rate':b,'possible_causes':reasons+changed or ['provider_cache_expiry_or_routing_unknown'],'inference':True})
-            prior[key]={k:r.get(k) for k in ('model','cache_policy','price','config_revision','prefix_fingerprint')};prior[key].update(context_limit=limit,rate=r['normalized']['cache_hit_rate'])
+            total.add(r);recent.append({k:v for k,v in r.items() if k not in {'raw_usage','usage_baseline'}})
+            if chat_turn:
+                last=r
+                key=(r['session_id'],r['provider_id']);old=prior.get(key)
+                limit=(r.get('context') or {}).get('limit')
+                if old:
+                    changed=[k for k in ('model','cache_policy','price','config_revision') if old.get(k)!=r.get(k)]
+                    if old['context_limit']!=limit:changed.append('context_limit')
+                    if changed:changes.append({'at':r['at'],'session_id':r['session_id'],'provider_id':r['provider_id'],'changed':changed,'before_model':old['model'],'model':r['model'],'price':r.get('price'),'context_limit':limit,'cache_policy':r.get('cache_policy')})
+                    a,b=old['rate'],r['normalized']['cache_hit_rate']
+                    if a is not None and b is not None and a-b>=.3:
+                        reasons=['stable_prefix_changed'] if old.get('prefix_fingerprint') and r.get('prefix_fingerprint') and old['prefix_fingerprint']!=r['prefix_fingerprint'] else []
+                        anomalies.append({'at':r['at'],'request_id':r['request_id'],'from_rate':a,'to_rate':b,'possible_causes':reasons+changed or ['provider_cache_expiry_or_routing_unknown'],'inference':True})
+                prior[key]={k:r.get(k) for k in ('model','cache_policy','price','config_revision','prefix_fingerprint')};prior[key].update(context_limit=limit,rate=r['normalized']['cache_hit_rate'])
             if trends_complete:
                 for period,at in [('hour',local.replace(minute=0,second=0,microsecond=0).isoformat()),('day',local.date().isoformat())]:
                     key=(period,at,r['provider_id'],r['model'])

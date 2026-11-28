@@ -202,6 +202,7 @@ class EntrypointRouteTests(EntryFixture):
         app = FastAPI(); runtime = SimpleNamespace(config=SimpleNamespace(store_path=self.native),
             foundation=SimpleNamespace(activity_gate=CodexProcessActivityGate()))
         namespace = {'app':app,'legacy':self.legacy,'RUNTIME':runtime,'LEDGER_SERVICES':services,
+                     'API_GENERATIONS':SimpleNamespace(usage_collector=None),
                      'INTEGRATION':SimpleNamespace(session_authority=self.authority,_session_lock=self.lock),
                      'web_session_fork_routes':web_session_fork_routes}
         tree = ast.parse((ROOT/'examples/api_loop_codex_canary.py').read_text())

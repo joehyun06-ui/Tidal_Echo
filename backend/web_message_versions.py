@@ -40,6 +40,10 @@ def message_key(conn, session_id, row):
         first = next((r for r in fresh if r['direction'] == row['direction']), None)
         if first and first['id'] == row['id']:
             if row['direction'] == 'in':
+                # A saved rewrite begins with a fresh answer. The next prompt
+                # starts another turn and has its own edit alternatives.
+                if fresh[0]['id'] != row['id']:
+                    return row['id']
                 return edge['prompt_key'] if edge['mode'] == 'regenerate' else edge['point_key']
             if edge['mode'] == 'regenerate':
                 return edge['point_key']

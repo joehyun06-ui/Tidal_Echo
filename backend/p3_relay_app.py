@@ -7,6 +7,8 @@ relay integrations are still installed only by the alternate Codex relay entrypo
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import urllib.parse
 
@@ -166,6 +168,7 @@ def _install_capability_route() -> None:
             if getattr(relay_app, "_API_GENERATION_CONTROLS_INSTALLED", False):
                 payload["web_sessions"]["providers"]["api"]["generation_controls"] = relay_app.brain_target() == "loop"
                 payload["web_sessions"]["providers"]["api"]["steer"] = False
+                payload["web_sessions"]["providers"]["api"]["message_rewrite"] = relay_app.brain_target() == "loop"
             if getattr(relay_app, "_CODEX_GENERATION_CONTROLS_INSTALLED", False):
                 codex = payload["web_sessions"]["providers"]["codex"]
                 codex["generation_controls"] = codex["create"]
@@ -429,6 +432,26 @@ async def app_version_selection(session_id: str, request: Request):
     relay_app.check_auth(request)
     encoded = urllib.parse.quote(session_id, safe="")
     return relay_app.loop_json(f"/loop/sessions/{encoded}/version-selection", method="POST", body=await request.json())
+
+@app.post("/app/sessions/{session_id}/rewrite/{operation}")
+async def app_message_rewrite(session_id: str, operation: str, request: Request):
+    relay_app.check_auth(request)
+    if (operation not in {"preview", "versions"}
+            or not getattr(relay_app, "_API_GENERATION_CONTROLS_INSTALLED", False)
+            or relay_app.brain_target() != "loop"):
+        raise HTTPException(status_code=404, detail="rewrite_unavailable")
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > 48 * 1024:
+            raise HTTPException(status_code=413, detail="request too large")
+        raw.extend(chunk)
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeError, RecursionError):
+        raise HTTPException(status_code=400, detail="rewrite_invalid") from None
+    encoded = urllib.parse.quote(session_id, safe="")
+    return await asyncio.to_thread(relay_app.loop_json, f"/loop/sessions/{encoded}/rewrite/{operation}",
+                                   method="POST", body=body)
 
 @app.delete("/app/conversations/{session_id}")
 async def app_conversation_delete(session_id: str, request: Request):
