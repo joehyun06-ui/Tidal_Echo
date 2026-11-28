@@ -33,16 +33,18 @@ class NativeRewriteHistoryTests(unittest.IsolatedAsyncioTestCase):
         port = server.sockets[0].getsockname()[1]
         with tempfile.TemporaryDirectory() as home:
             Path(home, "config.toml").write_text(
-                f'model_provider="fixture"\n[model_providers.fixture]\nname="fixture"\n'
+                f'project_doc_max_bytes=0\nmodel_provider="fixture"\n[model_providers.fixture]\nname="fixture"\n'
                 f'base_url="http://127.0.0.1:{port}/v1"\nwire_api="responses"\n', encoding="utf-8",
             )
             env = {"PATH": os.environ["PATH"], "HOME": home, "CODEX_HOME": home,
                    "HTTPS_PROXY": "http://127.0.0.1:1", "HTTP_PROXY": "http://127.0.0.1:1",
                    "NO_PROXY": "127.0.0.1,localhost"}
-            proc = await asyncio.create_subprocess_exec(
-                _bundled_codex_path(), "app-server", "--listen", "stdio://", cwd=home, env=env,
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            )
+            async def launch():
+                return await asyncio.create_subprocess_exec(
+                    _bundled_codex_path(), "app-server", "--listen", "stdio://", cwd=home, env=env,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+            proc = await launch()
             request_id = 0
 
             async def rpc(method, params):
@@ -71,6 +73,14 @@ class NativeRewriteHistoryTests(unittest.IsolatedAsyncioTestCase):
                                                        ("assistant", "output_text", rewritten)]]
                     self.assertEqual(await rpc("thread/inject_items", {**thread, "items": history}), {})
                     self.assertEqual((await rpc("thread/turns/list", thread))["data"], [])
+                    proc.terminate()
+                    await proc.wait()
+                    proc = await launch()
+                    await rpc("initialize", {"clientInfo": {"name": "fixture", "version": "1"},
+                                             "capabilities": {"experimentalApi": True}})
+                    resumed = await rpc("thread/resume", {**thread, "cwd": home, "model": "fixture-model",
+                                          "sandbox": "read-only", "approvalPolicy": "never", "runtimeWorkspaceRoots": []})
+                    self.assertEqual(resumed["thread"]["id"], thread["threadId"])
                     await rpc("turn/start", {**thread, "input": [{"type": "text", "text": "追问"}], "environments": []})
                     tail = (await observed)[-3:]
                     self.assertEqual([(x["role"], x["content"][0]["text"]) for x in tail],

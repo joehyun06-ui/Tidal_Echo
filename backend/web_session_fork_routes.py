@@ -75,7 +75,10 @@ def install(app, legacy, authority, lock, *, runtime=None, usage_ledger=None, re
             body = await legacy.read_internal_json(request)
             try:
                 return await rewrite.preview(legacy, authority, lock, session_id, body,
-                                             collector=rewrite_runtime.usage_collector)
+                                             collector=rewrite_runtime.usage_collector,
+                                             native=runtime if authority.provider_for_session(session_id) == "codex" else None)
+            except CodexGenerationError as error:
+                return JSONResponse({"ok": False, "error": error.category}, status_code=409)
             except ForkError as error:
                 return JSONResponse({"ok": False, "error": error.category}, status_code=error.status)
             except WebSessionProviderAuthorityError as error:
@@ -88,6 +91,27 @@ def install(app, legacy, authority, lock, *, runtime=None, usage_ledger=None, re
             legacy.check_internal_auth(request)
             body = await legacy.read_internal_json(request)
             async with fork_lock:
+                provider = version_call(lambda: authority.provider_for_session(session_id))
+                if isinstance(provider, JSONResponse):
+                    return provider
+                if runtime is not None and provider == "codex":
+                    from .web_codex_fork import fork_codex_conversation
+                    prepared = version_call(lambda: rewrite.prepare_save(authority, session_id, body,
+                                                relay_db=legacy.RELAY_DB, provider="codex"))
+                    if isinstance(prepared, JSONResponse):
+                        return prepared
+                    command, edge, rewritten = prepared
+                    try:
+                        result = await fork_codex_conversation(authority, session_id, {**command, "mode": "branch"},
+                                    relay_db=legacy.RELAY_DB, runtime=runtime, lock=lock, rewritten=rewritten)
+                    except ForkError as error:
+                        return JSONResponse({"ok": False, "error": error.category}, status_code=error.status)
+                    except WebSessionProviderAuthorityError as error:
+                        return JSONResponse({"ok": False, "error": error.category}, status_code=409)
+                    except (OSError, sqlite3.Error, ValueError, TypeError):
+                        return JSONResponse({"ok": False, "error": "version_storage_unavailable"}, status_code=503)
+                    finished = version_call(lambda: versions.finish(authority, edge["version_id"], relay_db=legacy.RELAY_DB))
+                    return finished if isinstance(finished, JSONResponse) else {**result, "version": edge}
                 return version_call(lambda: rewrite.save(authority, session_id, body, relay_db=legacy.RELAY_DB))
 
     @app.get("/loop/conversation-versions")

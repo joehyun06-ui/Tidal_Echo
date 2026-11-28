@@ -70,11 +70,11 @@ def parts(text, body):
         raise ForkError("rewrite_invalid_range", 400) from None
 
 
-def read_source(conn, authority, sid, body):
+def read_source(conn, authority, sid, body, provider="api"):
     session = authority.row_for_session(sid)
     if not session:
         raise ForkError("web_session_not_found", 404)
-    if session["provider"] != "api":
+    if session["provider"] != provider:
         raise ForkError("rewrite_provider_unavailable")
     row = conn.execute(
         "SELECT text,meta FROM messages WHERE id=? AND direction='out' AND kind='reply' "
@@ -109,11 +109,12 @@ def reserve(conn, request_id):
         raise ForkError("rewrite_request_already_sent")
 
 
-async def preview(legacy, authority, lock, sid, body, *, collector=None):
+async def preview(legacy, authority, lock, sid, body, *, collector=None, native=None):
     command = parse(body, saving=False)
+    provider = "codex" if native else "api"
     with lock, closing(versions.connect(legacy.RELAY_DB)) as conn, conn:
         check_idle(conn, sid)
-        _, selected, _ = parts(read_source(conn, authority, sid, command), command)
+        _, selected, _ = parts(read_source(conn, authority, sid, command, provider), command)
         if not selected.strip():
             raise ForkError("rewrite_invalid_range", 400)
         reserve(conn, command["request_id"])
@@ -128,7 +129,11 @@ async def preview(legacy, authority, lock, sid, body, *, collector=None):
         with capture_scope(collector, sid, "rewrite-" + command["request_id"]):
             # The existing relay's loop proxy has a 35-second deadline.
             async with asyncio.timeout(28):
-                result = await legacy.run_model(messages, session_id=sid, allow_fallback=False, max_tokens=2000, rewrite=True)
+                if native:
+                    from .web_codex_rewrite import generate
+                    result = await generate(native, sid, command["request_id"], PROMPT, messages[1]["content"])
+                else:
+                    result = await legacy.run_model(messages, session_id=sid, allow_fallback=False, max_tokens=2000, rewrite=True)
     except TimeoutError:
         raise ForkError("rewrite_generation_uncertain", 504) from None
     if result.get("outcome") != "success":
@@ -145,23 +150,28 @@ async def preview(legacy, authority, lock, sid, body, *, collector=None):
     except UnicodeError:
         raise ForkError("rewrite_generation_failed", 502) from None
     with lock, closing(versions.connect(legacy.RELAY_DB)) as conn:
-        parts(read_source(conn, authority, sid, command), command)
+        parts(read_source(conn, authority, sid, command, provider), command)
     return {"ok": True, "replacement": replacement, "request_id": command["request_id"]}
 
 
-def save(authority, sid, body, *, relay_db):
+def prepare_save(authority, sid, body, *, relay_db, provider):
     command = parse(body, saving=True)
     with closing(versions.connect(relay_db)) as conn:
         check_idle(conn, sid)
-        text = read_source(conn, authority, sid, command)
+        text = read_source(conn, authority, sid, command, provider)
     before, selected, after = parts(text, command)
     output = before + command["replacement"] + after
     if command["replacement"] == selected or not output.strip() or len(output) > MAX_TEXT:
         raise ForkError("rewrite_invalid_replacement", 400)
     request = {"request_id": command["request_id"], "message_id": command["message_id"]}
     edge = versions.prepare(authority, sid, {**request, "mode": "regenerate"}, relay_db=relay_db)
+    return request, edge, {"source": text, "text": output, "version_key": edge["point_key"]}
+
+
+def save(authority, sid, body, *, relay_db):
+    request, edge, rewritten = prepare_save(authority, sid, body, relay_db=relay_db, provider="api")
     result = fork_conversation(authority, sid, {**request, "mode": "branch"}, relay_db=relay_db,
-        rewritten_reply={"source": text, "text": output, "version_key": edge["point_key"]})
+        rewritten_reply=rewritten)
     # Refreshing the list exposes the alternative. Only the normal version
     # selection endpoint can change which version another device is reading.
     versions.finish(authority, edge["version_id"], relay_db=relay_db)

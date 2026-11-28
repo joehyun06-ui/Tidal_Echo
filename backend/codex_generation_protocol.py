@@ -40,6 +40,7 @@ GENERATION_RPC_METHODS = frozenset({
     "thread/start",
     "thread/resume",
     "thread/fork",
+    "thread/inject_items",
     "thread/unsubscribe",
     "turn/start",
     "turn/interrupt",
@@ -453,6 +454,7 @@ class CodexGenerationProtocol:
         attempt_id: str,
         persona: str,
         selection: ModelSelection | None = None,
+        ephemeral: bool = False,
     ) -> ThreadStartResult:
         if not isinstance(persona, str) or not persona.strip() or len(persona) > 131_072:
             raise CodexGenerationError("codex_generation_persona_invalid")
@@ -464,7 +466,7 @@ class CodexGenerationProtocol:
             "model": selection.model,
             "cwd": str(cwd),
             "baseInstructions": persona,
-            "ephemeral": False,
+            "ephemeral": ephemeral,
             "historyMode": "paginated",
         }
         if selection.reasoning_effort is not None:
@@ -475,7 +477,7 @@ class CodexGenerationProtocol:
         )
         thread = _mapping(raw.get("thread"), "codex_generation_thread_start_failed")
         thread_id = _safe_id(thread.get("id"), "codex_generation_thread_start_failed")
-        if thread.get("ephemeral") is not False or thread.get("historyMode") != "paginated":
+        if thread.get("ephemeral") is not ephemeral or thread.get("historyMode") != "paginated":
             raise CodexGenerationError("codex_generation_thread_contract_mismatch")
         response_model = _safe_model(raw.get("model"))
         if response_model != selection.model:
@@ -519,6 +521,13 @@ class CodexGenerationProtocol:
                 or raw.get("modelProvider") != model_provider or raw.get("cwd") != str(cwd)):
             raise CodexGenerationError("codex_generation_thread_contract_mismatch")
         return ThreadStartResult(fork_id, model, model_provider, reasoning_effort, cwd)
+
+    async def append_exchange(self, thread_id: str, question: str, answer: str) -> None:
+        items = [{"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+                 for role, kind, text in (("user", "input_text", question), ("assistant", "output_text", answer))]
+        if await self._request("thread/inject_items", {"threadId": _safe_id(thread_id, "codex_generation_thread_invalid"),
+                                                      "items": items}) != {}:
+            raise CodexGenerationError("codex_generation_thread_contract_mismatch")
 
     async def resume_thread(
         self,

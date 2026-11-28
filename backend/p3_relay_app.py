@@ -172,6 +172,7 @@ def _install_capability_route() -> None:
             if getattr(relay_app, "_CODEX_GENERATION_CONTROLS_INSTALLED", False):
                 codex = payload["web_sessions"]["providers"]["codex"]
                 codex["generation_controls"] = codex["create"]
+                codex["message_rewrite"] = codex["create"] and relay_app.brain_target() == "loop"
                 codex["image_input"] = codex["create"]
                 codex["text_only"] = not codex["create"]
             payload["session_context"] = bool(getattr(relay_app, "_WEB_SESSION_CONTEXT_INSTALLED", False) and relay_app.brain_target() == "loop")

@@ -150,11 +150,42 @@ def _bind_target(store_path, target, source_pin, native):
             raise
 
 
-async def fork_codex_conversation(authority, session_id, body, *, relay_db, runtime, lock):
+async def _copy_native_prefix(runtime, pin, target, persona, rows, bindings, rewritten):
+    """Native turns have real IDs. Rebuild a trailing series of injected pairs verbatim."""
+    generation = runtime.foundation.generation
+    original_end = len(rows) - 2 if rewritten is not None else len(rows)
+    boundary = original_end
+    while boundary and bindings[rows[boundary - 1]["id"]].startswith("rewrite:"):
+        boundary -= 2
+    if not rows:
+        return {}
+    if not pin["thread_id"]:
+        raise ForkError("codex_fork_history_unavailable")
+    if boundary:
+        thread = await generation.fork_thread(
+            thread_id=pin["thread_id"], last_turn_id=bindings[rows[boundary - 1]["id"]],
+            api_session=target, attempt_id=target, model=pin["model"], model_provider=pin["model_provider"],
+            reasoning_effort=pin["reasoning_effort"], persona=persona)
+    else:
+        selection = await generation.qualify(pin["model"], pin["reasoning_effort"])
+        thread = await generation.start_thread(api_session=target, attempt_id=target, persona=persona, selection=selection)
+        if thread.model_provider != pin["model_provider"]:
+            raise ForkError("fork_provider_mismatch")
+    for i in range(boundary, len(rows), 2):
+        question, answer = rows[i:i+2]
+        text = rewritten["text"] if rewritten is not None and i == original_end else answer["text"]
+        await generation.append_exchange(thread.thread_id, question["text"], text)
+    return {"thread_id": thread.thread_id, "cwd": str(thread.cwd)}
+
+
+async def fork_codex_conversation(authority, session_id, body, *, relay_db, runtime, lock, rewritten=None):
     if not runtime.generation_enabled:
         raise ForkError("codex_generation_disabled", 503)
     target = _request(body)
-    fingerprint = hashlib.sha256(json.dumps([session_id, body["message_id"], body["mode"]]).encode()).hexdigest()
+    identity = [session_id, body["message_id"], body["mode"]]
+    if rewritten is not None:
+        identity.append(rewritten)
+    fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     try:
         async with runtime.foundation.activity_gate.control():
             with lock:
@@ -183,6 +214,11 @@ async def fork_codex_conversation(authority, session_id, body, *, relay_db, runt
                     if receipt and receipt["phase"] == "dispatching":
                         raise ForkError("codex_fork_result_unknown")
                     rows, bindings, draft = _prefix(conn, runtime.config.store_path, session_id, body)
+                    if rewritten is not None:
+                        if body["mode"] != "branch" or len(rows) < 2 or rows[-1]["text"] != rewritten["source"]:
+                            raise ForkError("rewrite_source_changed")
+                        if json.loads(rows[-2]["meta"]).get("attachments") or rows[-2]["kind"] != "user":
+                            raise ForkError("fork_attachment_resend_unavailable")
                     native = json.loads(receipt["native"]) if receipt else None
             if not receipt:
                 await runtime.foundation.generation.qualify(pin["model"], pin["reasoning_effort"])
@@ -191,15 +227,7 @@ async def fork_codex_conversation(authority, session_id, body, *, relay_db, runt
                 with sqlite3.connect(relay_db, timeout=20) as conn:
                     conn.execute("INSERT INTO web_codex_forks VALUES (?,?,?,?)", (target, fingerprint, "dispatching", "{}"))
                 native = {"contract": {key: pin[key] for key in ("model", "model_provider", "reasoning_effort", "persona_hash")}}
-                if rows:
-                    if not pin["thread_id"]:
-                        raise ForkError("codex_fork_history_unavailable")
-                    result = await runtime.foundation.generation.fork_thread(
-                        thread_id=pin["thread_id"], last_turn_id=bindings[rows[-1]["id"]],
-                        api_session=target, attempt_id=target, model=pin["model"],
-                        model_provider=pin["model_provider"], reasoning_effort=pin["reasoning_effort"], persona=persona,
-                    )
-                    native.update(thread_id=result.thread_id, cwd=str(result.cwd))
+                native.update(await _copy_native_prefix(runtime, pin, target, persona, rows, bindings, rewritten))
                 with sqlite3.connect(relay_db, timeout=20) as conn:
                     conn.execute("UPDATE web_codex_forks SET phase='ready',native=? WHERE target=?", (json.dumps(native), target))
             with lock:
@@ -207,6 +235,12 @@ async def fork_codex_conversation(authority, session_id, body, *, relay_db, runt
                 current = store.get_session(runtime.config.store_path, session_id)
                 if not current or current["status"] != "active" or current["thread_id"] != pin["thread_id"]:
                     raise ForkError("codex_session_unavailable")
+                if rewritten is not None:
+                    with sqlite3.connect(relay_db) as db:
+                        original = db.execute("SELECT text FROM messages WHERE id=? AND json_extract(meta,'$.api_session')=?",
+                                              (body["message_id"], session_id)).fetchone()
+                    if not original or original[0] != rewritten["source"]:
+                        raise ForkError("rewrite_source_changed")
                 _bind_target(runtime.config.store_path, target, pin, native)
                 suffix = {"branch": " · 分支", "edit": " · 编辑", "regenerate": " · 新回答"}[body["mode"]]
                 new = authority.new_row(title=source["title"][:120-len(suffix)]+suffix, provider="codex", session_id=target)
@@ -220,9 +254,19 @@ async def fork_codex_conversation(authority, session_id, body, *, relay_db, runt
                         for row in rows:
                             meta = {"api_session": target, "source": "web_fork", "provider": "codex",
                                     "branch_origin": {"session_id": session_id, "message_id": row["id"]}}
+                            text, binding = row["text"], bindings[row["id"]]
+                            attachments = json.loads(row["meta"]).get("attachments")
+                            if attachments:
+                                meta["attachments"] = attachments
+                            if rewritten is not None and row["id"] in (rows[-2]["id"], rows[-1]["id"]):
+                                binding = "rewrite:" + target
+                                if row["id"] == rows[-1]["id"]:
+                                    text = rewritten["text"]
+                                    meta = {"api_session": target, "provider": "codex", "source": "web_rewrite",
+                                            "version_key": rewritten["version_key"], "version_usage": None}
                             copied = conn.execute("INSERT INTO messages (ts,direction,kind,text,meta) VALUES (?,?,?,?,?)",
-                                (row["ts"], row["direction"], row["kind"], row["text"], json.dumps(meta, ensure_ascii=False)))
-                            conn.execute("INSERT INTO web_codex_fork_turns VALUES (?,?)", (copied.lastrowid, bindings[row["id"]]))
+                                (row["ts"], row["direction"], row["kind"], text, json.dumps(meta, ensure_ascii=False)))
+                            conn.execute("INSERT INTO web_codex_fork_turns VALUES (?,?)", (copied.lastrowid, binding))
                         conn.execute("UPDATE web_codex_forks SET phase='copied' WHERE target=?", (target,))
                 authority.publish_row(new, activate=False)
             result = {"ok": True, "created": new, "duplicate": bool(receipt)}
