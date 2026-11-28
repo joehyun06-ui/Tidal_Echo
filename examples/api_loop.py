@@ -634,10 +634,10 @@ def _responses_body(
     }
 
 
-def _responses_text(data: dict[str, Any]) -> str:
+def _responses_text(data: dict[str, Any], *, preserve_whitespace: bool = False) -> str:
     output_text = data.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
+        return output_text if preserve_whitespace else output_text.strip()
     parts: list[str] = []
     output = data.get("output")
     if isinstance(output, list):
@@ -654,7 +654,8 @@ def _responses_text(data: dict[str, Any]) -> str:
                     and isinstance(part.get("text"), str)
                 ):
                     parts.append(part["text"])
-    return "".join(parts).strip()
+    text = "".join(parts)
+    return text if preserve_whitespace else text.strip()
 
 
 def _responses_event_error_metadata(event: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -749,6 +750,7 @@ async def complete_responses(
     messages: list[dict[str, str]],
     *,
     max_tokens: int | None = None,
+    rewrite: bool = False,
 ) -> dict[str, Any]:
     body = usage_ledger_capture.prepare_body(_responses_body(route, messages, stream=False, max_tokens=max_tokens), responses=True)
     try:
@@ -801,6 +803,8 @@ async def complete_responses(
         raise ModelRouteError("model_transport_uncertain", "dispatch_uncertain") from None
     if not isinstance(data, dict):
         raise ModelRouteError("invalid_model_response", "dispatch_uncertain")
+    if rewrite and data.get("status") in {None, "incomplete"}:
+        raise ModelRouteError("rewrite_output_incomplete", "explicit_failed")
     if data.get("status") not in {None, "completed"}:
         error = data.get("error")
         code = _safe_provider_error_identifier(error.get("code")) if isinstance(error, dict) else None
@@ -812,8 +816,8 @@ async def complete_responses(
             code,
             error_type,
         )
-    text = _responses_text(data)
-    if not text:
+    text = _responses_text(data, preserve_whitespace=rewrite)
+    if not text.strip():
         raise ModelRouteError("empty_model_response", "dispatch_uncertain")
     if len(text) > LOOP_ASSISTANT_MAX_CHARS:
         raise ModelRouteError("assistant_response_too_large", "dispatch_uncertain")
@@ -874,7 +878,8 @@ async def stream_chat(route: dict[str, str], messages: list[dict[str, str]], sin
 
 @usage_ledger_capture.observe_api(protocol='chat')
 async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *,
-                        temperature: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
+                        temperature: float | None = None, max_tokens: int | None = None,
+                        rewrite: bool = False) -> dict[str, Any]:
     body = _chat_completion_body(
         route,
         messages,
@@ -931,10 +936,15 @@ async def complete_chat(route: dict[str, str], messages: list[dict[str, str]], *
     except Exception as exc:
         usage_ledger_capture.transport_error(exc)
         raise ModelRouteError("model_transport_uncertain", "dispatch_uncertain") from None
-    msg = ((data.get("choices") or [{}])[0]).get("message") or {}
-    text = (msg.get("content") or "").strip()
-    if not text:
+    choice = (data.get("choices") or [{}])[0]
+    if rewrite and choice.get("finish_reason") != "stop":
+        raise ModelRouteError("rewrite_output_incomplete", "explicit_failed")
+    msg = choice.get("message") or {}
+    text = msg.get("content")
+    if not isinstance(text, str) or not text.strip():
         raise ModelRouteError("empty_model_response", "dispatch_uncertain")
+    if not rewrite:
+        text = text.strip()
     if len(text) > LOOP_ASSISTANT_MAX_CHARS:
         raise ModelRouteError("assistant_response_too_large", "dispatch_uncertain")
     return {"text": text, "usage": data.get("usage") or {}}
@@ -956,20 +966,24 @@ async def _complete_provider(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    rewrite: bool = False,
 ) -> dict[str, Any]:
+    options = {}
+    if max_tokens is not None:
+        options["max_tokens"] = max_tokens
+    if rewrite:
+        options["rewrite"] = True
     if _uses_responses_api(route):
-        if max_tokens is None:
-            return await complete_responses(route, messages)
-        return await complete_responses(route, messages, max_tokens=max_tokens)
-    if temperature is None and max_tokens is None:
-        return await complete_chat(route, messages)
-    return await complete_chat(route, messages, temperature=temperature, max_tokens=max_tokens)
+        return await complete_responses(route, messages, **options)
+    if temperature is not None:
+        options["temperature"] = temperature
+    return await complete_chat(route, messages, **options)
 
 
 async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", session_id: str = "",
                     emit_stream: bool = False, allow_fallback: bool = True,
                     temperature: float | None = None, max_tokens: int | None = None,
-                    progress_sink=None, on_route=None) -> dict[str, Any]:
+                    progress_sink=None, on_route=None, rewrite: bool = False) -> dict[str, Any]:
     tried: list[str] = []
 
     async def execute() -> dict[str, Any]:
@@ -987,11 +1001,12 @@ async def run_model(messages: list[dict[str, str]], *, stream_id: str = "", sess
                                          "done": False, "api_session": session_id})
                     out = await _stream_provider(route, messages, sink)
                 else:
-                    if temperature is None and max_tokens is None:
+                    if temperature is None and max_tokens is None and not rewrite:
                         out = await _complete_provider(route, messages)
                     else:
                         out = await _complete_provider(
-                            route, messages, temperature=temperature, max_tokens=max_tokens
+                            route, messages, temperature=temperature, max_tokens=max_tokens,
+                            **({"rewrite": True} if rewrite else {}),
                         )
             except asyncio.CancelledError:
                 raise

@@ -103,6 +103,27 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual(state["selections"], [])
         self.model.assert_not_awaited()
 
+    def test_first_followup_after_a_rewrite_has_its_own_edit_point(self):
+        target = self.post("versions", self.command(replacement="新回答")).json()["created"]["id"]
+        with sqlite3.connect(self.path) as conn:
+            followup = conn.execute(
+                "INSERT INTO messages(ts,direction,kind,text,meta) VALUES (?,'in','user',?,?)",
+                ("2026-11-12T03:00:00Z", "独立的后续提问", json.dumps({"api_session": target})),
+            ).lastrowid
+        result = self.client.post(f"/loop/sessions/{target}/versions", json={
+            "mode": "edit", "message_id": followup, "request_id": str(uuid.uuid4()),
+        })
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["version"]["point_key"], followup)
+
+    def test_incomplete_preview_returns_no_replacement_or_version(self):
+        self.model.return_value = {"outcome": "explicit_failed", "error": "rewrite_output_incomplete"}
+        response = self.post("preview", self.command(instructions=""))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json(), {"ok": False, "error": "rewrite_output_incomplete"})
+        self.assertTrue(self.model.await_args.kwargs["rewrite"])
+        self.assertEqual(versions.public_state(self.authority, relay_db=self.path)["versions"], [])
+
     def test_stale_or_foreign_or_split_ranges_and_codex_fail_before_dispatch(self):
         body = self.command(instructions="")
         cases = [

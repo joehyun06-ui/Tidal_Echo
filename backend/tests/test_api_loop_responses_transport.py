@@ -77,6 +77,35 @@ class ApiLoopResponsesTransportTests(NoNetworkMixin, unittest.IsolatedAsyncioTes
         self.assertEqual(seen[1][1]['messages'],messages)
         self.assertNotIn('invalid-test-relay-secret',json.dumps(seen))
 
+    async def test_rewrite_preserves_provider_whitespace_and_requires_complete_text(self):
+        text = "    pass\r\n\t"
+        chat = {"message": {"content": text}, "finish_reason": "stop"}
+        output = [{"type": "message", "content": [{"type": "output_text", "text": text}]}]
+        cases = [
+            ("fixture-chat", {"choices": [chat]}, True),
+            ("fixture-chat", {"choices": [{**chat, "finish_reason": "length"}]}, False),
+            ("fixture-chat", {"choices": [{"message": chat["message"]}]}, False),
+            ("gpt-5.6-sol", {"status": "completed", "output_text": text}, True),
+            ("gpt-5.6-sol", {"status": "completed", "output": output}, True),
+            ("gpt-5.6-sol", {"status": "incomplete", "output": output}, False),
+            ("gpt-5.6-sol", {"output": output}, False),
+        ]
+        for model, payload, complete in cases:
+            with self.subTest(model=model, payload=payload):
+                route = {"model": model, "url": "https://provider.invalid/v1", "key": "fixture"}
+                with mock.patch.object(self.module, "main_chain", return_value=[route]), mock.patch.object(
+                    self.module, "_provider_client",
+                    side_effect=self._client_factory(lambda _: httpx.Response(200, json=payload)),
+                ):
+                    result = await self.module.run_model(self.messages, max_tokens=2000, rewrite=True)
+                    if complete:
+                        self.assertEqual(result["text"], text)
+                        ordinary = await self.module.run_model(self.messages)
+                        self.assertEqual(ordinary["text"], text.strip())
+                    else:
+                        self.assertEqual(result["error"], "rewrite_output_incomplete")
+                        self.assertNotIn("text", result)
+
     async def test_gpt56_nonstream_routes_to_responses_with_stateless_body(self):
         seen = {}
 

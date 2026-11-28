@@ -128,10 +128,12 @@ async def preview(legacy, authority, lock, sid, body, *, collector=None):
         with capture_scope(collector, sid, "rewrite-" + command["request_id"]):
             # The existing relay's loop proxy has a 35-second deadline.
             async with asyncio.timeout(28):
-                result = await legacy.run_model(messages, session_id=sid, allow_fallback=False, max_tokens=2000)
+                result = await legacy.run_model(messages, session_id=sid, allow_fallback=False, max_tokens=2000, rewrite=True)
     except TimeoutError:
         raise ForkError("rewrite_generation_uncertain", 504) from None
     if result.get("outcome") != "success":
+        if result.get("error") == "rewrite_output_incomplete":
+            raise ForkError("rewrite_output_incomplete", 422)
         if result.get("outcome") == "dispatch_uncertain":
             raise ForkError("rewrite_generation_uncertain", 504)
         raise ForkError("rewrite_generation_failed", 502)
