@@ -117,3 +117,72 @@ class WebCodexForkTests(unittest.IsolatedAsyncioTestCase):
         self.authority.tombstone_for_session=lambda sid: {'id':sid} if sid==first['created']['id'] else None
         with self.assertRaisesRegex(ForkError,'web_session_deleted'):await self.fork()
         self.assertEqual(len(self.native_calls()),1)
+
+    async def test_saved_rewrite_and_its_child_rebuild_exact_native_prefix(self):
+        from backend import web_message_rewrite as rewrite, web_message_versions as versions
+        async def append(thread, question, answer):
+            self.calls.append(('append', (question, answer)))
+        self.runtime.foundation.generation.append_exchange = append
+        original = 'answer2'
+        command = dict(request_id=self.body['request_id'], message_id=4,
+                       source_sha256=hashlib.sha256(original.encode()).hexdigest(),
+                       start=2, end=4, replacement='  好\r\n')
+        request, edge, rewritten = rewrite.prepare_save(self.authority, 'source', command,
+                                                       relay_db=self.relay, provider='codex')
+        async def save():
+            return await fork_codex_conversation(self.authority, 'source', {**request, 'mode':'branch'},
+                        relay_db=self.relay, runtime=self.runtime, lock=RLock(), rewritten=rewritten)
+        result = await save()
+        target = result['created']['id']
+        versions.finish(self.authority, target, relay_db=self.relay)
+        self.assertEqual(self.native_calls()[0]['last_turn_id'], 'turn-1')
+        self.assertEqual(self.calls[-1], ('append', ('typo', 'an  好\r\ner2')))
+        self.assertEqual(self.rows(target)[-1]['text'], 'an  好\r\ner2')
+        self.assertEqual(self.rows('source')[-1]['text'], 'answer3')
+        self.assertTrue((await save())['duplicate'])
+        self.assertEqual(len(self.native_calls()), 1)
+        self.assertEqual(versions.public_state(self.authority, relay_db=self.relay)['versions'], [edge])
+        await self.fork(source=target, message_id=self.rows(target)[-1]['id'], request_id=str(uuid.uuid4()))
+        self.assertEqual(self.native_calls()[-1]['last_turn_id'], 'turn-1')
+        self.assertEqual(self.calls[-1], ('append', ('typo', 'an  好\r\ner2')))
+
+    async def test_isolated_preview_only_sends_selection_and_correlates_early_completion(self):
+        from backend import web_message_rewrite as rewrite
+        from unittest.mock import AsyncMock
+        self.legacy.RELAY_DB = self.relay
+        self.runtime.foundation.generation.config = SimpleNamespace(enabled=True, workspace_root=self.root)
+        final = '   新句\r\n'
+        def scope(**options):
+            async def request(method, params):
+                if method == 'account/read':
+                    return {'account': {'type':'chatgpt'}}
+                if method == 'model/list':
+                    return {'data':[{'model':'fixture-model','defaultReasoningEffort':'high'}]}
+                if method == 'config/read':
+                    return {'config': {}}
+                if method == 'thread/start':
+                    self.assertTrue(params['ephemeral'])
+                    self.assertEqual(params['dynamicTools'], [])
+                    self.assertEqual(params['approvalPolicy'], 'never')
+                    return {'model':'fixture-model','modelProvider':'openai','cwd':params['cwd'],
+                            'thread':{'id':'preview','ephemeral':True,'historyMode':'paginated'},
+                            'sandbox':{'type':'readOnly'},'approvalPolicy':'never'}
+                if method == 'turn/start':
+                    self.assertEqual(params['threadId'], 'preview')
+                    self.assertEqual(json.loads(params['input'][0]['text']),
+                                     {'selected_passage':'sw','editing_request':'简洁'})
+                    options['handler']('item/completed', {'threadId':'preview','turnId':'turn-preview',
+                        'item':{'type':'agentMessage','phase':'final_answer','text':final}})
+                    options['handler']('turn/completed', {'threadId':'preview','turn':{'id':'turn-preview','status':'completed'}})
+                    return {'turn':{'id':'turn-preview','status':'inProgress'}}
+                self.assertEqual(method, 'thread/unsubscribe')
+                return {}
+            return SimpleNamespace(request=request, close=AsyncMock())
+        self.runtime.foundation.runtime = SimpleNamespace(scope=scope)
+        body = {'request_id':str(uuid.uuid4()),'message_id':4,'start':2,'end':4,
+                'source_sha256': hashlib.sha256(b'answer2').hexdigest(),'instructions':'简洁'}
+        result = await rewrite.preview(self.legacy, self.authority, RLock(), 'source', body, native=self.runtime)
+        self.assertEqual(result['replacement'], final)
+        self.assertEqual(len(self.rows('source')), 6)
+        with self.assertRaisesRegex(ForkError, 'rewrite_request_already_sent'):
+            await rewrite.preview(self.legacy,self.authority,RLock(),'source',body,native=self.runtime)
